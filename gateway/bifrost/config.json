@@ -1,0 +1,18 @@
+{
+  "providers": [
+    {
+      "provider_key": "dflash",
+      "type": "custom",
+      "base_url": "http://localhost:8000/v1",
+      "api_key": "sk-local",
+      "models": ["qwen3.5-27b", "luce-dflash"]
+    },
+    {
+      "provider_key": "sglang",
+      "type": "custom",
+      "base_url": "http://localhost:8001/v1",
+      "api_key": "sk-local",
+      "models": ["gpt2-xl"]
+    }
+  ]
+}
