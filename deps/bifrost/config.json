@@ -1,0 +1,108 @@
+{
+  "providers": {
+    "anthropic": {
+      "keys": [
+        {
+          "name": "anthropic-key",
+          "value": "YOUR_ANTHROPIC_API_KEY",
+          "models": ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+          "weight": 1.0
+        }
+      ]
+    },
+    "openai": {
+      "keys": [
+        {
+          "name": "openai-key",
+          "value": "YOUR_OPENAI_API_KEY",
+          "models": ["gpt-4.5-preview", "gpt-4.1", "gpt-4.1-mini"],
+          "weight": 1.0
+        }
+      ]
+    },
+    "dflash": {
+      "keys": [
+        {
+          "name": "dflash-key",
+          "value": "sk-local",
+          "models": ["luce-dflash"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://localhost:8000",
+        "default_request_timeout_in_seconds": 120
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "chat_completion": true,
+          "chat_completion_stream": true
+        }
+      }
+    },
+    "vllm": {
+      "keys": [
+        {
+          "name": "vllm-key",
+          "value": "sk-local",
+          "models": ["qwen3.6-27b-autoround"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://localhost:8020",
+        "default_request_timeout_in_seconds": 120
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "chat_completion": true,
+          "chat_completion_stream": true
+        }
+      }
+    },
+    "sglang": {
+      "keys": [
+        {
+          "name": "sglang-key",
+          "value": "sk-local",
+          "models": ["gpt2-xl"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://localhost:8001",
+        "default_request_timeout_in_seconds": 60
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "chat_completion": true,
+          "chat_completion_stream": true
+        }
+      }
+    },
+    "gpt2": {
+      "keys": [
+        {
+          "name": "gpt2-key",
+          "value": "sk-local",
+          "models": ["shitty-default","shitty-inferkit","shitty-terrible","shitty-incoherent","shitty-repetitive","shitty-coherent","shitty-bloatware","shitty-best2021"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://localhost:9001",
+        "default_request_timeout_in_seconds": 60
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "chat_completion": true,
+          "chat_completion_stream": true
+        }
+      }
+    }
+  }
+}

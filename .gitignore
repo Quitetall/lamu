@@ -20,21 +20,29 @@ venv/
 
 # Logs / runtime
 *.log
-/server.log
 *.pid
 
-# Submodule builds
-lucebox-hub/dflash/build/
-lucebox-hub/dflash/.venv/
-lucebox-hub/megakernel/.venv/
+# Dependency builds
+deps/lucebox-hub/dflash/build/
+deps/lucebox-hub/dflash/.venv/
+deps/lucebox-hub/megakernel/.venv/
 
 # Containers
 librechat/
 
 # Chainlit generated files
-frontend/chainlit/.chainlit/
+web/.chainlit/
 
 # SQLite databases
 *.db
 *.db-shm
 *.db-wal
+
+# Training artifacts
+agents/training_data/
+agents/datasets/
+agents/adapters/
+agents/merged_models/
+
+# club-3090 (cloned dependency, managed by setup script)
+deps/club-3090/
