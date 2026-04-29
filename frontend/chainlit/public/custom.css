@@ -1,0 +1,5 @@
+/* Emoji font fallback — ensures emoji render in Firefox/Linux */
+body, .MuiTypography-root, p, span, div {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, "Twemoji", "Noto Color Emoji", "Apple Color Emoji", sans-serif;
+}

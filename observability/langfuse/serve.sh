@@ -6,7 +6,7 @@ YEL='\033[0;33m'
 NC='\033[0m'
 
 LANGFUSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HEALTH_URL="http://localhost:3000/api/public/health"
+HEALTH_URL="http://127.0.0.1:3000/api/public/health"
 
 if curl -sf "$HEALTH_URL" &>/dev/null; then
   echo -e "${GREEN}Langfuse already running at http://localhost:3000${NC}"
@@ -19,7 +19,7 @@ podman-compose up -d
 echo "Waiting for Langfuse to become ready..."
 ELAPSED=0
 INTERVAL=2
-TIMEOUT=60
+TIMEOUT=120
 
 while true; do
   if curl -sf "$HEALTH_URL" &>/dev/null; then

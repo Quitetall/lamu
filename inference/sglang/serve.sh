@@ -5,7 +5,7 @@
 set -euo pipefail
 
 MODEL_ID="${1:-gpt2-xl}"
-VENV="$HOME/local-llm/inference/sglang/.venv"
+VENV="$HOME/local-llm/.venv"
 PID_FILE="/tmp/sglang-${MODEL_ID}.pid"
 LOG="$HOME/local-llm/inference/sglang/${MODEL_ID}.log"
 
@@ -30,14 +30,6 @@ CTX_N="${CTX[$MODEL_ID]}"
 if curl -sf "http://localhost:$PORT_N/v1/models" &>/dev/null; then
   echo -e "  SGLang $MODEL_ID  ${GRY}already running on :$PORT_N${R}"
   exit 0
-fi
-
-# ── Install venv if needed ────────────────────────────────────────────────
-if [[ ! -f "$VENV/bin/python" ]]; then
-  echo "Creating SGLang venv..."
-  python3 -m venv "$VENV"
-  "$VENV/bin/pip" install --upgrade pip -q
-  "$VENV/bin/pip" install "sglang[all]" -q
 fi
 
 # ── Launch ────────────────────────────────────────────────────────────────

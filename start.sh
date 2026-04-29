@@ -8,7 +8,6 @@ GREEN="\033[32m"; YEL="\033[33m"; GRY="\033[90m"; R="\033[0m"; BOLD="\033[1m"
 echo -e "\n${BOLD}Local AI Stack${R}"
 
 bash "$ROOT/inference/dflash/serve.sh"
-# bash "$ROOT/inference/sglang/serve.sh" gpt2-xl   # uncomment to start GPT-2
 bash "$ROOT/gateway/bifrost/serve.sh"
 bash "$ROOT/observability/langfuse/serve.sh"
 bash "$ROOT/frontend/chainlit/serve.sh"

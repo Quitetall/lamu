@@ -33,3 +33,8 @@ librechat/
 
 # Chainlit generated files
 frontend/chainlit/.chainlit/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal

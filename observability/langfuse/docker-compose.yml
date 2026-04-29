@@ -22,8 +22,9 @@ services:
       NEXTAUTH_URL: http://localhost:3000
       NEXTAUTH_SECRET: a3f8c2e1d7b94056f2a1c3e8d5b70924
       SALT: 9e2b5d4f1a8c36071e4d2f9b6a031c85
-      ENCRYPTION_KEY: 5c1e7a3f0d924b86e2d5f8a1c3b60947
+      ENCRYPTION_KEY: 91da888a285f7b5cf4957ff78373d5b8ab14b503387ec447511c178060976486
       PORT: 3000
+      HOSTNAME: "0.0.0.0"
       TELEMETRY_ENABLED: "false"
     restart: unless-stopped
 

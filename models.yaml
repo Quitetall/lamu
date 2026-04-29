@@ -12,12 +12,74 @@ models:
     max_ctx: 8192
 
   - id: gpt2-xl
-    name: "GPT-2 XL (shitty-2021-llm)"
-    engine: shitty-2021-llm
-    source: ~/Desktop/shitty-2021-llm
-    port: 9001
+    name: "GPT-2 XL (raw)"
+    engine: sglang
+    port: 8001
     context: 1024
-    notes: "GPT-2 family (124M–1.5B). Custom Flask server with preset system.
-      Presets: shitty-best2021, shitty-inferkit, shitty-terrible, shitty-incoherent,
-      shitty-repetitive, shitty-coherent, shitty-bloatware, shitty-default.
-      Start: cd ~/Desktop/shitty-2021-llm && ./api --model gpt2-xl"
+
+  # GPT-2 presets — routed via gpt2_proxy (:9001) → SGLang (:8001)
+  - id: shitty-best2021
+    name: "GPT-2 XL — Best 2021"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 0.72
+    top_p: 0.95
+    max_tokens: 300
+    context: 256
+
+  - id: shitty-inferkit
+    name: "GPT-2 XL — InferKit"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 0.85
+    max_tokens: 120
+    context: 80
+
+  - id: shitty-coherent
+    name: "GPT-2 XL — Coherent"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 0.5
+    max_tokens: 200
+    context: 200
+
+  - id: shitty-repetitive
+    name: "GPT-2 XL — Repetitive"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 0.1
+    max_tokens: 80
+    context: 50
+
+  - id: shitty-terrible
+    name: "GPT-2 XL — Terrible"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 2.0
+    max_tokens: 25
+    context: 20
+
+  - id: shitty-incoherent
+    name: "GPT-2 XL — Incoherent"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 3.0
+    max_tokens: 15
+    context: 10
+
+  - id: shitty-bloatware
+    name: "GPT-2 XL — Bloatware"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 2.2
+    top_p: 0.5
+    max_tokens: 28
+    context: 512
+
+  - id: shitty-default
+    name: "GPT-2 XL — Default"
+    engine: gpt2-proxy
+    port: 9001
+    temperature: 0.7
+    max_tokens: 150
+    context: 100

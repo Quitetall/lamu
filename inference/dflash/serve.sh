@@ -15,7 +15,12 @@ fi
 
 echo -e "  Starting DFlash ${GRY}(log: $LOG)${R}"
 cd "$DFLASH_DIR"
-nohup .venv/bin/python scripts/server.py --port "$PORT" --max-ctx 8192 >"$LOG" 2>&1 &
+# Use the local-llm repo's server.py (has tool-calling support) instead of
+# the upstream lucebox-hub copy.
+SERVER_PY="$HOME/local-llm/inference/dflash/server.py"
+# budget=22 tuned for RTX 3090; on 4090, CUDA fragmentation prevents the 1.85 GB
+# rollback cache at budget=22 — reduce to 10 (~0.84 GB) so it fits contiguously.
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 nohup .venv/bin/python "$SERVER_PY" --port "$PORT" --max-ctx 8192 >"$LOG" 2>&1 &
 echo $! >"$PID_FILE"
 
 echo -n "  waiting for DFlash"
