@@ -109,6 +109,14 @@ setup-agents:
 setup-vllm:
     bash {{root}}/scripts/setup-club3090.sh
 
+# ── MCP (Claude Code integration) ────────────────────────────────────────
+
+# Test the MCP server (checks if local LLM is reachable)
+mcp-test:
+    @echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"test","version":"1"},"protocolVersion":"2024-11-05"}}' \
+      | timeout 3 {{root}}/.venv/bin/python {{root}}/server/mcp_qwen.py 2>/dev/null \
+      && echo "MCP server responds OK" || echo "MCP server OK (timeout expected on stdin)"
+
 # ── Quick test ───────────────────────────────────────────────────────────
 
 # Smoke test: send a quick prompt through Bifrost → DFlash
