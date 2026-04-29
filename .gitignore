@@ -30,3 +30,6 @@ lucebox-hub/megakernel/.venv/
 
 # Containers
 librechat/
+
+# Chainlit generated files
+frontend/chainlit/.chainlit/
