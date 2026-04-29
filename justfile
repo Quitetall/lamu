@@ -75,9 +75,17 @@ swap-gpt2:
 
 # ── Chat ─────────────────────────────────────────────────────────────────
 
-# Terminal chat REPL
+# Interactive REPL (auto-starts models if needed)
 chat:
     bash {{root}}/scripts/chat.sh
+
+# One-shot prompt (no REPL)
+ask +prompt:
+    bash {{root}}/scripts/chat.sh {{prompt}}
+
+# Chat with a specific model
+chat-with model:
+    bash {{root}}/scripts/chat.sh -m {{model}}
 
 # ── Swarm ────────────────────────────────────────────────────────────────
 
