@@ -15,7 +15,7 @@ fi
 
 echo -e "  Starting DFlash ${GRY}(log: $LOG)${R}"
 cd "$DFLASH_DIR"
-nohup .venv/bin/python scripts/server.py --port "$PORT" >"$LOG" 2>&1 &
+nohup .venv/bin/python scripts/server.py --port "$PORT" --max-ctx 8192 >"$LOG" 2>&1 &
 echo $! >"$PID_FILE"
 
 echo -n "  waiting for DFlash"

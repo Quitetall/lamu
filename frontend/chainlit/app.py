@@ -8,14 +8,14 @@ import os
 from dotenv import load_dotenv
 import chainlit as cl
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 load_dotenv()
 
 BIFROST_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
 BIFROST_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3.5-27b")
-AVAILABLE_MODELS = ["qwen3.5-27b", "gpt2-xl"]
+AVAILABLE_MODELS = ["luce-dflash", "gpt2-xl"]
 
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
@@ -54,9 +54,8 @@ async def on_chat_start():
     actions = [
         cl.Action(
             name="select_model",
-            value=m,
             label=m,
-            description=f"Switch to {m}",
+            payload={"model": m},
         )
         for m in AVAILABLE_MODELS
     ]
@@ -72,7 +71,7 @@ async def on_chat_start():
 
 @cl.action_callback("select_model")
 async def on_model_select(action: cl.Action):
-    model = action.value
+    model = action.payload["model"]
     cl.user_session.set("model", model)
     await cl.Message(content=f"Switched to **{model}**.").send()
     await action.remove()
@@ -135,7 +134,6 @@ async def on_message(message: cl.Message):
     await response_msg.update()
 
     # Persist to history (keep last 20 turns to avoid context blowout)
-    from langchain.schema import AIMessage
     history.append(HumanMessage(content=content))
     history.append(AIMessage(content=full_response))
     if len(history) > 40:

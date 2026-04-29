@@ -8,12 +8,16 @@ models:
     path: ~/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
     draft: ~/models/draft-35/model.safetensors
     port: 8000
-    context: 16384
+    context: 8192
+    max_ctx: 8192
 
   - id: gpt2-xl
-    name: "GPT-2 XL (2021)"
-    engine: sglang
-    hf_model: gpt2-xl
-    port: 8001
+    name: "GPT-2 XL (shitty-2021-llm)"
+    engine: shitty-2021-llm
+    source: ~/Desktop/shitty-2021-llm
+    port: 9001
     context: 1024
-    notes: "124M–1.5B GPT-2 family. Served via SGLang. Stateless, no instruction tuning."
+    notes: "GPT-2 family (124M–1.5B). Custom Flask server with preset system.
+      Presets: shitty-best2021, shitty-inferkit, shitty-terrible, shitty-incoherent,
+      shitty-repetitive, shitty-coherent, shitty-bloatware, shitty-default.
+      Start: cd ~/Desktop/shitty-2021-llm && ./api --model gpt2-xl"
