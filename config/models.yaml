@@ -29,15 +29,25 @@ models:
     port: 8000
     context: 8192
 
-  # ── Local: Qwen3.6-35B-A3B MoE Uncensored (llama-cpp-python) ────────
+  # ── Local: Qwen3.6-27B Dense Uncensored (llama-cpp-python) ──────────
+  - id: qwen3.6-27b-uncensored
+    name: "Qwen3.6-27B Dense Uncensored Heretic v2"
+    engine: llama-cpp
+    role: worker     # swarm implementer — strongest local model, uncensored
+    gguf: ~/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
+    port: 8020
+    context: 49152   # ~16GB model, plenty of room for KV cache
+    notes: "SWE-bench 77.2, Terminal-Bench 59.3, AIME 94.1. 94% fewer refusals (6/100). 0.0021 KL."
+
+  # ── Local: Qwen3.6-35B-A3B MoE Uncensored (llama-cpp-python) ──────
   - id: qwen3.6-35b-uncensored
     name: "Qwen3.6-35B-A3B Uncensored Heretic (MoE, 3B active)"
     engine: llama-cpp
-    role: worker     # swarm implementer — uncensored, never refuses
+    role: worker     # alternative — faster per-token, lower quality
     gguf: ~/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
     port: 8020
     context: 32768
-    notes: "35B total / 3B active MoE. 88% fewer refusals. 0.0015 KL divergence."
+    notes: "35B total / 3B active MoE. 88% fewer refusals. 0.0015 KL. Shares :8020 with dense."
 
   # ── Local: SGLang (GPT-2 XL) ──────────────────────────────────────────
   - id: gpt2-xl

@@ -31,9 +31,17 @@ status:
 serve-dflash:
     bash {{root}}/scripts/serve-dflash.sh
 
-# Start Qwen3.6-35B-A3B uncensored MoE on :8020 (swarm worker model)
+# Start Qwen3.6 uncensored on :8020 (auto-detects dense vs MoE)
 serve-qwen36:
     bash {{root}}/scripts/serve-qwen36.sh
+
+# Start Qwen3.6-27B dense specifically (best benchmarks)
+serve-qwen36-dense:
+    bash {{root}}/scripts/serve-qwen36.sh dense
+
+# Start Qwen3.6-35B-A3B MoE specifically (faster per-token)
+serve-qwen36-moe:
+    bash {{root}}/scripts/serve-qwen36.sh moe
 
 # Start vLLM via club-3090 (Qwen3.6-27B on :8020 — alternative)
 serve-vllm:
@@ -109,8 +117,16 @@ setup-web:
 setup-agents:
     bash {{root}}/agents/setup.sh
 
-# Download Qwen3.6-35B-A3B uncensored GGUF (~21 GB)
+# Download Qwen3.6-27B dense uncensored GGUF (~16 GB) — recommended
 setup-qwen36:
+    bash {{root}}/scripts/setup-qwen36-dense.sh
+
+# Download Qwen3.6-27B dense specifically
+setup-qwen36-dense:
+    bash {{root}}/scripts/setup-qwen36-dense.sh
+
+# Download Qwen3.6-35B-A3B MoE uncensored GGUF (~21 GB)
+setup-qwen36-moe:
     bash {{root}}/scripts/setup-qwen36-moe.sh
 
 # Clone + set up club-3090 for vLLM serving (~20 GB download)
