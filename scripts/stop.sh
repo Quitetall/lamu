@@ -20,4 +20,10 @@ if [[ -f /tmp/dflash-server.pid ]]; then
   rm -f /tmp/dflash-server.pid
 fi
 
+if [[ -f /tmp/qwen36-server.pid ]]; then
+  pid=$(cat /tmp/qwen36-server.pid)
+  kill "$pid" 2>/dev/null && echo -e "  Qwen3.6  \033[90mstopped (pid $pid)\033[0m" || true
+  rm -f /tmp/qwen36-server.pid
+fi
+
 echo

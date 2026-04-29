@@ -23,10 +23,12 @@ load_dotenv()
 
 BIFROST_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
 BIFROST_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "dflash/luce-dflash")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen/qwen3.6-35b-uncensored")
 
-DFLASH_MODELS = {"dflash/luce-dflash"}
+# Models that support tool calling → get the agentic loop
+AGENTIC_MODELS = {"dflash/luce-dflash", "qwen/qwen3.6-35b-uncensored"}
 AVAILABLE_MODELS = [
+    "qwen/qwen3.6-35b-uncensored",
     "dflash/luce-dflash",
     "gpt2/shitty-best2021",
     "gpt2/shitty-inferkit",
@@ -263,7 +265,7 @@ async def on_message(message: cl.Message):
     await response_msg.send()
 
     try:
-        if model in DFLASH_MODELS:
+        if model in AGENTIC_MODELS:
             reply, _ = await run_agent(content, history, model, response_msg)
         else:
             reply, _ = await run_simple(content, history, model, response_msg)

@@ -18,8 +18,9 @@ from rich.spinner import Spinner
 
 BIFROST_URL = "http://localhost:8080/v1/chat/completions"
 BIFROST_KEY = "sk-local"
-DEFAULT_MODEL = "dflash/luce-dflash"
+DEFAULT_MODEL = "qwen/qwen3.6-35b-uncensored"
 AVAILABLE_MODELS = [
+    "qwen/qwen3.6-35b-uncensored",
     "dflash/luce-dflash",
     "gpt2/shitty-best2021",
     "gpt2/shitty-inferkit",
