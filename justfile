@@ -43,9 +43,9 @@ serve-qwen36-dense:
 serve-qwen36-moe:
     bash {{root}}/scripts/serve-qwen36.sh moe
 
-# Start vLLM via club-3090 (Qwen3.6-27B on :8020 — alternative)
-serve-vllm:
-    bash {{root}}/scripts/serve-vllm.sh
+# Start Qwen3.6-27B uncensored via vLLM — full 262K context, tool calling, reasoning parser
+serve-vllm ctx="262144":
+    bash {{root}}/scripts/serve-vllm-qwen36.sh {{ctx}}
 
 # Start Bifrost gateway (:8080)
 serve-bifrost:
