@@ -31,7 +31,11 @@ status:
 serve-dflash:
     bash {{root}}/scripts/serve-dflash.sh
 
-# Start vLLM via club-3090 (Qwen3.6-27B on :8020)
+# Start Qwen3.6-35B-A3B uncensored MoE on :8020 (swarm worker model)
+serve-qwen36:
+    bash {{root}}/scripts/serve-qwen36.sh
+
+# Start vLLM via club-3090 (Qwen3.6-27B on :8020 — alternative)
 serve-vllm:
     bash {{root}}/scripts/serve-vllm.sh
 
@@ -105,6 +109,10 @@ setup-web:
 setup-agents:
     bash {{root}}/agents/setup.sh
 
+# Download Qwen3.6-35B-A3B uncensored GGUF (~21 GB)
+setup-qwen36:
+    bash {{root}}/scripts/setup-qwen36-moe.sh
+
 # Clone + set up club-3090 for vLLM serving (~20 GB download)
 setup-vllm:
     bash {{root}}/scripts/setup-club3090.sh
@@ -127,10 +135,10 @@ test-dflash:
       -d '{"model":"dflash/luce-dflash","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
       | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
 
-# Smoke test: send a prompt through Bifrost → vLLM
-test-vllm:
+# Smoke test: send a prompt through Bifrost → Qwen3.6 uncensored
+test-qwen36:
     @curl -s http://localhost:8080/v1/chat/completions \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer sk-local" \
-      -d '{"model":"vllm/qwen3.6-27b-autoround","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
+      -d '{"model":"qwen/qwen3.6-35b-uncensored","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
       | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"

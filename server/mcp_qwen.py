@@ -44,7 +44,7 @@ server = Server("local-llm")
 def _chat(
     prompt: str,
     system: str = "",
-    model: str = "dflash/luce-dflash",
+    model: str = "qwen/qwen3.6-35b-uncensored",
     max_tokens: int = 2048,
     temperature: float = 0.3,
 ) -> str:
@@ -99,11 +99,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="query_local_llm",
             description=(
-                "Send a prompt to the local Qwen3.5-27B model running on this machine. "
-                "Use this for bulk code generation, drafting implementations, getting a "
-                "second opinion, or any task that doesn't require cloud-tier reasoning. "
-                "The local model is fast and free but less capable than Claude — best for "
-                "well-specified implementation tasks with clear instructions."
+                "Send a prompt to the local Qwen3.6-35B-A3B uncensored model (MoE, 3B active). "
+                "Fast, free, never refuses. Use for bulk code generation, drafting "
+                "implementations, second opinions, or tasks that don't need cloud reasoning. "
+                "Best for well-specified implementation tasks with clear instructions."
             ),
             inputSchema={
                 "type": "object",

@@ -29,13 +29,15 @@ models:
     port: 8000
     context: 8192
 
-  # ── Local: vLLM (Qwen3.6-27B via club-3090) ───────────────────────────
-  - id: qwen3.6-27b-autoround
-    name: "Qwen3.6-27B AutoRound (vLLM)"
-    engine: vllm
-    role: worker     # swarm implementer (faster, vision, tools, MTP)
+  # ── Local: Qwen3.6-35B-A3B MoE Uncensored (llama-cpp-python) ────────
+  - id: qwen3.6-35b-uncensored
+    name: "Qwen3.6-35B-A3B Uncensored Heretic (MoE, 3B active)"
+    engine: llama-cpp
+    role: worker     # swarm implementer — uncensored, never refuses
+    gguf: ~/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
     port: 8020
-    context: 65536   # single-card default; 262K with dual-card
+    context: 32768
+    notes: "35B total / 3B active MoE. 88% fewer refusals. 0.0015 KL divergence."
 
   # ── Local: SGLang (GPT-2 XL) ──────────────────────────────────────────
   - id: gpt2-xl

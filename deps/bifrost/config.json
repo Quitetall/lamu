@@ -41,12 +41,12 @@
         }
       }
     },
-    "vllm": {
+    "qwen": {
       "keys": [
         {
-          "name": "vllm-key",
+          "name": "qwen-key",
           "value": "sk-local",
-          "models": ["qwen3.6-27b-autoround"],
+          "models": ["qwen3.6-35b-uncensored"],
           "weight": 1.0
         }
       ],
