@@ -42,10 +42,9 @@ class LocalLLM:
 
     def _request(self, path: str, payload: dict = None, timeout: int = 120) -> dict:
         url = f"{self.base_url}{path}"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode() if payload else None
         req = urllib.request.Request(url, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -58,9 +57,24 @@ class LocalLLM:
         return text.strip()
 
     def models(self) -> list[str]:
-        """List available model IDs."""
-        data = self._request("/models", timeout=5)
-        return [m["id"] for m in data.get("data", [])]
+        """List available model IDs by probing all known local endpoints."""
+        found = []
+        endpoints = [
+            ("http://localhost:8020/v1", "qwen"),    # Qwen3.6
+            ("http://localhost:8000/v1", "dflash"),   # DFlash
+            ("http://localhost:8001/v1", "sglang"),   # SGLang
+            ("http://localhost:9001/v1", "gpt2"),     # GPT-2 proxy
+        ]
+        for base, provider in endpoints:
+            try:
+                req = urllib.request.Request(f"{base}/models")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read())
+                    for m in data.get("data", []):
+                        found.append(f"{provider}/{m['id']}")
+            except Exception:
+                pass
+        return found
 
     def chat(
         self,
@@ -183,7 +197,7 @@ class LocalLLM:
         status = {}
         for name, base in endpoints.items():
             try:
-                url = f"{base}/v1/models" if name != "gpt2proxy" else f"{base}/health"
+                url = f"{base}/health" if name in ("bifrost", "gpt2proxy") else f"{base}/v1/models"
                 req = urllib.request.Request(url)
                 with urllib.request.urlopen(req, timeout=2) as resp:
                     status[name] = "up"

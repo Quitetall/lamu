@@ -29,7 +29,7 @@ case "$VARIANT" in
   dense)
     GGUF=$(find "$DENSE_DIR" -name "*Q4_K_M*.gguf" -print -quit 2>/dev/null)
     MODEL_LABEL="Qwen3.6-27B Dense"
-    CTX=49152  # 16GB model leaves ~8GB for KV cache
+    CTX=8192
     ;;
   moe)
     GGUF=$(find "$MOE_DIR" -name "*Q4_K_M*.gguf" -print -quit 2>/dev/null)
@@ -41,7 +41,7 @@ case "$VARIANT" in
     GGUF=$(find "$DENSE_DIR" -name "*Q4_K_M*.gguf" -print -quit 2>/dev/null)
     if [[ -n "$GGUF" ]]; then
       MODEL_LABEL="Qwen3.6-27B Dense"
-      CTX=49152
+      CTX=8192  # 16GB model on 24GB GPU; leaves room for KV cache
     else
       GGUF=$(find "$MOE_DIR" -name "*Q4_K_M*.gguf" -print -quit 2>/dev/null)
       MODEL_LABEL="Qwen3.6-35B-A3B MoE"
@@ -63,6 +63,7 @@ echo -e "  ${GRY}Context: $CTX${R}"
 
 nohup "$VENV/bin/python" -m llama_cpp.server \
   --model "$GGUF" \
+  --model_alias "qwen3.6-35b-uncensored" \
   --host 0.0.0.0 \
   --port "$PORT" \
   --n_gpu_layers -1 \
