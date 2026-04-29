@@ -24,6 +24,7 @@ status:
     @echo "SGLang  :8001  $(curl -sf http://localhost:8001/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
     @echo "GPT2prx :9001  $(curl -sf http://localhost:9001/health >/dev/null 2>&1 && echo '✓' || echo '✗')"
     @echo "Chainlit:7860  $(curl -sf http://localhost:7860 >/dev/null 2>&1 && echo '✓' || echo '✗')"
+    @echo "ComfyUI :8188  $(curl -sf http://localhost:8188/system_stats >/dev/null 2>&1 && echo '✓' || echo '✗')"
 
 # ── Individual services ──────────────────────────────────────────────────
 
@@ -62,6 +63,10 @@ serve-sglang:
 # Start Chainlit web UI (:7860)
 serve-web:
     bash {{root}}/web/serve.sh
+
+# Start ComfyUI for image/video generation (:8188)
+serve-comfyui:
+    bash {{root}}/scripts/serve-comfyui.sh
 
 # ── Model swap ───────────────────────────────────────────────────────────
 
@@ -146,6 +151,10 @@ setup-web:
 # Set up LangGraph agents (create venv + install deps)
 setup-agents:
     bash {{root}}/agents/setup.sh
+
+# Set up ComfyUI + video nodes (image/video generation)
+setup-comfyui:
+    bash {{root}}/scripts/setup-comfyui.sh
 
 # Download Qwen3.6-27B dense uncensored GGUF (~16 GB) — recommended
 setup-qwen36:

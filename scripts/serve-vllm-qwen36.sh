@@ -39,7 +39,7 @@ nohup "$VENV/bin/python" -m vllm.entrypoints.openai.api_server \
   --quantization bitsandbytes \
   --load-format bitsandbytes \
   --kv-cache-dtype fp8_e5m2 \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \

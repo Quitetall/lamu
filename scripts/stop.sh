@@ -26,4 +26,10 @@ if [[ -f /tmp/qwen36-server.pid ]]; then
   rm -f /tmp/qwen36-server.pid
 fi
 
+if [[ -f /tmp/comfyui.pid ]]; then
+  pid=$(cat /tmp/comfyui.pid)
+  kill "$pid" 2>/dev/null && echo -e "  ComfyUI  \033[90mstopped (pid $pid)\033[0m" || true
+  rm -f /tmp/comfyui.pid
+fi
+
 echo
