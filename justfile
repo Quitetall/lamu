@@ -85,6 +85,28 @@ chat:
 swarm task repo test_cmd="python -m pytest tests/ -v --tb=short":
     cd {{root}} && .venv/bin/python -m agents.swarm "{{task}}" --repo "{{repo}}" --test "{{test_cmd}}"
 
+# ── Benchmarks ───────────────────────────────────────────────────────────
+
+# List available builtin benchmark tasks
+bench-list:
+    cd {{root}} && .venv/bin/python -m agents.bench list
+
+# Run builtin benchmark with Opus solo (cloud-only baseline)
+bench-opus:
+    cd {{root}} && .venv/bin/python -m agents.bench run --suite builtin --config opus-solo
+
+# Run builtin benchmark with the full swarm
+bench-swarm:
+    cd {{root}} && .venv/bin/python -m agents.bench run --suite builtin --config swarm
+
+# Run SWE-bench Lite (real GitHub issues, requires datasets package)
+bench-swebench config limit="10":
+    cd {{root}} && .venv/bin/python -m agents.bench run --suite swebench --config {{config}} --limit {{limit}}
+
+# Compare two benchmark runs
+bench-compare run_a run_b:
+    cd {{root}} && .venv/bin/python -m agents.bench compare {{run_a}} {{run_b}}
+
 # ── Training ─────────────────────────────────────────────────────────────
 
 # Show training data stats

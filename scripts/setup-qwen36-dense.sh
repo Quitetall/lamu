@@ -25,9 +25,8 @@ if [[ -f "$TARGET" ]]; then
 fi
 
 echo -e "  Downloading ${QUANT} (~16 GB for Q4_K_M)...\n"
-huggingface-cli download "$REPO" "$FILENAME" \
-  --local-dir "$MODEL_DIR" \
-  --local-dir-use-symlinks False
+hf download "$REPO" "$FILENAME" \
+  --local-dir "$MODEL_DIR"
 
 FOUND=$(find "$MODEL_DIR" -name "*${QUANT}*.gguf" -print -quit)
 if [[ -n "$FOUND" ]]; then
