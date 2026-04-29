@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: docker.io/library/postgres:15
+    network_mode: host
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  langfuse:
+    image: docker.io/langfuse/langfuse:2
+    network_mode: host
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@localhost:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: a3f8c2e1d7b94056f2a1c3e8d5b70924
+      SALT: 9e2b5d4f1a8c36071e4d2f9b6a031c85
+      ENCRYPTION_KEY: 5c1e7a3f0d924b86e2d5f8a1c3b60947
+      PORT: 3000
+      TELEMETRY_ENABLED: "false"
+    restart: unless-stopped
+
+volumes:
+  langfuse_postgres_data:
