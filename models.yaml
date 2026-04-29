@@ -1,0 +1,19 @@
+# Model registry — source of truth for the full stack
+# Each model needs: id, engine, and engine-specific config
+
+models:
+  - id: qwen3.5-27b
+    name: "Qwen3.5-27B DFlash"
+    engine: dflash
+    path: ~/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
+    draft: ~/models/draft-35/model.safetensors
+    port: 8000
+    context: 16384
+
+  - id: gpt2-xl
+    name: "GPT-2 XL (2021)"
+    engine: sglang
+    hf_model: gpt2-xl
+    port: 8001
+    context: 1024
+    notes: "124M–1.5B GPT-2 family. Served via SGLang. Stateless, no instruction tuning."

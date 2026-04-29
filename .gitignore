@@ -1,0 +1,32 @@
+# Model weights — never commit
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+models/
+
+# Secrets
+.env
+*.env
+**/secrets.yaml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Logs / runtime
+*.log
+/server.log
+*.pid
+
+# Submodule builds
+lucebox-hub/dflash/build/
+lucebox-hub/dflash/.venv/
+lucebox-hub/megakernel/.venv/
+
+# Containers
+librechat/
