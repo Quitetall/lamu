@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CMD=$(python3 -c \"import json,sys; d=json.load(sys.stdin); print(d.get('tool_input',d).get('command',''))\" 2>/dev/null || true); case \"$CMD\" in *grep*|*rg\\ *|*ripgrep*|*find\\ *|*fd\\ *|*ack\\ *|*ag\\ *) HINTS=''; [ -f graphify-out/graph.json ] && HINTS=\"$HINTS graphify: Knowledge graph exists at graphify-out/GRAPH_REPORT.md — check it before grepping raw files.\"; [ -d wiki ] && HINTS=\"$HINTS wiki: Accumulated findings at wiki/index.md — check if this question is already answered.\"; [ -n \"$HINTS\" ] && echo \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"additionalContext\\\":\\\"TOKEN EFFICIENCY:$HINTS Use query_local_llm MCP tool for bulk code generation instead of writing it yourself.\\\"}}\" || true ;; esac"
+          }
+        ]
+      },
+      {
+        "matcher": "Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"graphify: Try graphify query or graphify path before globbing — the knowledge graph may already have the structural answer.\"}}' || true"
+          }
+        ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"graphify: Try graphify query before grepping — the knowledge graph indexes relationships that grep cannot find.\"}}' || true"
+          }
+        ]
+      }
+    ]
+  }
+}
