@@ -11,7 +11,12 @@ set -euo pipefail
 ROOT="$HOME/local-llm"
 VENV="$ROOT/.venv"
 PORT=8020
-MODEL="zhiqing/Huihui-Qwen3.6-27B-abliterated-AWQ"
+# Prefer local heretic AWQ if available, fall back to HuggingFace
+if [[ -d "$HOME/models/qwen3.6-27b-heretic-awq" ]]; then
+  MODEL="$HOME/models/qwen3.6-27b-heretic-awq"
+else
+  MODEL="zhiqing/Huihui-Qwen3.6-27B-abliterated-AWQ"
+fi
 PID_FILE="/tmp/qwen36-server.pid"
 LOG="/tmp/qwen36-vllm.log"
 GRY="\033[90m"; GREEN="\033[32m"; YEL="\033[33m"; R="\033[0m"
