@@ -27,7 +27,7 @@ mkdir -p "$EAGLE_DIR" "$DATA_DIR"
 
 # ── Step 1: Install deps ────────────────────────────────────────────────
 echo "[1/4] Installing dependencies..."
-"$VENV/bin/pip" install datasets safetensors wandb -q 2>/dev/null
+"$VENV/bin/python" -m pip install datasets safetensors wandb -q 2>/dev/null || true
 
 # ── Step 2: Generate training data ─────────────────────────────────────
 echo "[2/4] Generating hidden state training data..."
@@ -56,7 +56,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 print(f"Loading model in 4-bit (bitsandbytes)...")
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_compute_dtype=torch.bfloat16,
     bnb_4bit_quant_type="nf4",
 )
 model = AutoModelForCausalLM.from_pretrained(
@@ -64,7 +64,7 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=bnb_config,
     device_map="auto",
     trust_remote_code=True,
-    torch_dtype=torch.float16,
+    dtype=torch.bfloat16,
     output_hidden_states=True,
 )
 model.eval()
@@ -108,7 +108,7 @@ for i, sample in enumerate(ds):
 
     # Save the second-to-last layer hidden states and the target tokens
     # EAGLE predicts from hidden_states[-2] → next tokens
-    hidden = outputs.hidden_states[-2][0].cpu().numpy().astype(np.float16)
+    hidden = outputs.hidden_states[-2][0].float().cpu().numpy().astype(np.float16)
     targets = input_ids[0, 1:].cpu().numpy()  # shifted by 1
 
     np.savez_compressed(
