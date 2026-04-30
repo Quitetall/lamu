@@ -11,11 +11,16 @@ set -euo pipefail
 ROOT="$HOME/local-llm"
 VENV="$ROOT/.venv"
 PORT=8020
-# Prefer local heretic AWQ if available, fall back to HuggingFace
-if [[ -d "$HOME/models/qwen3.6-27b-heretic-awq" ]]; then
+# Prefer local heretic GPTQ/AWQ if available, fall back to HuggingFace
+if [[ -d "$HOME/models/qwen3.6-27b-heretic-gptq" ]]; then
+  MODEL="$HOME/models/qwen3.6-27b-heretic-gptq"
+  QUANT="gptq"
+elif [[ -d "$HOME/models/qwen3.6-27b-heretic-awq" ]]; then
   MODEL="$HOME/models/qwen3.6-27b-heretic-awq"
+  QUANT="awq"
 else
   MODEL="zhiqing/Huihui-Qwen3.6-27B-abliterated-AWQ"
+  QUANT="awq"
 fi
 PID_FILE="/tmp/qwen36-server.pid"
 LOG="/tmp/qwen36-vllm.log"
@@ -38,7 +43,7 @@ nohup "$VENV/bin/python" -m vllm.entrypoints.openai.api_server \
   --port "$PORT" \
   --host 0.0.0.0 \
   --max-model-len "$CTX" \
-  --quantization awq \
+  --quantization "$QUANT" \
   --kv-cache-dtype fp8_e5m2 \
   --gpu-memory-utilization 0.92 \
   --reasoning-parser qwen3 \
