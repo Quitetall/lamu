@@ -145,6 +145,13 @@ def load_context(repo_path: str, task: str) -> str:
 
 # ── LLM factory ────────────��────────────────────────────────────────────
 
+def strip_think(text: str) -> str:
+    """Strip <think>...</think> blocks from model output."""
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    return text.strip()
+
+
 def llm(model: str, temperature: float = 0.3, max_tokens: int = 4096) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
@@ -222,8 +229,8 @@ async def planner_node(state: SwarmState) -> dict:
         HumanMessage(content=f"Task: {state['task']}\n\nCodebase:\n{state['context']}{extra}"),
     ])
 
-    # Extract JSON from response (handle markdown fences)
-    text = response.content.strip()
+    # Strip think blocks + markdown fences, extract JSON
+    text = strip_think(response.content)
     if text.startswith("```"):
         text = re.sub(r"^```\w*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
@@ -261,7 +268,7 @@ async def worker_node(state: SwarmState) -> dict:
             HumanMessage(content=f"Subtask: {subtask['description']}\n\nCurrent files:\n{context}{test_hint}"),
         ])
 
-        return {"subtask_id": subtask["id"], "output": response.content}
+        return {"subtask_id": subtask["id"], "output": strip_think(response.content)}
 
     results = await asyncio.gather(*[run_subtask(s) for s in state["plan"]])
     return {"implementations": list(results)}
@@ -286,8 +293,9 @@ async def integrator_node(state: SwarmState) -> dict:
         HumanMessage(content=f"Notes: {state['integration_notes']}\n\n{impl_text}"),
     ])
 
-    parsed = _parse_file_blocks(response.content)
-    return {"integrated_diff": response.content, "applied_files": parsed}
+    clean = strip_think(response.content)
+    parsed = _parse_file_blocks(clean)
+    return {"integrated_diff": clean, "applied_files": parsed}
 
 
 def _parse_file_blocks(text: str) -> dict[str, str]:
@@ -349,7 +357,7 @@ async def critic_node(state: SwarmState) -> dict:
         )),
     ])
 
-    text = response.content.strip()
+    text = strip_think(response.content)
     if text.startswith("```"):
         text = re.sub(r"^```\w*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
