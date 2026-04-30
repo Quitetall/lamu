@@ -35,7 +35,7 @@ ENDPOINTS = {
     "dflash": "http://localhost:8000/v1",
 }
 
-server = Server("local-llm")
+server = Server("lamu")
 
 
 def _discover_models() -> dict[str, list[str]]:

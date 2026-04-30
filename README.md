@@ -1,6 +1,8 @@
-# local-llm
+# LAMU
 
-A complete local AI stack for a single RTX 4090. Uncensored Qwen3.6-27B with 262K context, agentic coding swarm, training pipeline, and universal access from terminal, browser, Claude Code, or any OpenAI-compatible client.
+**Local Agent Model Utility** — a framework for running AI models as local agents on consumer hardware. Plug into any tool, any framework, zero cloud dependency.
+
+Currently configured for Qwen3.6-27B Uncensored on RTX 4090 with 262K context, but designed to be model-agnostic and futureproof. Swap the model, keep the framework.
 
 ## What it does
 
@@ -15,12 +17,24 @@ That same model is simultaneously available to:
 - **Any HTTP client** via OpenAI-compatible API (`:8080/v1/chat/completions`)
 - **Python** via `from server.client import chat`
 - **Web browser** via Chainlit UI (`:7860`)
+- **Any framework** that speaks OpenAI protocol
+
+## Philosophy
+
+LAMU is a **framework**, not just a model runner. The current cutting-edge config ships ready to go, but every layer is swappable:
+
+- **Model**: Currently Qwen3.6-27B Heretic. Tomorrow it could be Llama 4, Gemma 5, or whatever beats it. Change one GGUF path.
+- **Engine**: Currently llama-cpp-python. When SGLang/vLLM properly support your model + hardware, swap the serve script.
+- **Gateway**: Currently Bifrost. Could be LiteLLM, any OpenAI-compatible router.
+- **Framework integration**: MCP for Claude Code today. Tomorrow it's whatever protocol wins.
+
+The config is opinionated. The architecture isn't.
 
 ## What makes this different
 
 No other project combines all of these in one stack:
 
-| Feature | Ollama | LM Studio | Open WebUI | text-gen-webui | **local-llm** |
+| Feature | Ollama | LM Studio | Open WebUI | text-gen-webui | **LAMU** |
 |---------|--------|-----------|------------|----------------|---------------|
 | OpenAI-compatible API | Yes | Yes | Via Ollama | Yes | **Yes** |
 | MCP server (Claude Code) | Community | No | No | No | **Built-in** |
@@ -77,8 +91,8 @@ No other project combines all of these in one stack:
 
 ```bash
 # Clone
-git clone https://github.com/Quitetall/local-llm ~/local-llm
-cd ~/local-llm
+git clone https://github.com/Quitetall/lamu ~/lamu
+cd ~/lamu
 
 # Download model (~16 GB)
 just setup-qwen36
@@ -151,6 +165,10 @@ swarm runs → successful pairs saved → prepare dataset → QLoRA fine-tune �
 ```
 
 Every successful swarm run (tests pass + critic approves) auto-saves a training tuple. Over time, fine-tune the local model on your codebase conventions. The model improves at your specific domain.
+
+## Why "LAMU"
+
+**L**ocal **A**gent **M**odel **U**tility. Also a nod to keeping things personal and close to home — your models, your hardware, your data, your rules.
 
 ## License
 

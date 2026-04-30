@@ -1,4 +1,4 @@
-# local-llm — command reference
+# LAMU — Local Agent Model Utility
 # Run `just` with no args to see all available commands.
 
 set dotenv-load
