@@ -88,18 +88,35 @@ def _chat(
         },
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read())
-            content = data["choices"][0]["message"]["content"]
-            # Strip think blocks
-            if "</think>" in content:
-                _, _, content = content.partition("</think>")
-            return content.strip()
-    except urllib.error.URLError as e:
-        return f"Error: local LLM unreachable ({e}). Is the stack running? Start with: just start"
-    except Exception as e:
-        return f"Error: {e}"
+    # Try Bifrost first, fall back to direct endpoint
+    endpoints = [
+        f"{BIFROST_URL}/chat/completions",
+        "http://localhost:8020/v1/chat/completions",
+    ]
+
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {API_KEY}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read())
+                content = data["choices"][0]["message"]["content"]
+                # Strip think blocks (belt and suspenders — server also strips)
+                if "</think>" in content:
+                    _, _, content = content.partition("</think>")
+                return content.strip()
+        except urllib.error.URLError:
+            continue
+        except Exception as e:
+            return f"Error: {e}"
+
+    return "Error: local LLM unreachable. Is the stack running? Start with: just start"
 
 
 @server.list_tools()
