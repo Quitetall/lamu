@@ -78,6 +78,25 @@ swap-qwen:
 swap-gpt2:
     bash {{root}}/scripts/swap.sh gpt2
 
+# Swap GPU to ComfyUI (kills LLM, starts ComfyUI)
+swap-comfyui:
+    #!/usr/bin/env bash
+    echo -e "\033[1mSwapping GPU to ComfyUI\033[0m"
+    kill $(cat /tmp/qwen36-server.pid 2>/dev/null) 2>/dev/null && echo "  Qwen3.6 stopped" || true
+    kill $(cat /tmp/dflash-server.pid 2>/dev/null) 2>/dev/null && echo "  DFlash stopped" || true
+    rm -f /tmp/qwen36-server.pid /tmp/dflash-server.pid
+    sleep 2
+    bash {{root}}/scripts/serve-comfyui.sh
+
+# Swap GPU back to LLM (kills ComfyUI, starts Qwen3.6)
+swap-llm:
+    #!/usr/bin/env bash
+    echo -e "\033[1mSwapping GPU to LLM\033[0m"
+    kill $(cat /tmp/comfyui.pid 2>/dev/null) 2>/dev/null && echo "  ComfyUI stopped" || true
+    rm -f /tmp/comfyui.pid
+    sleep 2
+    bash {{root}}/scripts/serve-qwen36.sh
+
 # ── Chat ─────────────────────────────────────────────────────────────────
 
 # Interactive REPL (auto-starts models if needed)
