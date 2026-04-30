@@ -56,8 +56,8 @@ serve-bifrost:
 serve-langfuse:
     bash {{root}}/scripts/serve-langfuse.sh
 
-# Start SGLang + GPT-2 proxy
-serve-sglang:
+# GPT-2 XL with 2021-era presets (shitty-best2021, shitty-inferkit, etc.)
+serve-timemachine:
     bash {{root}}/scripts/serve-sglang.sh gpt2-xl && bash {{root}}/scripts/serve-sglang-presets.sh
 
 # Start Chainlit web UI (:7860)
