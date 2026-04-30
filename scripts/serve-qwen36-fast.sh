@@ -62,11 +62,11 @@ nohup "$LLAMA_SERVER" \
   --ctx-size "$CTX" \
   --cache-type-k "$KV_TYPE" \
   --cache-type-v "$KV_TYPE" \
-  --flash-attn \
+  --flash-attn on \
   --spec-type ngram-mod \
-  --spec-ngram-size-n 24 \
-  --draft-min 12 \
-  --draft-max 48 \
+  --spec-ngram-mod-n-match 24 \
+  --spec-ngram-mod-n-min 12 \
+  --spec-ngram-mod-n-max 48 \
   --temp 0.6 \
   --top-p 0.95 \
   --top-k 20 \
