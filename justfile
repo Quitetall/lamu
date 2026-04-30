@@ -214,5 +214,5 @@ test-qwen36:
     @curl -s http://localhost:8080/v1/chat/completions \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer sk-local" \
-      -d '{"model":"qwen/qwen3.6-35b-uncensored","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
+      -d '{"model":"qwen/qwen3.6-27b-uncensored","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
       | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"

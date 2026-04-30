@@ -26,7 +26,7 @@ from mcp.types import TextContent, Tool
 
 BIFROST_URL = os.getenv("BIFROST_URL", "http://localhost:8080/v1")
 API_KEY = os.getenv("LLM_API_KEY", "sk-local")
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "qwen/qwen3.6-35b-uncensored")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "qwen/qwen3.6-27b-uncensored")
 
 # Known endpoints to probe for model discovery
 ENDPOINTS = {
@@ -126,7 +126,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "Which model to use (provider/name format). "
-                            "Options: qwen/qwen3.6-35b-uncensored (default, best), "
+                            "Options: qwen/qwen3.6-27b-uncensored (default, best), "
                             "dflash/luce-dflash (Qwen3.5-27B). "
                             "Use list_local_models to see what's running."
                         ),

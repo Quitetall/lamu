@@ -46,7 +46,7 @@
         {
           "name": "qwen-key",
           "value": "sk-local",
-          "models": ["qwen3.6-35b-uncensored"],
+          "models": ["qwen3.6-27b-uncensored"],
           "weight": 1.0
         }
       ],

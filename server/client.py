@@ -37,7 +37,7 @@ class LocalLLM:
         self.default_model = (
             default_model
             or os.getenv("LLM_MODEL")
-            or "qwen/qwen3.6-35b-uncensored"
+            or "qwen/qwen3.6-27b-uncensored"
         )
 
     def _request(self, path: str, payload: dict = None, timeout: int = 120) -> dict:

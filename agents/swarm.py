@@ -48,7 +48,7 @@ BIFROST_URL = os.getenv("BIFROST_URL", "http://localhost:8080/v1")
 BIFROST_KEY = os.getenv("BIFROST_KEY", "sk-local")
 
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "anthropic/claude-opus-4-7")
-WORKER_MODEL = os.getenv("WORKER_MODEL", "qwen/qwen3.6-35b-uncensored")
+WORKER_MODEL = os.getenv("WORKER_MODEL", "qwen/qwen3.6-27b-uncensored")
 CRITIC_MODEL = os.getenv("CRITIC_MODEL", "anthropic/claude-sonnet-4-6")
 
 MAX_WORKER_RETRIES = 3

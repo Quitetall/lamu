@@ -92,7 +92,7 @@ import uvicorn
 
 model = ModelSettings(
     model='$GGUF',
-    model_alias='qwen3.6-35b-uncensored',
+    model_alias='qwen3.6-27b-uncensored',
     n_gpu_layers=-1,
     n_ctx=$CTX,
     type_k=$TYPE_K,

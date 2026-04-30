@@ -23,12 +23,12 @@ load_dotenv()
 
 BIFROST_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1")
 BIFROST_KEY = os.getenv("OPENAI_API_KEY", "sk-local")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen/qwen3.6-35b-uncensored")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen/qwen3.6-27b-uncensored")
 
 # Models that support tool calling → get the agentic loop
-AGENTIC_MODELS = {"dflash/luce-dflash", "qwen/qwen3.6-35b-uncensored"}
+AGENTIC_MODELS = {"dflash/luce-dflash", "qwen/qwen3.6-27b-uncensored"}
 AVAILABLE_MODELS = [
-    "qwen/qwen3.6-35b-uncensored",
+    "qwen/qwen3.6-27b-uncensored",
     "dflash/luce-dflash",
     "gpt2/shitty-best2021",
     "gpt2/shitty-inferkit",

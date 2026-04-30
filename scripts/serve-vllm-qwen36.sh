@@ -39,7 +39,7 @@ echo -e "  ${GRY}Context: $CTX tokens${R}"
 
 nohup "$VENV/bin/python" -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" \
-  --served-model-name "qwen3.6-35b-uncensored" \
+  --served-model-name "qwen3.6-27b-uncensored" \
   --port "$PORT" \
   --host 0.0.0.0 \
   --max-model-len "$CTX" \

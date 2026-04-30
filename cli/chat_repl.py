@@ -30,7 +30,7 @@ from rich.table import Table
 ROOT = os.path.expanduser("~/local-llm")
 BIFROST_URL = "http://localhost:8080/v1/chat/completions"
 BIFROST_KEY = "sk-local"
-DEFAULT_MODEL = "qwen/qwen3.6-35b-uncensored"
+DEFAULT_MODEL = "qwen/qwen3.6-27b-uncensored"
 
 # Endpoints to probe for model discovery
 ENDPOINTS = {
