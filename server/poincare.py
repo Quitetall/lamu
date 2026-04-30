@@ -127,39 +127,77 @@ def load_graphify_json(path: str) -> nx.Graph:
     return G
 
 
-def load_networkx_from_codebase(path: str) -> nx.Graph:
-    """Fallback: build a simple graph from Python imports if no graphify output exists."""
+STDLIB_MODULES = {
+    "os", "sys", "json", "re", "math", "time", "datetime", "pathlib",
+    "typing", "collections", "functools", "itertools", "io", "abc",
+    "dataclasses", "enum", "copy", "hashlib", "uuid", "struct",
+    "subprocess", "shutil", "tempfile", "argparse", "logging",
+    "contextlib", "inspect", "importlib", "pkgutil", "warnings",
+    "asyncio", "threading", "multiprocessing", "concurrent",
+    "urllib", "http", "socket", "ssl", "email",
+    "unittest", "pytest", "textwrap", "string", "operator",
+    "ctypes", "signal", "atexit", "traceback", "pprint",
+}
+
+THIRD_PARTY_NOISE = {
+    "torch", "numpy", "np", "pandas", "scipy", "sklearn",
+    "transformers", "pydantic", "fastapi", "uvicorn", "starlette",
+    "rich", "click", "tqdm", "requests", "httpx", "aiohttp",
+    "PIL", "cv2", "matplotlib", "plotly", "networkx",
+    "dotenv", "yaml", "toml",
+}
+
+
+def load_networkx_from_codebase(path: str, filter_noise: bool = True) -> nx.Graph:
+    """Build a graph from Python AST. Filters stdlib/third-party noise by default."""
     import ast
-    import os
 
     G = nx.Graph()
-    repo = Path(path)
+    repo = Path(path).resolve()
+
+    # Assign community by top-level directory
+    community_map = {}
+    community_counter = 0
 
     py_files = list(repo.rglob("*.py"))
     for f in py_files:
-        if ".venv" in str(f) or "__pycache__" in str(f):
+        if any(skip in str(f) for skip in [".venv", "__pycache__", "lucebox-hub", "node_modules"]):
             continue
 
         rel = str(f.relative_to(repo))
-        G.add_node(rel, label=f.stem, type="file", community=0, file=rel)
+        top_dir = rel.split("/")[0] if "/" in rel else "root"
+        if top_dir not in community_map:
+            community_map[top_dir] = community_counter
+            community_counter += 1
+        comm = community_map[top_dir]
+
+        G.add_node(rel, label=f.stem, type="file", community=comm, file=rel)
 
         try:
             tree = ast.parse(f.read_text())
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name.startswith("_") and node.name != "__init__":
+                        continue  # skip private helpers
                     func_id = f"{rel}:{node.name}"
-                    G.add_node(func_id, label=node.name, type="function", community=0, file=rel)
+                    G.add_node(func_id, label=node.name, type="function", community=comm, file=rel)
                     G.add_edge(rel, func_id, relation="defines", type="EXTRACTED", confidence=1.0)
                 elif isinstance(node, ast.ClassDef):
                     cls_id = f"{rel}:{node.name}"
-                    G.add_node(cls_id, label=node.name, type="class", community=0, file=rel)
+                    G.add_node(cls_id, label=node.name, type="class", community=comm, file=rel)
                     G.add_edge(rel, cls_id, relation="defines", type="EXTRACTED", confidence=1.0)
                 elif isinstance(node, ast.Import):
                     for alias in node.names:
-                        G.add_node(alias.name, label=alias.name, type="module", community=0, file="")
+                        mod = alias.name.split(".")[0]
+                        if filter_noise and mod in STDLIB_MODULES | THIRD_PARTY_NOISE:
+                            continue
+                        G.add_node(alias.name, label=alias.name, type="module", community=comm, file="")
                         G.add_edge(rel, alias.name, relation="imports", type="EXTRACTED", confidence=1.0)
                 elif isinstance(node, ast.ImportFrom) and node.module:
-                    G.add_node(node.module, label=node.module, type="module", community=0, file="")
+                    mod = node.module.split(".")[0]
+                    if filter_noise and mod in STDLIB_MODULES | THIRD_PARTY_NOISE:
+                        continue
+                    G.add_node(node.module, label=node.module, type="module", community=comm, file="")
                     G.add_edge(rel, node.module, relation="imports", type="EXTRACTED", confidence=1.0)
         except (SyntaxError, UnicodeDecodeError):
             continue
