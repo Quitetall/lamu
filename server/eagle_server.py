@@ -55,7 +55,8 @@ class EagleHead(nn.Module):
     @torch.no_grad()
     def predict_next(self, hidden_state: torch.Tensor, n_draft: int = 4) -> list[int]:
         """Predict next n_draft tokens from a single hidden state vector."""
-        # hidden_state: [hidden_size]
+        # hidden_state: [hidden_size] — cast to match EAGLE head dtype
+        hidden_state = hidden_state.to(dtype=next(self.parameters()).dtype)
         x = hidden_state.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_size]
         logits = self.forward(x)  # [1, 1, vocab_size]
         token = logits[0, 0].argmax().item()
