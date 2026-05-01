@@ -97,6 +97,14 @@ swap-llm:
     sleep 2
     bash {{root}}/scripts/serve-qwen36.sh
 
+# Hot-reload to Q4_K_M (262K context, max context)
+reload-max-ctx:
+    @curl -s -X POST http://localhost:8020/reload -H "Content-Type: application/json" -d '{"quant":"Q4_K_M"}' | python3 -c "import sys,json; r=json.load(sys.stdin); print(f'Reloading: {r.get(\"from\",\"?\")} → {r.get(\"to\",\"?\")} ({r.get(\"context\",\"?\")} ctx)')"
+
+# Hot-reload to Q5_K_S (108K context, best quality)
+reload-quality:
+    @curl -s -X POST http://localhost:8020/reload -H "Content-Type: application/json" -d '{"quant":"Q5_K_S"}' | python3 -c "import sys,json; r=json.load(sys.stdin); print(f'Reloading: {r.get(\"from\",\"?\")} → {r.get(\"to\",\"?\")} ({r.get(\"context\",\"?\")} ctx)')"
+
 # ── Chat ─────────────────────────────────────────────────────────────────
 
 # Interactive REPL (auto-starts models if needed)

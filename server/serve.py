@@ -12,6 +12,7 @@ Key features:
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 from llama_cpp.server.app import create_app
@@ -29,12 +30,17 @@ CTX = int(os.getenv("LLM_CTX") or "262144")
 
 QUANT_PREFERENCE = ["Q5_K_S", "Q5_K_M", "Q4_K_M", "Q4_K_S", "Q3_K_L"]
 
+# Hot-reload: which quant to prefer (set via /reload endpoint)
+_active_quant_override: str | None = None
 
-def find_gguf() -> str:
-    for q in QUANT_PREFERENCE:
+
+def find_gguf(quant: str | None = None) -> str:
+    quant = quant or os.getenv("LLM_QUANT")
+    order = [quant] if quant else QUANT_PREFERENCE
+    for q in order:
         for f in MODELS_DIR.glob(f"*{q}*.gguf"):
             return str(f)
-    raise FileNotFoundError(f"No GGUF found in {MODELS_DIR}")
+    raise FileNotFoundError(f"No GGUF matching {order} in {MODELS_DIR}")
 
 
 def kv_type_for_quant(gguf_path: str) -> int:
@@ -185,7 +191,62 @@ def main():
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "model": "qwen3.6-27b-uncensored", "context": ctx}
+        return {
+            "status": "ok",
+            "model": "qwen3.6-27b-uncensored",
+            "quant": Path(gguf).name,
+            "context": ctx,
+            "kv_type": "Q8_0" if kv_type == 8 else "Q4_0",
+        }
+
+    @app.post("/reload")
+    async def reload(request: Request):
+        """Hot-reload with a different quant. Restarts the server process.
+
+        POST /reload {"quant": "Q4_K_M"}     → switch to Q4_K_M (262K context)
+        POST /reload {"quant": "Q5_K_S"}     → switch to Q5_K_S (108K, better quality)
+        POST /reload {}                      → restart with auto-select
+        """
+        import subprocess, signal
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        target_quant = body.get("quant")
+
+        # Verify the target quant exists
+        try:
+            target_gguf = find_gguf(target_quant)
+        except FileNotFoundError as e:
+            return Response(
+                content=json.dumps({"error": str(e)}),
+                status_code=404,
+                media_type="application/json",
+            )
+
+        target_ctx = ctx_for_quant(target_gguf)
+        target_kv = kv_type_for_quant(target_gguf)
+
+        # Respond first, then restart
+        import threading
+        def _restart():
+            import time
+            time.sleep(0.5)
+            env = os.environ.copy()
+            if target_quant:
+                env["LLM_QUANT"] = target_quant
+            # Re-exec ourselves
+            os.execve(
+                sys.executable,
+                [sys.executable] + sys.argv,
+                env,
+            )
+
+        threading.Thread(target=_restart, daemon=True).start()
+        return {
+            "status": "reloading",
+            "from": Path(gguf).name,
+            "to": Path(target_gguf).name,
+            "context": target_ctx,
+            "kv_type": "Q8_0" if target_kv == 8 else "Q4_0",
+        }
 
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
