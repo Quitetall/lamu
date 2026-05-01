@@ -48,7 +48,7 @@ from datasets import load_dataset
 MODEL_ID = "llmfan46/Qwen3.6-27B-uncensored-heretic-v2"
 DATA_DIR = Path(os.path.expanduser("~/models/qwen3.6-27b-heretic-eagle/train_data"))
 NUM_SAMPLES = 2000  # More = better EAGLE head, but slower
-MAX_LEN = 2048
+MAX_LEN = 1024  # shorter to avoid OOM on 24GB GPU (hidden states are large)
 
 print(f"Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -79,7 +79,11 @@ except:
 print(f"Generating hidden states for {NUM_SAMPLES} samples...")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-saved = 0
+# Resume from existing samples
+existing = len(list(DATA_DIR.glob("sample_*.npz")))
+saved = existing
+if existing > 0:
+    print(f"  Resuming from {existing} existing samples")
 for i, sample in enumerate(ds):
     if saved >= NUM_SAMPLES:
         break
@@ -102,24 +106,28 @@ for i, sample in enumerate(ds):
     if input_ids.shape[1] < 64:
         continue
 
-    # Forward pass — collect hidden states
-    with torch.no_grad():
-        outputs = model(input_ids, output_hidden_states=True)
+    # Forward pass — collect hidden states (skip if OOM on long sequences)
+    try:
+        with torch.no_grad():
+            outputs = model(input_ids, output_hidden_states=True)
 
-    # Save the second-to-last layer hidden states and the target tokens
-    # EAGLE predicts from hidden_states[-2] → next tokens
-    hidden = outputs.hidden_states[-2][0].float().cpu().numpy().astype(np.float16)
-    targets = input_ids[0, 1:].cpu().numpy()  # shifted by 1
+        hidden = outputs.hidden_states[-2][0].float().cpu().numpy().astype(np.float16)
+        targets = input_ids[0, 1:].cpu().numpy()
 
-    np.savez_compressed(
-        DATA_DIR / f"sample_{saved:05d}.npz",
-        hidden_states=hidden[:-1],  # align with targets
-        target_tokens=targets,
-    )
+        np.savez_compressed(
+            DATA_DIR / f"sample_{saved:05d}.npz",
+            hidden_states=hidden[:-1],
+            target_tokens=targets,
+        )
 
-    saved += 1
-    if saved % 50 == 0:
-        print(f"  {saved}/{NUM_SAMPLES} samples generated")
+        saved += 1
+        if saved % 50 == 0:
+            print(f"  {saved}/{NUM_SAMPLES} samples generated", flush=True)
+
+        del outputs, hidden, targets
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        continue
 
 print(f"Data generation complete: {saved} samples in {DATA_DIR}")
 del model
@@ -174,26 +182,36 @@ class EagleDataset(Dataset):
         return hidden, targets
 
 # ── EAGLE Head Model ─────────────────────────────────────────────────
-class EagleHead(nn.Module):
-    """Simple EAGLE head: 2 transformer layers + LM head."""
+# Key insight: project down to a smaller dimension, run transformer there,
+# then project back up to vocab. This keeps the model small (~80M params
+# instead of 1.9B).
 
-    def __init__(self, hidden_size, vocab_size, num_layers=2, num_heads=16):
+INNER_DIM = 1024  # bottleneck dimension
+
+class EagleHead(nn.Module):
+    """EAGLE head with bottleneck projection. ~80M params."""
+
+    def __init__(self, hidden_size, vocab_size, inner_dim=INNER_DIM, num_layers=2, num_heads=8):
         super().__init__()
-        self.norm_in = nn.LayerNorm(hidden_size)
+        self.proj_down = nn.Linear(hidden_size, inner_dim)
+        self.norm_in = nn.LayerNorm(inner_dim)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
+            d_model=inner_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_size * 4,
+            dim_feedforward=inner_dim * 4,
             dropout=0.0,
             batch_first=True,
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.proj_up = nn.Linear(inner_dim, hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, hidden_states):
-        x = self.norm_in(hidden_states)
+        x = self.proj_down(hidden_states)
+        x = self.norm_in(x)
         x = self.transformer(x)
+        x = self.proj_up(x)
         logits = self.lm_head(x)
         return logits
 
@@ -202,16 +220,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Training on: {device}")
 
 dataset = EagleDataset(DATA_DIR, max_len=512)
-loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2)
+loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=2, pin_memory=True)
 
-model = EagleHead(hidden_size, vocab_size, num_layers=2, num_heads=16).to(device)
-model = model.to(torch.float16)
+# Use FP32 for training stability (NaN with FP16 + 248K vocab cross-entropy)
+model = EagleHead(hidden_size, vocab_size).to(device).float()
 
 param_count = sum(p.numel() for p in model.parameters()) / 1e6
 print(f"  EAGLE head parameters: {param_count:.0f}M")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 criterion = nn.CrossEntropyLoss(ignore_index=-1)
+scaler = torch.amp.GradScaler('cuda')
 
 NUM_EPOCHS = 10
 print(f"  Training for {NUM_EPOCHS} epochs...")
@@ -222,24 +242,26 @@ for epoch in range(NUM_EPOCHS):
     n_batches = 0
 
     for hidden, targets in loader:
-        hidden = hidden.to(device, dtype=torch.float16)
+        hidden = hidden.to(device)  # float32
         targets = targets.to(device)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             logits = model(hidden)
-            # Flatten for cross-entropy
-            loss = criterion(logits.view(-1, vocab_size).float(), targets.view(-1))
+            loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         n_batches += 1
 
+    scheduler.step()
     avg_loss = total_loss / max(n_batches, 1)
-    print(f"  Epoch {epoch+1}/{NUM_EPOCHS}: loss = {avg_loss:.4f}")
+    print(f"  Epoch {epoch+1}/{NUM_EPOCHS}: loss = {avg_loss:.4f}", flush=True)
 
 # Save
 torch.save(model.state_dict(), OUTPUT_DIR / "eagle_head.pt")
