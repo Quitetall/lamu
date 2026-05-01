@@ -239,6 +239,137 @@ def test_delete_head():
         },
         "test_cmd": "python -m pytest tests/test_linked_list.py -v",
     },
+    {
+        "id": "lru-cache-006",
+        "description": "Implement an LRU Cache class in `src/lru_cache.py` with get(key), put(key, value), and a capacity limit. get/put must be O(1).",
+        "setup": "mkdir -p src tests",
+        "setup_files": {
+            "tests/test_lru_cache.py": '''from src.lru_cache import LRUCache
+
+def test_basic():
+    cache = LRUCache(2)
+    cache.put(1, 1)
+    cache.put(2, 2)
+    assert cache.get(1) == 1
+    cache.put(3, 3)  # evicts key 2
+    assert cache.get(2) == -1
+    cache.put(4, 4)  # evicts key 1
+    assert cache.get(1) == -1
+    assert cache.get(3) == 3
+    assert cache.get(4) == 4
+
+def test_update():
+    cache = LRUCache(2)
+    cache.put(1, 1)
+    cache.put(2, 2)
+    cache.put(1, 10)  # update, key 1 is now most recent
+    cache.put(3, 3)   # evicts key 2 (not 1)
+    assert cache.get(2) == -1
+    assert cache.get(1) == 10
+
+def test_single_capacity():
+    cache = LRUCache(1)
+    cache.put(1, 1)
+    assert cache.get(1) == 1
+    cache.put(2, 2)
+    assert cache.get(1) == -1
+    assert cache.get(2) == 2
+''',
+            "src/__init__.py": "",
+        },
+        "test_cmd": "python -m pytest tests/test_lru_cache.py -v",
+    },
+    {
+        "id": "json-parser-007",
+        "description": "Create `src/json_parser.py` with a function `parse(s)` that parses a JSON string into Python objects. Support strings, numbers, booleans, null, arrays, and objects. No imports allowed (implement from scratch).",
+        "setup": "mkdir -p src tests",
+        "setup_files": {
+            "tests/test_json_parser.py": '''from src.json_parser import parse
+
+def test_string():
+    assert parse('"hello"') == "hello"
+    assert parse('"with \\\\"escapes\\\\""') == 'with "escapes"'
+
+def test_number():
+    assert parse("42") == 42
+    assert parse("3.14") == 3.14
+    assert parse("-7") == -7
+
+def test_bool_null():
+    assert parse("true") is True
+    assert parse("false") is False
+    assert parse("null") is None
+
+def test_array():
+    assert parse("[1, 2, 3]") == [1, 2, 3]
+    assert parse("[]") == []
+    assert parse('[1, "two", true, null]') == [1, "two", True, None]
+
+def test_object():
+    assert parse('{"a": 1}') == {"a": 1}
+    assert parse('{}') == {}
+    result = parse('{"name": "test", "values": [1, 2], "nested": {"x": true}}')
+    assert result["name"] == "test"
+    assert result["values"] == [1, 2]
+    assert result["nested"]["x"] is True
+''',
+            "src/__init__.py": "",
+        },
+        "test_cmd": "python -m pytest tests/test_json_parser.py -v",
+    },
+    {
+        "id": "binary-search-tree-008",
+        "description": "Implement a Binary Search Tree in `src/bst.py` with insert, search, delete, inorder traversal (returns sorted list), min, and max.",
+        "setup": "mkdir -p src tests",
+        "setup_files": {
+            "tests/test_bst.py": '''from src.bst import BST
+
+def test_insert_search():
+    tree = BST()
+    for v in [5, 3, 7, 1, 4]:
+        tree.insert(v)
+    assert tree.search(3) is True
+    assert tree.search(6) is False
+
+def test_inorder():
+    tree = BST()
+    for v in [5, 3, 7, 1, 4, 6, 8]:
+        tree.insert(v)
+    assert tree.inorder() == [1, 3, 4, 5, 6, 7, 8]
+
+def test_min_max():
+    tree = BST()
+    for v in [5, 3, 7, 1, 9]:
+        tree.insert(v)
+    assert tree.min() == 1
+    assert tree.max() == 9
+
+def test_delete_leaf():
+    tree = BST()
+    for v in [5, 3, 7]:
+        tree.insert(v)
+    tree.delete(3)
+    assert tree.inorder() == [5, 7]
+
+def test_delete_with_children():
+    tree = BST()
+    for v in [5, 3, 7, 1, 4]:
+        tree.insert(v)
+    tree.delete(3)
+    assert tree.inorder() == [1, 4, 5, 7]
+
+def test_delete_root():
+    tree = BST()
+    for v in [5, 3, 7]:
+        tree.insert(v)
+    tree.delete(5)
+    assert tree.search(5) is False
+    assert sorted(tree.inorder()) == [3, 7]
+''',
+            "src/__init__.py": "",
+        },
+        "test_cmd": "python -m pytest tests/test_bst.py -v",
+    },
 ]
 
 

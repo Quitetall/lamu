@@ -53,7 +53,7 @@ CRITIC_MODEL = os.getenv("CRITIC_MODEL", "anthropic/claude-sonnet-4-6")
 
 MAX_WORKER_RETRIES = 3
 MAX_PLANNER_LOOPS = 2
-CONTEXT_BUDGET = 200_000  # chars (~50k tokens)
+CONTEXT_BUDGET = 400_000  # chars (~100k tokens — utilizes the 108-262K context window)
 
 
 # ── State ────��──────────────────────────────────���───────────────────────

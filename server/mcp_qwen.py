@@ -66,6 +66,17 @@ def _chat(
 ) -> str:
     """Send a chat completion to Bifrost (routes to the right backend)."""
     model = model or DEFAULT_MODEL
+
+    # RAG: prepend relevant wiki context to the prompt
+    try:
+        from server.rag import WikiRAG
+        rag = WikiRAG()
+        wiki_context = rag.retrieve(prompt, max_pages=2)
+        if wiki_context:
+            prompt = f"Relevant context from knowledge base:\n{wiki_context}\n\nUser question:\n{prompt}"
+    except Exception:
+        pass
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})

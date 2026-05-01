@@ -1,0 +1,11 @@
+lucebox-hub/
+.venv/
+__pycache__/
+*.pyc
+deps/lucebox-hub/
+node_modules/
+ComfyUI/
+EAGLE/
+SpecForge/
+poincare.html
+graphify-out/
