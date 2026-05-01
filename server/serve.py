@@ -1,12 +1,5 @@
 """
-Production Qwen3.6 server — native chat template, think-block middleware, health.
-
-Key features:
-1. Uses the model's native Jinja2 chat template (NOT chatml) — enables tool calling
-2. Strips <think>...</think> from ALL responses (streaming and non-streaming)
-3. Health endpoint at /health
-4. Auto-selects best quant + optimal KV cache config
-5. Correct settings for 262K context on 24GB GPU
+Production Qwen3.6 server — think-block stripping via ASGI middleware.
 """
 
 import json
@@ -15,11 +8,6 @@ import re
 import sys
 from pathlib import Path
 
-from llama_cpp.server.app import create_app
-from llama_cpp.server.settings import ModelSettings, ServerSettings
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
 import uvicorn
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -27,11 +15,7 @@ import uvicorn
 MODELS_DIR = Path.home() / "models" / "qwen3.6-27b-heretic"
 PORT = int(os.getenv("LLM_PORT") or "8020")
 CTX = int(os.getenv("LLM_CTX") or "262144")
-
 QUANT_PREFERENCE = ["Q5_K_S", "Q5_K_M", "Q4_K_M", "Q4_K_S", "Q3_K_L"]
-
-# Hot-reload: which quant to prefer (set via /reload endpoint)
-_active_quant_override: str | None = None
 
 
 def find_gguf(quant: str | None = None) -> str:
@@ -43,121 +27,142 @@ def find_gguf(quant: str | None = None) -> str:
     raise FileNotFoundError(f"No GGUF matching {order} in {MODELS_DIR}")
 
 
-def kv_type_for_quant(gguf_path: str) -> int:
-    if "Q5_K" in gguf_path:
-        return 8  # Q8_0
-    return 2  # Q4_0
+def kv_type_for_quant(p: str) -> int:
+    return 8 if "Q5_K" in p else 2
 
 
-def ctx_for_quant(gguf_path: str) -> int:
+def ctx_for_quant(p: str) -> int:
     if CTX != 262144:
         return CTX
-    if "Q5_K" in gguf_path:
-        return 108000
-    return 262144
-
-
-# ── Think-block stripping ───────────────────────────────────────────────
-
-THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+    return 108000 if "Q5_K" in p else 262144
 
 
 def strip_think(text: str) -> str:
     if "</think>" in text:
         return text.split("</think>", 1)[1].strip()
-    return THINK_RE.sub("", text).strip() or text
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip() or text
 
 
-class ThinkBlockMiddleware(BaseHTTPMiddleware):
-    """Strips think blocks from ALL chat completion responses (streaming + non-streaming)."""
+# ── ASGI Middleware ─────────────────────────────────────────────────────
 
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
+class ThinkStripASGI:
+    """Wraps the llama-cpp-python ASGI app and strips think blocks from responses."""
 
-        if "/chat/completions" not in str(request.url):
-            return response
+    def __init__(self, app):
+        self.app = app
 
-        content_type = response.headers.get("content-type", "")
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or b"/chat/completions" not in scope.get("path", b"").encode() if isinstance(scope.get("path", ""), str) else b"/chat/completions" not in scope.get("path", b""):
+            # Check path properly
+            path = scope.get("path", "")
+            if "/chat/completions" not in path:
+                return await self.app(scope, receive, send)
 
-        # ── Streaming (SSE) ──────────────────────────────────────────
-        if "text/event-stream" in content_type:
-            async def filter_stream():
-                think_buf = []
-                think_done = False
+        # Collect response to modify it
+        response_started = False
+        response_headers = []
+        response_status = 200
+        body_parts = []
+        is_streaming = False
 
-                async for chunk in response.body_iterator:
-                    text = chunk if isinstance(chunk, str) else chunk.decode()
+        async def intercept_send(message):
+            nonlocal response_started, response_headers, response_status, is_streaming
 
-                    for line in text.split("\n"):
-                        line = line.strip()
-                        if not line or not line.startswith("data: "):
-                            if line:
-                                yield line + "\n"
-                            else:
-                                yield "\n"
-                            continue
+            if message["type"] == "http.response.start":
+                response_started = True
+                response_status = message.get("status", 200)
+                response_headers = dict(message.get("headers", []))
 
-                        payload = line[6:]
-                        if payload == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            continue
+                # Check if streaming
+                for k, v in message.get("headers", []):
+                    if k == b"content-type" and b"text/event-stream" in v:
+                        is_streaming = True
+                        break
 
-                        try:
-                            data = json.loads(payload)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
+                if is_streaming:
+                    # For streaming, pass through start and filter body chunks
+                    await send(message)
+                return
 
-                            if not content:
-                                yield f"data: {payload}\n\n"
-                                continue
+            if message["type"] == "http.response.body":
+                chunk = message.get("body", b"")
+                more = message.get("more_body", False)
 
-                            if not think_done:
-                                if "</think>" in content:
-                                    _, _, after = content.partition("</think>")
-                                    think_done = True
-                                    after = after.lstrip("\n")
-                                    if after:
-                                        delta["content"] = after
-                                        data["choices"][0]["delta"] = delta
-                                        yield f"data: {json.dumps(data)}\n\n"
-                                    continue
-                                else:
-                                    # Still in think block — suppress
-                                    continue
+                if is_streaming:
+                    # Filter SSE stream in real-time
+                    text = chunk.decode("utf-8", errors="replace")
+                    filtered = self._filter_sse(text)
+                    await send({"type": "http.response.body", "body": filtered.encode(), "more_body": more})
+                    return
 
-                            yield f"data: {json.dumps(data)}\n\n"
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            yield f"data: {payload}\n\n"
+                body_parts.append(chunk)
+                if not more:
+                    # Complete body — strip thinks from JSON
+                    full = b"".join(body_parts)
+                    try:
+                        data = json.loads(full)
+                        for choice in data.get("choices", []):
+                            msg = choice.get("message", {})
+                            if msg.get("content"):
+                                msg["content"] = strip_think(msg["content"])
+                        modified = json.dumps(data).encode()
+                    except (json.JSONDecodeError, KeyError):
+                        modified = full
 
-            return StreamingResponse(
-                filter_stream(),
-                media_type="text/event-stream",
-                headers={k: v for k, v in response.headers.items() if k.lower() != "content-length"},
-            )
+                    await send({
+                        "type": "http.response.start",
+                        "status": response_status,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"content-length", str(len(modified)).encode()],
+                        ],
+                    })
+                    await send({"type": "http.response.body", "body": modified, "more_body": False})
 
-        # ── Non-streaming (JSON) ─────────────────────────────────────
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk if isinstance(chunk, bytes) else chunk.encode()
+        self._think_done = False
+        await self.app(scope, receive, intercept_send)
 
-        try:
-            data = json.loads(body)
-            for choice in data.get("choices", []):
-                msg = choice.get("message", {})
-                if msg.get("content"):
-                    msg["content"] = strip_think(msg["content"])
-            return Response(
-                content=json.dumps(data).encode(),
-                status_code=response.status_code,
-                media_type="application/json",
-            )
-        except (json.JSONDecodeError, KeyError):
-            return Response(content=body, status_code=response.status_code, media_type="application/json")
+    def _filter_sse(self, text: str) -> str:
+        lines = text.split("\n")
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("data: "):
+                out.append(line)
+                continue
+            if stripped == "data: [DONE]":
+                out.append(line)
+                continue
+            payload = stripped[6:]
+            try:
+                data = json.loads(payload)
+                content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if not content:
+                    out.append(line)
+                    continue
+                if not self._think_done:
+                    if "</think>" in content:
+                        _, _, after = content.partition("</think>")
+                        self._think_done = True
+                        if after.strip():
+                            data["choices"][0]["delta"]["content"] = after.lstrip("\n")
+                            out.append(f"data: {json.dumps(data)}")
+                    # suppress think content
+                    continue
+                out.append(line)
+            except (json.JSONDecodeError, KeyError, IndexError):
+                out.append(line)
+        return "\n".join(out)
 
 
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main():
+    from llama_cpp.server.app import create_app
+    from llama_cpp.server.settings import ModelSettings, ServerSettings
+    from starlette.requests import Request
+    from starlette.responses import Response
+
     gguf = find_gguf()
     kv_type = kv_type_for_quant(gguf)
     ctx = ctx_for_quant(gguf)
@@ -165,9 +170,8 @@ def main():
     print(f"LAMU Server")
     print(f"  Model:    {Path(gguf).name}")
     print(f"  Context:  {ctx:,} tokens")
-    print(f"  KV type:  {'Q8_0' if kv_type == 8 else 'Q4_0'}")
-    print(f"  Template: native Qwen3.6 (from GGUF, tool calling enabled)")
-    print(f"  Think:    stripped from all responses (streaming + non-streaming)")
+    print(f"  KV:       {'Q8_0' if kv_type == 8 else 'Q4_0'}")
+    print(f"  Think:    stripped (ASGI middleware)")
     print(f"  Port:     {PORT}")
 
     model = ModelSettings(
@@ -179,17 +183,14 @@ def main():
         type_v=kv_type,
         flash_attn=True,
         logits_all=False,
-        # chat_format=None → uses model's native Jinja2 template from GGUF
-        # Enables Qwen3.6's tool calling syntax:
-        #   <tool_call><function=name><parameter=p>value</parameter></function></tool_call>
+        chat_format="chatml",
     )
 
-    server = ServerSettings(host="0.0.0.0", port=PORT)
-    app = create_app(server_settings=server, model_settings=[model])
+    server_settings = ServerSettings(host="0.0.0.0", port=PORT)
+    inner_app = create_app(server_settings=server_settings, model_settings=[model])
 
-    app.add_middleware(ThinkBlockMiddleware)
-
-    @app.get("/health")
+    # Add /health endpoint
+    @inner_app.get("/health")
     async def health():
         return {
             "status": "ok",
@@ -199,54 +200,29 @@ def main():
             "kv_type": "Q8_0" if kv_type == 8 else "Q4_0",
         }
 
-    @app.post("/reload")
+    # Add /reload endpoint
+    @inner_app.post("/reload")
     async def reload(request: Request):
-        """Hot-reload with a different quant. Restarts the server process.
-
-        POST /reload {"quant": "Q4_K_M"}     → switch to Q4_K_M (262K context)
-        POST /reload {"quant": "Q5_K_S"}     → switch to Q5_K_S (108K, better quality)
-        POST /reload {}                      → restart with auto-select
-        """
-        import subprocess, signal
         body = await request.json() if request.headers.get("content-type") == "application/json" else {}
         target_quant = body.get("quant")
-
-        # Verify the target quant exists
         try:
             target_gguf = find_gguf(target_quant)
         except FileNotFoundError as e:
-            return Response(
-                content=json.dumps({"error": str(e)}),
-                status_code=404,
-                media_type="application/json",
-            )
+            return Response(content=json.dumps({"error": str(e)}), status_code=404, media_type="application/json")
 
-        target_ctx = ctx_for_quant(target_gguf)
-        target_kv = kv_type_for_quant(target_gguf)
-
-        # Respond first, then restart
         import threading
         def _restart():
-            import time
-            time.sleep(0.5)
+            import time; time.sleep(0.5)
             env = os.environ.copy()
             if target_quant:
                 env["LLM_QUANT"] = target_quant
-            # Re-exec ourselves
-            os.execve(
-                sys.executable,
-                [sys.executable] + sys.argv,
-                env,
-            )
+            os.execve(sys.executable, [sys.executable] + sys.argv, env)
 
         threading.Thread(target=_restart, daemon=True).start()
-        return {
-            "status": "reloading",
-            "from": Path(gguf).name,
-            "to": Path(target_gguf).name,
-            "context": target_ctx,
-            "kv_type": "Q8_0" if target_kv == 8 else "Q4_0",
-        }
+        return {"status": "reloading", "to": Path(target_gguf).name, "context": ctx_for_quant(target_gguf)}
+
+    # Wrap with think-stripping ASGI middleware
+    app = ThinkStripASGI(inner_app)
 
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
