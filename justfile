@@ -228,3 +228,7 @@ test-qwen36:
 # Start Qwen3.6 with native C++ server + ngram-mod speculation (50-137 t/s)
 serve-fast:
     bash {{root}}/scripts/serve-qwen36-fast.sh
+
+# Start EAGLE speculative decoding server (main model + trained EAGLE head)
+serve-eagle:
+    bash {{root}}/scripts/serve-eagle.sh
