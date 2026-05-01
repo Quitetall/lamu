@@ -111,7 +111,7 @@ for i, sample in enumerate(ds):
         with torch.no_grad():
             outputs = model(input_ids, output_hidden_states=True)
 
-        hidden = outputs.hidden_states[-2][0].float().cpu().numpy().astype(np.float16)
+        hidden = outputs.hidden_states[-1][0].float().cpu().numpy().astype(np.float16)
         targets = input_ids[0, 1:].cpu().numpy()
 
         np.savez_compressed(

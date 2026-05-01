@@ -87,11 +87,17 @@ class LeanDecoder:
         tokens = self.llm.tokenize(prompt.encode())
         self.llm.reset()
         self.llm.eval(tokens)
-        n_past = len(tokens)
+
+        n_vocab = llama_cpp.llama_model_n_embd(self.llm._model.model)  # used for embeddings
+        # Get actual vocab size from config
+        n_vocab = 248320
 
         for _ in range(max_tokens):
-            # Get logits for last token
-            logits = self.llm.scores[n_past - 1] if len(self.llm.scores.shape) > 1 else self.llm.scores
+            # Get logits via C API (llm.scores is broken with embedding=True)
+            logits_ptr = llama_cpp.llama_get_logits_ith(self.llm._ctx.ctx, -1)
+            if not logits_ptr:
+                break
+            logits = np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,)).copy()
 
             # Sample
             if temperature > 0:
@@ -106,28 +112,28 @@ class LeanDecoder:
             yield token
             self.total += 1
 
-            # Get hidden state at current position for EAGLE draft
-            hidden = get_hidden_state(self.llm, n_past - 1)
+            # Get hidden state for EAGLE draft
+            hidden = get_hidden_state(self.llm, -1)
 
-            # Eval the new token
+            # Eval the accepted token
             self.llm.eval([token])
-            n_past += 1
 
-            # EAGLE draft
+            # EAGLE draft from hidden state
             if hidden is not None:
                 draft_token = self.eagle.draft(hidden)
                 self.drafted += 1
 
-                # Check if main model agrees
-                main_logits = self.llm.scores[n_past - 1] if len(self.llm.scores.shape) > 1 else self.llm.scores
-                main_pred = int(np.argmax(main_logits))
+                # Verify: does main model agree?
+                verify_ptr = llama_cpp.llama_get_logits_ith(self.llm._ctx.ctx, -1)
+                if verify_ptr:
+                    verify_logits = np.ctypeslib.as_array(verify_ptr, shape=(n_vocab,)).copy()
+                    main_pred = int(np.argmax(verify_logits))
 
-                if main_pred == draft_token:
-                    self.accepted += 1
-                    yield draft_token
-                    self.total += 1
-                    self.llm.eval([draft_token])
-                    n_past += 1
+                    if main_pred == draft_token:
+                        self.accepted += 1
+                        yield draft_token
+                        self.total += 1
+                        self.llm.eval([draft_token])
 
     @property
     def acceptance_rate(self):
