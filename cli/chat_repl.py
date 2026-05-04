@@ -277,8 +277,8 @@ def main():
         Text.assemble(
             ("  ", ""),
             ("/model fast", "dim bold"), (" (494t/s)  ", "dim"),
-            ("/model smart", "dim bold"), (" (40t/s)  ", "dim"),
-            ("/model dflash", "dim bold"), (" (200t/s)  ", "dim"),
+            ("/model smart", "dim bold"), (" (49t/s)  ", "dim"),
+            ("/model dflash", "dim bold"), (" (one-shot)  ", "dim"),
         )
     )
     console.print(
@@ -330,12 +330,19 @@ def main():
             # Check aliases first
             if req in MODEL_ALIASES:
                 endpoint = MODEL_ALIASES[req]
+                if endpoint == "dflash":
+                    console.print("[yellow]DFlash is one-shot (106 t/s), not a persistent server.[/yellow]")
+                    console.print("[dim]Use:[/dim] [bold]just serve-dflash-oneshot \"your prompt\"[/bold]")
+                    continue
                 if endpoint in MODEL_URLS:
-                    api_url = MODEL_URLS[endpoint]
-                    # Probe to get actual model name
+                    # Verify endpoint is actually running
                     ep_url = ENDPOINTS.get(endpoint, (None, None))[0]
                     ep_models = probe_endpoint(ep_url) if ep_url else []
-                    model = ep_models[0] if ep_models else endpoint
+                    if not ep_models:
+                        console.print(f"[yellow]{endpoint} not running.[/yellow] Start with: [bold]just start[/bold]")
+                        continue
+                    api_url = MODEL_URLS[endpoint]
+                    model = ep_models[0]
                     label = ENDPOINTS.get(endpoint, (None, endpoint))[1]
                     console.print(f"[green]->[/green] [cyan bold]{model}[/cyan bold] [dim]({label})[/dim]")
                     continue
