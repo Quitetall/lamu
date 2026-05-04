@@ -34,11 +34,30 @@ DEFAULT_MODEL = "qwen/qwen3.6-27b-uncensored"
 
 # Endpoints to probe for model discovery
 ENDPOINTS = {
-    "bifrost":  ("http://localhost:8080/v1/models", "gateway"),
-    "qwen36":   ("http://localhost:8020/v1/models", "Qwen3.6 uncensored"),
-    "dflash":   ("http://localhost:8000/v1/models", "Qwen3.5 DFlash"),
-    "sglang":   ("http://localhost:8001/v1/models", "SGLang"),
-    "gpt2proxy": ("http://localhost:9001/v1/models", "GPT-2 presets"),
+    "bifrost":     ("http://localhost:8080/v1/models", "gateway"),
+    "qwen36":      ("http://localhost:8020/v1/models", "Qwen3.6 27B (40+ t/s)"),
+    "megakernel":  ("http://localhost:8001/v1/models", "Qwen3.5 0.8B (494 t/s)"),
+    "dflash":      ("http://localhost:8000/v1/models", "Qwen3.5 DFlash (200 t/s)"),
+    "gpt2proxy":   ("http://localhost:9001/v1/models", "GPT-2 presets"),
+}
+
+# Direct endpoint URLs for each model (bypasses Bifrost)
+MODEL_URLS = {
+    "megakernel": "http://localhost:8001/v1/chat/completions",
+    "qwen36":     "http://localhost:8020/v1/chat/completions",
+    "dflash":     "http://localhost:8000/v1/chat/completions",
+}
+
+# Shorthand aliases for /model command
+MODEL_ALIASES = {
+    "fast": "megakernel",
+    "0.8b": "megakernel",
+    "mega": "megakernel",
+    "smart": "qwen36",
+    "3.6":  "qwen36",
+    "qwen": "qwen36",
+    "dflash": "dflash",
+    "3.5":  "dflash",
 }
 
 console = Console()
@@ -270,7 +289,14 @@ def main():
     console.print(
         Text.assemble(
             ("  ", ""),
-            ("/model", "dim bold"), (" switch  ", "dim"),
+            ("/model fast", "dim bold"), (" (494t/s)  ", "dim"),
+            ("/model smart", "dim bold"), (" (40t/s)  ", "dim"),
+            ("/model dflash", "dim bold"), (" (200t/s)  ", "dim"),
+        )
+    )
+    console.print(
+        Text.assemble(
+            ("  ", ""),
             ("/models", "dim bold"), (" list  ", "dim"),
             ("/status", "dim bold"), ("  ", "dim"),
             ("/clear", "dim bold"), ("  ", "dim"),
@@ -312,20 +338,35 @@ def main():
             if len(parts) < 2 or parts[1] == "list":
                 cmd_models()
                 continue
-            req_model = parts[1].strip()
+            req = parts[1].strip().lower()
+
+            # Check aliases first
+            if req in MODEL_ALIASES:
+                endpoint = MODEL_ALIASES[req]
+                if endpoint in MODEL_URLS:
+                    api_url = MODEL_URLS[endpoint]
+                    # Probe to get actual model name
+                    ep_url = ENDPOINTS.get(endpoint, (None, None))[0]
+                    ep_models = probe_endpoint(ep_url) if ep_url else []
+                    model = ep_models[0] if ep_models else endpoint
+                    label = ENDPOINTS.get(endpoint, (None, endpoint))[1]
+                    console.print(f"[green]->[/green] [cyan bold]{model}[/cyan bold] [dim]({label})[/dim]")
+                    continue
+
+            # Fall back to available model matching
             current_available = get_available_models()
-            # Allow partial match
-            matches = [m for m in current_available if req_model in m]
+            matches = [m for m in current_available if req in m.lower()]
             if len(matches) == 1:
                 model = matches[0]
                 console.print(f"[green]->[/green] [cyan bold]{model}[/cyan bold]")
             elif len(matches) > 1:
                 console.print(f"[yellow]ambiguous:[/yellow] {', '.join(matches)}")
-            elif req_model in current_available:
-                model = req_model
+            elif req in current_available:
+                model = req
                 console.print(f"[green]->[/green] [cyan bold]{model}[/cyan bold]")
             else:
-                console.print(f"[yellow]not found:[/yellow] {req_model}")
+                console.print(f"[yellow]not found:[/yellow] {req}")
+                console.print(f"[dim]aliases:[/dim] fast, smart, dflash, 0.8b, 3.5, 3.6")
                 console.print(f"[dim]available:[/dim] {', '.join(current_available)}")
             continue
 
