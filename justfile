@@ -38,8 +38,8 @@ serve-dflash:
 
 # Swap between 27B models (can't run both — shared GPU). 0.8B stays running.
 # Options: qwen36, qwen35, dflash, status
-swap model="status":
-    bash {{root}}/scripts/swap-model.sh {{model}}
+swap model="status" ctx="":
+    bash {{root}}/scripts/swap-model.sh {{model}} {{ctx}}
 
 # Start Qwen3.6 ngram-mod production (40+ t/s warm, 131K ctx on :8020)
 serve-qwen36:
@@ -234,9 +234,9 @@ test-qwen36:
       -d '{"model":"qwen/qwen3.6-27b-uncensored","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
       | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
 
-# Start Qwen3.6 with native C++ server + ngram-mod speculation (50-137 t/s)
-serve-fast:
-    bash {{root}}/scripts/serve-qwen36-fast.sh
+# DFlash one-shot (106 t/s, uses full GPU)
+serve-dflash-oneshot prompt="Write Python quicksort.":
+    bash {{root}}/scripts/serve-qwen36-fast.sh "{{prompt}}"
 
 # Start EAGLE speculative decoding server (main model + trained EAGLE head)
 serve-eagle:
