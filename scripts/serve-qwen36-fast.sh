@@ -1,88 +1,50 @@
 #!/usr/bin/env bash
-# scripts/serve-qwen36-fast.sh — native llama-server with ngram-mod speculation
+# scripts/serve-qwen36-fast.sh — Maximum speed: DFlash speculative decoding
 #
-# Uses the optimized C++ llama-server binary (no Python overhead) with
-# ngram-mod speculative decoding for 50-137 t/s on RTX 4090.
+# Qwen3.6-27B heretic @ 80+ t/s on RTX 4090
+# Uses llama.cpp DFlash PR branch (~/llama.cpp on dflash-pr branch)
+# Draft: z-lab/Qwen3.6-27B-DFlash Q4_K_M (974 MB)
 #
-# ngram-mod: hash-based pattern matching from conversation history.
-# No draft model needed. Gets faster as the conversation grows.
-# Especially good for code generation (repetitive patterns).
-#
-# Usage: serve-qwen36-fast.sh [context]
+# NOTE: DFlash in llama-server crashes on 2nd request (PR bug).
+#       This script uses llama-speculative-simple (one-shot mode).
+#       For persistent server, use `just swap 3.6` (ngram-mod only, 49.5 t/s).
 set -euo pipefail
 
-LLAMA_SERVER="$HOME/llama.cpp/build/bin/llama-server"
-MODELS_DIR="$HOME/models/qwen3.6-27b-heretic"
-PORT=8020
-PID_FILE="/tmp/qwen36-server.pid"
-LOG="/tmp/qwen36-server.log"
+LLAMA_DIR="$HOME/llama.cpp"
+TARGET=$(ls "$HOME/models/qwen3.6-27b-heretic/"*Q4_K_M*.gguf | head -1)
+DRAFT="$HOME/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf"
+BIN="$LLAMA_DIR/build/bin/llama-speculative-simple"
+
 GRY="\033[90m"; GREEN="\033[32m"; YEL="\033[33m"; R="\033[0m"
 
-CTX="${1:-262144}"
-
-if [[ ! -f "$LLAMA_SERVER" ]]; then
-  echo -e "${YEL}llama-server not built.${R} Run:"
-  echo -e "  ${GRY}cd ~/llama.cpp && cmake --build build --config Release -j4 --target llama-server${R}"
+if [ ! -f "$BIN" ]; then
+  echo -e "  ${YEL}DFlash binary not found. Build with:${R}"
+  echo "  cd ~/llama.cpp && git checkout dflash-pr"
+  echo "  cd build && cmake --build . --target llama-speculative-simple -j\$(nproc)"
   exit 1
 fi
 
-if curl -sf "http://localhost:$PORT/health" &>/dev/null; then
-  echo -e "  Qwen3.6  ${GRY}already running on :$PORT${R}"
-  exit 0
-fi
-
-# Find best GGUF (prefer Q5_K_S for quality)
-GGUF=""
-for q in Q5_K_S Q5_K_M Q4_K_M Q4_K_S; do
-  GGUF=$(find "$MODELS_DIR" -name "*${q}*.gguf" -print -quit 2>/dev/null)
-  [[ -n "$GGUF" ]] && break
-done
-
-if [[ -z "$GGUF" ]]; then
-  echo -e "${YEL}No model found in $MODELS_DIR${R}"
+if [ ! -f "$DRAFT" ]; then
+  echo -e "  ${YEL}DFlash draft not found at $DRAFT${R}"
+  echo "  Convert: python convert_hf_to_gguf.py ~/models/qwen3.6-27b-dflash-draft/ --outtype f16 ..."
   exit 1
 fi
 
-# KV cache type based on quant
-KV_TYPE="q4_0"
-if [[ "$GGUF" == *"Q5_K"* ]] && [[ "$CTX" -le 108000 ]]; then
-  KV_TYPE="q8_0"
-fi
+PROMPT="${1:-Write a Python implementation of quicksort with comments.}"
+N_GEN="${2:-256}"
 
-echo -e "  Starting Qwen3.6 (native, ngram-mod) ${GRY}(log: $LOG)${R}"
-echo -e "  ${GRY}Model: $(basename "$GGUF")${R}"
-echo -e "  ${GRY}Context: $CTX | KV: $KV_TYPE | Speculation: ngram-mod${R}"
+echo -e "  ${GREEN}DFlash${R} spec decode ${GRY}(draft-max=8, Q4_K_M draft)${R}"
+echo -e "  ${GRY}prompt: ${PROMPT:0:60}...${R}"
 
-nohup "$LLAMA_SERVER" \
-  -m "$GGUF" \
-  --alias "qwen3.6-27b-uncensored" \
-  --host 0.0.0.0 \
-  --port "$PORT" \
-  -ngl 99 \
-  --ctx-size "$CTX" \
-  --cache-type-k "$KV_TYPE" \
-  --cache-type-v "$KV_TYPE" \
-  --flash-attn on \
-  --spec-type ngram-mod \
-  --spec-ngram-mod-n-match 24 \
-  --spec-ngram-mod-n-min 12 \
-  --spec-ngram-mod-n-max 48 \
-  --temp 0.6 \
-  --top-p 0.95 \
-  --top-k 20 \
-  >"$LOG" 2>&1 &
-echo $! >"$PID_FILE"
-
-echo -n "  waiting for Qwen3.6"
-for _ in $(seq 1 90); do
-  if curl -sf "http://localhost:$PORT/health" &>/dev/null; then
-    echo -e " ${GREEN}ready${R}"
-    echo -e "  ${GRY}ngram-mod: gets faster as conversation grows (50→137 t/s)${R}"
-    exit 0
-  fi
-  if ! kill -0 "$(cat $PID_FILE 2>/dev/null)" 2>/dev/null; then
-    echo -e " ${YEL}crashed${R}"; tail -5 "$LOG"; exit 1
-  fi
-  echo -n "."; sleep 2
-done
-echo -e " ${YEL}timeout — check $LOG${R}"
+"$BIN" \
+  -m "$TARGET" \
+  -md "$DRAFT" \
+  --dflash --draft-max 8 \
+  -p "$PROMPT" \
+  -n "$N_GEN" \
+  -cd 512 -c 4096 \
+  --temp 0 --top-k 1 --seed 42 \
+  -ngl 999 -ngld 99 -fa on \
+  -ctk q4_0 -ctv q4_0 \
+  -ctkd q8_0 -ctvd q8_0 \
+  -t 8
