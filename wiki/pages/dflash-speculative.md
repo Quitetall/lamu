@@ -97,3 +97,18 @@ DDTree = Dynamic Decoding Tree. Verifies multiple draft branches in parallel. At
 - `~/local-llm/lucebox-hub/` branch `fix/dflash-conv-cache-prefill-mismatch` — our fix
 - `~/local-llm/server/dflash_24gb.py` — 24GB VRAM wrapper for lucebox daemon
 - `~/local-llm/scripts/serve-qwen36-fast.sh` — one-shot DFlash script
+
+## Context Preset Benchmarks
+
+`just swap 3.6 <preset>` — Qwen3.6-27B Q4_K_M, Q4_0 KV cache, ngram-mod, RTX 4090:
+
+| Preset | Context | Cold | Warm (ngram) | VRAM | Megakernel alongside? |
+|--------|---------|------|-------|------|---------|
+| `lightning` | 32K | 42 t/s | 95+ t/s | 19.5 GB | Yes |
+| `fast` | 64K | 43 t/s | 95+ t/s | 20 GB | Yes |
+| `med` (default) | 131K | 43 t/s | 49 t/s | 20.5 GB | Yes (tight) |
+| `big` | 262K | 41 t/s | **99 t/s** | 23 GB | No |
+
+Cold = first request (no patterns cached). Warm = repeat/similar request (ngram matches).
+
+DFlash (106 t/s) is independent of context preset — it uses its own max-ctx.
