@@ -28,17 +28,15 @@ from rich.spinner import Spinner
 from rich.table import Table
 
 ROOT = os.path.expanduser("~/local-llm")
-BIFROST_URL = "http://localhost:8080/v1/chat/completions"
-BIFROST_KEY = "sk-local"
-DEFAULT_MODEL = "qwen/qwen3.6-27b-uncensored"
+DEFAULT_API_URL = "http://localhost:8020/v1/chat/completions"
+API_KEY = "sk-local"
+DEFAULT_MODEL = "qwen3.6-27b-uncensored"
 
 # Endpoints to probe for model discovery
 ENDPOINTS = {
-    "bifrost":     ("http://localhost:8080/v1/models", "gateway"),
-    "qwen36":      ("http://localhost:8020/v1/models", "Qwen3.6 27B (40+ t/s)"),
+    "qwen36":      ("http://localhost:8020/v1/models", "Qwen3.6 27B (49+ t/s)"),
     "megakernel":  ("http://localhost:8001/v1/models", "Qwen3.5 0.8B (494 t/s)"),
-    "dflash":      ("http://localhost:8000/v1/models", "Qwen3.5 DFlash (200 t/s)"),
-    "gpt2proxy":   ("http://localhost:9001/v1/models", "GPT-2 presets"),
+    "dflash":      ("http://localhost:8000/v1/models", "DFlash (106 t/s)"),
 }
 
 # Direct endpoint URLs for each model (bypasses Bifrost)
@@ -72,7 +70,7 @@ console = Console()
 
 def probe_endpoint(url: str, timeout: int = 2) -> list[str]:
     try:
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {BIFROST_KEY}"})
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_KEY}"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             return [m["id"] for m in data.get("data", [])]
@@ -91,36 +89,20 @@ def discover_models() -> dict[str, list[str]]:
 
 
 def get_available_models() -> list[str]:
-    """Return flat list of Bifrost-routable model names."""
-    # If Bifrost is up, it knows all routes
-    bifrost_models = probe_endpoint("http://localhost:8080/v1/models")
-    if bifrost_models:
-        # Bifrost returns models as provider/name already
-        return bifrost_models
-
-    # Fallback: direct model names from individual endpoints
+    """Return flat list of available model names from all endpoints."""
     models = []
     for name, (url, _) in ENDPOINTS.items():
-        if name == "bifrost":
-            continue
         models.extend(probe_endpoint(url))
     return models
 
 
 def auto_start():
     """Start the LLM stack if nothing is running."""
-    console.print("[dim]No models detected. Starting stack...[/dim]")
+    console.print("[dim]No models detected. Starting Qwen3.6...[/dim]")
 
-    # Try Qwen3.6 first (primary), then DFlash (fallback)
-    scripts = [
-        ("Qwen3.6", f"{ROOT}/scripts/serve-qwen36.sh"),
-        ("Bifrost", f"{ROOT}/scripts/serve-bifrost.sh"),
-    ]
-
-    for label, script in scripts:
-        if os.path.exists(script):
-            console.print(f"  [dim]Starting {label}...[/dim]")
-            subprocess.run(["bash", script], capture_output=True)
+    # Use swap script (the canonical way to start models)
+    swap_script = f"{ROOT}/scripts/swap-model.sh"
+    subprocess.run(["bash", swap_script, "3.6", "med"], capture_output=True)
 
     # Verify something came up
     import time
@@ -133,7 +115,7 @@ def auto_start():
 
 # ── Streaming ────────────────────────────────────────────────────────────
 
-def stream_response(messages: list[dict], model: str, url: str = BIFROST_URL) -> tuple[str, str]:
+def stream_response(messages: list[dict], model: str, url: str = DEFAULT_API_URL) -> tuple[str, str]:
     """Stream from backend, buffer silently. Returns (reply, think)."""
     payload = {
         "model": model,
@@ -146,7 +128,7 @@ def stream_response(messages: list[dict], model: str, url: str = BIFROST_URL) ->
         data=json.dumps(payload).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {BIFROST_KEY}",
+            "Authorization": f"Bearer {API_KEY}",
         },
     )
 
@@ -251,7 +233,7 @@ def main():
     if args.direct:
         api_url = f"http://localhost:{args.direct}/v1/chat/completions"
     else:
-        api_url = BIFROST_URL
+        api_url = DEFAULT_API_URL
 
     # One-shot mode: llm "what is quicksort"
     if args.prompt:

@@ -7,13 +7,22 @@ root := env("HOME") / "local-llm"
 
 # ── Stack lifecycle ──────────────────────────────────────────────────────
 
-# Start the full stack (DFlash + Bifrost + Langfuse + Chainlit)
-start:
-    bash {{root}}/scripts/start.sh
+# Start production stack (27B + 0.8B megakernel)
+start ctx="med":
+    bash {{root}}/scripts/swap-model.sh 3.6 {{ctx}}
+    @echo "Starting megakernel 0.8B on :8001..."
+    @nohup {{root}}/.venv/bin/python {{root}}/server/megakernel_server.py --port 8001 > /tmp/megakernel.log 2>&1 &
+    @sleep 8 && curl -sf http://localhost:8001/health > /dev/null && echo "  0.8B ready on :8001" || echo "  0.8B failed (check /tmp/megakernel.log)"
 
-# Stop the full stack
+# Stop everything
 stop:
-    bash {{root}}/scripts/stop.sh
+    -pkill -f "llama-server" 2>/dev/null
+    -pkill -f "megakernel_server" 2>/dev/null
+    @echo "All models stopped."
+
+# Diagnose all problems
+doctor:
+    bash {{root}}/scripts/doctor.sh
 
 # Show what's running
 status:
