@@ -28,11 +28,16 @@ status:
 
 # ── Individual services ──────────────────────────────────────────────────
 
-# Start DFlash (Qwen3.5-27B on :8000)
+# Start DFlash (Qwen3.5-27B, 130-200+ t/s speculative decoding on :8000)
 serve-dflash:
     bash {{root}}/scripts/serve-dflash.sh
 
-# Start Qwen3.6 uncensored on :8020 (auto-detects dense vs MoE)
+# Swap between models (can't run both — shared GPU)
+# Options: qwen36, dflash, status
+swap model="status":
+    bash {{root}}/scripts/swap-model.sh {{model}}
+
+# Start Qwen3.6 ngram-mod production (40+ t/s warm, 131K ctx on :8020)
 serve-qwen36:
     bash {{root}}/scripts/serve-qwen36.sh
 

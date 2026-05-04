@@ -99,11 +99,18 @@ def _chat(
         },
     )
 
-    # Try Bifrost first, fall back to direct endpoint
-    endpoints = [
-        f"{BIFROST_URL}/chat/completions",
-        "http://localhost:8020/v1/chat/completions",
-    ]
+    # Route by model name, fall back through available endpoints
+    if model and ("dflash" in model or "qwen3.5" in model.lower()):
+        endpoints = [
+            "http://localhost:8000/v1/chat/completions",
+            f"{BIFROST_URL}/chat/completions",
+        ]
+    else:
+        endpoints = [
+            f"{BIFROST_URL}/chat/completions",
+            "http://localhost:8020/v1/chat/completions",
+            "http://localhost:8000/v1/chat/completions",  # DFlash fallback
+        ]
 
     for url in endpoints:
         try:
@@ -153,10 +160,10 @@ async def list_tools() -> list[Tool]:
                     "model": {
                         "type": "string",
                         "description": (
-                            "Which model to use (provider/name format). "
-                            "Options: qwen/qwen3.6-27b-uncensored (default, best), "
-                            "dflash/luce-dflash (Qwen3.5-27B). "
-                            "Use list_local_models to see what's running."
+                            "Which model to use. Options: "
+                            "qwen3.6 (default, smartest, 40t/s, 131K ctx, uncensored) | "
+                            "dflash (Qwen3.5-27B, 130-200 t/s, faster but slightly less capable). "
+                            "Use 'dflash' for bulk/fast tasks, default for complex reasoning."
                         ),
                     },
                     "system": {
