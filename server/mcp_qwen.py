@@ -33,6 +33,7 @@ ENDPOINTS = {
     "bifrost": "http://localhost:8080/v1",
     "qwen36": "http://localhost:8020/v1",
     "dflash": "http://localhost:8000/v1",
+    "megakernel": "http://localhost:8001/v1",
 }
 
 server = Server("lamu")
@@ -100,7 +101,11 @@ def _chat(
     )
 
     # Route by model name, fall back through available endpoints
-    if model and ("dflash" in model or "qwen3.5" in model.lower()):
+    if model and ("megakernel" in model or "fast" in model or "0.8" in model):
+        endpoints = [
+            "http://localhost:8001/v1/chat/completions",
+        ]
+    elif model and ("dflash" in model or "qwen3.5" in model.lower()):
         endpoints = [
             "http://localhost:8000/v1/chat/completions",
             f"{BIFROST_URL}/chat/completions",
@@ -162,8 +167,9 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Which model to use. Options: "
                             "qwen3.6 (default, smartest, 40t/s, 131K ctx, uncensored) | "
-                            "dflash (Qwen3.5-27B, 130-200 t/s, faster but slightly less capable). "
-                            "Use 'dflash' for bulk/fast tasks, default for complex reasoning."
+                            "dflash (Qwen3.5-27B, 130-200 t/s, fast + capable) | "
+                            "fast (Qwen3.5-0.8B megakernel, 462 t/s, instant for simple tasks). "
+                            "Use 'fast' for routing/classification/simple gen, 'dflash' for bulk, default for reasoning."
                         ),
                     },
                     "system": {

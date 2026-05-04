@@ -28,6 +28,10 @@ status:
 
 # ── Individual services ──────────────────────────────────────────────────
 
+# Start megakernel (Qwen3.5-0.8B, 462+ t/s, runs alongside 27B on :8001)
+serve-fast:
+    bash {{root}}/scripts/serve-megakernel.sh
+
 # Start DFlash (Qwen3.5-27B, 130-200+ t/s speculative decoding on :8000)
 serve-dflash:
     bash {{root}}/scripts/serve-dflash.sh
