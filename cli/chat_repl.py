@@ -45,6 +45,7 @@ ENDPOINTS = {
 MODEL_URLS = {
     "megakernel": "http://localhost:8001/v1/chat/completions",
     "qwen36":     "http://localhost:8020/v1/chat/completions",
+    "qwen35":     "http://localhost:8020/v1/chat/completions",  # same port, swap via `just swap 3.5`
     "dflash":     "http://localhost:8000/v1/chat/completions",
 }
 
@@ -56,9 +57,13 @@ MODEL_ALIASES = {
     "smart": "qwen36",
     "3.6":  "qwen36",
     "qwen": "qwen36",
+    "3.5":  "qwen35",
+    "qwen35": "qwen35",
     "dflash": "dflash",
-    "3.5":  "dflash",
 }
+
+# Note: qwen35 uses same port as qwen36 (swap via `just swap qwen35`)
+# After swapping, /model 3.5 routes to :8020 which now serves 3.5
 
 console = Console()
 

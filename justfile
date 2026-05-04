@@ -36,8 +36,8 @@ serve-fast:
 serve-dflash:
     bash {{root}}/scripts/serve-dflash.sh
 
-# Swap between models (can't run both — shared GPU)
-# Options: qwen36, dflash, status
+# Swap between 27B models (can't run both — shared GPU). 0.8B stays running.
+# Options: qwen36, qwen35, dflash, status
 swap model="status":
     bash {{root}}/scripts/swap-model.sh {{model}}
 
