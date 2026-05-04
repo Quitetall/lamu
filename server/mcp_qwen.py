@@ -62,7 +62,7 @@ def _chat(
     prompt: str,
     system: str = "",
     model: str = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 16384,
     temperature: float = 0.3,
 ) -> str:
     """Send a chat completion to Bifrost (routes to the right backend)."""
@@ -129,11 +129,18 @@ def _chat(
             )
             with urllib.request.urlopen(req, timeout=180) as resp:
                 data = json.loads(resp.read())
-                content = data["choices"][0]["message"]["content"]
-                # Strip think blocks (belt and suspenders — server also strips)
+                msg = data["choices"][0]["message"]
+                content = msg.get("content") or ""
+                # Strip think blocks
                 if "</think>" in content:
                     _, _, content = content.partition("</think>")
-                return content.strip()
+                content = content.strip()
+                # If content empty (model spent all tokens thinking), return reasoning
+                if not content:
+                    reasoning = msg.get("reasoning_content", "")
+                    if reasoning:
+                        content = "[thinking truncated] " + reasoning[-500:]
+                return content
         except urllib.error.URLError:
             continue
         except Exception as e:
@@ -180,7 +187,7 @@ async def list_tools() -> list[Tool]:
                     "max_tokens": {
                         "type": "integer",
                         "description": "Max tokens (default 4096)",
-                        "default": 4096,
+                        "default": 16384,
                     },
                     "temperature": {
                         "type": "number",
