@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+cd /tmp
 # scripts/train-eagle-v2.sh — proper EAGLE training with all improvements
 #
 # 1. 20K samples (70% code + 30% general)
@@ -29,7 +30,8 @@ echo "[1/3] Generating training data (20K samples, 70% code + 30% general)..."
 import json, os, sys, torch, numpy as np
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from datasets import load_dataset
+from datasets import load_dataset, disable_caching
+disable_caching()
 
 MODEL_ID = "llmfan46/Qwen3.6-27B-uncensored-heretic-v2"
 DATA_DIR = Path(os.path.expanduser("~/models/qwen3.6-27b-heretic-eagle/train_data_v2"))
@@ -66,19 +68,13 @@ if not emb_path.exists():
 
 # Load datasets
 print("  Loading datasets...", flush=True)
-try:
-    code_ds = load_dataset("bigcode/starcoderdata", data_dir="python", split="train", streaming=True)
-    code_iter = iter(code_ds)
-    code_key = "content"
-    print("  Code: bigcode/starcoderdata (python)", flush=True)
-except:
-    code_ds = load_dataset("codeparrot/github-code", languages=["Python"], split="train", streaming=True)
-    code_iter = iter(code_ds)
-    code_key = "code"
-    print("  Code: codeparrot/github-code (Python)", flush=True)
+code_ds = load_dataset("iamtarun/python_code_instructions_18k_alpaca", split="train", streaming=True)
+code_iter = iter(code_ds)
+code_key = "output"  # the actual code is in "output"
+print("  Code: python_code_instructions_18k (alpaca)", flush=True)
 
-general_ds = load_dataset("anon8231489123/ShareGPT_Vicuna_unfiltered", split="train")
-print(f"  General: ShareGPT ({len(general_ds)} conversations)", flush=True)
+general_ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
+print(f"  General: CodeAlpaca ({len(general_ds)} samples)", flush=True)
 
 saved = existing
 gen_idx = 0
@@ -131,8 +127,9 @@ print(f"  Generating general samples ({NUM_GENERAL})...", flush=True)
 while saved < existing + TOTAL and gen_idx < len(general_ds):
     sample = general_ds[gen_idx]
     gen_idx += 1
-    if "conversations" in sample:
-        text = " ".join([c.get("value", "") for c in sample["conversations"]])
+    # CodeAlpaca has 'instruction' + 'output'
+    if "output" in sample and "instruction" in sample:
+        text = sample.get("instruction", "") + "\n" + sample.get("output", "")
     elif "text" in sample:
         text = sample["text"]
     else:

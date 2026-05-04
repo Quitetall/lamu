@@ -1,0 +1,39 @@
+{
+  "config": "swarm",
+  "timestamp": "2026-04-30T10:24:28.099173",
+  "total": 5,
+  "passed": 0,
+  "pass_rate": 0.0,
+  "results": [
+    {
+      "passed": false,
+      "output": "Error: No module named 'langchain_core'",
+      "task_id": "calc-001",
+      "elapsed": 0.0
+    },
+    {
+      "passed": false,
+      "output": "Error: No module named 'langchain_core'",
+      "task_id": "stack-002",
+      "elapsed": 0.0
+    },
+    {
+      "passed": false,
+      "output": "Error: No module named 'langchain_core'",
+      "task_id": "csv-003",
+      "elapsed": 0.0
+    },
+    {
+      "passed": false,
+      "output": "Error: No module named 'langchain_core'",
+      "task_id": "api-004",
+      "elapsed": 0.0
+    },
+    {
+      "passed": false,
+      "output": "Error: No module named 'langchain_core'",
+      "task_id": "linked-list-005",
+      "elapsed": 0.0
+    }
+  ]
+}

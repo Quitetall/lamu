@@ -1,0 +1,49 @@
+{
+  "config": "swarm",
+  "timestamp": "2026-04-30T10:44:18.536005",
+  "total": 5,
+  "passed": 4,
+  "pass_rate": 80.0,
+  "results": [
+    {
+      "passed": true,
+      "output": "============================= test session starts ==============================\nplatform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python\ncachedir: .pytest_cache\nhypothesis profile 'default'\nrootdir: /tmp/bench_calc-001_5fbsd97r\nplugins: anyio-4.13.0, datalad-1.4.1, hypothesis-6.152.1\ncollecting ... collected 4 items\n\ntests/test_calculator.py::test_add PASSED                                [ 25%]\ntests/test_calculator.py::test_subtract PASSED                           [ 50%]\ntests/test_calculator.py::test_multiply PASSED                           [ 75%]\ntests/test_calculator.py::test_divide PASSED                             [100%]\n\n============================== 4 passed in 0.08s ===============================\n",
+      "retries": 2,
+      "planner_loops": 1,
+      "task_id": "calc-001",
+      "elapsed": 81.6
+    },
+    {
+      "passed": true,
+      "output": "============================= test session starts ==============================\nplatform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python\ncachedir: .pytest_cache\nhypothesis profile 'default'\nrootdir: /tmp/bench_stack-002_bn3mzmj_\nplugins: anyio-4.13.0, datalad-1.4.1, hypothesis-6.152.1\ncollecting ... collected 6 items\n\ntests/test_stack.py::test_push_pop PASSED                                [ 16%]\ntests/test_stack.py::test_peek PASSED                                    [ 33%]\ntests/test_stack.py::test_is_empty PASSED                                [ 50%]\ntests/test_stack.py::test_size PASSED                                    [ 66%]\ntests/test_stack.py::test_empty_pop PASSED                               [ 83%]\ntests/test_stack.py::test_empty_peek PASSED                              [100%]\n\n============================== 6 passed in 0.08s ===============================\n",
+      "retries": 2,
+      "planner_loops": 1,
+      "task_id": "stack-002",
+      "elapsed": 106.6
+    },
+    {
+      "passed": true,
+      "output": "============================= test session starts ==============================\nplatform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python\ncachedir: .pytest_cache\nhypothesis profile 'default'\nrootdir: /tmp/bench_csv-003_zb1o66rl\nplugins: anyio-4.13.0, datalad-1.4.1, hypothesis-6.152.1\ncollecting ... collected 1 item\n\ntests/test_csv_stats.py::test_summarize PASSED                           [100%]\n\n============================== 1 passed in 0.09s ===============================\n",
+      "retries": 3,
+      "planner_loops": 1,
+      "task_id": "csv-003",
+      "elapsed": 283.9
+    },
+    {
+      "passed": false,
+      "output": "============================= test session starts ==============================\nplatform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python\ncachedir: .pytest_cache\nhypothesis profile 'default'\nrootdir: /tmp/bench_api-004_brdue5xp\nplugins: anyio-4.13.0, datalad-1.4.1, hypothesis-6.152.1\ncollecting ... collected 0 items / 1 error\n\n==================================== ERRORS ====================================\n______________________ ERROR collecting tests/test_api.py ______________________\nImportError while importing test module '/tmp/bench_api-004_brdue5xp/tests/test_api.py'.\nHint: make sure your test modules/packages have valid Python names.\nTraceback:\n/usr/lib/python3.14/importlib/__init__.py:88: in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntests/test_api.py:2: in <module>\n    from fastapi.testclient import TestClient\nE   ModuleNotFoundError: No module named 'fastapi'\n=========================== short test summary info ============================\nERROR tests/test_api.py\n!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n=============================== 1 error in 0.14s ===============================\n",
+      "retries": 4,
+      "planner_loops": 2,
+      "task_id": "api-004",
+      "elapsed": 151.6
+    },
+    {
+      "passed": true,
+      "output": "============================= test session starts ==============================\nplatform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python\ncachedir: .pytest_cache\nhypothesis profile 'default'\nrootdir: /tmp/bench_linked-list-005_fw70t1lb\nplugins: anyio-4.13.0, datalad-1.4.1, hypothesis-6.152.1\ncollecting ... collected 7 items\n\ntests/test_linked_list.py::test_append_and_to_list PASSED                [ 14%]\ntests/test_linked_list.py::test_prepend PASSED                           [ 28%]\ntests/test_linked_list.py::test_delete PASSED                            [ 42%]\ntests/test_linked_list.py::test_find PASSED                              [ 57%]\ntests/test_linked_list.py::test_len PASSED                               [ 71%]\ntests/test_linked_list.py::test_reverse PASSED                           [ 85%]\ntests/test_linked_list.py::test_delete_head PASSED                       [100%]\n\n============================== 7 passed in 0.08s ===============================\n",
+      "retries": 3,
+      "planner_loops": 1,
+      "task_id": "linked-list-005",
+      "elapsed": 275.0
+    }
+  ]
+}
