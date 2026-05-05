@@ -330,16 +330,142 @@ class LamuMcpServer:
         return [TextContent(type="text", text="\n".join(lines))]
 
     def _handle_load_model(self, args: dict) -> list[TextContent]:
-        """Load a model."""
+        """Load a model onto GPU."""
+        import subprocess
+        import time as _time
+
         name = args["name"]
-        # TODO: implement actual loading via backend pool
-        return [TextContent(type="text", text=f"load_model not yet implemented (model: {name})")]
+
+        # Find in registry (partial match)
+        entry: Optional[ModelEntry] = None
+        for n, e in self._entries.items():
+            if name in n or n in name:
+                entry = e
+                break
+
+        if not entry:
+            return [TextContent(type="text", text=f"Model '{name}' not found in registry. Use scan_models first.")]
+
+        if self._scheduler.is_loaded(entry.name):
+            return [TextContent(type="text", text=f"Model '{entry.name}' already loaded.")]
+
+        # Check VRAM budget
+        can_load, to_evict = self._scheduler.plan_load(entry)
+        if not can_load:
+            return [TextContent(type="text", text=f"Cannot fit '{entry.name}' ({entry.vram_mb}MB) in VRAM. Not enough space even after eviction.")]
+
+        # Evict if needed
+        for evict_name in to_evict:
+            loaded = self._scheduler.get_loaded(evict_name)
+            if loaded and loaded.pid:
+                import signal
+                try:
+                    import os
+                    os.kill(loaded.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self._scheduler.mark_unloaded(evict_name)
+
+        if to_evict:
+            _time.sleep(3)  # wait for VRAM to free
+
+        # Pick a port
+        from lamu.core.config import PORT_MAIN, PORT_SIDECAR
+        port = PORT_SIDECAR  # default to sidecar port
+        if not self._scheduler.loaded_models():
+            port = PORT_MAIN  # if nothing loaded, use main port
+
+        # Start llama-server
+        from lamu.core.config import LLAMA_BIN
+        if not LLAMA_BIN.exists():
+            return [TextContent(type="text", text=f"llama-server not found at {LLAMA_BIN}")]
+
+        cmd = [
+            str(LLAMA_BIN), "-m", str(entry.path),
+            "--host", "0.0.0.0", "--port", str(port),
+            "--ctx-size", str(min(entry.context_max, 32768)),
+            "-ngl", "99", "--flash-attn", "on",
+            "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
+            "--parallel", "1",
+        ]
+
+        # Detect ngram-mod support (not available on DFlash PR branch)
+        try:
+            help_out = subprocess.run(
+                [str(LLAMA_BIN), "--help"], capture_output=True, text=True, timeout=5
+            )
+            has_ngram = "--spec-ngram-mod-n-match" in help_out.stdout
+        except Exception:
+            has_ngram = False
+
+        if has_ngram and entry.arch in ("qwen35", "qwen3"):
+            cmd.extend(["--spec-type", "ngram-mod",
+                       "--spec-ngram-mod-n-match", "24",
+                       "--spec-ngram-mod-n-min", "12",
+                       "--spec-ngram-mod-n-max", "48"])
+
+        self._scheduler.mark_loading(entry)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=open("/tmp/lamu-load.log", "w"))
+
+        # Wait for health
+        import urllib.request
+        import json
+        for _ in range(45):
+            _time.sleep(1)
+            try:
+                req = urllib.request.Request(f"http://localhost:{port}/health")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if json.loads(resp.read()).get("status") == "ok":
+                        # Get actual VRAM
+                        from lamu.core.scheduler import _query_gpu_pids
+                        pids = _query_gpu_pids()
+                        vram = 0
+                        for pid, mem in pids:
+                            if pid == proc.pid:
+                                vram = mem
+                                break
+                        if vram == 0:
+                            vram = entry.vram_mb  # fallback to estimate
+
+                        self._scheduler.confirm_loaded(entry.name, proc.pid, port, vram)
+                        evict_msg = f" (evicted: {to_evict})" if to_evict else ""
+                        return [TextContent(type="text",
+                            text=f"Loaded '{entry.name}' on :{port} ({vram}MB VRAM){evict_msg}")]
+            except Exception:
+                pass
+
+        # Timeout
+        proc.kill()
+        self._scheduler.mark_unloaded(entry.name)
+        return [TextContent(type="text", text=f"Failed to load '{entry.name}' (timeout after 45s). Check /tmp/lamu-load.log")]
 
     def _handle_unload_model(self, args: dict) -> list[TextContent]:
-        """Unload a model."""
+        """Unload a model from GPU."""
+        import os
+        import signal
+
         name = args["name"]
-        # TODO: implement actual unloading
-        return [TextContent(type="text", text=f"unload_model not yet implemented (model: {name})")]
+
+        # Find loaded model (partial match)
+        target: Optional[str] = None
+        for n in list(self._scheduler._loaded.keys()):
+            if name in n or n in name:
+                target = n
+                break
+
+        if not target:
+            return [TextContent(type="text", text=f"Model '{name}' not loaded. Nothing to unload.")]
+
+        loaded = self._scheduler.get_loaded(target)
+        if loaded and loaded.pid and loaded.pid > 0:
+            try:
+                os.kill(loaded.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self._scheduler.mark_unloaded(target)
+        return [TextContent(type="text", text=f"Unloaded '{target}'. VRAM freed.")]
 
     def _handle_vram_status(self) -> list[TextContent]:
         """VRAM budget snapshot."""
