@@ -1,274 +1,282 @@
 # LAMU
 
-**Local Agent Model Utility** — 106 tokens/second on a single RTX 4090. No cloud, no API keys, no censorship.
+**Local Agent Model Utility** — a single-process MCP-first daemon that auto-discovers your GGUF models, schedules them on a budgeted GPU, and serves them over MCP and OpenAI-compatible HTTP. Three speed tiers up to **106 t/s** on one RTX 4090. Python prototype, Rust drop-in.
 
-Three models running simultaneously on 24 GB:
+```
+                     ┌──────── lamu ────────┐
+  Claude Code ─MCP─▶ │  router · scheduler  │ ─▶ llama.cpp / megakernel / DFlash
+       agents        │  queue · reasoning   │      (per-backend spawn)
+                     └────────┬─────────────┘
+                              ▼
+                          OpenAI HTTP
+                          for everyone else
+```
 
-| Model | Speed | Use |
-|-------|-------|-----|
-| **Qwen3.6-27B** uncensored | **106 t/s** (DFlash) · 49 t/s (ngram) | Complex reasoning, 131K context |
-| **Qwen3.5-0.8B** megakernel | **494 t/s** | Instant routing, agent tools |
-| **Qwen3.5-27B** | 49 t/s (swap) | Alternative reasoning model |
+| Tier | Speed | Engine | Use |
+|------|-------|--------|-----|
+| **DFlash** (Lucebox DDTree) | **106 t/s** | matched-3.6 draft, 5.12 tok/step | one-shot, full GPU |
+| **ngram-mod** (warm) | 49.5 t/s | hash-based speculation, no draft | always-on, 131K ctx |
+| **megakernel** | 494 t/s | hand-written CUDA, Qwen3.5-0.8B | routing, agent tools |
 
-Built from wanting to recreate the 2021 InferKit experience. Evolved into a full inference stack with two merged upstream contributions.
+Started from 2021 InferKit / GPT-2 nostalgia — the GPT-2 proxy is still in the registry, not dead code. Two upstream merges along the way ([Lucebox #89](https://github.com/Luce-Org/lucebox-hub/pull/89), [#94](https://github.com/Luce-Org/lucebox-hub/pull/94)).
 
 ---
 
 ## Quick Start
 
 ```bash
-# Clone
 git clone https://github.com/Quitetall/lamu ~/local-llm
 cd ~/local-llm
+python3.12 -m venv .venv && uv pip install -e . --python .venv/bin/python
 
-# Create environment
-python3.12 -m venv .venv
-
-# Download Qwen3.6-27B uncensored (~16 GB)
-just setup-qwen36
-
-# Start production server (49 t/s ngram-mod, always-on)
-just swap 3.6
-
-# Chat
-llm
+python -m lamu scan                   # discover GGUFs in ~/models
+python -m lamu start                  # MCP daemon on stdio
+python -m lamu serve [port=8020]      # OpenAI-compat HTTP
+python -m lamu repl  [api_url]        # chat REPL
 ```
 
-For **106 t/s** DFlash speculative decoding:
-```bash
-# One-time: build llama.cpp DFlash branch + download draft model
-cd ~/llama.cpp && git checkout dflash-pr
-cd build && cmake --build . --target llama-speculative-simple -j$(nproc)
+Rust drop-in (same CLI surface):
 
-# Run (one-shot, uses full GPU)
+```bash
+cd lamu-rs && cargo build --release
+./target/release/lamu start            # same MCP behaviour, lower overhead
+./target/release/lamu serve --port 8020
+```
+
+For the **106 t/s** DFlash one-shot:
+
+```bash
 just serve-fast "Write quicksort in Python"
 ```
 
 ---
 
-## Three Speed Tiers
+## v2 Architecture
 
-### Tier 1: Megakernel — 494 t/s
-Qwen3.5-0.8B with hand-written CUDA kernels from [Lucebox](https://github.com/Luce-Org/lucebox-hub). Runs alongside the 27B model (2.7 GB VRAM).
-
-```bash
-just serve-fast    # starts on :8001
+```
+┌────────────────────────────────────────────────────────────┐
+│  lamu daemon (single process)                              │
+│                                                            │
+│  ┌───────────┐  ┌────────────┐  ┌─────────────────────┐    │
+│  │ MCP stdio │  │ OpenAI :*  │  │ CLI REPL (lamu repl)│    │
+│  │ (primary) │  │ (compat)   │  │  → talks to daemon  │    │
+│  └─────┬─────┘  └─────┬──────┘  └──────────┬──────────┘    │
+│        │              │                    │               │
+│  ┌─────▼──────────────▼────────────────────▼──────────┐    │
+│  │  Router  — capability routing (chat/code/...)      │    │
+│  │  Queue   — FIFO/LIFO/Priority, bounded concurrency │    │
+│  │  Reasoning extractor — per-family <think> handling │    │
+│  └────────────────────────┬───────────────────────────┘    │
+│                           │                                │
+│  ┌────────────────────────▼───────────────────────────┐    │
+│  │  VRAM scheduler — bin-packing + LRU eviction       │    │
+│  │  pinned models honoured · NVML-driven              │    │
+│  └─┬──────────────┬──────────────┬─────────────┬──────┘    │
+│    │              │              │             │           │
+│  ┌─▼─────┐  ┌─────▼──────┐  ┌────▼────┐  ┌─────▼────┐      │
+│  │llama  │  │megakernel  │  │ DFlash  │  │HF / ONNX │      │
+│  │.cpp   │  │  (PyTorch) │  │ lucebox │  │ (future) │      │
+│  └───────┘  └────────────┘  └─────────┘  └──────────┘      │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### Tier 2: ngram-mod — 49 t/s (warm)
-Qwen3.6-27B with hash-based speculative decoding. Zero overhead, no draft model. Production server with OpenAI API.
+Key v2 invariants:
 
-```bash
-just swap 3.6      # starts on :8020
-```
-
-### Tier 3: DFlash — 106 t/s
-Block-diffusion speculative decoding with matched Qwen3.6-27B-DFlash draft. 5.12 tokens committed per step.
-
-```bash
-just serve-fast "your prompt here"    # one-shot (full GPU)
-```
+- **MCP first.** OpenAI HTTP is a compat shim. The CLI also targets the daemon, not the backends directly.
+- **Capabilities are requirements, not preferences.** `capabilities=["code"]` will load a code model, evicting LRU if needed. The router never silently downgrades.
+- **`plan_query` dry-run.** Returns `{would_route_to, reason, loaded, would_evict}` for debugging agent loops.
+- **Per-model request queue.** Concurrent agents calling the same model serialise on a configurable strategy (FIFO default). Set `LAMU_QUEUE_STRATEGY=priority` and pass `priority`/`origin` per request when ordering matters.
+- **Reasoning extractor lives in the model entry.** `<think>...</think>` is buffered and stripped (or annotated) per family — Qwen3.5/3.6, DeepSeek, o1.
 
 ---
 
-## Model Switching
+## MCP — Claude Code Integration
 
-```bash
-just swap 3.6       # Qwen3.6-27B heretic uncensored
-just swap 3.5       # Qwen3.5-27B
-just swap status    # show what's running
-```
-
-In the chat REPL:
-```
-llm
-> /model fast       # switch to 0.8B (494 t/s)
-> /model smart      # switch to 27B
-> /model dflash     # switch to DFlash 27B
-```
-
----
-
-## Claude Code Integration (MCP)
-
-LAMU exposes local models as tools for Claude Code.
-
-**Setup** (add to `~/.claude.json`):
-```json
+```jsonc
+// ~/.claude.json
 {
   "mcpServers": {
     "local-llm": {
       "type": "stdio",
-      "command": "/home/YOUR_USER/local-llm/.venv/bin/python",
-      "args": ["/home/YOUR_USER/local-llm/server/mcp_qwen.py"]
+      "command": "/home/YOU/local-llm/.venv/bin/python",
+      "args": ["-m", "lamu", "start"],
+      "cwd": "/home/YOU/local-llm"
     }
+    // — or, drop-in Rust binary —
+    // "command": "/home/YOU/local-llm/lamu-rs/target/release/lamu",
+    // "args": ["start"]
   }
 }
 ```
 
-**Tools:**
-- `query_local_llm` — send prompts to local model (default 27B, `model="fast"` for 0.8B)
-- `list_local_models` — discover running models
+**Tools exposed:**
 
-**Routing:**
-```
-model="fast"     → 0.8B megakernel (494 t/s, simple tasks)
-model="dflash"   → DFlash 27B (when running)
-default          → Qwen3.6-27B (complex reasoning)
-```
+| Tool | Purpose |
+|------|---------|
+| `query` | Send prompt. `model=` overrides routing; `capabilities=[…]` enforces requirements; `priority`/`origin` flow through the queue; `include_reasoning=true` returns `<think>` as a structured field. |
+| `plan_query` | Dry-run routing decision — no generation. |
+| `list_models` | Registry + load status + capabilities. |
+| `load_model` / `unload_model` | Manual VRAM control. |
+| `vram_status` | Snapshot of allocation. |
+| `scan_models` | Re-discover GGUFs on disk. |
+| `queue_status` | Per-model queue depth + scheduling strategy. |
 
 ---
 
-## API Reference
+## OpenAI HTTP
 
-OpenAI-compatible on every model:
+Drop-in compat:
 
 ```bash
-# 27B (production)
 curl http://localhost:8020/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":1000}'
-
-# 0.8B (instant)
-curl http://localhost:8001/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":200}'
+  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":1000,"stream":true}'
 ```
 
-**Streaming:** Add `"stream": true` to any request.
-
-**Python SDK:**
-```python
-from server.client import LocalLLM
-
-llm = LocalLLM()
-response = llm.chat("explain quicksort")
-for token in llm.stream("write a long function"):
-    print(token, end="", flush=True)
-```
+Streaming, models list, health — all standard. Reasoning is stripped from `content` and exposed in `reasoning_content` (Qwen extension). Both Python (FastAPI) and Rust (axum) implementations validated for end-to-end SSE: identical chunk format, identical `[DONE]` terminator.
 
 ---
 
-## Architecture
+## Model Registry
 
+`python -m lamu scan` walks `~/models/`, parses GGUF headers, and emits `config/models.yaml`:
+
+```yaml
+- name: qwen3.6-27b-uncensored-heretic-v2-q4_k_m
+  path: ~/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
+  format: gguf
+  backend: llama_cpp
+  arch: qwen35
+  params_b: 27.6
+  quant: Q4_K_M
+  vram_mb: 17358
+  context_max: 262144
+  capabilities: [chat, code, reasoning, long_context]
+  reasoning_marker: { open_tag: "<think>", close_tag: "</think>", family: qwen35 }
+  speculative:
+    draft_path: ~/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
+    method: dflash
+    draft_max: 8
 ```
-┌──────────────────────────────────────────────────────┐
-│  SURFACES                                            │
-│  llm (REPL) │ MCP (Claude Code) │ OpenAI API │ SDK  │
-└──────────────────────┬───────────────────────────────┘
-                       │
-         ┌─────────────┼──────────────┐
-         │             │              │
-  ┌──────▼──────┐ ┌────▼─────┐ ┌─────▼──────┐
-  │ Qwen3.6 27B │ │ Qwen3.5  │ │  DFlash    │
-  │  :8020      │ │  0.8B    │ │  106 t/s   │
-  │ ngram-mod   │ │  :8001   │ │  one-shot  │
-  │ 131K ctx    │ │ 494 t/s  │ │  DDTree    │
-  └─────────────┘ └──────────┘ └────────────┘
-         │
-  ┌──────▼──────────┐
-  │  Agent Swarm    │
-  │  plan → work    │
-  │  → test → review│
-  └─────────────────┘
-```
+
+Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` — chosen per-entry. Adding a new backend is a single file in `lamu/backends/` (or `lamu-rs/lamu-core/src/backends/`) plus one `make_backend` arm.
 
 ---
 
-## Benchmarks
+## Three Speed Tiers (v1 perf legacy, still authoritative)
 
 RTX 4090, 24 GB VRAM, Qwen3.6-27B-uncensored-heretic-v2 Q4_K_M:
 
 | Method | Speed | Acceptance | Notes |
 |--------|-------|-----------|-------|
-| **Lucebox DFlash+DDTree** | **106 t/s** | 32%, 5.12 tok/step | Matched 3.6 draft |
+| **Lucebox DFlash + DDTree** | **106 t/s** | 32%, 5.12 tok/step | Matched 3.6 draft; PR [#94](https://github.com/Luce-Org/lucebox-hub/pull/94) |
 | llama.cpp DFlash PR | 82 t/s | 77.9%, draft-max=8 | GGUF Q4_K_M draft |
-| ngram-mod (warm) | 49.5 t/s | Pattern matching | No draft model |
-| ngram-mod (cold) | 9.8 t/s | First request | |
-| 0.8B megakernel | 494 t/s | N/A | Different model |
+| ngram-mod (warm) | 49.5 t/s | pattern matching | no draft model |
+| ngram-mod (cold) | 9.8 t/s | first request | |
+| 0.8B megakernel | 494 t/s | n/a | hand-written CUDA |
 
-Q4_K_M draft outperforms F16 draft (77.6 > 72.7 t/s). Bandwidth beats accuracy.
+Q4_K_M draft outperforms F16 (77.6 vs 72.7 t/s) — bandwidth beats accuracy on the draft path.
 
 ---
 
-## Full Manual
+## Testing
 
-### Build Requirements
-
-- **GPU:** NVIDIA RTX 4090 (24 GB) or similar
-- **OS:** Linux (Arch/CachyOS tested)
-- **CUDA:** 13.2 with **gcc-14** as host compiler (`CUDAHOSTCXX=g++-14`)
-- **Python:** 3.12+
-- **Tools:** `just`, `cmake`, `git`
-
-GCC 16 + NVCC 13.2 are incompatible. Always use gcc-14 for CUDA builds.
-
-### All Commands
+`pytest` with stubbed heavy deps so the unit layer runs CPU-only (no torch/transformers/llama_cpp imported):
 
 ```bash
-# Server management
-just swap 3.6           # Qwen3.6-27B ngram-mod on :8020
-just swap 3.5           # Qwen3.5-27B on :8020
-just swap dflash        # DFlash lucebox on :8000
-just swap status        # show what's running
-just serve-fast         # DFlash one-shot (106 t/s)
-just status             # all endpoints
+pytest tests/ -q
+# → 264 passed, 15 deselected (GPU-marked)
+
+cargo test --workspace
+# → 50 passed across 9 crates
+```
+
+Layout:
+
+```
+tests/
+├── unit/        — 250 tests, modules stubbed at conftest level
+│   ├── core/    — registry, scheduler, router, reasoning, types, health, supervisor
+│   ├── backends/, mcp/, api/, daemon/, cli/
+│   └── server/, agents/, scripts/, web/
+└── integration/ — 14 tests, real subprocesses
+    ├── test_backend_death.py        — process kill, scheduler reconciles
+    ├── test_oom_quarantine.py       — VRAM exhausted → quarantine path
+    ├── test_bad_registry.py         — corrupt YAML, missing files
+    ├── test_no_hang.py              — load/unload/query never blocks indefinitely
+    └── test_concurrent_health.py    — N agents probing health at once
+```
+
+Heavy modules (`torch`, `transformers`, `llama_cpp`, `langchain*`, `chainlit`, …) are replaced with `_StubModule` instances at conftest import — the runtime never touches them. Real subprocesses are guarded by `no_real_subprocess`. `nvidia-smi` is intercepted by the `mock_nvidia_smi` fixture which simulates VRAM state, PIDs, timeouts, and failures.
+
+GGUF tests use a synthesised binary from `make_gguf_bytes(arch, file_type, truncate=, bad_magic=)` — covers happy path + corruption.
+
+---
+
+## Build Requirements
+
+- **GPU:** NVIDIA RTX 4090 (24 GB) or larger
+- **OS:** Linux (Arch / CachyOS tested)
+- **CUDA:** 13.2 with **gcc-14** as host compiler (`CUDAHOSTCXX=g++-14`). gcc-16 + nvcc 13.2 do not link.
+- **Python:** 3.12+
+- **Rust:** 1.85+ (edition 2024)
+- **Tools:** `just`, `cmake`, `git`, `uv`
+
+---
+
+## Commands
+
+```bash
+# v2 daemon
+python -m lamu scan|start|status|serve|repl
+lamu  scan|start|status|serve|repl                  # rust binary, same surface
+
+# v1 servers (still wired through justfile)
+just swap 3.6 | 3.5 | dflash                        # rotate :8020 / :8000
+just serve-fast ["prompt"]                          # 106 t/s DFlash, optional one-shot
+just serve-megakernel                               # 494 t/s on :8001
+just status                                         # all endpoints
 
 # Chat
-llm                     # interactive REPL
-llm "your question"     # one-shot
+llm                                                 # legacy direct REPL
+python -m lamu repl                                 # v2 daemon-routed REPL
 
-# Agent swarm
+# Agent swarm + training
 just swarm "task" /path/to/repo
-just bench-swarm        # run benchmarks
+just bench-swarm
+just train-status | train
 
-# Training
-just train-status       # check collected data
-just train              # QLoRA fine-tuning
-
-# Model setup
-just setup-qwen36       # download Qwen3.6-27B
+# Tests
+pytest tests/ -q
+cargo test --workspace
 ```
 
-### Wiki
+---
 
-13 pages of hard-won optimization knowledge at `wiki/pages/`:
+## Wiki
 
-- `dflash-speculative.md` — DFlash setup, benchmarks, both implementations
-- `build-requirements.md` — gcc-14 requirement, clang status
-- `262k-context.md` — how to achieve 262K on 24 GB
-- `ngram-speculation.md` — ngram-mod tuning
-- `vram-budget.md` — what fits where
-- `eagle-training.md` — EAGLE v3 experiments (archived)
+13 pages of hard-won optimization knowledge in `wiki/pages/`:
 
-### Knowledge Graph
+`dflash-speculative.md` · `build-requirements.md` · `262k-context.md` · `ngram-speculation.md` · `vram-budget.md` · `eagle-training.md` · `eagle-cpp-integration.md` · `mcp-setup.md` · `model-selection.md` · `serving-engine.md` · `token-efficiency.md` · `training-loop.md` · `vllm-limitations.md`.
 
-Graphify builds a navigable graph of the codebase (321 nodes, 424 edges, 25 communities):
-
-```bash
-# View in browser
-open graphify-out/graph.html
-
-# Query
-/graphify query "how does DFlash connect to MCP"
-```
+Knowledge graph (~1,000 nodes) in `graphify-out/graph.html`. Query with `/graphify query "<question>"`.
 
 ---
 
 ## Open Source Contributions
 
 | PR | Repo | Status | Impact |
-|---|------|--------|--------|
-| [#89](https://github.com/Luce-Org/lucebox-hub/pull/89) | Luce-Org/lucebox-hub | **Merged** | Fixed conv_input_cache crash for all 24 GB GPUs |
+|----|------|--------|--------|
+| [#89](https://github.com/Luce-Org/lucebox-hub/pull/89) | Luce-Org/lucebox-hub | **Merged** | Fixed `conv_input_cache` crash on all 24 GB GPUs |
 | [#94](https://github.com/Luce-Org/lucebox-hub/pull/94) | Luce-Org/lucebox-hub | Submitted | Qwen3.6 SWA draft support → 57% speedup |
 
 ---
 
 ## Philosophy
 
-Started from wanting to run GPT-2 locally like InferKit in 2021. Now running a 27B uncensored model at 106 tokens per second with speculative decoding, agent swarms, and MCP integration — all on a single consumer GPU.
+Wanted GPT-2 running locally like InferKit in 2021. Now running a 27B uncensored model at 106 t/s with speculative decoding, agent swarms, MCP integration, and a Rust port — all on one consumer GPU.
 
-The config is opinionated. The architecture isn't. Every layer is swappable: model, engine, gateway, framework integration. When something better comes along, change one path.
+The config is opinionated. The architecture isn't. Every layer is swappable: model, backend, transport, framework. When something better lands, change one path.
 
 ---
 
