@@ -359,22 +359,33 @@ fn random_hex(len: usize) -> String {
 }
 
 /// Auto-register running models found on standard ports.
+///
+/// Probes `/v1/models` (not `/health`) so we learn which model is actually
+/// serving on each port, then match against the registry by bidirectional
+/// substring. Avoids registering the wrong entry just because it's first
+/// in iteration order.
 pub async fn auto_register(state: &AppState) {
     let probes = [lamu_core::config::PORT_MAIN, lamu_core::config::PORT_SIDECAR];
     for port in probes {
-        let url = format!("http://localhost:{}/health", port);
-        if let Ok(r) = state.client.get(&url).timeout(Duration::from_secs(1)).send().await {
-            if let Ok(j) = r.json::<Value>().await {
-                if j.get("status").and_then(|v| v.as_str()) == Some("ok") {
-                    // Pick first matching entry not yet loaded
-                    let mut scheduler = state.scheduler.lock();
-                    for entry in state.entries.values() {
-                        if !scheduler.is_loaded(&entry.name) {
-                            scheduler.register_loaded(entry.clone(), None, port, entry.vram_mb);
-                            break;
-                        }
-                    }
+        let url = format!("http://localhost:{}/v1/models", port);
+        let Ok(resp) = state.client.get(&url)
+            .timeout(Duration::from_secs(2))
+            .send().await
+        else { continue };
+        let Ok(j) = resp.json::<Value>().await else { continue };
+        let Some(model_id) = j.get("data").and_then(|d| d.get(0))
+            .and_then(|m| m.get("id")).and_then(|v| v.as_str())
+        else { continue };
+        let model_id = model_id.to_lowercase();
+
+        let mut scheduler = state.scheduler.lock();
+        for entry in state.entries.values() {
+            let ename = entry.name.to_lowercase();
+            if ename.contains(&model_id) || model_id.contains(&ename) {
+                if !scheduler.is_loaded(&entry.name) {
+                    scheduler.register_loaded(entry.clone(), None, port, entry.vram_mb);
                 }
+                break;
             }
         }
     }

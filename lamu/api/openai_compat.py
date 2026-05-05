@@ -289,20 +289,29 @@ def serve(port: int = 8020) -> None:
     entries = load_registry(registry_path)
     scheduler = VramScheduler()
 
-    # Auto-register running models
+    # Auto-register running models. Probe /v1/models to learn which model is
+    # actually serving on each port, then match against the registry by
+    # bidirectional substring (model id may be lowercased / suffixed).
+    import json
     import urllib.request
 
     for probe_port in [8020, 8001]:
         try:
-            req = urllib.request.Request(f"http://localhost:{probe_port}/health")
-            with urllib.request.urlopen(req, timeout=1):
-                # Find matching entry
-                for entry in entries:
-                    if not scheduler.is_loaded(entry.name):
-                        scheduler.register_loaded(entry, pid=0, port=probe_port, vram_actual_mb=entry.vram_mb)
-                        break
+            req = urllib.request.Request(f"http://localhost:{probe_port}/v1/models")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read())
+            model_id = data["data"][0]["id"].lower()
         except Exception:
-            pass
+            continue
+
+        for entry in entries:
+            ename = entry.name.lower()
+            if ename in model_id or model_id in ename:
+                if not scheduler.is_loaded(entry.name):
+                    scheduler.register_loaded(
+                        entry, pid=0, port=probe_port, vram_actual_mb=entry.vram_mb
+                    )
+                break
 
     app = create_app(scheduler, entries)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
