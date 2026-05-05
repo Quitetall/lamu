@@ -122,6 +122,7 @@ def stream_response(messages: list[dict], model: str, url: str = DEFAULT_API_URL
         "messages": messages,
         "stream": True,
         "temperature": 0.7,
+        "max_tokens": 16384,
     }
     req = urllib.request.Request(
         url,
