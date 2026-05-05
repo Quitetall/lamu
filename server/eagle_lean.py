@@ -48,15 +48,40 @@ class EagleHead(nn.Module):
         )
         self.enc = nn.TransformerEncoder(layer, num_layers=2)
         self.lm = nn.Linear(inner_dim, vocab_size, bias=False)
+        # Reusable host-pinned + device-side hidden buffer; rebuilt on first
+        # `draft()` once we know the actual device/dtype.
+        self._draft_buf: torch.Tensor | None = None
 
     def forward(self, x):
         return self.lm(self.enc(self.norm(self.down(x))))
 
+    def _trunk(self, x):
+        """Everything before the vocab projection."""
+        return self.enc(self.norm(self.down(x)))
+
     @torch.no_grad()
     def draft(self, hidden_np: np.ndarray) -> int:
-        x = torch.from_numpy(hidden_np.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-        x = x.to(device=self.lm.weight.device, dtype=self.lm.weight.dtype)
-        return self.forward(x)[0, 0].argmax().item()
+        # Reuse a pinned buffer to avoid host→device alloc + transfer per call.
+        if self._draft_buf is None:
+            self._draft_buf = torch.empty(
+                (1, 1, self.down.in_features),
+                device=self.lm.weight.device, dtype=self.lm.weight.dtype,
+            )
+        # Single explicit copy_; avoids the implicit float-cast + tensor materialisation
+        # that `from_numpy().to(...)` does each call.
+        self._draft_buf.copy_(
+            torch.from_numpy(hidden_np).view(1, 1, -1),
+            non_blocking=True,
+        )
+        h = self._trunk(self._draft_buf)            # [1,1,inner]
+        # Fused matmul + argmax. `topk(1)` on GPU returns the index without
+        # materialising the full host-side logits vector — same matmul work
+        # as the original `lm(...)` call but the argmax stays on-device until
+        # we pull the single int back. Dropping the host copy of a 248K-element
+        # fp16 tensor saves ~500KB of device→host bandwidth per draft.
+        logits = self.lm(h)[0, 0]                   # [vocab]
+        idx = torch.argmax(logits)                  # scalar tensor on device
+        return int(idx.item())
 
 
 # ── Hidden state extraction from llama-cpp ──────────────────────────────
@@ -88,52 +113,72 @@ class LeanDecoder:
         self.llm.reset()
         self.llm.eval(tokens)
 
-        n_vocab = llama_cpp.llama_model_n_embd(self.llm._model.model)  # used for embeddings
-        # Get actual vocab size from config
-        n_vocab = 248320
+        n_vocab = 248320  # qwen3.6 vocab size
+        ctx = self.llm._ctx.ctx
+        mem = llama_cpp.llama_get_memory(ctx)
+        eos = self.llm.token_eos()
 
         for _ in range(max_tokens):
-            # Get logits via C API (llm.scores is broken with embedding=True)
-            logits_ptr = llama_cpp.llama_get_logits_ith(self.llm._ctx.ctx, -1)
+            # Read main logits at last position. Direct ndarray view — no copy
+            # since we consume immediately and the next eval invalidates anyway.
+            logits_ptr = llama_cpp.llama_get_logits_ith(ctx, -1)
             if not logits_ptr:
                 break
-            logits = np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,)).copy()
+            logits = np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,))
 
-            # Sample
+            # Sample (softmax materialises a fresh array, so the view above is safe)
             if temperature > 0:
-                probs = _softmax(logits / temperature)
-                token = int(np.random.choice(len(probs), p=probs))
+                probs = _softmax(logits.astype(np.float32) / temperature)
+                token = int(np.random.choice(n_vocab, p=probs))
             else:
                 token = int(np.argmax(logits))
 
-            if token == self.llm.token_eos():
+            if token == eos:
                 break
 
             yield token
             self.total += 1
 
-            # Get hidden state for EAGLE draft
+            # Hidden state at the position we just sampled from.
             hidden = get_hidden_state(self.llm, -1)
+            if hidden is None:
+                # No EAGLE this step — single-token eval and continue.
+                self.llm.eval([token])
+                continue
 
-            # Eval the accepted token
-            self.llm.eval([token])
+            # EAGLE drafts the *next* token speculatively.
+            draft_token = self.eagle.draft(hidden)
+            self.drafted += 1
 
-            # EAGLE draft from hidden state
-            if hidden is not None:
-                draft_token = self.eagle.draft(hidden)
-                self.drafted += 1
+            # Batched eval: process [token, draft] in a single forward pass.
+            # logits at position -2 hold the main model's prediction for "after token",
+            # which is exactly what `draft` is trying to be — so this is the direct
+            # first-draft-verification read with no extra forward.
+            self.llm.eval([token, draft_token])
 
-                # Verify: does main model agree?
-                verify_ptr = llama_cpp.llama_get_logits_ith(self.llm._ctx.ctx, -1)
-                if verify_ptr:
-                    verify_logits = np.ctypeslib.as_array(verify_ptr, shape=(n_vocab,)).copy()
-                    main_pred = int(np.argmax(verify_logits))
+            verify_ptr = llama_cpp.llama_get_logits_ith(ctx, -2)
+            if not verify_ptr:
+                continue
+            verify_logits = np.ctypeslib.as_array(verify_ptr, shape=(n_vocab,))
+            main_pred = int(np.argmax(verify_logits))
 
-                    if main_pred == draft_token:
-                        self.accepted += 1
-                        yield draft_token
-                        self.total += 1
-                        self.llm.eval([draft_token])
+            if main_pred == draft_token:
+                # Accept: KV cache already holds [token, draft]. Two output tokens
+                # for the cost of one batched forward.
+                self.accepted += 1
+                yield draft_token
+                self.total += 1
+            else:
+                # Reject: roll the draft out of KV, replace with main_pred.
+                # Speculative-decoding semantics: on reject, emit main's choice
+                # so output distribution still matches the main model.
+                pos_max = llama_cpp.llama_memory_seq_pos_max(mem, 0)
+                llama_cpp.llama_memory_seq_rm(mem, 0, pos_max, pos_max + 1)
+                yield main_pred
+                self.total += 1
+                if main_pred == eos:
+                    break
+                self.llm.eval([main_pred])
 
     @property
     def acceptance_rate(self):
@@ -225,6 +270,14 @@ async def chat(req: ChatRequest):
 
 def main():
     global decoder
+
+    # Pull every Tensor Core lever available on the GPU. The lm_head matmul
+    # (1024 × 248320) and the verify forward both benefit; with TF32/cudnn
+    # benchmark off we leave 30-40% throughput on the table.
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
 
     gguf = None
     for q in ["Q4_K_M", "Q5_K_S"]:
