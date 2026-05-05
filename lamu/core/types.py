@@ -100,13 +100,25 @@ class StreamChunk:
 
 
 @dataclass(frozen=True)
+class QueryStats:
+    """Performance stats for a query (inspired by abdimoallim/llm)."""
+    latency_ms: float               # total wall time
+    time_to_first_token_ms: float   # streaming: ms until first token
+    tokens_generated: int
+    tokens_per_second: float
+    prompt_tokens: int
+    retries: int = 0
+    stream_chunks: int = 0
+
+
+@dataclass(frozen=True)
 class QueryResult:
     """Result from a model query."""
     content: str
     reasoning: Optional[str]
     model_used: str
-    tokens_generated: int
-    tokens_per_second: float
+    stats: QueryStats
+    finish_reason: str = "stop"     # "stop" | "length" | "error"
 
 
 @dataclass(frozen=True)
