@@ -10,5 +10,6 @@ pub mod router;
 pub mod reasoning;
 pub mod config;
 pub mod error;
+pub mod backends;
 
 pub use error::{Error, Result};

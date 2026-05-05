@@ -16,6 +16,6 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-
-# TODO: pick MCP crate when porting (rmcp, mcp-server-rs, or hand-roll JSON-RPC)
-# rmcp = "0.1"
+parking_lot = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
+libc = "0.2"

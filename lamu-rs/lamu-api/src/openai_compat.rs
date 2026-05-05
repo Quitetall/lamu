@@ -1,6 +1,27 @@
-//! OpenAI-compatible request/response types + handlers.
+//! OpenAI-compatible HTTP layer.
+//! Direct port of `lamu/api/openai_compat.py`.
 
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Json};
+use axum::routing::{get, post};
+use axum::Router as AxumRouter;
+use futures_util::stream::Stream;
+use lamu_core::reasoning::get_extractor;
+use lamu_core::registry::load_registry;
+use lamu_core::router::Router;
+use lamu_core::scheduler::VramScheduler;
+use lamu_core::types::{Capability, ModelEntry, ReasoningMarker};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
@@ -10,6 +31,7 @@ pub struct Message {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatRequest {
+    #[serde(default)]
     pub model: Option<String>,
     pub messages: Vec<Message>,
     #[serde(default = "default_max_tokens")]
@@ -18,33 +40,360 @@ pub struct ChatRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
     pub top_k: Option<u32>,
+    #[serde(default)]
     pub top_p: Option<f32>,
 }
 
 fn default_max_tokens() -> u32 { 16384 }
 fn default_temperature() -> f32 { 0.7 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatResponse {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
-    pub choices: Vec<Choice>,
+#[derive(Clone)]
+pub struct AppState {
+    pub scheduler: Arc<Mutex<VramScheduler>>,
+    pub router: Arc<Mutex<Router>>,
+    pub entries: Arc<HashMap<String, ModelEntry>>,
+    pub client: reqwest::Client,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Choice {
-    pub index: u32,
-    pub message: AssistantMessage,
-    pub finish_reason: String,
+pub fn build_app(state: AppState) -> AxumRouter {
+    AxumRouter::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(state)
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AssistantMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    let n = state.scheduler.lock().loaded_models().len();
+    Json(json!({"status": "ok", "models_loaded": n}))
+}
+
+async fn list_models(State(state): State<AppState>) -> Json<Value> {
+    let mut data = Vec::new();
+    let scheduler = state.scheduler.lock();
+    for (name, entry) in state.entries.iter() {
+        let loaded = scheduler.is_loaded(name);
+        let caps: Vec<&str> = entry.capabilities.iter().map(|c| match c {
+            Capability::Chat => "chat",
+            Capability::Code => "code",
+            Capability::Reasoning => "reasoning",
+            Capability::Routing => "routing",
+            Capability::Vision => "vision",
+            Capability::LongContext => "long_context",
+        }).collect();
+        data.push(json!({
+            "id": name,
+            "object": "model",
+            "owned_by": "local",
+            "loaded": loaded,
+            "params_b": entry.params_b,
+            "vram_mb": entry.vram_mb,
+            "capabilities": caps,
+        }));
+    }
+    Json(json!({"data": data, "object": "list"}))
+}
+
+#[derive(Serialize)]
+struct ErrorResponse<'a> {
+    error: ErrorBody<'a>,
+}
+
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    message: String,
+    #[serde(rename = "type")]
+    typ: &'a str,
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> impl IntoResponse {
+    let completion_id = format!("chatcmpl-{}", random_hex(12));
+    let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+    let (port, model_name, marker) = {
+        let scheduler = state.scheduler.lock();
+        let router = state.router.lock();
+        let decision = router.route(&scheduler, req.model.as_deref(), None);
+
+        if decision.model_name.is_empty() || !decision.loaded {
+            let body = ErrorResponse {
+                error: ErrorBody {
+                    message: format!("No loaded model available: {}", decision.reason),
+                    typ: "model_not_available",
+                },
+            };
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::to_value(body).unwrap())).into_response();
+        }
+
+        let Some(loaded) = scheduler.get_loaded(&decision.model_name) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": {"message": "internal: lost loaded model"}}))).into_response();
+        };
+        let port = loaded.port;
+        let entry = state.entries.get(&decision.model_name).cloned();
+        let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
+        (port, decision.model_name, marker)
+    };
+
+    {
+        let mut scheduler = state.scheduler.lock();
+        scheduler.mark_used(&model_name);
+    }
+
+    let messages_json: Vec<Value> = req.messages.iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
+
+    let mut payload = json!({
+        "messages": messages_json,
+        "max_tokens": req.max_tokens,
+        "temperature": req.temperature,
+        "stream": req.stream,
+    });
+    if let Some(k) = req.top_k { payload["top_k"] = json!(k); }
+    if let Some(p) = req.top_p { payload["top_p"] = json!(p); }
+
+    let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
+
+    if req.stream {
+        return stream_response(state.client.clone(), backend_url, payload,
+                               completion_id, created, model_name, marker).await
+            .into_response();
+    }
+
+    // Non-streaming
+    let resp = match state.client.post(&backend_url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"message": format!("Backend unreachable: {}", e)}}))).into_response(),
+    };
+
+    let data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"message": format!("Bad JSON from backend: {}", e)}}))).into_response(),
+    };
+
+    let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
+    let raw_content = msg.and_then(|m| m.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+    let reasoning_content = msg.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).unwrap_or("");
+
+    let extractor = get_extractor(marker);
+    let (reasoning, content) = if !reasoning_content.is_empty() {
+        (reasoning_content.to_string(), raw_content.to_string())
+    } else {
+        extractor.split(raw_content)
+    };
+
+    let finish = data.get("choices").and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str())
+        .unwrap_or("stop");
+
+    let usage = data.get("usage").cloned().unwrap_or(Value::Null);
+    let timings = data.get("timings").cloned();
+
+    let mut message_obj = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !reasoning.is_empty() {
+        message_obj["reasoning_content"] = Value::String(reasoning);
+    }
+
+    let mut response = json!({
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": message_obj,
+            "finish_reason": finish,
+        }],
+        "usage": usage,
+    });
+    if let Some(t) = timings {
+        response["timings"] = t;
+    }
+
+    Json(response).into_response()
+}
+
+async fn stream_response(
+    client: reqwest::Client,
+    backend_url: String,
+    payload: Value,
+    completion_id: String,
+    created: u64,
+    model_name: String,
+    marker: Option<ReasoningMarker>,
+) -> Sse<Pin<Box<dyn Stream<Item = std::result::Result<Event, Infallible>> + Send>>> {
+    let s = async_stream::stream! {
+        let resp = match client.post(&backend_url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let chunk = json!({"error": format!("backend: {}", e)});
+                yield Ok(Event::default().data(chunk.to_string()));
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
+        };
+
+        let mut byte_stream = resp.bytes_stream();
+        let mut buf = String::new();
+
+        let open_tag = marker.as_ref().map(|m| m.open_tag.clone()).unwrap_or_else(|| "<think>".to_string());
+        let close_tag = marker.as_ref().map(|m| m.close_tag.clone()).unwrap_or_else(|| "</think>".to_string());
+
+        let mut pending = String::new();
+        let mut in_reasoning = false;
+        let mut reasoning_done = false;
+
+        use futures_util::stream::StreamExt;
+        while let Some(chunk_res) = byte_stream.next().await {
+            let Ok(bytes) = chunk_res else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("data: ") else { continue };
+                if rest == "[DONE]" {
+                    if !pending.trim().is_empty() && reasoning_done {
+                        let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                        yield Ok(Event::default().data(chunk.to_string()));
+                    }
+                    let done_chunk = json!({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    });
+                    yield Ok(Event::default().data(done_chunk.to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
+                let Some(token) = val.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                else { continue };
+                if token.is_empty() { continue; }
+
+                pending.push_str(token);
+
+                if !in_reasoning && !reasoning_done {
+                    if let Some(idx) = pending.find(open_tag.as_str()) {
+                        in_reasoning = true;
+                        let pre = pending[..idx].to_string();
+                        let after = pending[idx + open_tag.len()..].to_string();
+                        pending = after;
+                        if !pre.trim().is_empty() {
+                            let chunk = make_chunk(&completion_id, created, &model_name, &pre);
+                            yield Ok(Event::default().data(chunk.to_string()));
+                        }
+                    } else if pending.len() > open_tag.len() * 3 {
+                        reasoning_done = true;
+                        let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                        yield Ok(Event::default().data(chunk.to_string()));
+                        pending.clear();
+                    }
+                } else if in_reasoning && !reasoning_done {
+                    if let Some(idx) = pending.find(close_tag.as_str()) {
+                        reasoning_done = true;
+                        in_reasoning = false;
+                        pending = pending[idx + close_tag.len()..].to_string();
+                        if !pending.trim().is_empty() {
+                            let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                            yield Ok(Event::default().data(chunk.to_string()));
+                            pending.clear();
+                        }
+                    } else {
+                        pending.clear();
+                    }
+                } else if reasoning_done {
+                    let chunk = make_chunk(&completion_id, created, &model_name, token);
+                    yield Ok(Event::default().data(chunk.to_string()));
+                    pending.clear();
+                }
+            }
+        }
+
+        let done_chunk = json!({
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        yield Ok(Event::default().data(done_chunk.to_string()));
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(Box::pin(s))
+}
+
+fn make_chunk(id: &str, created: u64, model: &str, content: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+    })
+}
+
+fn random_hex(len: usize) -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut s = format!("{:x}", nanos);
+    s.truncate(len);
+    s
+}
+
+/// Auto-register running models found on standard ports.
+pub async fn auto_register(state: &AppState) {
+    let probes = [lamu_core::config::PORT_MAIN, lamu_core::config::PORT_SIDECAR];
+    for port in probes {
+        let url = format!("http://localhost:{}/health", port);
+        if let Ok(r) = state.client.get(&url).timeout(Duration::from_secs(1)).send().await {
+            if let Ok(j) = r.json::<Value>().await {
+                if j.get("status").and_then(|v| v.as_str()) == Some("ok") {
+                    // Pick first matching entry not yet loaded
+                    let mut scheduler = state.scheduler.lock();
+                    for entry in state.entries.values() {
+                        if !scheduler.is_loaded(&entry.name) {
+                            scheduler.register_loaded(entry.clone(), None, port, entry.vram_mb);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load registry from default path + build app state.
+pub fn build_state(registry_path: &Path) -> anyhow::Result<AppState> {
+    let entries_vec = load_registry(registry_path)?;
+    let scheduler = VramScheduler::new();
+    let router = Router::new(&scheduler, entries_vec.clone());
+    let entries: HashMap<String, ModelEntry> = entries_vec.into_iter()
+        .map(|e| (e.name.clone(), e)).collect();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    Ok(AppState {
+        scheduler: Arc::new(Mutex::new(scheduler)),
+        router: Arc::new(Mutex::new(router)),
+        entries: Arc::new(entries),
+        client,
+    })
 }
