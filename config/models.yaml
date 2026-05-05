@@ -1,38 +1,32 @@
 models:
-  gpt2-xl.q4_k_m:
-    path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
+  qwen3.6-27b-dflash-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/Qwen3.6-27B-DFlash-Q4_K_M.gguf
     format: gguf
-    backend: llama.cpp
-    arch: gpt2
-    params_b: 2.0
+    backend: llama_cpp
+    arch: dflash-draft
+    params_b: 1.7
     quant: Q4_K_M
-    vram_mb: 1246
+    vram_mb: 1083
     context_max: 131072
     capabilities:
     - chat
     - long_context
-  qwen3.5-27b-q4_k_m:
-    path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
+  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
     format: gguf
-    backend: llama.cpp
-    arch: qwen35
-    params_b: 27.9
+    backend: llama_cpp
+    arch: qwen35moe
+    params_b: 35.3
     quant: Q4_K_M
-    vram_mb: 17561
+    vram_mb: 22204
     context_max: 131072
     capabilities:
     - chat
-    - code
-    - reasoning
     - long_context
-    reasoning_marker:
-      open_tag: <think>
-      close_tag: </think>
-      family: qwen35
   qwen3.5-4b-q4_k_m:
     path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
     format: gguf
-    backend: llama.cpp
+    backend: llama_cpp
     arch: qwen35
     params_b: 4.6
     quant: Q4_K_M
@@ -47,10 +41,86 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+  dflash-3.6-f16:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash
+    params_b: 5.8
+    quant: F16
+    vram_mb: 3641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+  gpt2-xl.q4_k_m:
+    path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: gpt2
+    params_b: 2.0
+    quant: Q4_K_M
+    vram_mb: 1246
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  dflash-3.6-q4km:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash
+    params_b: 1.7
+    quant: unknown
+    vram_mb: 1083
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+  qwen3.6-27b-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-official-gguf/Qwen3.6-27B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 28.0
+    quant: Q4_K_M
+    vram_mb: 17641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.5-27b-q4_k_m:
+    path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 27.9
+    quant: Q4_K_M
+    vram_mb: 17561
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
   qwen3.6-27b-uncensored-heretic-v2-q4_k_m:
     path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
     format: gguf
-    backend: llama.cpp
+    backend: llama_cpp
     arch: qwen35
     params_b: 27.6
     quant: Q4_K_M
@@ -68,81 +138,11 @@ models:
   qwen3.6-27b-uncensored-heretic-v2-q5_k_s:
     path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q5_K_S.gguf
     format: gguf
-    backend: llama.cpp
+    backend: llama_cpp
     arch: qwen35
     params_b: 31.1
     quant: Q5_K_S
     vram_mb: 19595
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-    reasoning_marker:
-      open_tag: <think>
-      close_tag: </think>
-      family: qwen35
-  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
-    format: gguf
-    backend: llama.cpp
-    arch: qwen35moe
-    params_b: 35.3
-    quant: Q4_K_M
-    vram_mb: 22204
-    context_max: 131072
-    capabilities:
-    - chat
-    - long_context
-  qwen3.6-27b-dflash-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/Qwen3.6-27B-DFlash-Q4_K_M.gguf
-    format: gguf
-    backend: llama.cpp
-    arch: dflash-draft
-    params_b: 1.7
-    quant: Q4_K_M
-    vram_mb: 1083
-    context_max: 131072
-    capabilities:
-    - chat
-    - long_context
-  dflash-3.6-f16:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
-    format: gguf
-    backend: llama.cpp
-    arch: dflash
-    params_b: 5.8
-    quant: F16
-    vram_mb: 3641
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-  dflash-3.6-q4km:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
-    format: gguf
-    backend: llama.cpp
-    arch: dflash
-    params_b: 1.7
-    quant: unknown
-    vram_mb: 1083
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-  qwen3.6-27b-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-official-gguf/Qwen3.6-27B-Q4_K_M.gguf
-    format: gguf
-    backend: llama.cpp
-    arch: qwen35
-    params_b: 28.0
-    quant: Q4_K_M
-    vram_mb: 17641
     context_max: 131072
     capabilities:
     - chat
