@@ -47,3 +47,5 @@ agents/merged_models/
 # club-3090 (cloned dependency, managed by setup script)
 deps/club-3090/
 lucebox-hub-old/
+graphify-out/cache/
+graphify-out/.graphify_*

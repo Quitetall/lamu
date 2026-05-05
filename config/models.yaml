@@ -1,124 +1,155 @@
-# Model registry — source of truth for the full stack
-# Each model needs: id, engine, and engine-specific config
-# Bifrost routing: provider/model → backend (see deps/bifrost/config.json)
-
 models:
-  # ── Cloud (via Bifrost → API) ──────────────────────────────────────────
-  - id: claude-opus-4-7
-    name: "Claude Opus 4.7"
-    engine: anthropic
-    role: planner    # swarm orchestrator
-
-  - id: claude-sonnet-4-6
-    name: "Claude Sonnet 4.6"
-    engine: anthropic
-    role: critic     # swarm reviewer
-
-  - id: gpt-4.1
-    name: "GPT-4.1"
-    engine: openai
-    role: critic     # alternate reviewer
-
-  # ── Local: DFlash (Qwen3.5-27B) ───────────────────────────────────────
-  - id: luce-dflash
-    name: "Qwen3.5-27B DFlash"
-    engine: dflash
-    role: worker     # swarm implementer
-    path: ~/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
-    draft: ~/models/draft-35/model.safetensors
-    port: 8000
-    context: 8192
-
-  # ── Local: Qwen3.6-27B Dense Uncensored (llama-cpp-python) ──────────
-  - id: qwen3.6-27b-uncensored
-    name: "Qwen3.6-27B Dense Uncensored Heretic v2"
-    engine: llama-cpp
-    role: worker     # swarm implementer — strongest local model, uncensored
-    gguf: ~/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
-    port: 8020
-    context: 49152   # ~16GB model, plenty of room for KV cache
-    notes: "SWE-bench 77.2, Terminal-Bench 59.3, AIME 94.1. 94% fewer refusals (6/100). 0.0021 KL."
-
-  # ── Local: Qwen3.6-35B-A3B MoE Uncensored (llama-cpp-python) ──────
-  - id: qwen3.6-27b-uncensored
-    name: "Qwen3.6-35B-A3B Uncensored Heretic (MoE, 3B active)"
-    engine: llama-cpp
-    role: worker     # alternative — faster per-token, lower quality
-    gguf: ~/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
-    port: 8020
-    context: 32768
-    notes: "35B total / 3B active MoE. 88% fewer refusals. 0.0015 KL. Shares :8020 with dense."
-
-  # ── Local: SGLang (GPT-2 XL) ──────────────────────────────────────────
-  - id: gpt2-xl
-    name: "GPT-2 XL (raw)"
-    engine: sglang
-    port: 8001
-    context: 1024
-
-  # ── GPT-2 presets (proxy :9001 → SGLang :8001) ────────────────────────
-  - id: shitty-best2021
-    name: "GPT-2 XL — Best 2021"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 0.72
-    top_p: 0.95
-    max_tokens: 300
-    context: 256
-
-  - id: shitty-inferkit
-    name: "GPT-2 XL — InferKit"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 0.85
-    max_tokens: 120
-    context: 80
-
-  - id: shitty-coherent
-    name: "GPT-2 XL — Coherent"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 0.5
-    max_tokens: 200
-    context: 200
-
-  - id: shitty-repetitive
-    name: "GPT-2 XL — Repetitive"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 0.1
-    max_tokens: 80
-    context: 50
-
-  - id: shitty-terrible
-    name: "GPT-2 XL — Terrible"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 2.0
-    max_tokens: 25
-    context: 20
-
-  - id: shitty-incoherent
-    name: "GPT-2 XL — Incoherent"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 3.0
-    max_tokens: 15
-    context: 10
-
-  - id: shitty-bloatware
-    name: "GPT-2 XL — Bloatware"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 2.2
-    top_p: 0.5
-    max_tokens: 28
-    context: 512
-
-  - id: shitty-default
-    name: "GPT-2 XL — Default"
-    engine: gpt2-proxy
-    port: 9001
-    temperature: 0.7
-    max_tokens: 150
-    context: 100
+  gpt2-xl.q4_k_m:
+    path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: gpt2
+    params_b: 2.0
+    quant: Q4_K_M
+    vram_mb: 1246
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  qwen3.5-27b-q4_k_m:
+    path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: qwen35
+    params_b: 27.9
+    quant: Q4_K_M
+    vram_mb: 17561
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.5-4b-q4_k_m:
+    path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: qwen35
+    params_b: 4.6
+    quant: Q4_K_M
+    vram_mb: 2874
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.6-27b-uncensored-heretic-v2-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: qwen35
+    params_b: 27.6
+    quant: Q4_K_M
+    vram_mb: 17358
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.6-27b-uncensored-heretic-v2-q5_k_s:
+    path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q5_K_S.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: qwen35
+    params_b: 31.1
+    quant: Q5_K_S
+    vram_mb: 19595
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: qwen35moe
+    params_b: 35.3
+    quant: Q4_K_M
+    vram_mb: 22204
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  qwen3.6-27b-dflash-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/Qwen3.6-27B-DFlash-Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: dflash-draft
+    params_b: 1.7
+    quant: Q4_K_M
+    vram_mb: 1083
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  dflash-3.6-f16:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: dflash
+    params_b: 5.8
+    quant: F16
+    vram_mb: 3641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+  dflash-3.6-q4km:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: dflash
+    params_b: 1.7
+    quant: unknown
+    vram_mb: 1083
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+  qwen3.6-27b-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-official-gguf/Qwen3.6-27B-Q4_K_M.gguf
+    format: gguf
+    backend: llama.cpp
+    arch: qwen35
+    params_b: 28.0
+    quant: Q4_K_M
+    vram_mb: 17641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
