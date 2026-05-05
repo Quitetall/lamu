@@ -1,0 +1,21 @@
+[package]
+name = "lamu-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP stdio server — primary interface"
+
+[dependencies]
+lamu-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+# TODO: pick MCP crate when porting (rmcp, mcp-server-rs, or hand-roll JSON-RPC)
+# rmcp = "0.1"

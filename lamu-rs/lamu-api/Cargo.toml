@@ -1,0 +1,21 @@
+[package]
+name = "lamu-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenAI-compatible HTTP API"
+
+[dependencies]
+lamu-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+# TODO: pick HTTP framework when porting
+# axum = "0.7"
+# tower = "0.5"

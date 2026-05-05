@@ -1,0 +1,23 @@
+[package]
+name = "lamu-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "LAMU daemon entry point + CLI"
+
+[[bin]]
+name = "lamu"
+path = "src/main.rs"
+
+[dependencies]
+lamu-core.workspace = true
+lamu-mcp = { path = "../lamu-mcp" }
+lamu-api = { path = "../lamu-api" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }

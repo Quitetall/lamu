@@ -1,0 +1,21 @@
+[package]
+name = "lamu-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core types, registry, scheduler, router, reasoning extraction"
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+tokio.workspace = true
+dirs = "5"
+
+[dev-dependencies]
+anyhow.workspace = true
