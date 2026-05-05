@@ -69,7 +69,13 @@ _wiki = WikipediaQueryRun(
 
 @tool
 def python_repl(code: str) -> str:
-    """Execute Python code and return stdout/result. Use for calculations, data processing, etc."""
+    """Execute Python code and return stdout/result. Use for calculations, data processing, etc.
+
+    `except Exception` is intentional here — the tool's contract is "run
+    arbitrary user code and surface either output or the error string back
+    to the model". `BaseException` (KeyboardInterrupt, SystemExit) still
+    propagates so the user can still abort the process.
+    """
     import io
     import contextlib
     buf = io.StringIO()
@@ -77,8 +83,8 @@ def python_repl(code: str) -> str:
         with contextlib.redirect_stdout(buf):
             exec(compile(code, "<repl>", "exec"), {})  # noqa: S102
         return buf.getvalue() or "(no output)"
-    except Exception as e:
-        return f"Error: {e}"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
 
 
 TOOLS = [_ddg, _wiki, python_repl]
@@ -154,8 +160,11 @@ async def run_agent(
                             result = await asyncio.to_thread(
                                 tool_fn.run, args if isinstance(args, str) else json.dumps(args)
                             )
-                        except Exception as e:
-                            result = f"Error running {name}: {e}"
+                        except Exception as exc:
+                            # Tool failures are surfaced to the model verbatim
+                            # so it can self-correct. Class name included so
+                            # the failure type is non-ambiguous.
+                            result = f"{type(exc).__name__} from {name}: {exc}"
                     else:
                         result = f"Unknown tool: {name}"
                     step.output = str(result)[:3000]
@@ -269,8 +278,13 @@ async def on_message(message: cl.Message):
             reply, _ = await run_agent(content, history, model, response_msg)
         else:
             reply, _ = await run_simple(content, history, model, response_msg)
-    except Exception as e:
-        await response_msg.stream_token(f"\n\n*Error: {e}*")
+    except Exception as exc:
+        # Surface a typed error message to the user. We deliberately catch
+        # `Exception` (not `BaseException`) so KeyboardInterrupt still
+        # propagates and lets the user abort the chat process.
+        await response_msg.stream_token(
+            f"\n\n*{type(exc).__name__}: {exc}*"
+        )
         return
 
     await response_msg.update()

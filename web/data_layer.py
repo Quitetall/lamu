@@ -29,8 +29,21 @@ def _now() -> str:
 
 
 def _run(fn):
-    """Run a synchronous SQLite function in a thread."""
-    return asyncio.to_thread(fn)
+    """Run a synchronous SQLite function in a thread.
+
+    Phase C: every SQLite error is wrapped in `DataLayerError` so callers
+    only need a single `except` instead of catching every `sqlite3.*Error`.
+    Programming bugs (TypeError, AttributeError, etc.) still propagate.
+    """
+    async def _wrapped():
+        try:
+            return await asyncio.to_thread(fn)
+        except sqlite3.Error as exc:
+            from lamu.core.errors import DataLayerError
+            raise DataLayerError(
+                f"sqlite operation failed: {type(exc).__name__}: {exc}"
+            ) from exc
+    return _wrapped()
 
 
 def _init_db():

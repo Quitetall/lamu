@@ -859,6 +859,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -906,6 +907,8 @@ name = "lamu-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
+ "futures-util",
  "lamu-core",
  "libc",
  "parking_lot",

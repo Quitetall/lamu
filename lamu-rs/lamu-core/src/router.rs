@@ -73,8 +73,7 @@ impl Router {
 
         // Try loaded models first
         let loaded_matches = self.find_loaded_matching(scheduler, &required);
-        if !loaded_matches.is_empty() {
-            let best = self.rank_loaded(loaded_matches);
+        if let Some(best) = self.rank_loaded(loaded_matches) {
             return RouteDecision {
                 model_name: best.entry.name.clone(),
                 reason: format!("best loaded model matching {:?}", required_vec(&required)),
@@ -155,14 +154,15 @@ impl Router {
         }).collect()
     }
 
-    fn rank_loaded<'b>(&self, models: Vec<&'b LoadedModel>) -> &'b LoadedModel {
-        models.into_iter()
-            .max_by(|a, b| {
-                a.entry.params_b.partial_cmp(&b.entry.params_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.last_used.cmp(&b.last_used))
-            })
-            .expect("non-empty")
+    fn rank_loaded<'b>(&self, models: Vec<&'b LoadedModel>) -> Option<&'b LoadedModel> {
+        // Returns None instead of panicking on empty input. Caller checks
+        // emptiness before this is reached, but defensive in case the
+        // invariant ever changes.
+        models.into_iter().max_by(|a, b| {
+            a.entry.params_b.partial_cmp(&b.entry.params_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.last_used.cmp(&b.last_used))
+        })
     }
 }
 

@@ -1,0 +1,17 @@
+[run]
+source = lamu, agents, cli, web, server
+omit =
+    scripts/*
+    lucebox-hub/*
+    deps/*
+    graphify-out/*
+    tests/*
+    */__main__.py
+    */setup.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:

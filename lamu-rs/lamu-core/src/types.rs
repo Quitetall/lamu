@@ -140,3 +140,68 @@ pub struct VramBudget {
     pub loaded_models: Vec<(String, u32)>,
     pub available_mb: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_round_trips_through_serde() {
+        let cap = Capability::LongContext;
+        let s = serde_json::to_string(&cap).unwrap();
+        assert_eq!(s, "\"long_context\"");
+        let back: Capability = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, Capability::LongContext);
+    }
+
+    #[test]
+    fn backend_type_serde_snake_case() {
+        let b = BackendType::DflashLucebox;
+        assert_eq!(serde_json::to_string(&b).unwrap(), "\"dflash_lucebox\"");
+    }
+
+    #[test]
+    fn model_format_serde_lowercase() {
+        let f = ModelFormat::Gguf;
+        assert_eq!(serde_json::to_string(&f).unwrap(), "\"gguf\"");
+    }
+
+    #[test]
+    fn model_state_distinct() {
+        // distinct variants — guards against accidental dedup
+        let states = [
+            ModelState::Unloaded, ModelState::Loading,
+            ModelState::Loaded, ModelState::Error,
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for (j, b) in states.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn speculative_config_default_draft_max() {
+        let yaml = r#"
+draft_path: /tmp/d.gguf
+method: dflash
+"#;
+        let cfg: SpeculativeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.draft_max, 8);
+    }
+
+    #[test]
+    fn route_decision_serializable() {
+        let d = RouteDecision {
+            model_name: "x".into(),
+            reason: "r".into(),
+            loaded: true,
+            would_evict: vec!["a".into()],
+        };
+        let j = serde_json::to_value(&d).unwrap();
+        assert_eq!(j["loaded"], true);
+        assert_eq!(j["would_evict"][0], "a");
+    }
+}

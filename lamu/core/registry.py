@@ -1,13 +1,16 @@
 """Model registry — auto-discovers models on disk, writes/reads YAML config."""
 from __future__ import annotations
 
+import logging
 import struct
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
+from lamu.core.errors import RegistryParseWarning
 from lamu.core.types import (
     BackendType,
     Capability,
@@ -16,6 +19,9 @@ from lamu.core.types import (
     ReasoningMarker,
     SpeculativeConfig,
 )
+
+
+_log = logging.getLogger(__name__)
 
 # VRAM estimation heuristics (bytes per parameter at various quant levels)
 _QUANT_BPW: dict[str, float] = {
@@ -47,7 +53,18 @@ _ARCH_REASONING: dict[str, ReasoningMarker] = {
 
 
 def _parse_gguf_metadata(path: Path) -> dict[str, object]:
-    """Read key GGUF metadata without loading full model."""
+    """Read key GGUF metadata without loading full model.
+
+    Raises:
+        FileNotFoundError: if `path` does not exist.
+
+    On a corrupt or truncated GGUF the function emits a `RegistryParseWarning`
+    via `warnings.warn` and returns whatever metadata was parseable. Callers
+    that want to abort on partial parses can `warnings.simplefilter("error")`.
+    """
+    if not path.exists():
+        raise FileNotFoundError(path)
+
     meta: dict[str, object] = {}
     try:
         with open(path, "rb") as f:
@@ -66,14 +83,10 @@ def _parse_gguf_metadata(path: Path) -> dict[str, object]:
 
             # Parse KV pairs to extract architecture and params
             for _ in range(min(n_kv, 100)):  # cap to avoid huge reads
-                # Read key
                 key_len = struct.unpack("<Q", f.read(8))[0]
                 key = f.read(key_len).decode("utf-8", errors="replace")
-
-                # Read value type
                 val_type = struct.unpack("<I", f.read(4))[0]
 
-                # Parse value based on type
                 if val_type == 8:  # string
                     str_len = struct.unpack("<Q", f.read(8))[0]
                     val = f.read(str_len).decode("utf-8", errors="replace").strip("\x00")
@@ -91,22 +104,26 @@ def _parse_gguf_metadata(path: Path) -> dict[str, object]:
                 elif val_type == 9:  # array
                     arr_type = struct.unpack("<I", f.read(4))[0]
                     arr_len = struct.unpack("<Q", f.read(8))[0]
-                    # Skip array data (complex to parse generically)
-                    if arr_type == 8:  # string array
+                    if arr_type == 8:
                         for _ in range(min(arr_len, 5)):
                             sl = struct.unpack("<Q", f.read(8))[0]
                             f.read(sl)
-                    elif arr_type in (4, 5):  # uint32/int32 array
+                    elif arr_type in (4, 5):
                         f.read(arr_len * 4)
-                    elif arr_type == 6:  # float32 array
+                    elif arr_type == 6:
                         f.read(arr_len * 4)
                     else:
-                        break  # unknown array type, stop parsing
+                        break
                 else:
-                    break  # unknown type, stop parsing
+                    break
 
-    except (OSError, struct.error):
-        pass
+    except (OSError, struct.error) as exc:
+        warnings.warn(
+            f"gguf parse skipped {path.name}: {type(exc).__name__}: {exc}",
+            RegistryParseWarning,
+            stacklevel=2,
+        )
+        _log.warning("gguf_parse_skip path=%s err=%s", path, exc)
 
     return meta
 

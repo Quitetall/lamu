@@ -317,7 +317,8 @@ async def test_runner_node(state: SwarmState) -> dict:
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
 
-    # Run tests
+    # Run tests. Typed catch — only `subprocess` failure modes are tolerated;
+    # any other exception (e.g. config parse) must bubble up as SwarmStepError.
     cmd = state.get("test_cmd", "python -m pytest tests/ -v --tb=short")
     try:
         result = await asyncio.to_thread(
@@ -331,6 +332,9 @@ async def test_runner_node(state: SwarmState) -> dict:
     except subprocess.TimeoutExpired:
         passed = False
         output = "TEST TIMEOUT (300s)"
+    except (subprocess.SubprocessError, OSError, FileNotFoundError) as exc:
+        from lamu.core.errors import SwarmStepError
+        raise SwarmStepError(f"test runner failed: {exc}") from exc
 
     return {
         "test_passed": passed,

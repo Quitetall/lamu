@@ -10,7 +10,7 @@ use lamu_core::reasoning::get_extractor;
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
-use lamu_core::types::{Capability, ModelEntry};
+use lamu_core::types::{BackendType, Capability, ModelEntry};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -48,10 +48,12 @@ impl LamuMcpServer {
             .map(|e| (e.name.clone(), e.clone()))
             .collect();
         let router = Router::new(&scheduler, entries_vec);
+        // Phase C: propagate reqwest builder failure as Error::Http instead
+        // of panicking the whole MCP server at startup.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
-            .expect("reqwest");
+            .map_err(|e| lamu_core::Error::Http(format!("reqwest client init: {}", e)))?;
 
         let queue_strategy = match std::env::var("LAMU_QUEUE_STRATEGY").as_deref() {
             Ok("lifo") => QueueStrategy::Lifo,
@@ -393,39 +395,12 @@ impl LamuMcpServer {
             }
         };
 
-        // Spawn llama-server
-        let bin = lamu_core::config::llama_bin();
-        if !bin.exists() {
-            return format!("llama-server not found at {}", bin.display());
-        }
-
-        let supports_ngram = {
-            let out = tokio::process::Command::new(&bin).arg("--help").output().await;
-            match out {
-                Ok(o) => String::from_utf8_lossy(&o.stdout).contains("--spec-ngram-mod-n-match"),
-                Err(_) => false,
-            }
-        };
-
-        let mut cmd = tokio::process::Command::new(&bin);
-        cmd.arg("-m").arg(&entry.path)
-            .arg("--host").arg("0.0.0.0")
-            .arg("--port").arg(port.to_string())
-            .arg("--ctx-size").arg(std::cmp::min(entry.context_max, 32768).to_string())
-            .arg("-ngl").arg("99")
-            .arg("--flash-attn").arg("on")
-            .arg("--cache-type-k").arg("q4_0")
-            .arg("--cache-type-v").arg("q4_0")
-            .arg("--parallel").arg("1");
-
-        if supports_ngram && (entry.arch == "qwen35" || entry.arch == "qwen3") {
-            cmd.args([
-                "--spec-type", "ngram-mod",
-                "--spec-ngram-mod-n-match", "24",
-                "--spec-ngram-mod-n-min", "12",
-                "--spec-ngram-mod-n-max", "48",
-            ]);
-        }
+        // Build per-backend spawn command + health probe path.
+        let (mut cmd, health_path, expect_status_ok, max_wait_secs) =
+            match build_spawn_cmd(&entry, port).await {
+                Ok(t) => t,
+                Err(msg) => return msg,
+            };
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
@@ -443,36 +418,44 @@ impl LamuMcpServer {
             }
         };
         let pid = child.id().unwrap_or(0);
-        // Detach — we keep PID and kill later via libc
+        // Detach — keep PID and kill later via libc
         std::mem::forget(child);
 
         // Health poll
         let client = self.state.lock().client.clone();
-        for _ in 0..45 {
+        let url = format!("http://localhost:{}{}", port, health_path);
+        for _ in 0..max_wait_secs {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let url = format!("http://localhost:{}/health", port);
-            if let Ok(r) = client.get(&url).send().await {
-                if let Ok(j) = r.json::<Value>().await {
-                    if j.get("status").and_then(|v| v.as_str()) == Some("ok") {
-                        // Confirm + register VRAM
-                        let mut st = self.state.lock();
-                        let pids = st.scheduler.query_gpu_pids();
-                        let vram = pids.iter()
-                            .find(|(p, _)| *p == pid)
-                            .map(|(_, m)| *m)
-                            .unwrap_or(entry.vram_mb);
-                        let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
-                        let evict_msg = if to_evict.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (evicted: {:?})", to_evict)
-                        };
-                        return format!(
-                            "Loaded '{}' on :{} ({}MB VRAM){}",
-                            entry.name, port, vram, evict_msg
-                        );
-                    }
+            let healthy = if expect_status_ok {
+                match client.get(&url).send().await {
+                    Ok(r) => match r.json::<Value>().await {
+                        Ok(j) => j.get("status").and_then(|v| v.as_str()) == Some("ok"),
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
                 }
+            } else {
+                client.get(&url).send().await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            };
+            if healthy {
+                let mut st = self.state.lock();
+                let pids = st.scheduler.query_gpu_pids();
+                let vram = pids.iter()
+                    .find(|(p, _)| *p == pid)
+                    .map(|(_, m)| *m)
+                    .unwrap_or(entry.vram_mb);
+                let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
+                let evict_msg = if to_evict.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (evicted: {:?})", to_evict)
+                };
+                return format!(
+                    "Loaded '{}' on :{} ({}MB VRAM){}",
+                    entry.name, port, vram, evict_msg
+                );
             }
         }
 
@@ -480,7 +463,7 @@ impl LamuMcpServer {
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         let mut st = self.state.lock();
         st.scheduler.mark_unloaded(&entry.name);
-        format!("Failed to load '{}' (timeout 45s)", entry.name)
+        format!("Failed to load '{}' (timeout {}s)", entry.name, max_wait_secs)
     }
 
     fn handle_unload_model(&self, args: Value) -> String {
@@ -670,4 +653,150 @@ fn tools_list_response(id: Option<Value>) -> Value {
         "id": id,
         "result": { "tools": tools }
     })
+}
+
+/// Build the right spawn `Command` for the entry's backend. Returns
+/// `(cmd, health_url_path, expect_status_ok, max_wait_secs)`.
+async fn build_spawn_cmd(
+    entry: &ModelEntry,
+    port: u16,
+) -> std::result::Result<(tokio::process::Command, &'static str, bool, u32), String> {
+    use tokio::process::Command;
+    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+
+    match entry.backend {
+        BackendType::LlamaCpp => {
+            let bin = lamu_core::config::llama_bin();
+            if !bin.exists() {
+                return Err(format!("llama-server not found at {}", bin.display()));
+            }
+            let supports_ngram = match Command::new(&bin).arg("--help").output().await {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).contains("--spec-ngram-mod-n-match"),
+                Err(_) => false,
+            };
+            let mut cmd = Command::new(&bin);
+            cmd.arg("-m").arg(&entry.path)
+                .arg("--host").arg("0.0.0.0")
+                .arg("--port").arg(port.to_string())
+                .arg("--ctx-size").arg(std::cmp::min(entry.context_max, 32768).to_string())
+                .arg("-ngl").arg("99")
+                .arg("--flash-attn").arg("on")
+                .arg("--cache-type-k").arg("q4_0")
+                .arg("--cache-type-v").arg("q4_0")
+                .arg("--parallel").arg("1");
+            if supports_ngram && (entry.arch == "qwen35" || entry.arch == "qwen3") {
+                cmd.args([
+                    "--spec-type", "ngram-mod",
+                    "--spec-ngram-mod-n-match", "24",
+                    "--spec-ngram-mod-n-min", "12",
+                    "--spec-ngram-mod-n-max", "48",
+                ]);
+            }
+            Ok((cmd, "/health", true, 45))
+        }
+        BackendType::Megakernel => {
+            let py = home.join("local-llm/.venv/bin/python");
+            let script = home.join("local-llm/server/megakernel_server.py");
+            let workdir = home.join("local-llm/lucebox-hub/megakernel");
+            if !py.exists() {
+                return Err(format!("python not found at {}", py.display()));
+            }
+            if !script.exists() {
+                return Err(format!("megakernel server not found at {}", script.display()));
+            }
+            let mut cmd = Command::new(&py);
+            cmd.arg(&script)
+                .arg("--port").arg(port.to_string())
+                .current_dir(&workdir)
+                .env("CUDA_VISIBLE_DEVICES", "0");
+            Ok((cmd, "/health", false, 30))
+        }
+        BackendType::Dflash | BackendType::DflashLucebox => {
+            let spec = entry.speculative.as_ref().ok_or_else(|| format!(
+                "dflash backend requires `speculative` config in entry '{}'", entry.name
+            ))?;
+            let py = home.join("local-llm/.venv/bin/python");
+            let script = home.join("local-llm/server/dflash_24gb.py");
+            let workdir = home.join("local-llm/lucebox-hub/dflash");
+            let test_bin = workdir.join("build/test_dflash");
+            if !py.exists() {
+                return Err(format!("python not found at {}", py.display()));
+            }
+            if !script.exists() {
+                return Err(format!("dflash server not found at {}", script.display()));
+            }
+            if !test_bin.exists() {
+                return Err(format!("test_dflash binary not found at {}", test_bin.display()));
+            }
+            let mut cmd = Command::new(&py);
+            cmd.arg(&script)
+                .arg("--port").arg(port.to_string())
+                .arg("--max-ctx").arg("8192")
+                .arg("--budget").arg("6")
+                .arg("--bin").arg(&test_bin)
+                .arg("--target").arg(&entry.path)
+                .arg("--draft").arg(&spec.draft_path)
+                .current_dir(&workdir)
+                .env("CUDA_VISIBLE_DEVICES", "0")
+                .env("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "1");
+            Ok((cmd, "/v1/models", false, 90))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_capability_known() {
+        assert_eq!(parse_capability("chat"), Some(Capability::Chat));
+        assert_eq!(parse_capability("code"), Some(Capability::Code));
+        assert_eq!(parse_capability("reasoning"), Some(Capability::Reasoning));
+        assert_eq!(parse_capability("routing"), Some(Capability::Routing));
+        assert_eq!(parse_capability("vision"), Some(Capability::Vision));
+        assert_eq!(parse_capability("long_context"), Some(Capability::LongContext));
+    }
+
+    #[test]
+    fn parse_capability_unknown_returns_none() {
+        assert_eq!(parse_capability("totally_fake"), None);
+        assert_eq!(parse_capability(""), None);
+    }
+
+    #[test]
+    fn initialize_response_shape() {
+        let id = Some(json!(7));
+        let resp = initialize_response(id.clone());
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 7);
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(resp["result"]["serverInfo"]["name"], "lamu");
+        assert!(resp["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn tools_list_response_includes_all_tools() {
+        let resp = tools_list_response(Some(json!(1)));
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for required in [
+            "query", "plan_query", "list_models", "load_model",
+            "unload_model", "vram_status", "scan_models", "queue_status",
+        ] {
+            assert!(names.contains(&required), "missing tool: {}", required);
+        }
+    }
+
+    #[test]
+    fn tools_list_response_query_requires_prompt() {
+        let resp = tools_list_response(None);
+        let query = resp["result"]["tools"].as_array().unwrap()
+            .iter().find(|t| t["name"] == "query").unwrap();
+        let required = query["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "prompt"));
+    }
 }

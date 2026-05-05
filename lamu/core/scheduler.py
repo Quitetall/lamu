@@ -1,20 +1,46 @@
 """VRAM Budget Scheduler — bin-packing for GPU model management."""
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
+from lamu.core.errors import GpuUnavailableError
 from lamu.core.types import LoadedModel, ModelEntry, ModelState, VramBudget
+
+
+_log = logging.getLogger(__name__)
 
 
 # Reserve 1.5 GB for CUDA overhead, display, compute buffers
 _VRAM_RESERVED_MB: int = 1500
 
+# Module-level flag: once set, every GPU operation refuses to silently fall back.
+_gpu_unavailable_reason: Optional[str] = None
+
+
+def _mark_gpu_unavailable(reason: str) -> None:
+    global _gpu_unavailable_reason
+    _gpu_unavailable_reason = reason
+    _log.warning("gpu_unavailable: %s", reason)
+
+
+def gpu_available() -> bool:
+    """True if nvidia-smi is reachable. Refreshed by every _query_vram call."""
+    return _gpu_unavailable_reason is None
+
 
 def _query_vram() -> tuple[int, int]:
-    """Query GPU VRAM via nvidia-smi. Returns (used_mb, total_mb)."""
+    """Query GPU VRAM via nvidia-smi. Returns (used_mb, total_mb).
+
+    Marks the GPU unavailable on subprocess/parse failure but does NOT raise
+    here — `(0, 0)` is the long-standing contract for callers like `budget()`
+    that need to keep returning a snapshot. To force a hard error use
+    `require_gpu()`.
+    """
+    global _gpu_unavailable_reason
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total",
@@ -22,17 +48,34 @@ def _query_vram() -> tuple[int, int]:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
+            _mark_gpu_unavailable(
+                f"nvidia-smi exit={result.returncode}: {result.stderr.strip()}"
+            )
             return (0, 0)
         parts = result.stdout.strip().split(",")
         used = int(parts[0].strip())
         total = int(parts[1].strip())
+        # Successful query — clear the unavailable flag.
+        _gpu_unavailable_reason = None
         return (used, total)
-    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError):
+    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError) as exc:
+        _mark_gpu_unavailable(f"{type(exc).__name__}: {exc}")
         return (0, 0)
+
+
+def require_gpu() -> None:
+    """Raise GpuUnavailableError if the GPU is in unavailable state.
+
+    Call this at the gate of any GPU-touching operation (model load,
+    eviction, etc.) to make silent CPU fallback impossible.
+    """
+    if _gpu_unavailable_reason is not None:
+        raise GpuUnavailableError(_gpu_unavailable_reason)
 
 
 def _query_gpu_pids() -> list[tuple[int, int]]:
     """Query GPU processes. Returns [(pid, used_mb), ...]."""
+    global _gpu_unavailable_reason
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
@@ -40,6 +83,9 @@ def _query_gpu_pids() -> list[tuple[int, int]]:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
+            _mark_gpu_unavailable(
+                f"nvidia-smi(pids) exit={result.returncode}"
+            )
             return []
         pids: list[tuple[int, int]] = []
         for line in result.stdout.strip().split("\n"):
@@ -48,7 +94,8 @@ def _query_gpu_pids() -> list[tuple[int, int]]:
             parts = line.split(",")
             pids.append((int(parts[0].strip()), int(parts[1].strip())))
         return pids
-    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError):
+    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError) as exc:
+        _mark_gpu_unavailable(f"{type(exc).__name__}: {exc}")
         return []
 
 

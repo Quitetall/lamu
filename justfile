@@ -37,9 +37,34 @@ status:
 
 # ── Individual services ──────────────────────────────────────────────────
 
-# Start megakernel (Qwen3.5-0.8B, 462+ t/s, runs alongside 27B on :8001)
-serve-fast:
-    bash {{root}}/scripts/serve-megakernel.sh
+# Sidecar: small model on :8001 alongside 27B
+sidecar tier="fast":
+    #!/usr/bin/env bash
+    pkill -f "megakernel_server\|llama-server.*8001" 2>/dev/null; sleep 2
+    case "{{tier}}" in
+      fast|4b)
+        echo "Starting Qwen3.5-4B on :8001 (~200 t/s)..."
+        nohup {{root}}/../llama.cpp/build/bin/llama-server \
+          -m ~/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf \
+          --host 0.0.0.0 --port 8001 -ngl 99 --flash-attn on --parallel 1 \
+          --ctx-size 8192 > /tmp/sidecar.log 2>&1 &
+        sleep 8 && curl -sf http://localhost:8001/health > /dev/null && echo "  4B ready on :8001" || echo "  4B failed"
+        ;;
+      lobo|0.8b|mega)
+        echo "Starting 0.8B megakernel on :8001 (494 t/s, lobotomized)..."
+        nohup {{root}}/.venv/bin/python {{root}}/server/megakernel_server.py --port 8001 > /tmp/sidecar.log 2>&1 &
+        sleep 10 && curl -sf http://localhost:8001/health > /dev/null && echo "  0.8B ready on :8001" || echo "  0.8B failed"
+        ;;
+      off)
+        echo "Sidecar stopped."
+        ;;
+      *)
+        echo "Usage: just sidecar [fast|lobo|off]"
+        echo "  fast/4b  — Qwen3.5-4B (~200 t/s, smart)"
+        echo "  lobo/0.8b — 0.8B megakernel (494 t/s, lobotomized)"
+        echo "  off       — kill sidecar"
+        ;;
+    esac
 
 # Start DFlash (Qwen3.5-27B, 130-200+ t/s speculative decoding on :8000)
 serve-dflash:
@@ -250,3 +275,38 @@ serve-dflash-oneshot prompt="Write Python quicksort.":
 # Start EAGLE speculative decoding server (main model + trained EAGLE head)
 serve-eagle:
     bash {{root}}/scripts/serve-eagle.sh
+
+# ── Tests + lint ─────────────────────────────────────────────────────────
+
+# Default test target: fast unit suite (skips slow/gpu/network/rust markers)
+test:
+    cd {{root}} && .venv/bin/python -m pytest
+
+# Same as `test` but explicit alias.
+test-fast:
+    cd {{root}} && .venv/bin/python -m pytest
+
+# Run integration tests (kill backend mid-stream, OOM quarantine, no-hang)
+test-slow:
+    cd {{root}} && .venv/bin/python -m pytest tests/integration --override-ini="addopts="
+
+# GPU smoke tests — require CUDA
+test-gpu:
+    cd {{root}} && .venv/bin/python -m pytest -m gpu --override-ini="addopts="
+
+# Run the Rust workspace test suite
+test-rust:
+    cd {{root}}/lamu-rs && cargo test --workspace
+
+# Coverage report (terminal output, no enforced gate)
+coverage:
+    cd {{root}} && .venv/bin/python -m pytest --cov=lamu --cov=agents --cov=cli --cov=web --cov=server --cov-report=term-missing
+
+# Lint Python (ruff if installed) + Rust (clippy)
+lint:
+    -cd {{root}} && .venv/bin/python -m ruff check lamu agents cli web server tests
+    cd {{root}}/lamu-rs && cargo clippy --workspace -- -D warnings
+
+# Install dev dependencies (pytest etc.)
+test-setup:
+    cd {{root}} && uv pip install --python .venv/bin/python pytest pytest-asyncio pytest-mock pytest-cov httpx respx freezegun hypothesis ruff

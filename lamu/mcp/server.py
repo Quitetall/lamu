@@ -11,7 +11,11 @@ Tools exposed:
 """
 from __future__ import annotations
 
+import json as _json
+import logging
+import os
 import time
+import urllib.error
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -19,8 +23,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-import os
-
+from lamu.core.errors import BackendError
+from lamu.core.health import HealthRegistry
 from lamu.core.queue import QueueRequest, RequestQueue, Strategy as QueueStrategy
 from lamu.core.reasoning import get_extractor
 from lamu.core.registry import load_registry, scan_directory, write_registry
@@ -33,6 +37,22 @@ from lamu.core.types import (
     QueryStats,
     RouteDecision,
     VramBudget,
+)
+
+
+_log = logging.getLogger(__name__)
+
+
+# Errors expected when talking to a (potentially dying) backend over HTTP.
+# Anything outside this set is a real bug and must propagate.
+_BACKEND_HTTP_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    _json.JSONDecodeError,
+    KeyError,
+    IndexError,
 )
 
 
@@ -68,6 +88,7 @@ class LamuMcpServer:
 
         # TODO: backend pool (lazy init on first load)
         self._backends: dict[str, object] = {}
+        self._health = HealthRegistry()
 
         # Per-model request queues (concurrent agent serialization)
         strategy_str = os.environ.get("LAMU_QUEUE_STRATEGY", "fifo").lower()
@@ -138,6 +159,22 @@ class LamuMcpServer:
                                     "False = stripped (default). True = structured blocks."
                                 ),
                                 "default": False,
+                            },
+                            "priority": {
+                                "type": "integer",
+                                "description": (
+                                    "Queue priority for PRIORITY strategy. "
+                                    "Higher = served first. Default 0."
+                                ),
+                                "default": 0,
+                            },
+                            "origin": {
+                                "type": "string",
+                                "description": (
+                                    "Caller identifier (agent name, tool, etc.) "
+                                    "for queue diagnostics. Default 'anonymous'."
+                                ),
+                                "default": "anonymous",
                             },
                         },
                         "required": ["prompt"],
@@ -307,39 +344,47 @@ class LamuMcpServer:
                     headers={"Content-Type": "application/json"},
                 )
                 t0 = time.monotonic()
-                # urlopen is sync; offload to thread to keep event loop responsive
                 import asyncio as _asyncio
                 resp_data = await _asyncio.to_thread(_urlopen_read, req)
                 data = json.loads(resp_data)
                 elapsed = time.monotonic() - t0
+        except _BACKEND_HTTP_ERRORS as exc:
+            self._health.get_or_create(decision.model_name).record_error(exc)
+            _log.warning(
+                "mcp_query_backend_error model=%s err=%s",
+                decision.model_name, exc,
+            )
+            raise BackendError(
+                f"backend '{decision.model_name}' failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
-            msg = data["choices"][0]["message"]
-            content = msg.get("content") or ""
-            reasoning_content = msg.get("reasoning_content", "")
+        # Mark backend healthy on success.
+        self._health.get_or_create(decision.model_name).record_success()
 
-            # Apply reasoning extraction
-            entry = self._entries.get(decision.model_name)
-            extractor = get_extractor(entry.reasoning_marker if entry else None)
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        reasoning_content = msg.get("reasoning_content", "")
 
-            if reasoning_content:
-                # Server already separated them
-                reasoning = reasoning_content
-            else:
-                reasoning, content = extractor.split(content)
+        entry = self._entries.get(decision.model_name)
+        extractor = get_extractor(entry.reasoning_marker if entry else None)
 
-            # Build response
-            if include_reasoning and reasoning:
-                result_text = f"**Reasoning:**\n{reasoning}\n\n**Answer:**\n{content}"
-            else:
-                result_text = content
+        if reasoning_content:
+            reasoning = reasoning_content
+        else:
+            reasoning, content = extractor.split(content)
 
-            if not result_text.strip():
-                result_text = f"[Model thinking truncated — reasoning: {len(reasoning)} chars]"
+        if include_reasoning and reasoning:
+            result_text = f"**Reasoning:**\n{reasoning}\n\n**Answer:**\n{content}"
+        else:
+            result_text = content
 
-            return [TextContent(type="text", text=result_text)]
+        if not result_text.strip():
+            result_text = (
+                f"[Model thinking truncated — reasoning: {len(reasoning)} chars]"
+            )
 
-        except Exception as e:
-            return [TextContent(type="text", text=f"Generation error: {e}")]
+        return [TextContent(type="text", text=result_text)]
 
     def _handle_plan_query(self, args: dict) -> list[TextContent]:
         """Dry-run routing."""
@@ -434,13 +479,14 @@ class LamuMcpServer:
             "--parallel", "1",
         ]
 
-        # Detect ngram-mod support (not available on DFlash PR branch)
+        # Detect ngram-mod support (not available on DFlash PR branch).
         try:
             help_out = subprocess.run(
-                [str(LLAMA_BIN), "--help"], capture_output=True, text=True, timeout=5
+                [str(LLAMA_BIN), "--help"], capture_output=True, text=True, timeout=5,
             )
             has_ngram = "--spec-ngram-mod-n-match" in help_out.stdout
-        except Exception:
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            _log.debug("ngram_probe_failed err=%s", exc)
             has_ngram = False
 
         if has_ngram and entry.arch in ("qwen35", "qwen3"):
@@ -461,24 +507,30 @@ class LamuMcpServer:
             try:
                 req = urllib.request.Request(f"http://localhost:{port}/health")
                 with urllib.request.urlopen(req, timeout=2) as resp:
-                    if json.loads(resp.read()).get("status") == "ok":
-                        # Get actual VRAM
-                        from lamu.core.scheduler import _query_gpu_pids
-                        pids = _query_gpu_pids()
-                        vram = 0
-                        for pid, mem in pids:
-                            if pid == proc.pid:
-                                vram = mem
-                                break
-                        if vram == 0:
-                            vram = entry.vram_mb  # fallback to estimate
+                    health_payload = json.loads(resp.read())
+            except _BACKEND_HTTP_ERRORS as exc:
+                _log.debug("load_health_probe_failed port=%d err=%s", port, exc)
+                continue
 
-                        self._scheduler.confirm_loaded(entry.name, proc.pid, port, vram)
-                        evict_msg = f" (evicted: {to_evict})" if to_evict else ""
-                        return [TextContent(type="text",
-                            text=f"Loaded '{entry.name}' on :{port} ({vram}MB VRAM){evict_msg}")]
-            except Exception:
-                pass
+            if health_payload.get("status") != "ok":
+                continue
+
+            from lamu.core.scheduler import _query_gpu_pids
+            pids = _query_gpu_pids()
+            vram = 0
+            for pid, mem in pids:
+                if pid == proc.pid:
+                    vram = mem
+                    break
+            if vram == 0:
+                vram = entry.vram_mb
+
+            self._scheduler.confirm_loaded(entry.name, proc.pid, port, vram)
+            evict_msg = f" (evicted: {to_evict})" if to_evict else ""
+            return [TextContent(
+                type="text",
+                text=f"Loaded '{entry.name}' on :{port} ({vram}MB VRAM){evict_msg}",
+            )]
 
         # Timeout
         proc.kill()

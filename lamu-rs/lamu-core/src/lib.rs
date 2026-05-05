@@ -10,6 +10,7 @@ pub mod router;
 pub mod reasoning;
 pub mod config;
 pub mod error;
+pub mod health;
 pub mod backends;
 pub mod queue;
 

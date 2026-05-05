@@ -11,6 +11,19 @@ dependencies = [
     "pydantic",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-mock",
+    "pytest-cov",
+    "httpx",
+    "respx",
+    "freezegun",
+    "hypothesis",
+    "ruff",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -18,3 +31,39 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["lamu*"]
 exclude = ["tests*", "lucebox-hub*", "deps*", "graphify-out*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "slow: integration / long-running tests",
+    "gpu: requires CUDA / heavy ML deps",
+    "network: hits external network",
+    "rust: shells out to cargo",
+]
+addopts = "-m 'not slow and not gpu and not network and not rust' --strict-markers --tb=short"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning:torch.*",
+    "ignore::DeprecationWarning:pkg_resources.*",
+    "ignore::pytest.PytestCollectionWarning",
+]
+
+[tool.coverage.run]
+source = ["lamu", "agents", "cli", "web", "server"]
+omit = [
+    "scripts/*",
+    "lucebox-hub/*",
+    "deps/*",
+    "graphify-out/*",
+    "tests/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

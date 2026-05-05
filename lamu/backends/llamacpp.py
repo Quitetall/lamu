@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from lamu.backends.base import Backend
+from lamu.core.errors import BackendError
 from lamu.core.types import ModelEntry
 
 
@@ -36,7 +37,7 @@ class LlamaCppBackend(Backend):
         self._model_name = entry.name
 
         if not self._bin.exists():
-            raise RuntimeError(f"llama-server not found at {self._bin}")
+            raise BackendError(f"llama-server not found at {self._bin}")
 
         cmd: list[str] = [
             str(self._bin),
@@ -76,7 +77,9 @@ class LlamaCppBackend(Backend):
 
         # Timeout
         self.unload()
-        raise RuntimeError(f"llama-server failed to start within 60s (port {port})")
+        raise BackendError(
+            f"llama-server failed to start within 60s (port {port})"
+        )
 
     def unload(self) -> None:
         if self._proc:

@@ -18,6 +18,21 @@ import urllib.error
 from typing import Iterator, Optional
 
 
+# Network/parse errors expected from probing un-running services. Anything
+# outside this set must propagate so real bugs do not hide behind silent
+# `except Exception: return []` patterns.
+_PROBE_EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    json.JSONDecodeError,
+    KeyError,
+    IndexError,
+    TypeError,
+)
+
+
 class LocalLLM:
     """Minimal client for the local LLM stack. Zero dependencies beyond stdlib."""
 
@@ -72,7 +87,8 @@ class LocalLLM:
                     data = json.loads(resp.read())
                     for m in data.get("data", []):
                         found.append(f"{provider}/{m['id']}")
-            except Exception:
+            except _PROBE_EXPECTED_ERRORS:
+                # Endpoint down — fine. Anything else propagates.
                 pass
         return found
 
@@ -182,7 +198,7 @@ class LocalLLM:
         try:
             self._request("/models", timeout=3)
             return True
-        except Exception:
+        except _PROBE_EXPECTED_ERRORS:
             return False
 
     def health(self) -> dict:
@@ -201,7 +217,7 @@ class LocalLLM:
                 req = urllib.request.Request(url)
                 with urllib.request.urlopen(req, timeout=2) as resp:
                     status[name] = "up"
-            except Exception:
+            except _PROBE_EXPECTED_ERRORS:
                 status[name] = "down"
         return status
 

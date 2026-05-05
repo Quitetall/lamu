@@ -4,7 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
+from lamu.core.errors import ReasoningOverflow
 from lamu.core.types import ReasoningMarker, StreamChunk
+
+
+# Hard cap on the streaming buffer while inside a think-block. If a backend
+# emits more than this without a close-tag, treat it as a malformed stream
+# and surface ReasoningOverflow rather than silently growing memory.
+_REASONING_BUFFER_CAP_BYTES: int = 64 * 1024
 
 
 class ReasoningExtractor:
@@ -73,6 +80,11 @@ class ReasoningExtractor:
 
         for token in tokens:
             buffer += token
+            if len(buffer) > _REASONING_BUFFER_CAP_BYTES:
+                raise ReasoningOverflow(
+                    f"reasoning buffer exceeded {_REASONING_BUFFER_CAP_BYTES} bytes"
+                    f" without close tag {close_tag!r}"
+                )
 
             if not in_reasoning and not reasoning_done:
                 # Haven't entered reasoning yet — check for open tag

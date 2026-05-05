@@ -1,13 +1,26 @@
 //! Backends — model lifecycle management.
 //! Direct port of `lamu/backends/`.
 
+pub mod dflash;
 pub mod llamacpp;
+pub mod megakernel;
 
-use crate::types::ModelEntry;
+use crate::types::{BackendType, ModelEntry};
 use crate::Result;
 use async_trait::async_trait;
 use futures_util::stream::Stream;
 use std::pin::Pin;
+
+/// Construct the right backend impl for the entry's declared type.
+pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
+    match entry.backend {
+        BackendType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppBackend::new(None)?)),
+        BackendType::Megakernel => Ok(Box::new(megakernel::MegakernelBackend::new()?)),
+        BackendType::Dflash | BackendType::DflashLucebox => {
+            Ok(Box::new(dflash::DflashBackend::new()?))
+        }
+    }
+}
 
 #[async_trait]
 pub trait Backend: Send + Sync {

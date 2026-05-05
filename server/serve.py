@@ -50,8 +50,14 @@ class ThinkStripASGI:
 
     def __init__(self, app):
         self.app = app
+        # Initialize the SSE filter state so _filter_sse is usable per-request
+        # without first going through __call__. Phase C: required for direct
+        # unit-testability and for any future caller that filters offline.
+        self._think_done = False
 
     async def __call__(self, scope, receive, send):
+        # Reset per-request — cookies cross requests.
+        self._think_done = False
         if scope["type"] != "http" or b"/chat/completions" not in scope.get("path", b"").encode() if isinstance(scope.get("path", ""), str) else b"/chat/completions" not in scope.get("path", b""):
             # Check path properly
             path = scope.get("path", "")
@@ -119,7 +125,7 @@ class ThinkStripASGI:
                     })
                     await send({"type": "http.response.body", "body": modified, "more_body": False})
 
-        self._think_done = False
+        # _think_done already reset at top of __call__.
         await self.app(scope, receive, intercept_send)
 
     def _filter_sse(self, text: str) -> str:

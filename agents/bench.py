@@ -502,8 +502,18 @@ async def run_suite(
                 result = await run_task_swarm(task, workdir)
             else:
                 raise ValueError(f"Unknown config: {config}")
-        except Exception as e:
-            result = {"passed": False, "output": f"Error: {e}"}
+        except (
+            subprocess.SubprocessError, OSError, TimeoutError,
+            ValueError, KeyError, RuntimeError,
+        ) as exc:
+            # Bench is best-effort — record failure as a structured row but
+            # never let one task crash the whole suite. The exception type is
+            # narrowed so any new bug class still surfaces.
+            result = {
+                "passed": False,
+                "output": f"{type(exc).__name__}: {exc}",
+                "error_type": type(exc).__name__,
+            }
 
         elapsed = time.time() - start
 

@@ -16,6 +16,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from lamu.api.errors import backend_error_response, no_backend_response
+from lamu.core.health import HealthRegistry
 from lamu.core.reasoning import get_extractor
 from lamu.core.registry import load_registry
 from lamu.core.router import Router
@@ -41,12 +43,14 @@ class ChatRequest(BaseModel):
 def create_app(
     scheduler: VramScheduler,
     registry: list[ModelEntry],
+    health: Optional[HealthRegistry] = None,
 ) -> FastAPI:
     """Create the OpenAI-compatible FastAPI app."""
 
     app = FastAPI(title="LAMU", version="2.0")
     router = Router(scheduler, registry)
     entries_map: dict[str, ModelEntry] = {e.name: e for e in registry}
+    health_reg = health or HealthRegistry()
 
     @app.get("/health")
     async def health() -> dict:
@@ -75,24 +79,22 @@ def create_app(
 
         # Route
         capabilities: Optional[list[Capability]] = None
-        decision = router.route(model=req.model, capabilities=capabilities)
+        decision = router.route(
+            model=req.model,
+            capabilities=capabilities,
+            health_map=health_reg.all() or None,
+        )
 
         if not decision.model_name or not decision.loaded:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "message": f"No loaded model available: {decision.reason}",
-                        "type": "model_not_available",
-                    }
-                },
+            return no_backend_response(
+                reason=f"No loaded model available: {decision.reason}",
             )
 
         loaded = scheduler.get_loaded(decision.model_name)
         if not loaded:
-            return JSONResponse(
+            return backend_error_response(
+                reason="internal: model lost after routing",
                 status_code=500,
-                content={"error": {"message": "internal: model lost after routing"}},
             )
 
         scheduler.mark_used(decision.model_name)
@@ -261,9 +263,10 @@ def create_app(
             return JSONResponse(response)
 
         except urllib.error.URLError as e:
-            return JSONResponse(
-                status_code=502,
-                content={"error": {"message": f"Backend unreachable: {e}"}},
+            # Record the failure against the model that was about to serve.
+            health_reg.get_or_create(decision.model_name).record_error(e)
+            return backend_error_response(
+                reason=f"Backend unreachable: {e}", status_code=502,
             )
 
     def _make_chunk(cid: str, created: int, model: str, content: str) -> dict:

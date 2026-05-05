@@ -1,8 +1,9 @@
 """Request router — capability-based model selection with dry-run support."""
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
+from lamu.core.health import BackendHealth
 from lamu.core.scheduler import VramScheduler
 from lamu.core.types import Capability, LoadedModel, ModelEntry, RouteDecision
 
@@ -32,14 +33,28 @@ class Router:
         self,
         model: Optional[str] = None,
         capabilities: Optional[Sequence[Capability]] = None,
+        health_map: Optional[Mapping[str, BackendHealth]] = None,
     ) -> RouteDecision:
         """Select the best model for a request. Does NOT load — just decides.
 
+        Args:
+            model: explicit model name override (highest priority).
+            capabilities: required capabilities; default = {CHAT}.
+            health_map: optional {model_name -> BackendHealth}. Models whose
+                health is not `usable` (DEAD/QUARANTINED) are filtered out.
+                Backwards compatible: if absent, no health filtering.
+
         Priority:
-        1. Explicit model name (if given)
+        1. Explicit model name (if given) — refuses if model is unhealthy
         2. Best loaded model matching capabilities
         3. Best unloaded model matching capabilities (requires scheduler load)
         """
+        def _is_usable(name: str) -> bool:
+            if not health_map:
+                return True
+            h = health_map.get(name)
+            return h is None or h.usable
+
         # Explicit model override
         if model:
             entry = self._find_model(model)
@@ -47,6 +62,12 @@ class Router:
                 return RouteDecision(
                     model_name=model,
                     reason=f"model '{model}' not found in registry",
+                    loaded=False,
+                )
+            if not _is_usable(entry.name):
+                return RouteDecision(
+                    model_name=entry.name,
+                    reason=f"model '{entry.name}' is unhealthy: {health_map[entry.name].state.value}",
                     loaded=False,
                 )
             loaded = self._scheduler.is_loaded(entry.name)
@@ -75,7 +96,10 @@ class Router:
         required = set(capabilities) if capabilities else {Capability.CHAT}
 
         # Try loaded models first (prefer already-running for speed)
-        loaded_matches = self._find_loaded_matching(required)
+        loaded_matches = [
+            m for m in self._find_loaded_matching(required)
+            if _is_usable(m.entry.name)
+        ]
         if loaded_matches:
             best = self._rank_loaded(loaded_matches)
             return RouteDecision(
@@ -85,11 +109,20 @@ class Router:
             )
 
         # No loaded model matches — find best unloaded candidate
-        candidates = self._find_registry_matching(required)
+        candidates = [
+            e for e in self._find_registry_matching(required)
+            if _is_usable(e.name)
+        ]
         if not candidates:
+            base_reason = (
+                f"no model in registry has capabilities "
+                f"{[c.value for c in required]}"
+            )
+            if health_map:
+                base_reason += " (after health filtering)"
             return RouteDecision(
                 model_name="",
-                reason=f"no model in registry has capabilities {[c.value for c in required]}",
+                reason=base_reason,
                 loaded=False,
             )
 

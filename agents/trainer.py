@@ -139,11 +139,13 @@ def train(
     """Run QLoRA fine-tuning with unsloth (optimized for consumer GPUs)."""
     try:
         from unsloth import FastLanguageModel
-    except ImportError:
-        print("unsloth not installed. Install with:")
-        print("  pip install 'unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git'")
-        print("  pip install --no-deps trl peft accelerate bitsandbytes")
-        return None
+    except ImportError as exc:
+        from lamu.core.errors import MissingDependency
+        raise MissingDependency(
+            "unsloth is required for QLoRA fine-tuning. Install with:\n"
+            "  pip install 'unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git'\n"
+            "  pip install --no-deps trl peft accelerate bitsandbytes"
+        ) from exc
 
     from datasets import load_dataset
     from trl import SFTTrainer, SFTConfig
@@ -246,9 +248,9 @@ def export(
     """Merge LoRA + export to GGUF (for DFlash) or HF format (for vLLM)."""
     try:
         from unsloth import FastLanguageModel
-    except ImportError:
-        print("unsloth not installed.")
-        return None
+    except ImportError as exc:
+        from lamu.core.errors import MissingDependency
+        raise MissingDependency("unsloth is required for export") from exc
 
     if adapter_path is None:
         adapters = sorted(ADAPTER_DIR.glob("lora_*"))

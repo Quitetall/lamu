@@ -25,17 +25,20 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
-    pub fn new(bin_path: Option<PathBuf>) -> Self {
-        Self {
+    pub fn new(bin_path: Option<PathBuf>) -> Result<Self> {
+        // reqwest::Client::build can fail (e.g. invalid TLS config). Phase C:
+        // propagate as Error::Http instead of panicking.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| Error::Http(format!("reqwest client init: {}", e)))?;
+        Ok(Self {
             bin_path: bin_path.unwrap_or_else(llama_bin),
             proc: None,
             port: 0,
             model_name: String::new(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
-                .build()
-                .expect("reqwest client"),
-        }
+            client,
+        })
     }
 
     /// Detect ngram-mod support by checking --help.

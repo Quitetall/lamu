@@ -39,6 +39,18 @@ ENDPOINTS = {
 server = Server("lamu")
 
 
+_PROBE_EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    json.JSONDecodeError,
+    KeyError,
+    IndexError,
+    TypeError,
+)
+
+
 def _discover_models() -> dict[str, list[str]]:
     """Probe all known endpoints and return available models."""
     result = {}
@@ -53,7 +65,7 @@ def _discover_models() -> dict[str, list[str]]:
                 models = [m["id"] for m in data.get("data", [])]
                 if models:
                     result[name] = models
-        except Exception:
+        except _PROBE_EXPECTED_ERRORS:
             pass
     return result
 
@@ -68,14 +80,15 @@ def _chat(
     """Send a chat completion to Bifrost (routes to the right backend)."""
     model = model or DEFAULT_MODEL
 
-    # RAG: prepend relevant wiki context to the prompt
+    # RAG: prepend relevant wiki context to the prompt. RAG is best-effort —
+    # if the wiki dir is missing or unreadable, fall through silently.
     try:
         from server.rag import WikiRAG
         rag = WikiRAG()
         wiki_context = rag.retrieve(prompt, max_pages=2)
         if wiki_context:
             prompt = f"Relevant context from knowledge base:\n{wiki_context}\n\nUser question:\n{prompt}"
-    except Exception:
+    except (ImportError, OSError, FileNotFoundError):
         pass
 
     messages = []
@@ -143,8 +156,11 @@ def _chat(
                 return content
         except urllib.error.URLError:
             continue
-        except Exception as e:
-            return f"Error: {e}"
+        except _PROBE_EXPECTED_ERRORS as exc:
+            from lamu.core.errors import BackendError
+            raise BackendError(
+                f"local LLM call failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     return "Error: local LLM unreachable. Is the stack running? Start with: just start"
 

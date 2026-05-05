@@ -69,12 +69,21 @@ console = Console()
 # ── Discovery ────────────────────────────────────────────────────────────
 
 def probe_endpoint(url: str, timeout: int = 2) -> list[str]:
+    """Probe an OpenAI-compatible endpoint for available model IDs.
+
+    Returns an empty list when the endpoint is unreachable or returns junk —
+    those are normal "service down" outcomes. Anything else (e.g. RuntimeError
+    from a programming bug) propagates so we don't lose real failures.
+    """
     try:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_KEY}"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             return [m["id"] for m in data.get("data", [])]
-    except Exception:
+    except (
+        urllib.error.URLError, ConnectionError, TimeoutError, OSError,
+        json.JSONDecodeError, KeyError, IndexError, TypeError,
+    ):
         return []
 
 

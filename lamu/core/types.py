@@ -25,7 +25,7 @@ class ModelFormat(Enum):
 
 
 class BackendType(Enum):
-    LLAMACPP = "llama.cpp"
+    LLAMACPP = "llama_cpp"
     MEGAKERNEL = "megakernel"
     DFLASH = "dflash"
     DFLASH_LUCEBOX = "dflash_lucebox"

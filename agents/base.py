@@ -27,7 +27,11 @@ llm = ChatOpenAI(
     model=_model,
 )
 
-# Langfuse tracing — optional; degrades gracefully if keys are missing
+# Langfuse tracing — optional; degrades gracefully if keys are missing.
+# Phase C: narrow the exception, record an explicit `tracing_enabled` flag,
+# and emit the warning to stderr so callers can detect the disabled state.
+tracing_enabled: bool = False
+langfuse_handler = None
 try:
     from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
 
@@ -36,9 +40,14 @@ try:
         secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
         host=os.environ.get("LANGFUSE_HOST", "http://localhost:3000"),
     )
-except Exception as exc:  # noqa: BLE001
-    warnings.warn(f"Langfuse handler not initialised: {exc}", stacklevel=1)
+    tracing_enabled = True
+except (ImportError, ValueError, TypeError, OSError) as exc:
+    warnings.warn(
+        f"Langfuse tracing disabled: {type(exc).__name__}: {exc}",
+        stacklevel=1,
+    )
     langfuse_handler = None
+    tracing_enabled = False
 
 
 def get_config() -> dict:
