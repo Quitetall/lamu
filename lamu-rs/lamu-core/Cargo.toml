@@ -27,3 +27,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+futures-util = "0.3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

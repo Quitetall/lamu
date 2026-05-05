@@ -19,6 +19,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+import os
+
+from lamu.core.queue import QueueRequest, RequestQueue, Strategy as QueueStrategy
 from lamu.core.reasoning import get_extractor
 from lamu.core.registry import load_registry, scan_directory, write_registry
 from lamu.core.router import Router
@@ -31,6 +34,13 @@ from lamu.core.types import (
     RouteDecision,
     VramBudget,
 )
+
+
+def _urlopen_read(req: object) -> bytes:
+    """Sync helper for offloading urlopen via to_thread."""
+    import urllib.request as _u
+    with _u.urlopen(req, timeout=300) as resp:  # type: ignore[arg-type]
+        return resp.read()
 
 
 class LamuMcpServer:
@@ -58,6 +68,18 @@ class LamuMcpServer:
 
         # TODO: backend pool (lazy init on first load)
         self._backends: dict[str, object] = {}
+
+        # Per-model request queues (concurrent agent serialization)
+        strategy_str = os.environ.get("LAMU_QUEUE_STRATEGY", "fifo").lower()
+        try:
+            self._queue_strategy = QueueStrategy(strategy_str)
+        except ValueError:
+            self._queue_strategy = QueueStrategy.FIFO
+        try:
+            self._queue_concurrency = int(os.environ.get("LAMU_QUEUE_CONCURRENCY", "1"))
+        except ValueError:
+            self._queue_concurrency = 1
+        self._queues: dict[str, RequestQueue] = {}
 
         self._register_tools()
 
@@ -184,6 +206,11 @@ class LamuMcpServer:
                     description="Re-scan disk for new models and update registry.",
                     inputSchema={"type": "object", "properties": {}},
                 ),
+                Tool(
+                    name="queue_status",
+                    description="Show per-model queue depth and scheduling strategy.",
+                    inputSchema={"type": "object", "properties": {}},
+                ),
             ]
 
         @self._server.call_tool()
@@ -202,7 +229,16 @@ class LamuMcpServer:
                 return self._handle_vram_status()
             elif name == "scan_models":
                 return self._handle_scan()
+            elif name == "queue_status":
+                return await self._handle_queue_status()
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+    def _get_or_create_queue(self, model_name: str) -> RequestQueue:
+        q = self._queues.get(model_name)
+        if q is None:
+            q = RequestQueue(strategy=self._queue_strategy, concurrency=self._queue_concurrency)
+            self._queues[model_name] = q
+        return q
 
     async def _handle_query(self, args: dict) -> list[TextContent]:
         """Route and generate."""
@@ -213,6 +249,8 @@ class LamuMcpServer:
         max_tokens = args.get("max_tokens", 16384)
         temperature = args.get("temperature", 0.7)
         include_reasoning = args.get("include_reasoning", False)
+        priority = args.get("priority", 0)
+        origin = args.get("origin", "anonymous")
 
         # Parse capabilities
         capabilities: Optional[list[Capability]] = None
@@ -257,16 +295,23 @@ class LamuMcpServer:
             "stream": False,
         }
 
+        # Acquire queue slot — concurrent agents serialized per model
+        queue = self._get_or_create_queue(decision.model_name)
+        queue_req = QueueRequest(payload=None, priority=priority, origin=origin)
+
         try:
-            req = urllib.request.Request(
-                f"http://localhost:{loaded.port}/v1/chat/completions",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            t0 = time.monotonic()
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                data = json.loads(resp.read())
-            elapsed = time.monotonic() - t0
+            async with await queue.enqueue(queue_req):
+                req = urllib.request.Request(
+                    f"http://localhost:{loaded.port}/v1/chat/completions",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                t0 = time.monotonic()
+                # urlopen is sync; offload to thread to keep event loop responsive
+                import asyncio as _asyncio
+                resp_data = await _asyncio.to_thread(_urlopen_read, req)
+                data = json.loads(resp_data)
+                elapsed = time.monotonic() - t0
 
             msg = data["choices"][0]["message"]
             content = msg.get("content") or ""
@@ -491,6 +536,20 @@ class LamuMcpServer:
             type="text",
             text=f"Scanned {self._models_dir}: {len(entries)} models found. Registry updated.",
         )]
+
+    async def _handle_queue_status(self) -> list[TextContent]:
+        """Per-model queue depth + scheduling strategy."""
+        lines = [
+            f"Strategy: {self._queue_strategy.value} (concurrency={self._queue_concurrency})",
+            "Per-model queue depth:",
+        ]
+        if not self._queues:
+            lines.append("  (no queues active)")
+        else:
+            for name, q in self._queues.items():
+                depth = await q.depth()
+                lines.append(f"  {name}: {depth} pending")
+        return [TextContent(type="text", text="\n".join(lines))]
 
     async def run(self) -> None:
         """Start the MCP server on stdio."""

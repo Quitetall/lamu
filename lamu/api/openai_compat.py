@@ -49,11 +49,8 @@ def create_app(
     entries_map: dict[str, ModelEntry] = {e.name: e for e in registry}
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        loaded = scheduler.loaded_models()
-        if loaded:
-            return {"status": "ok", "models_loaded": len(loaded)}
-        return {"status": "ok", "models_loaded": 0}
+    async def health() -> dict:
+        return {"status": "ok", "models_loaded": len(scheduler.loaded_models())}
 
     @app.get("/v1/models")
     async def list_models() -> dict:
@@ -71,7 +68,7 @@ def create_app(
             })
         return {"data": models_data, "object": "list"}
 
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(req: ChatRequest) -> JSONResponse | StreamingResponse:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())

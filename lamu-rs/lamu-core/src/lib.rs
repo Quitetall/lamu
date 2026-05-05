@@ -11,5 +11,6 @@ pub mod reasoning;
 pub mod config;
 pub mod error;
 pub mod backends;
+pub mod queue;
 
 pub use error::{Error, Result};

@@ -4,7 +4,8 @@
 //! Protocol: line-delimited JSON-RPC 2.0 over stdin/stdout.
 //! Logs to stderr. Tools dispatched via `tools::*`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use lamu_core::queue::{QueueRequest, RequestQueue, Strategy as QueueStrategy};
 use lamu_core::reasoning::get_extractor;
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
 use lamu_core::router::Router;
@@ -15,10 +16,16 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex as AsyncMutex;
 
 pub struct LamuMcpServer {
     pub state: Arc<Mutex<ServerState>>,
+    /// Per-model request queues (separate from parking_lot state — async).
+    pub queues: Arc<AsyncMutex<HashMap<String, Arc<RequestQueue<()>>>>>,
+    pub queue_strategy: QueueStrategy,
+    pub queue_concurrency: usize,
 }
 
 pub struct ServerState {
@@ -46,6 +53,14 @@ impl LamuMcpServer {
             .build()
             .expect("reqwest");
 
+        let queue_strategy = match std::env::var("LAMU_QUEUE_STRATEGY").as_deref() {
+            Ok("lifo") => QueueStrategy::Lifo,
+            Ok("priority") => QueueStrategy::Priority,
+            _ => QueueStrategy::Fifo,
+        };
+        let queue_concurrency: usize = std::env::var("LAMU_QUEUE_CONCURRENCY")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+
         Ok(Self {
             state: Arc::new(Mutex::new(ServerState {
                 models_dir,
@@ -55,6 +70,9 @@ impl LamuMcpServer {
                 router,
                 client,
             })),
+            queues: Arc::new(AsyncMutex::new(HashMap::new())),
+            queue_strategy,
+            queue_concurrency,
         })
     }
 
@@ -134,6 +152,7 @@ impl LamuMcpServer {
             "unload_model" => self.handle_unload_model(args),
             "vram_status" => self.handle_vram_status(),
             "scan_models" => self.handle_scan(),
+            "queue_status" => self.handle_queue_status().await,
             other => format!("Unknown tool: {}", other),
         };
 
@@ -145,6 +164,16 @@ impl LamuMcpServer {
                 "isError": false
             }
         })
+    }
+
+    async fn get_or_create_queue(&self, model_name: &str) -> Arc<RequestQueue<()>> {
+        let mut map = self.queues.lock().await;
+        if let Some(q) = map.get(model_name) {
+            return q.clone();
+        }
+        let q = Arc::new(RequestQueue::<()>::new(self.queue_strategy, self.queue_concurrency));
+        map.insert(model_name.to_string(), q.clone());
+        q
     }
 
     async fn handle_query(&self, args: Value) -> String {
@@ -159,6 +188,8 @@ impl LamuMcpServer {
         let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(16384) as u32;
         let temperature = args.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
         let include_reasoning = args.get("include_reasoning").and_then(|v| v.as_bool()).unwrap_or(false);
+        let priority = args.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let origin = args.get("origin").and_then(|v| v.as_str()).unwrap_or("anonymous").to_string();
 
         let caps: Vec<Capability> = caps_raw
             .map(|arr| arr.iter()
@@ -214,6 +245,16 @@ impl LamuMcpServer {
             "stream": false,
         });
         let url = format!("http://localhost:{}/v1/chat/completions", port);
+
+        // Acquire queue slot before hitting backend
+        let queue = self.get_or_create_queue(&model_name).await;
+        let _guard = queue.enqueue(QueueRequest {
+            payload: (),
+            priority,
+            enqueued_at: Instant::now(),
+            origin,
+        }).await;
+
         let resp = match client.post(&url).json(&payload).send().await {
             Ok(r) => r,
             Err(e) => return format!("Generation error: {}", e),
@@ -486,6 +527,28 @@ impl LamuMcpServer {
         lines.join("\n")
     }
 
+    async fn handle_queue_status(&self) -> String {
+        let strategy = match self.queue_strategy {
+            QueueStrategy::Fifo => "fifo",
+            QueueStrategy::Lifo => "lifo",
+            QueueStrategy::Priority => "priority",
+        };
+        let mut lines = vec![
+            format!("Strategy: {} (concurrency={})", strategy, self.queue_concurrency),
+            "Per-model queue depth:".into(),
+        ];
+        let map = self.queues.lock().await;
+        if map.is_empty() {
+            lines.push("  (no queues active)".into());
+        } else {
+            for (name, q) in map.iter() {
+                let depth = q.depth().await;
+                lines.push(format!("  {}: {} pending", name, depth));
+            }
+        }
+        lines.join("\n")
+    }
+
     fn handle_scan(&self) -> String {
         let mut st = self.state.lock();
         let entries = match scan_directory(&st.models_dir) {
@@ -532,7 +595,7 @@ fn tools_list_response(id: Option<Value>) -> Value {
     let tools = vec![
         json!({
             "name": "query",
-            "description": "Send prompt to local LLM. Routes by capabilities or explicit model. Fast, free, uncensored.",
+            "description": "Send prompt to local LLM. Routes by capabilities or explicit model. Queued per-model (FIFO default) so concurrent agents don't collide. Fast, free, uncensored.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -543,6 +606,8 @@ fn tools_list_response(id: Option<Value>) -> Value {
                     "max_tokens": {"type": "integer", "default": 16384},
                     "temperature": {"type": "number", "default": 0.7},
                     "include_reasoning": {"type": "boolean", "default": false},
+                    "priority": {"type": "integer", "default": 0, "description": "Higher served first (priority strategy only)"},
+                    "origin": {"type": "string", "default": "anonymous", "description": "Agent identifier for queue observability"},
                 },
                 "required": ["prompt"]
             }
@@ -591,6 +656,11 @@ fn tools_list_response(id: Option<Value>) -> Value {
         json!({
             "name": "scan_models",
             "description": "Re-scan disk for new models.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "queue_status",
+            "description": "Show per-model queue depth and scheduling strategy.",
             "inputSchema": {"type": "object", "properties": {}}
         }),
     ];
