@@ -4,7 +4,7 @@
 
 ```
                      ┌──────── lamu ────────┐
-  Claude Code ─MCP─▶ │  router · scheduler  │ ─▶ llama.cpp / megakernel / DFlash
+ Claude Code ─MCP─▶ │  router · scheduler  │ ─▶ llama.cpp / megakernel / DFlash
        agents        │  queue · reasoning   │      (per-backend spawn)
                      └────────┬─────────────┘
                               ▼
