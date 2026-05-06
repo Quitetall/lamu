@@ -54,7 +54,13 @@ pub struct Message {
 
 #[derive(Debug)]
 enum StreamEvent {
+    /// Final-answer token (delta.content).
     Token(String),
+    /// Thinking token (delta.reasoning_content). Qwen3-Thinking and
+    /// other reasoning models emit these *first*, before any content.
+    /// Wrapping them in `<think>…</think>` here lets the existing
+    /// strip_think_blocks logic gate them by show_thinking.
+    Reason(String),
     Done,
     Error(String),
 }
@@ -100,6 +106,10 @@ pub struct ChatTui {
     last_token_at: Option<Instant>,
     /// Tokens received this request. llama.cpp emits one delta per token.
     tokens_this_req: usize,
+    /// True when the most recent stream event was reasoning_content
+    /// and we're still inside the synthetic <think>…</think> block.
+    /// Flipped off when the first content token arrives, or on Done.
+    in_think: bool,
     /// Last completed request's TTFT in seconds.
     last_prompt_secs: Option<f32>,
     /// Last completed request's generation tok/s.
@@ -130,6 +140,7 @@ impl ChatTui {
             first_token_at: None,
             last_token_at: None,
             tokens_this_req: 0,
+            in_think: false,
             last_prompt_secs: None,
             last_gen_tps: None,
         }
@@ -178,6 +189,7 @@ impl ChatTui {
         self.first_token_at = None;
         self.last_token_at = None;
         self.tokens_this_req = 0;
+        self.in_think = false;
 
         let (tx, rx) = mpsc::channel::<StreamEvent>();
         self.rx = Some(rx);
@@ -243,6 +255,20 @@ impl ChatTui {
         if let Some(rx) = &self.rx {
             loop {
                 match rx.try_recv() {
+                    Ok(StreamEvent::Reason(t)) => {
+                        let now = Instant::now();
+                        if self.first_token_at.is_none() {
+                            self.first_token_at = Some(now);
+                        }
+                        self.last_token_at = Some(now);
+                        self.tokens_this_req += 1;
+                        if !self.in_think {
+                            self.pending.push_str("<think>");
+                            self.in_think = true;
+                        }
+                        self.pending.push_str(&t);
+                        changed = true;
+                    }
                     Ok(StreamEvent::Token(t)) => {
                         let now = Instant::now();
                         if self.first_token_at.is_none() {
@@ -250,6 +276,10 @@ impl ChatTui {
                         }
                         self.last_token_at = Some(now);
                         self.tokens_this_req += 1;
+                        if self.in_think {
+                            self.pending.push_str("</think>\n");
+                            self.in_think = false;
+                        }
                         self.pending.push_str(&t);
                         changed = true;
                     }
@@ -265,6 +295,10 @@ impl ChatTui {
             }
         }
         if close {
+            if self.in_think {
+                self.pending.push_str("</think>");
+                self.in_think = false;
+            }
             // Snapshot timing before we drop req state so the status
             // bar can keep showing the last numbers.
             if let (Some(start), Some(first)) = (self.req_started, self.first_token_at) {
@@ -470,8 +504,16 @@ fn stream_worker(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let token = v.get("choices").and_then(|c| c.get(0))
-            .and_then(|c| c.get("delta")).and_then(|d| d.get("content"))
+        let delta = v.get("choices").and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"));
+        // reasoning_content first — Qwen3-Thinking emits these before
+        // any content during the prompt-eval-then-think phase.
+        let reason = delta.and_then(|d| d.get("reasoning_content"))
+            .and_then(|s| s.as_str()).unwrap_or("").to_string();
+        if !reason.is_empty() {
+            if tx.send(StreamEvent::Reason(reason)).is_err() { return; }
+        }
+        let token = delta.and_then(|d| d.get("content"))
             .and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !token.is_empty() {
             if tx.send(StreamEvent::Token(token)).is_err() { return; }
