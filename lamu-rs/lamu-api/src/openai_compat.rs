@@ -1,13 +1,15 @@
 //! OpenAI-compatible HTTP layer.
 //! Direct port of `lamu/api/openai_compat.py`.
 
+use crate::metrics::LamuMetrics;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router as AxumRouter;
 use futures_util::stream::Stream;
+use lamu_core::health::HealthRegistry;
 use lamu_core::reasoning::get_extractor;
 use lamu_core::registry::load_registry;
 use lamu_core::router::Router;
@@ -21,7 +23,7 @@ use std::convert::Infallible;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
@@ -55,14 +57,36 @@ pub struct AppState {
     pub router: Arc<Mutex<Router>>,
     pub entries: Arc<HashMap<String, ModelEntry>>,
     pub client: reqwest::Client,
+    /// Shared with the daemon when the v3 wire-up matures. Today the
+    /// HTTP layer creates its own — DEAD/QUARANTINED filtering still
+    /// works, just per-surface state.
+    pub health: Arc<Mutex<HealthRegistry>>,
+    pub metrics: Arc<LamuMetrics>,
 }
 
 pub fn build_app(state: AppState) -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
+}
+
+async fn metrics_endpoint(State(state): State<AppState>) -> Response {
+    state.metrics.scrapes_total.inc();
+    {
+        let scheduler = state.scheduler.lock();
+        let health = state.health.lock();
+        state.metrics.refresh(&scheduler, &health, None);
+    }
+    let (body, ctype) = state.metrics.render();
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, ctype)],
+        body,
+    )
+        .into_response()
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -114,16 +138,26 @@ async fn chat_completions(
 ) -> impl IntoResponse {
     let completion_id = format!("chatcmpl-{}", random_hex(12));
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let t_start = Instant::now();
 
     let (port, model_name, marker) = {
         let scheduler = state.scheduler.lock();
         let router = state.router.lock();
-        // No HealthRegistry on lamu-api yet — daemon owns the registry and
-        // shares it with MCP. lamu-api still gates on `decision.loaded` so
-        // QUARANTINED-but-running backends are caught at the next layer.
-        let decision = router.route(&scheduler, req.model.as_deref(), None, None);
+        let health = state.health.lock();
+        // health_map filters DEAD/QUARANTINED. health is populated as the
+        // OpenAI-compat layer sees failures from backends — see the error
+        // arms below.
+        let decision = router.route(
+            &scheduler,
+            req.model.as_deref(),
+            None,
+            Some(health.all()),
+        );
 
         if decision.model_name.is_empty() || !decision.loaded {
+            state.metrics.requests_total
+                .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "no_backend"])
+                .inc();
             let body = ErrorResponse {
                 error: ErrorBody {
                     message: format!("No loaded model available: {}", decision.reason),
@@ -172,14 +206,26 @@ async fn chat_completions(
     // Non-streaming
     let resp = match state.client.post(&backend_url).json(&payload).send().await {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY,
-            Json(json!({"error": {"message": format!("Backend unreachable: {}", e)}}))).into_response(),
+        Err(e) => {
+            state.health.lock().get_or_create(&model_name).record_error(format!("{e}"));
+            state.metrics.requests_total
+                .with_label_values(&[&model_name, "backend_error"])
+                .inc();
+            return (StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"message": format!("Backend unreachable: {}", e)}}))).into_response();
+        }
     };
 
     let data: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_GATEWAY,
-            Json(json!({"error": {"message": format!("Bad JSON from backend: {}", e)}}))).into_response(),
+        Err(e) => {
+            state.health.lock().get_or_create(&model_name).record_error(format!("{e}"));
+            state.metrics.requests_total
+                .with_label_values(&[&model_name, "backend_error"])
+                .inc();
+            return (StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"message": format!("Bad JSON from backend: {}", e)}}))).into_response();
+        }
     };
 
     let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
@@ -218,10 +264,34 @@ async fn chat_completions(
             "message": message_obj,
             "finish_reason": finish,
         }],
-        "usage": usage,
+        "usage": usage.clone(),
     });
     if let Some(t) = timings {
         response["timings"] = t;
+    }
+
+    // Metrics: success path — match Python lamu/api/openai_compat.py.
+    state.health.lock().get_or_create(&model_name).record_success();
+    state.metrics.requests_total
+        .with_label_values(&[&model_name, "ok"])
+        .inc();
+    state.metrics.request_duration_seconds
+        .with_label_values(&[&model_name, "total"])
+        .observe(t_start.elapsed().as_secs_f64());
+    let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    if completion_tokens > 0 {
+        state.metrics.tokens_generated_total
+            .with_label_values(&[&model_name, "content"])
+            .inc_by(completion_tokens);
+    }
+    if !response["choices"][0]["message"]["reasoning_content"].is_null() {
+        let r = response["choices"][0]["message"]["reasoning_content"]
+            .as_str().map(|s| s.len() as u64 / 4).unwrap_or(0);
+        if r > 0 {
+            state.metrics.tokens_generated_total
+                .with_label_values(&[&model_name, "reasoning"])
+                .inc_by(r);
+        }
     }
 
     Json(response).into_response()
@@ -404,10 +474,14 @@ pub fn build_state(registry_path: &Path) -> anyhow::Result<AppState> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()?;
+    let metrics = LamuMetrics::new()
+        .map_err(|e| anyhow::anyhow!("prometheus init: {e}"))?;
     Ok(AppState {
         scheduler: Arc::new(Mutex::new(scheduler)),
         router: Arc::new(Mutex::new(router)),
         entries: Arc::new(entries),
         client,
+        health: Arc::new(Mutex::new(HealthRegistry::new())),
+        metrics: Arc::new(metrics),
     })
 }

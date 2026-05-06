@@ -96,7 +96,7 @@ DDTree = Dynamic Decoding Tree. Verifies multiple draft branches in parallel. At
 - `~/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf` — F16 draft (slower, don't use)
 - `~/local-llm/lucebox-hub/` branch `fix/dflash-conv-cache-prefill-mismatch` — our fix
 - `~/local-llm/server/dflash_24gb.py` — 24GB VRAM wrapper for lucebox daemon
-- `~/local-llm/scripts/serve-qwen36-fast.sh` — one-shot DFlash script
+- `~/local-llm/legacy/scripts/serve-qwen36-fast.sh` — one-shot DFlash script (v1; v3 invokes via `just serve-fast`)
 
 ## Context Preset Benchmarks
 

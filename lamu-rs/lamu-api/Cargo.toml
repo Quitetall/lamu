@@ -20,6 +20,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 parking_lot = "0.12"
 futures-util = "0.3"
 async-stream = "0.3"
+prometheus = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

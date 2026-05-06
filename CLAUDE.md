@@ -54,10 +54,11 @@ Key files:
 - `agents/swarm.py` — agentic coding swarm (plan→implement→test→review)
 - `agents/trainer.py` — QLoRA fine-tuning pipeline
 - `agents/bench.py` — benchmark runner
-- `cli/chat_repl.py` — terminal REPL
+- `legacy/cli/chat_repl.py` — terminal REPL (v1; superseded by `lamu repl`)
 - `web/app.py` — Chainlit web frontend
 - `justfile` — all commands (43 recipes)
 - `config/models.yaml` — model registry
+- `lamu-rs/lamu-cli/` — canonical Rust binary (`lamu` on $PATH after `just install`)
 
 Hardware: RTX 4090 (24GB), 64GB RAM, Arch Linux.
 Model: Qwen3.6-27B Dense Uncensored Heretic v2, GGUF Q5_K_S, 108K context.

@@ -13,6 +13,7 @@
 
 use crate::error::{Error, Result};
 use crate::health::{BackendHealth, HealthState};
+use crate::observability::emit as emit_sink;
 use serde_json::json;
 use std::time::Duration;
 
@@ -32,15 +33,10 @@ impl Default for RestartPolicy {
     }
 }
 
-/// Operator-readable JSON line on stderr. Matches Python `_emit_event`.
+/// Operator-readable JSON line. Routes through the observability sink so
+/// the optional file/OTLP exporters see every supervisor event.
 fn emit_event(event: &str, fields: serde_json::Value) {
-    let mut obj = json!({"event": event});
-    if let Some(map) = fields.as_object() {
-        for (k, v) in map {
-            obj[k] = v.clone();
-        }
-    }
-    eprintln!("{}", obj);
+    emit_sink(event, None, fields);
 }
 
 /// Coordinates restart attempts for a single backend.

@@ -11,50 +11,6 @@ models:
     capabilities:
     - chat
     - long_context
-  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: qwen35moe
-    params_b: 35.3
-    quant: Q4_K_M
-    vram_mb: 22204
-    context_max: 131072
-    capabilities:
-    - chat
-    - long_context
-  qwen3.5-4b-q4_k_m:
-    path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: qwen35
-    params_b: 4.6
-    quant: Q4_K_M
-    vram_mb: 2874
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-    reasoning_marker:
-      open_tag: <think>
-      close_tag: </think>
-      family: qwen35
-  dflash-3.6-f16:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: dflash
-    params_b: 5.8
-    quant: F16
-    vram_mb: 3641
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
   gpt2-xl.q4_k_m:
     path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
     format: gguf
@@ -63,6 +19,18 @@ models:
     params_b: 2.0
     quant: Q4_K_M
     vram_mb: 1246
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35moe
+    params_b: 35.3
+    quant: Q4_K_M
+    vram_mb: 22204
     context_max: 131072
     capabilities:
     - chat
@@ -99,6 +67,20 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+  dflash-3.6-f16:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash
+    params_b: 5.8
+    quant: F16
+    vram_mb: 3641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
   qwen3.5-27b-q4_k_m:
     path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
     format: gguf
@@ -125,6 +107,24 @@ models:
     params_b: 27.6
     quant: Q4_K_M
     vram_mb: 17358
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.5-4b-q4_k_m:
+    path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 4.6
+    quant: Q4_K_M
+    vram_mb: 2874
     context_max: 131072
     capabilities:
     - chat

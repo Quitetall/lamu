@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use lamu_core::health::HealthRegistry;
+use lamu_core::observability::{emit, new_trace_id, trace_id_from_traceparent};
 use lamu_core::queue::{QueueRequest, RequestQueue, Strategy as QueueStrategy};
 use lamu_core::reasoning::get_extractor;
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
@@ -205,6 +206,26 @@ impl LamuMcpServer {
         let priority = args.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let origin = args.get("origin").and_then(|v| v.as_str()).unwrap_or("anonymous").to_string();
 
+        // Trace ID: accept W3C traceparent from `_meta`, else generate.
+        let trace_id = args
+            .get("_meta")
+            .and_then(|m| m.get("traceparent"))
+            .and_then(|v| v.as_str())
+            .and_then(trace_id_from_traceparent)
+            .unwrap_or_else(new_trace_id);
+
+        emit(
+            "mcp_query_start",
+            Some(&trace_id),
+            json!({
+                "model_hint": model,
+                "capabilities": caps_raw,
+                "origin": origin,
+                "priority": priority,
+                "prompt_len": prompt.len(),
+            }),
+        );
+
         let caps: Vec<Capability> = caps_raw
             .map(|arr| arr.iter()
                 .filter_map(|v| v.as_str())
@@ -271,16 +292,45 @@ impl LamuMcpServer {
 
         let resp = match client.post(&url).json(&payload).send().await {
             Ok(r) => r,
-            Err(e) => return format!("Generation error: {}", e),
+            Err(e) => {
+                emit(
+                    "mcp_query_failed",
+                    Some(&trace_id),
+                    json!({
+                        "model": model_name,
+                        "error_type": "request_send",
+                        "error": format!("{e}"),
+                    }),
+                );
+                return format!("Generation error: {}", e);
+            }
         };
         let data: Value = match resp.json().await {
             Ok(v) => v,
-            Err(e) => return format!("JSON decode error: {}", e),
+            Err(e) => {
+                emit(
+                    "mcp_query_failed",
+                    Some(&trace_id),
+                    json!({
+                        "model": model_name,
+                        "error_type": "json_decode",
+                        "error": format!("{e}"),
+                    }),
+                );
+                return format!("JSON decode error: {}", e);
+            }
         };
 
         let msg = match data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")) {
             Some(m) => m,
-            None => return "no message in response".into(),
+            None => {
+                emit(
+                    "mcp_query_failed",
+                    Some(&trace_id),
+                    json!({"model": model_name, "error_type": "no_message"}),
+                );
+                return "no message in response".into();
+            }
         };
         let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let reasoning_content = msg.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
@@ -297,6 +347,16 @@ impl LamuMcpServer {
         } else {
             content_clean.clone()
         };
+
+        emit(
+            "mcp_query_done",
+            Some(&trace_id),
+            json!({
+                "model": model_name,
+                "content_len": content_clean.len(),
+                "reasoning_len": reasoning.len(),
+            }),
+        );
 
         if text.trim().is_empty() {
             format!("[Model thinking truncated — reasoning: {} chars]", reasoning.len())

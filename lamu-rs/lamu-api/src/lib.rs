@@ -1,6 +1,7 @@
 //! lamu-api — OpenAI-compatible HTTP layer.
 //! Direct port of `lamu/api/openai_compat.py`.
 
+pub mod metrics;
 pub mod openai_compat;
 
 use lamu_core::config::registry_path;

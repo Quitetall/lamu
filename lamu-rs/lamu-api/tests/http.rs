@@ -3,7 +3,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use lamu_api::metrics::LamuMetrics;
 use lamu_api::openai_compat::{build_app, AppState};
+use lamu_core::health::HealthRegistry;
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
 use lamu_core::types::{
@@ -46,6 +48,8 @@ fn make_state() -> AppState {
         router: Arc::new(Mutex::new(router)),
         entries: Arc::new(entries_map),
         client,
+        health: Arc::new(Mutex::new(HealthRegistry::new())),
+        metrics: Arc::new(LamuMetrics::new().unwrap()),
     }
 }
 
@@ -90,6 +94,47 @@ async fn chat_completions_503_when_no_loaded_model() {
             .unwrap(),
     ).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_serves_prometheus_text() {
+    let app = build_app(make_state());
+    let resp = app.oneshot(
+        Request::builder().uri("/metrics").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/plain"), "ct = {ct}");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    // Series that always render (Gauge + non-vec Counter):
+    //   lamu_vram_total_mb, lamu_metrics_scrapes_total.
+    // Vector series only render once they have a sample — covered by
+    // metrics_counts_503 below.
+    assert!(text.contains("lamu_vram_total_mb"), "no vram_total: {text}");
+    assert!(text.contains("lamu_metrics_scrapes_total"), "no scrapes: {text}");
+}
+
+#[tokio::test]
+async fn metrics_counts_503() {
+    let app = build_app(make_state());
+    // Trigger a 503 — should bump lamu_requests_total{status="no_backend"}
+    let req_body = r#"{"model":"qwen35-27b","messages":[{"role":"user","content":"hi"}]}"#;
+    let _ = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap(),
+    ).await.unwrap();
+    let resp = app.oneshot(
+        Request::builder().uri("/metrics").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains(r#"lamu_requests_total{model="qwen35-27b",status="no_backend"} 1"#),
+        "metrics body: {text}");
 }
 
 #[tokio::test]
