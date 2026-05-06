@@ -296,6 +296,11 @@ fn stream_chat(
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
 
+    // Live MD renderer — receives only the *visible* (post-think-filter)
+    // tokens. Each push redraws the in-flight assistant message via
+    // termimad; trailing scrollback above stays intact.
+    let mut md = crate::md_stream::StreamMdRenderer::new();
+
     let reader = BufReader::new(resp);
     for line_res in reader.lines() {
         let line = match line_res {
@@ -341,7 +346,9 @@ fn stream_chat(
         if token.contains(THINK_CLOSE) {
             in_think = false;
             if !state.show_thinking && think_indicator_shown {
-                let _ = writeln!(handle);
+                // Wipe the (thinking…) line so the MD render starts fresh.
+                let _ = write!(handle, "\r\x1b[2K");
+                let _ = handle.flush();
                 think_indicator_shown = false;
             }
         }
@@ -349,12 +356,11 @@ fn stream_chat(
         let (visible, new_state) = filter_think(&token, in_think, state.show_thinking);
         in_think = new_state;
         if !visible.is_empty() {
-            let _ = write!(handle, "{}", visible);
-            let _ = handle.flush();
+            let _ = md.push_token(&visible);
         }
     }
 
-    let _ = writeln!(handle);
+    let _ = md.finalize();
     let stripped = strip_think_blocks(&full);
     Some(Message {
         role: Role::Assistant,
