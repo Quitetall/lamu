@@ -34,7 +34,9 @@ use ratatui::Terminal;
 use std::io;
 use std::time::{Duration, Instant};
 
+use crate::cloud_models::{self, CloudModel, QuotaState};
 use crate::favorites::Favorites;
+use crate::mcp_servers::{self, McpServerEntry, ProbeStatus};
 
 const REFRESH_MS: u64 = 1000;
 
@@ -42,6 +44,7 @@ const REFRESH_MS: u64 = 1000;
 pub enum Mode {
     Dashboard,
     Launchers,
+    McpServers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,31 @@ impl SortKey {
 pub enum InputMode {
     Normal,
     Filter,
+}
+
+/// Restricts the dashboard list to a subset of model sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFilter {
+    All,
+    LocalOnly,
+    CloudOnly,
+}
+
+impl SourceFilter {
+    fn label(self) -> &'static str {
+        match self {
+            SourceFilter::All => "all",
+            SourceFilter::LocalOnly => "local",
+            SourceFilter::CloudOnly => "cloud",
+        }
+    }
+}
+
+/// View row — points at either a local registry entry or a cloud entry.
+#[derive(Debug, Clone, Copy)]
+pub enum ModelRef {
+    Local(usize),
+    Cloud(usize),
 }
 
 /// External CLI harness the TUI can launch. Each entry is detected with
@@ -179,8 +207,15 @@ pub struct AppState {
     /// Cached sorted+filtered indices into `entries` / `HARNESSES`.
     /// Recomputed on every state change. The `list_state.selected()`
     /// indexes INTO these vecs, not the underlying slices.
-    pub model_view: Vec<usize>,
     pub harness_view: Vec<usize>,
+    pub mcp_servers: Vec<McpServerEntry>,
+    pub mcp_state: ListState,
+    pub cloud_models: Vec<CloudModel>,
+    pub source_filter: SourceFilter,
+    /// Unified view: each row references either a local registry entry
+    /// or a cloud entry. Replaces the previous `Vec<usize>` so cloud
+    /// models can sit alongside local ones in the same scroll buffer.
+    pub model_view: Vec<ModelRef>,
 }
 
 impl AppState {
@@ -199,6 +234,13 @@ impl AppState {
         launcher_state.select(Some(0));
         let harness_installed = HARNESSES.iter().map(|h| which_exists(h.bin)).collect();
         let favorites = Favorites::load();
+
+        let mcp_servers = mcp_servers::load_servers();
+        let mut mcp_state = ListState::default();
+        if !mcp_servers.is_empty() {
+            mcp_state.select(Some(0));
+        }
+        let cloud_models = cloud_models::load();
 
         let mut s = Self {
             entries,
@@ -220,29 +262,52 @@ impl AppState {
             harness_sort: SortKey::Default,
             harness_filter: String::new(),
             input_mode: InputMode::Normal,
-            model_view: Vec::new(),
             harness_view: Vec::new(),
+            mcp_servers,
+            mcp_state,
+            cloud_models,
+            source_filter: SourceFilter::All,
+            model_view: Vec::new(),
         };
         s.recompute_views();
         Ok(s)
     }
 
+    fn move_mcp(&mut self, delta: i32) {
+        if self.mcp_servers.is_empty() {
+            return;
+        }
+        let n = self.mcp_servers.len() as i32;
+        let cur = self.mcp_state.selected().unwrap_or(0) as i32;
+        let next = ((cur + delta).rem_euclid(n)) as usize;
+        self.mcp_state.select(Some(next));
+    }
+
+    fn selected_mcp_idx(&self) -> Option<usize> {
+        self.mcp_state.selected()
+    }
+
+    /// Test: a model is "deployed" if the scheduler currently lists it
+    /// among loaded_models.
+    fn model_deployed(&self, name: &str) -> bool {
+        self.vram.loaded_models.iter().any(|(n, _)| n == name)
+    }
+
     /// Build sorted+filtered index vectors. Favorites pinned at the top
-    /// regardless of sort key (unless sort=Name and the user wants pure
-    /// alpha — then we still pin: deliberate UX call).
+    /// regardless of sort key. Local models render before cloud (when
+    /// source_filter = All) — both blocks individually sorted.
     pub fn recompute_views(&mut self) {
-        // Models
+        // Local models filter
         let filter = self.model_filter.to_lowercase();
-        let mut idx: Vec<usize> = (0..self.entries.len())
+        let mut local_idx: Vec<usize> = (0..self.entries.len())
             .filter(|i| {
                 if filter.is_empty() {
                     return true;
                 }
                 let e = &self.entries[*i];
-                if e.name.to_lowercase().contains(&filter) {
-                    return true;
-                }
-                if e.quant.to_lowercase().contains(&filter) {
+                if e.name.to_lowercase().contains(&filter)
+                    || e.quant.to_lowercase().contains(&filter)
+                {
                     return true;
                 }
                 e.capabilities.iter().any(|c| {
@@ -259,15 +324,36 @@ impl AppState {
             })
             .collect();
 
+        let mut cloud_idx: Vec<usize> = (0..self.cloud_models.len())
+            .filter(|i| {
+                if filter.is_empty() {
+                    return true;
+                }
+                let m = &self.cloud_models[*i];
+                m.name.to_lowercase().contains(&filter)
+                    || m.provider.to_lowercase().contains(&filter)
+                    || m.notes.to_lowercase().contains(&filter)
+            })
+            .collect();
+
+        // Source filter
+        match self.source_filter {
+            SourceFilter::All => {}
+            SourceFilter::LocalOnly => cloud_idx.clear(),
+            SourceFilter::CloudOnly => local_idx.clear(),
+        }
+
         let sort = self.model_sort;
         let entries = &self.entries;
+        let cloud_models = &self.cloud_models;
         let favs = &self.favorites;
-        idx.sort_by(|a, b| {
-            // Favorites always first.
+
+        // Sort local
+        local_idx.sort_by(|a, b| {
             let fa = favs.has_model(&entries[*a].name);
             let fb = favs.has_model(&entries[*b].name);
             if fa != fb {
-                return fb.cmp(&fa); // fa=true should come first → reverse cmp
+                return fb.cmp(&fa);
             }
             match sort {
                 SortKey::Default | SortKey::Name => entries[*a].name.cmp(&entries[*b].name),
@@ -279,7 +365,35 @@ impl AppState {
                 SortKey::Ctx => entries[*b].context_max.cmp(&entries[*a].context_max),
             }
         });
-        self.model_view = idx;
+
+        // Sort cloud
+        cloud_idx.sort_by(|a, b| {
+            let fa = favs.has_model(&cloud_models[*a].full_id());
+            let fb = favs.has_model(&cloud_models[*b].full_id());
+            if fa != fb {
+                return fb.cmp(&fa);
+            }
+            match sort {
+                SortKey::Default | SortKey::Name => {
+                    cloud_models[*a].name.cmp(&cloud_models[*b].name)
+                }
+                SortKey::Ctx => cloud_models[*b]
+                    .context_max
+                    .cmp(&cloud_models[*a].context_max),
+                // Cloud has no params/vram — fall back to name.
+                _ => cloud_models[*a].name.cmp(&cloud_models[*b].name),
+            }
+        });
+
+        // Merge: local first, then cloud.
+        let mut view: Vec<ModelRef> = Vec::with_capacity(local_idx.len() + cloud_idx.len());
+        for i in local_idx {
+            view.push(ModelRef::Local(i));
+        }
+        for i in cloud_idx {
+            view.push(ModelRef::Cloud(i));
+        }
+        self.model_view = view;
 
         // Harnesses
         let h_filter = self.harness_filter.to_lowercase();
@@ -368,11 +482,32 @@ impl AppState {
         self.list_state.select(Some(next));
     }
 
-    fn selected_entry(&self) -> Option<&ModelEntry> {
+    fn selected_ref(&self) -> Option<ModelRef> {
         self.list_state
             .selected()
             .and_then(|i| self.model_view.get(i).copied())
-            .and_then(|orig| self.entries.get(orig))
+    }
+
+    fn selected_entry(&self) -> Option<&ModelEntry> {
+        match self.selected_ref()? {
+            ModelRef::Local(i) => self.entries.get(i),
+            ModelRef::Cloud(_) => None,
+        }
+    }
+
+    fn selected_cloud(&self) -> Option<&CloudModel> {
+        match self.selected_ref()? {
+            ModelRef::Cloud(i) => self.cloud_models.get(i),
+            ModelRef::Local(_) => None,
+        }
+    }
+
+    /// Display name for the selected row (local entry name OR cloud full_id).
+    fn selected_name(&self) -> Option<String> {
+        match self.selected_ref()? {
+            ModelRef::Local(i) => self.entries.get(i).map(|e| e.name.clone()),
+            ModelRef::Cloud(i) => self.cloud_models.get(i).map(|m| m.full_id()),
+        }
     }
 }
 
@@ -442,10 +577,10 @@ fn run_loop<B: ratatui::backend::Backend>(
                     match key.code {
                         KeyCode::Esc => {
                             state.input_mode = InputMode::Normal;
-                            // Clear the buffer on cancel — the user wanted out.
                             match state.mode {
                                 Mode::Dashboard => state.model_filter.clear(),
                                 Mode::Launchers => state.harness_filter.clear(),
+                                Mode::McpServers => {}
                             }
                             state.recompute_views();
                         }
@@ -456,6 +591,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             match state.mode {
                                 Mode::Dashboard => { state.model_filter.pop(); }
                                 Mode::Launchers => { state.harness_filter.pop(); }
+                                Mode::McpServers => {}
                             }
                             state.recompute_views();
                         }
@@ -463,6 +599,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             match state.mode {
                                 Mode::Dashboard => state.model_filter.push(c),
                                 Mode::Launchers => state.harness_filter.push(c),
+                                Mode::McpServers => {}
                             }
                             state.recompute_views();
                         }
@@ -498,8 +635,16 @@ fn run_loop<B: ratatui::backend::Backend>(
                             state.mode = Mode::Launchers;
                             state.status_msg.clear();
                         }
+                        KeyCode::Char('m') => {
+                            state.mode = Mode::McpServers;
+                            state.mcp_servers = mcp_servers::load_servers();
+                            state.status_msg = format!(
+                                "{} MCP server(s) configured. [p] probe, [a] probe all.",
+                                state.mcp_servers.len()
+                            );
+                        }
                         KeyCode::Char('*') | KeyCode::Char('f') => {
-                            if let Some(name) = state.selected_entry().map(|e| e.name.clone()) {
+                            if let Some(name) = state.selected_name() {
                                 let added = state.favorites.toggle_model(&name);
                                 state.recompute_views();
                                 state.status_msg = if added {
@@ -508,6 +653,21 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     format!("☆ unfavorited {}", name)
                                 };
                             }
+                        }
+                        KeyCode::Char('L') => {
+                            state.source_filter = SourceFilter::LocalOnly;
+                            state.recompute_views();
+                            state.status_msg = "showing local only".into();
+                        }
+                        KeyCode::Char('C') => {
+                            state.source_filter = SourceFilter::CloudOnly;
+                            state.recompute_views();
+                            state.status_msg = "showing cloud only".into();
+                        }
+                        KeyCode::Char('A') => {
+                            state.source_filter = SourceFilter::All;
+                            state.recompute_views();
+                            state.status_msg = "showing all sources".into();
                         }
                         KeyCode::Char('o') => {
                             state.model_sort = state.model_sort.cycle();
@@ -519,19 +679,33 @@ fn run_loop<B: ratatui::backend::Backend>(
                             state.model_filter.clear();
                             state.status_msg = "filter: type to refine, Enter to apply, Esc to cancel".into();
                         }
-                        KeyCode::Char('c') | KeyCode::Enter => {
-                            if let Some(model_name) = state.selected_entry().map(|e| e.name.clone()) {
-                                run_subprocess_in_tui(
-                                    terminal,
-                                    || -> Result<()> {
-                                        println!("\n→ Chat with {} (/quit returns to dashboard)\n", model_name);
-                                        let api_url = "http://localhost:8020/v1/chat/completions".to_string();
-                                        crate::repl::run_repl_with_model(api_url, Some(model_name.clone()))
-                                    },
-                                )?;
+                        KeyCode::Enter => {
+                            // Branch on local vs cloud. Local hits the
+                            // OpenAI compat at :8020 with the model name.
+                            // Cloud routes via Bifrost (LAMU_GATEWAY_URL or
+                            // localhost:8080) with `provider/model` id.
+                            if let Some(local_name) = state.selected_entry().map(|e| e.name.clone()) {
+                                run_subprocess_in_tui(terminal, || -> Result<()> {
+                                    println!("\n→ Chat with {} (/quit returns to dashboard)\n", local_name);
+                                    let api_url = "http://localhost:8020/v1/chat/completions".to_string();
+                                    crate::repl::run_repl_with_model(api_url, Some(local_name.clone()))
+                                })?;
                                 state.last_harness = Some("lamu repl");
                                 state.refresh();
                                 state.status_msg = "Returned from chat.".into();
+                            } else if let Some(cloud) = state.selected_cloud().cloned() {
+                                let gateway = std::env::var("LAMU_GATEWAY_URL")
+                                    .unwrap_or_else(|_| "http://localhost:8080/v1".into());
+                                let trimmed = gateway.trim_end_matches('/').to_string();
+                                let api_url = format!("{}/chat/completions", trimmed);
+                                let model_id = cloud.full_id();
+                                run_subprocess_in_tui(terminal, || -> Result<()> {
+                                    println!("\n→ Chat with {} via {} (/quit returns)\n", model_id, trimmed);
+                                    crate::repl::run_repl_with_model(api_url, Some(model_id.clone()))
+                                })?;
+                                state.last_harness = Some("lamu repl");
+                                state.refresh();
+                                state.status_msg = "Returned from cloud chat.".into();
                             }
                         }
                         KeyCode::Char('l') => {
@@ -541,6 +715,54 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     e.name
                                 );
                             }
+                        }
+                        _ => {}
+                    },
+                    Mode::McpServers => match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Esc | KeyCode::Char('d') => {
+                            state.mode = Mode::Dashboard;
+                            state.status_msg.clear();
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => state.move_mcp(1),
+                        KeyCode::Char('k') | KeyCode::Up => state.move_mcp(-1),
+                        KeyCode::Char('r') => {
+                            state.mcp_servers = mcp_servers::load_servers();
+                            state.status_msg = "Re-loaded ~/.claude.json".into();
+                        }
+                        KeyCode::Char('p') | KeyCode::Enter => {
+                            if let Some(idx) = state.selected_mcp_idx() {
+                                if let Some(entry) = state.mcp_servers.get(idx).cloned() {
+                                    state.status_msg = format!("Probing {} (≤3s)...", entry.name);
+                                    let status = mcp_servers::probe(&entry);
+                                    if let Some(e) = state.mcp_servers.get_mut(idx) {
+                                        e.status = status.clone();
+                                    }
+                                    state.status_msg = match &status {
+                                        ProbeStatus::Healthy { server_name } =>
+                                            format!("✓ {} → server={}", entry.name, server_name),
+                                        ProbeStatus::Unreachable { reason } =>
+                                            format!("✗ {} — {}", entry.name, reason),
+                                        ProbeStatus::Untested =>
+                                            format!("? {} — {} not probed", entry.name, entry.typ),
+                                    };
+                                }
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            state.status_msg = format!("Probing {} server(s)...", state.mcp_servers.len());
+                            let mut servers = state.mcp_servers.clone();
+                            for s in servers.iter_mut() {
+                                s.status = mcp_servers::probe(s);
+                            }
+                            state.mcp_servers = servers;
+                            let healthy = state.mcp_servers.iter().filter(|s| matches!(s.status, ProbeStatus::Healthy{..})).count();
+                            state.status_msg = format!(
+                                "Probed {}: {} healthy, {} unreachable",
+                                state.mcp_servers.len(),
+                                healthy,
+                                state.mcp_servers.len() - healthy,
+                            );
                         }
                         _ => {}
                     },
@@ -673,7 +895,147 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     match state.mode {
         Mode::Dashboard => draw_dashboard(f, state),
         Mode::Launchers => draw_launchers(f, state),
+        Mode::McpServers => draw_mcp(f, state),
     }
+}
+
+fn draw_mcp(f: &mut ratatui::Frame, state: &AppState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Min(8),    // list
+            Constraint::Length(5), // detail
+            Constraint::Length(3), // help footer
+        ])
+        .split(f.area());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "MCP SERVERS",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  source="),
+        Span::styled(
+            mcp_servers::config_path().display().to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(format!("  count={}  ", state.mcp_servers.len())),
+        Span::raw("[d/Esc] back"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(header, chunks[0]);
+
+    let label = format!(
+        "  {:<20}  {:<6}  {:<8}  {:<24}  {}",
+        "NAME", "TYPE", "STATUS", "COMMAND", "ARGS"
+    );
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(chunks[1]);
+    f.render_widget(
+        Paragraph::new(label).style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        split[0],
+    );
+
+    let items: Vec<ListItem> = state
+        .mcp_servers
+        .iter()
+        .map(|s| {
+            let (status_label, color) = match &s.status {
+                ProbeStatus::Healthy { .. } => ("✓ healthy", Color::Green),
+                ProbeStatus::Unreachable { .. } => ("✗ down", Color::Red),
+                ProbeStatus::Untested => ("? untested", Color::Yellow),
+            };
+            let line = format!(
+                "{:<20}  {:<6}  {:<10}  {:<24}  {}",
+                truncate(&s.name, 20),
+                s.typ,
+                status_label,
+                truncate(&s.command, 24),
+                s.args.join(" "),
+            );
+            ListItem::new(line).style(Style::default().fg(color))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Configured servers"))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("→ ");
+    let mut s = state.mcp_state.clone();
+    f.render_stateful_widget(list, split[1], &mut s);
+
+    // Detail pane
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(idx) = state.selected_mcp_idx() {
+        if let Some(entry) = state.mcp_servers.get(idx) {
+            lines.push(Line::from(format!(
+                "{} {} {}",
+                entry.command,
+                entry.args.join(" "),
+                entry.cwd.as_deref().map(|c| format!("(cwd={})", c)).unwrap_or_default(),
+            )));
+            match &entry.status {
+                ProbeStatus::Healthy { server_name } => {
+                    lines.push(Line::from(Span::styled(
+                        format!("✓ initialize → server.name={server_name}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                ProbeStatus::Unreachable { reason } => {
+                    lines.push(Line::from(Span::styled(
+                        format!("✗ {reason}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                ProbeStatus::Untested => {
+                    lines.push(Line::from(Span::styled(
+                        "? press [p] or Enter to probe (sends initialize, ≤3s)".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            }
+        }
+    }
+    if !state.status_msg.is_empty() {
+        lines.push(Line::from(Span::styled(
+            state.status_msg.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Detail")),
+        chunks[2],
+    );
+
+    // Footer
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
+        Span::styled("[p/Enter]", Style::default().fg(Color::Cyan)),
+        Span::raw(" probe "),
+        Span::styled("[a]", Style::default().fg(Color::Cyan)),
+        Span::raw(" probe all "),
+        Span::styled("[r]", Style::default().fg(Color::Cyan)),
+        Span::raw(" reload .claude.json "),
+        Span::styled("[d/Esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" back "),
+        Span::styled("[q]", Style::default().fg(Color::Cyan)),
+        Span::raw(" quit"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, chunks[3]);
 }
 
 fn draw_dashboard(f: &mut ratatui::Frame, state: &AppState) {
@@ -717,8 +1079,8 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .split(area);
 
     let header_label = format!(
-        "   {:<46}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
-        "NAME", "PARAMS", "QUANT", "CTX", "VRAM (MB)", "CAPABILITIES",
+        "   {:<7} {:<40}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
+        "SOURCE", "NAME", "PARAMS", "QUANT", "CTX", "VRAM (MB)", "CAPABILITIES",
     );
     let header_widget = Paragraph::new(header_label).style(
         Style::default()
@@ -730,46 +1092,89 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let items: Vec<ListItem> = state
         .model_view
         .iter()
-        .map(|&i| {
-            let e = &state.entries[i];
-            let caps = e.capabilities.iter().map(|c| match c {
-                lamu_core::types::Capability::Chat => "chat",
-                lamu_core::types::Capability::Code => "code",
-                lamu_core::types::Capability::Reasoning => "reason",
-                lamu_core::types::Capability::Routing => "route",
-                lamu_core::types::Capability::Vision => "vision",
-                lamu_core::types::Capability::LongContext => "long",
-            }).collect::<Vec<_>>().join(",");
-            let star = if state.favorites.has_model(&e.name) { "★" } else { " " };
-            let line = format!(
-                "{} {:<46}  {:>4}B  {:<6}  {:>5}  {:>9}  [{}]",
-                star,
-                truncate(&e.name, 46),
-                format_params(e.params_b),
-                e.quant,
-                format_ctx(e.context_max),
-                e.vram_mb,
-                caps,
-            );
-            let style = if state.favorites.has_model(&e.name) {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            };
-            ListItem::new(line).style(style)
+        .map(|r| match r {
+            ModelRef::Local(i) => {
+                let e = &state.entries[*i];
+                let caps = e.capabilities.iter().map(|c| match c {
+                    lamu_core::types::Capability::Chat => "chat",
+                    lamu_core::types::Capability::Code => "code",
+                    lamu_core::types::Capability::Reasoning => "reason",
+                    lamu_core::types::Capability::Routing => "route",
+                    lamu_core::types::Capability::Vision => "vision",
+                    lamu_core::types::Capability::LongContext => "long",
+                }).collect::<Vec<_>>().join(",");
+                let fav = state.favorites.has_model(&e.name);
+                let deployed = state.model_deployed(&e.name);
+                let glyph = if deployed { "●" } else if fav { "★" } else { " " };
+                let line = format!(
+                    "{} {:<7} {:<40}  {:>4}B  {:<6}  {:>5}  {:>9}  [{}]",
+                    glyph,
+                    "[LOCAL]",
+                    truncate(&e.name, 40),
+                    format_params(e.params_b),
+                    e.quant,
+                    format_ctx(e.context_max),
+                    e.vram_mb,
+                    caps,
+                );
+                let style = if deployed {
+                    let s = Style::default().fg(Color::Green);
+                    if fav { s.add_modifier(Modifier::BOLD) } else { s }
+                } else if fav {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(line).style(style)
+            }
+            ModelRef::Cloud(i) => {
+                let m = &state.cloud_models[*i];
+                let id = m.full_id();
+                let fav = state.favorites.has_model(&id);
+                let glyph = if fav { "★" } else { " " };
+                let line = format!(
+                    "{} {:<7} {:<40}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
+                    glyph,
+                    "[CLOUD]",
+                    truncate(&id, 40),
+                    "—",
+                    "—",
+                    format_ctx(m.context_max),
+                    "—",
+                    m.notes,
+                );
+                // Color by quota state — distinct from local-deployed-green:
+                //   Available → blue
+                //   Low       → amber (term yellow)
+                //   Exhausted → red
+                // Favorited cloud rows add Bold without changing the
+                // color so users can still see the quota signal.
+                let base = match m.quota {
+                    QuotaState::Available => Color::Blue,
+                    QuotaState::Low => Color::Yellow,
+                    QuotaState::Exhausted => Color::Red,
+                };
+                let mut style = Style::default().fg(base);
+                if fav {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                ListItem::new(line).style(style)
+            }
         })
         .collect();
 
     let title = if state.model_filter.is_empty() {
         format!(
-            "Models  [{}]  sort={}  /filter  *favorite  o sort",
+            "Models  [{}]  source={}  sort={}  L/C/A switch  /filter  *favorite",
             state.model_view.len(),
+            state.source_filter.label(),
             state.model_sort.label()
         )
     } else {
         format!(
-            "Models  [{}]  filter='{}'  sort={}  Esc clears",
+            "Models  [{}]  source={}  filter='{}'  sort={}  Esc clears",
             state.model_view.len(),
+            state.source_filter.label(),
             state.model_filter,
             state.model_sort.label()
         )
@@ -839,24 +1244,24 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" "),
         Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
         Span::raw(" chat "),
         Span::styled("[*]", Style::default().fg(Color::Yellow)),
         Span::raw(" fav "),
+        Span::styled("[L/C/A]", Style::default().fg(Color::Cyan)),
+        Span::raw(" source "),
         Span::styled("[/]", Style::default().fg(Color::Cyan)),
         Span::raw(" filter "),
         Span::styled("[o]", Style::default().fg(Color::Cyan)),
         Span::raw(" sort "),
         Span::styled("[h]", Style::default().fg(Color::Cyan)),
         Span::raw(" harness "),
+        Span::styled("[m]", Style::default().fg(Color::Cyan)),
+        Span::raw(" mcp "),
         Span::styled("[s]", Style::default().fg(Color::Cyan)),
         Span::raw(" serve "),
         Span::styled("[b]", Style::default().fg(Color::Cyan)),
         Span::raw(" bifrost "),
-        Span::styled("[r]", Style::default().fg(Color::Cyan)),
-        Span::raw(" refresh "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" quit"),
     ]))
@@ -1135,8 +1540,8 @@ mod tests {
     #[test]
     fn move_cursor_wraps() {
         let mut s = AppState::new().unwrap();
-        // Synthesise three entries so the wrap logic has something to chew on.
         s.entries = (0..3).map(|i| dummy_entry(i)).collect();
+        s.cloud_models.clear();
         s.recompute_views();
         s.list_state.select(Some(0));
         s.move_cursor(-1);
@@ -1200,6 +1605,13 @@ mod tests {
         assert_eq!(seen.len(), 5);
     }
 
+    fn local_name_at(s: &AppState, idx: usize) -> &str {
+        match s.model_view[idx] {
+            ModelRef::Local(i) => s.entries[i].name.as_str(),
+            ModelRef::Cloud(_) => panic!("expected local at index {idx}"),
+        }
+    }
+
     #[test]
     fn filter_substring_narrows_view() {
         let mut s = AppState::new().unwrap();
@@ -1208,12 +1620,13 @@ mod tests {
             dummy_entry_named("beta-13b"),
             dummy_entry_named("gamma-7b"),
         ];
+        s.cloud_models.clear(); // narrow to local in tests so cloud rows
+                                // don't muddle the assertions
         s.model_filter = "7b".into();
         s.recompute_views();
         assert_eq!(s.model_view.len(), 2);
-        // Both names contain "7b"; default sort = alpha.
-        assert_eq!(s.entries[s.model_view[0]].name, "alpha-7b");
-        assert_eq!(s.entries[s.model_view[1]].name, "gamma-7b");
+        assert_eq!(local_name_at(&s, 0), "alpha-7b");
+        assert_eq!(local_name_at(&s, 1), "gamma-7b");
     }
 
     #[test]
@@ -1223,9 +1636,12 @@ mod tests {
         let mut b = dummy_entry_named("medium"); b.params_b = 7.0;
         let mut c = dummy_entry_named("large"); c.params_b = 70.0;
         s.entries = vec![a, b, c];
+        s.cloud_models.clear();
         s.model_sort = SortKey::Params;
         s.recompute_views();
-        let names: Vec<_> = s.model_view.iter().map(|&i| s.entries[i].name.clone()).collect();
+        let names: Vec<_> = (0..s.model_view.len())
+            .map(|i| local_name_at(&s, i).to_string())
+            .collect();
         assert_eq!(names, vec!["large", "medium", "small"]);
     }
 
@@ -1237,19 +1653,42 @@ mod tests {
             dummy_entry_named("beta"),
             dummy_entry_named("gamma"),
         ];
+        s.cloud_models.clear();
         s.favorites.models.insert("gamma".to_string());
         s.recompute_views();
-        // Gamma pinned even though alphabetically last.
-        assert_eq!(s.entries[s.model_view[0]].name, "gamma");
-        // Order of the rest stays alphabetical.
-        assert_eq!(s.entries[s.model_view[1]].name, "alpha");
-        assert_eq!(s.entries[s.model_view[2]].name, "beta");
+        assert_eq!(local_name_at(&s, 0), "gamma");
+        assert_eq!(local_name_at(&s, 1), "alpha");
+        assert_eq!(local_name_at(&s, 2), "beta");
+    }
+
+    #[test]
+    fn source_filter_local_hides_cloud() {
+        let mut s = AppState::new().unwrap();
+        s.entries = vec![dummy_entry_named("a")];
+        // Cloud seed list is non-empty by default — verify filter prunes it.
+        let initial_total = s.model_view.len();
+        s.source_filter = SourceFilter::LocalOnly;
+        s.recompute_views();
+        assert_eq!(s.model_view.len(), 1);
+        assert!(initial_total > 1, "default seed should provide cloud rows");
+    }
+
+    #[test]
+    fn source_filter_cloud_hides_local() {
+        let mut s = AppState::new().unwrap();
+        s.entries = vec![dummy_entry_named("a"), dummy_entry_named("b")];
+        s.source_filter = SourceFilter::CloudOnly;
+        s.recompute_views();
+        for r in &s.model_view {
+            assert!(matches!(r, ModelRef::Cloud(_)));
+        }
     }
 
     #[test]
     fn empty_filter_shows_everything() {
         let mut s = AppState::new().unwrap();
         s.entries = (0..5).map(|i| dummy_entry_named(&format!("e{i}"))).collect();
+        s.cloud_models.clear();
         s.model_filter.clear();
         s.recompute_views();
         assert_eq!(s.model_view.len(), 5);

@@ -1,6 +1,8 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
+mod cloud_models;
 mod favorites;
+mod mcp_servers;
 mod md_stream;
 mod repl;
 mod tui;
