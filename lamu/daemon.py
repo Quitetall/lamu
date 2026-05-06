@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+from lamu.core.health import HealthRegistry
 from lamu.core.registry import load_registry, scan_directory, write_registry
 from lamu.core.scheduler import VramScheduler
 
@@ -88,10 +89,17 @@ def cmd_status() -> None:
 
 
 def cmd_start() -> None:
-    """Start the LAMU MCP server."""
+    """Start the LAMU MCP server.
+
+    Constructs the daemon-wide singletons — one VramScheduler, one
+    HealthRegistry — and hands them to every surface that follows. MCP
+    today, OpenAI-compat tomorrow. Two surfaces seeing the same backend
+    DEAD/QUARANTINED state is the whole point of the v3 wiring.
+    """
     from lamu.mcp.server import LamuMcpServer
 
     sched = VramScheduler()
+    health = HealthRegistry()
 
     # Auto-register already-running models. Typed catch — anything outside
     # _PROBE_EXPECTED_ERRORS is a real bug and must surface.
@@ -108,16 +116,18 @@ def cmd_start() -> None:
         entries = load_registry(REGISTRY_PATH)
         for entry in entries:
             if entry.name in model_id.lower() or model_id.lower() in entry.name:
-                from lamu.core.scheduler import _query_gpu_pids
-                pids = _query_gpu_pids()
+                pids = sched.query_gpu_pids()
                 vram = sum(v for _, v in pids) // max(len(pids), 1)
                 sched.register_loaded(entry, pid=0, port=port, vram_actual_mb=vram)
+                # Adopted backend starts HEALTHY by virtue of probing OK.
+                health.get_or_create(entry.name).record_success()
                 break
 
     server = LamuMcpServer(
         models_dir=MODELS_DIR,
         registry_path=REGISTRY_PATH,
         scheduler=sched,
+        health=health,
     )
 
     print("LAMU daemon starting (MCP stdio)...", file=sys.stderr)

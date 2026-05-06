@@ -4,8 +4,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import time
-from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Optional
 
 from lamu.core.errors import GpuUnavailableError
 from lamu.core.types import LoadedModel, ModelEntry, ModelState, VramBudget
@@ -17,101 +16,157 @@ _log = logging.getLogger(__name__)
 # Reserve 1.5 GB for CUDA overhead, display, compute buffers
 _VRAM_RESERVED_MB: int = 1500
 
-# Module-level flag: once set, every GPU operation refuses to silently fall back.
-_gpu_unavailable_reason: Optional[str] = None
 
-
-def _mark_gpu_unavailable(reason: str) -> None:
-    global _gpu_unavailable_reason
-    _gpu_unavailable_reason = reason
-    _log.warning("gpu_unavailable: %s", reason)
-
-
-def gpu_available() -> bool:
-    """True if nvidia-smi is reachable. Refreshed by every _query_vram call."""
-    return _gpu_unavailable_reason is None
-
+# ── Module-level pure probes ────────────────────────────────────────────────
+# Both raise GpuUnavailableError on any failure. Callers that want to track
+# availability state should wrap and update their own state — the module
+# itself holds none.
 
 def _query_vram() -> tuple[int, int]:
     """Query GPU VRAM via nvidia-smi. Returns (used_mb, total_mb).
 
-    Marks the GPU unavailable on subprocess/parse failure but does NOT raise
-    here — `(0, 0)` is the long-standing contract for callers like `budget()`
-    that need to keep returning a snapshot. To force a hard error use
-    `require_gpu()`.
+    Raises:
+        GpuUnavailableError: nvidia-smi missing, returned non-zero, timed out,
+            or produced unparsable output.
     """
-    global _gpu_unavailable_reason
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode != 0:
-            _mark_gpu_unavailable(
-                f"nvidia-smi exit={result.returncode}: {result.stderr.strip()}"
-            )
-            return (0, 0)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise GpuUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+
+    if result.returncode != 0:
+        raise GpuUnavailableError(
+            f"nvidia-smi exit={result.returncode}: {result.stderr.strip()}"
+        )
+    try:
         parts = result.stdout.strip().split(",")
-        used = int(parts[0].strip())
-        total = int(parts[1].strip())
-        # Successful query — clear the unavailable flag.
-        _gpu_unavailable_reason = None
-        return (used, total)
-    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError) as exc:
-        _mark_gpu_unavailable(f"{type(exc).__name__}: {exc}")
-        return (0, 0)
-
-
-def require_gpu() -> None:
-    """Raise GpuUnavailableError if the GPU is in unavailable state.
-
-    Call this at the gate of any GPU-touching operation (model load,
-    eviction, etc.) to make silent CPU fallback impossible.
-    """
-    if _gpu_unavailable_reason is not None:
-        raise GpuUnavailableError(_gpu_unavailable_reason)
+        return (int(parts[0].strip()), int(parts[1].strip()))
+    except (ValueError, IndexError) as exc:
+        raise GpuUnavailableError(
+            f"nvidia-smi parse: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _query_gpu_pids() -> list[tuple[int, int]]:
-    """Query GPU processes. Returns [(pid, used_mb), ...]."""
-    global _gpu_unavailable_reason
+    """Query GPU processes. Returns [(pid, used_mb), ...].
+
+    Raises:
+        GpuUnavailableError: same conditions as `_query_vram`.
+    """
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode != 0:
-            _mark_gpu_unavailable(
-                f"nvidia-smi(pids) exit={result.returncode}"
-            )
-            return []
-        pids: list[tuple[int, int]] = []
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise GpuUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+
+    if result.returncode != 0:
+        raise GpuUnavailableError(
+            f"nvidia-smi(pids) exit={result.returncode}: {result.stderr.strip()}"
+        )
+    pids: list[tuple[int, int]] = []
+    try:
         for line in result.stdout.strip().split("\n"):
             if not line.strip():
                 continue
             parts = line.split(",")
             pids.append((int(parts[0].strip()), int(parts[1].strip())))
-        return pids
-    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError) as exc:
-        _mark_gpu_unavailable(f"{type(exc).__name__}: {exc}")
-        return []
+    except (ValueError, IndexError) as exc:
+        raise GpuUnavailableError(
+            f"nvidia-smi(pids) parse: {type(exc).__name__}: {exc}"
+        ) from exc
+    return pids
 
+
+# ── Scheduler ──────────────────────────────────────────────────────────────
+# Owns availability state. Tests can construct a fresh instance to reset.
 
 class VramScheduler:
-    """Budget-aware VRAM scheduler with bin-packing and LRU eviction."""
+    """Budget-aware VRAM scheduler with bin-packing and LRU eviction.
+
+    Holds the GPU-availability state on the instance so tests, daemons, and
+    parallel runs each see their own. Module-level globals are intentionally
+    avoided.
+    """
 
     def __init__(self, reserved_mb: int = _VRAM_RESERVED_MB) -> None:
         self._reserved_mb = reserved_mb
         self._loaded: dict[str, LoadedModel] = {}
         self._total_mb: int = 0
+        self._gpu_unavailable_reason: Optional[str] = None
         self._refresh_total()
 
+    # ── GPU availability state ─────────────────────────────────────────
+
+    @property
+    def gpu_available(self) -> bool:
+        """True if the last GPU probe succeeded."""
+        return self._gpu_unavailable_reason is None
+
+    @property
+    def gpu_unavailable_reason(self) -> Optional[str]:
+        """Human-readable reason for the last failure, or None when healthy."""
+        return self._gpu_unavailable_reason
+
+    def require_gpu(self) -> None:
+        """Raise GpuUnavailableError if the GPU is in unavailable state.
+
+        Call at the gate of any GPU-touching operation (model load, eviction,
+        etc.) to make silent CPU fallback impossible.
+        """
+        if self._gpu_unavailable_reason is not None:
+            raise GpuUnavailableError(self._gpu_unavailable_reason)
+
+    def _track(self, exc: Optional[GpuUnavailableError]) -> None:
+        """Mark availability state. Called after every probe."""
+        if exc is None:
+            if self._gpu_unavailable_reason is not None:
+                _log.info("gpu_recovered")
+            self._gpu_unavailable_reason = None
+        else:
+            reason = str(exc)
+            if reason != self._gpu_unavailable_reason:
+                _log.warning("gpu_unavailable: %s", reason)
+            self._gpu_unavailable_reason = reason
+
+    # ── Probes (track state) ───────────────────────────────────────────
+
+    def query_vram(self) -> tuple[int, int]:
+        """Probe nvidia-smi, update availability state, return (used, total).
+
+        Returns (0, 0) on failure — does not raise. Call `require_gpu()`
+        for a hard error.
+        """
+        try:
+            result = _query_vram()
+            self._track(None)
+            return result
+        except GpuUnavailableError as exc:
+            self._track(exc)
+            return (0, 0)
+
+    def query_gpu_pids(self) -> list[tuple[int, int]]:
+        """Probe nvidia-smi for compute apps. Updates state, never raises."""
+        try:
+            pids = _query_gpu_pids()
+            self._track(None)
+            return pids
+        except GpuUnavailableError as exc:
+            self._track(exc)
+            return []
+
     def _refresh_total(self) -> None:
-        """Query total VRAM once (doesn't change)."""
-        _, total = _query_vram()
+        """Query total VRAM once at construction (doesn't change)."""
+        _, total = self.query_vram()
         self._total_mb = total
+
+    # ── Snapshot ───────────────────────────────────────────────────────
 
     @property
     def total_mb(self) -> int:
@@ -125,7 +180,7 @@ class VramScheduler:
 
     def budget(self) -> VramBudget:
         """Snapshot current VRAM budget."""
-        used_mb, total_mb = _query_vram()
+        used_mb, total_mb = self.query_vram()
         loaded_pairs = tuple(
             (name, m.vram_actual_mb)
             for name, m in self._loaded.items()
@@ -137,6 +192,8 @@ class VramScheduler:
             loaded_models=loaded_pairs,
             available_mb=self.available_mb,
         )
+
+    # ── Loaded-model bookkeeping ───────────────────────────────────────
 
     def register_loaded(
         self,
@@ -184,7 +241,6 @@ class VramScheduler:
         if needed_mb <= 0:
             return []
 
-        # Sort by last_used (oldest first), skip pinned
         evictable = [
             (name, m)
             for name, m in self._loaded.items()
@@ -200,7 +256,6 @@ class VramScheduler:
             if freed >= needed_mb:
                 return to_evict
 
-        # Can't free enough even evicting everything
         return []
 
     def plan_load(self, entry: ModelEntry) -> tuple[bool, list[str]]:
@@ -214,7 +269,6 @@ class VramScheduler:
         if self.can_fit(entry):
             return (True, [])
 
-        # Need to evict
         deficit = entry.vram_mb - self.available_mb
         to_evict = self.plan_eviction(deficit)
         if not to_evict:
@@ -234,7 +288,7 @@ class VramScheduler:
             state=ModelState.LOADING,
             pid=None,
             port=0,
-            vram_actual_mb=entry.vram_mb,  # use estimate until confirmed
+            vram_actual_mb=entry.vram_mb,
             last_used_ts=time.monotonic(),
         )
         self._loaded[entry.name] = model

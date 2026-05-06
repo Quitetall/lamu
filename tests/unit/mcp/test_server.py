@@ -171,3 +171,95 @@ async def test_handle_query_records_health_on_failure(server, sample_registry):
     assert h is not None
     assert h.state is HealthState.DEGRADED
     assert h.consecutive_errors == 1
+
+
+# ── v3 supervisor wiring ────────────────────────────────────────────────────
+
+
+def test_load_model_registers_supervisor(server, sample_registry, monkeypatch):
+    """Successful load_model installs a Supervisor keyed by model name."""
+    qwen = sample_registry[0]
+    monkeypatch.setattr(server, "_spawn_backend", lambda entry, port: 12345)
+    out = _text(server._handle_load_model({"name": "qwen35-27b"}))
+    assert "Loaded" in out
+    assert qwen.name in server._supervisors
+
+
+def test_unload_model_drops_supervisor(server, sample_registry, monkeypatch):
+    """Unload tears the Supervisor down — its lifetime ends with the backend."""
+    qwen = sample_registry[0]
+    monkeypatch.setattr(server, "_spawn_backend", lambda entry, port: 12345)
+    server._handle_load_model({"name": "qwen35-27b"})
+    assert qwen.name in server._supervisors
+
+    with patch("os.kill"):
+        server._handle_unload_model({"name": "qwen35-27b"})
+    assert qwen.name not in server._supervisors
+
+
+@pytest.mark.asyncio
+async def test_query_failure_routes_through_supervisor(
+    server, sample_registry, monkeypatch
+):
+    """Once a Supervisor is registered, query failures advance health via it
+    (not via a raw record_error). With max_attempts=0 the supervisor takes the
+    DEAD path without trying to restart, so the test stays fast and silent."""
+    from lamu.core.errors import BackendError
+    from lamu.core.health import HealthState
+    from lamu.core.supervisor import Supervisor, RestartPolicy
+
+    qwen = sample_registry[0]
+    monkeypatch.setattr(server, "_spawn_backend", lambda entry, port: 4321)
+    server._handle_load_model({"name": "qwen35-27b"})
+    h = server._health.get(qwen.name)
+
+    # Replace the registered supervisor with one that won't actually restart.
+    restart_calls: list[int] = []
+    server._supervisors[qwen.name] = Supervisor(
+        health=h,
+        restart_fn=lambda: restart_calls.append(1),
+        policy=RestartPolicy(max_attempts=0, backoff_seconds=()),
+    )
+
+    # Drive the failure threshold (DEGRADED → DEAD).
+    with patch("urllib.request.urlopen", side_effect=ConnectionError("nope")):
+        for _ in range(3):
+            with pytest.raises(BackendError):
+                await server._handle_query({"prompt": "hi", "model": qwen.name})
+
+    assert h.state in (HealthState.DEAD, HealthState.QUARANTINED)
+
+
+def test_restart_backend_re_spawns_and_updates_scheduler(
+    server, sample_registry, monkeypatch
+):
+    """Supervisor.restart_fn → _restart_backend → _spawn_backend + confirm_loaded."""
+    qwen = sample_registry[0]
+    monkeypatch.setattr(server, "_spawn_backend", lambda entry, port: 12345)
+    server._handle_load_model({"name": "qwen35-27b"})
+    assert server._scheduler.get_loaded(qwen.name).pid == 12345
+
+    # Pretend the backend died; restart should produce a new pid.
+    monkeypatch.setattr(server, "_spawn_backend", lambda entry, port: 67890)
+    server._restart_backend(qwen.name)
+    assert server._scheduler.get_loaded(qwen.name).pid == 67890
+
+
+def test_restart_backend_unknown_model_raises(server):
+    """Restart on a model that's not in the scheduler surfaces typed error."""
+    from lamu.core.errors import BackendUnavailable
+    with pytest.raises(BackendUnavailable):
+        server._restart_backend("ghost-model")
+
+
+@pytest.mark.asyncio
+async def test_query_refuses_quarantined_model(server, sample_registry):
+    """Phase A2: router gets health_map. A QUARANTINED backend never routes."""
+    from lamu.core.health import BackendHealth, HealthState
+    qwen = sample_registry[0]
+    server._scheduler.register_loaded(qwen, pid=1, port=8020, vram_actual_mb=18000)
+    server._health._by_id[qwen.name] = BackendHealth(
+        backend_id=qwen.name, state=HealthState.QUARANTINED,
+    )
+    out = _text(await server._handle_query({"prompt": "hi", "model": qwen.name}))
+    assert "No model available" in out or "unhealthy" in out

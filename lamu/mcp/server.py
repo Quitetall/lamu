@@ -23,13 +23,14 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from lamu.core.errors import BackendError
+from lamu.core.errors import BackendError, BackendUnavailable
 from lamu.core.health import HealthRegistry
 from lamu.core.queue import QueueRequest, RequestQueue, Strategy as QueueStrategy
 from lamu.core.reasoning import get_extractor
 from lamu.core.registry import load_registry, scan_directory, write_registry
 from lamu.core.router import Router
 from lamu.core.scheduler import VramScheduler
+from lamu.core.supervisor import Supervisor
 from lamu.core.types import (
     Capability,
     ModelEntry,
@@ -64,13 +65,21 @@ def _urlopen_read(req: object) -> bytes:
 
 
 class LamuMcpServer:
-    """MCP server that manages local models with budget-aware routing."""
+    """MCP server that manages local models with budget-aware routing.
+
+    Shares ``scheduler`` and ``health`` with the rest of the daemon — the
+    OpenAI-compat layer reads the same VRAM map and the same health states,
+    so a backend marked DEAD by an HTTP request also fails MCP routing.
+    Pass ``None`` only in tests; production daemons construct one of each
+    in ``daemon.cmd_start`` and hand them in here.
+    """
 
     def __init__(
         self,
         models_dir: Path,
         registry_path: Path,
         scheduler: VramScheduler,
+        health: Optional[HealthRegistry] = None,
     ) -> None:
         self._models_dir = models_dir
         self._registry_path = registry_path
@@ -88,7 +97,13 @@ class LamuMcpServer:
 
         # TODO: backend pool (lazy init on first load)
         self._backends: dict[str, object] = {}
-        self._health = HealthRegistry()
+        # Shared with daemon + OpenAI compat. Default-construct only when not
+        # supplied (test convenience); production always passes the daemon's.
+        self._health = health if health is not None else HealthRegistry()
+        # One Supervisor per loaded backend. Backend death runs through
+        # supervisor.report_failure → restart-with-backoff → quarantine.
+        # Keyed by model name; populated when load_model succeeds.
+        self._supervisors: dict[str, Supervisor] = {}
 
         # Per-model request queues (concurrent agent serialization)
         strategy_str = os.environ.get("LAMU_QUEUE_STRATEGY", "fifo").lower()
@@ -103,6 +118,31 @@ class LamuMcpServer:
         self._queues: dict[str, RequestQueue] = {}
 
         self._register_tools()
+
+    # ── Failure / success funnels ──────────────────────────────────────────
+    # All backend success/failure observations route through these so we
+    # have a single place to (a) update health, (b) drive supervisor
+    # restart, (c) emit structured events. Direct `self._health.record_*`
+    # calls would bypass supervisor — keep them out of the hot path.
+
+    def _report_failure(self, model_name: str, exc: BaseException) -> None:
+        """Funnel for backend failures.
+
+        If a Supervisor exists for this model, the failure routes through it
+        (which advances health state and triggers restart-with-backoff once
+        the DEAD threshold is hit). Otherwise we fall back to a direct
+        health update — useful in tests and during the load handshake before
+        the supervisor is registered.
+        """
+        sup = self._supervisors.get(model_name)
+        if sup is not None:
+            sup.report_failure(exc)
+        else:
+            self._health.get_or_create(model_name).record_error(exc)
+
+    def _report_success(self, model_name: str) -> None:
+        """Funnel for backend successes — clears DEGRADED, never QUARANTINED."""
+        self._health.get_or_create(model_name).record_success()
 
     def _register_tools(self) -> None:
         @self._server.list_tools()
@@ -294,11 +334,26 @@ class LamuMcpServer:
         if caps_raw:
             capabilities = [Capability(c) for c in caps_raw]
 
-        # Route
-        decision = self._router.route(model=model, capabilities=capabilities)
+        # Route — health_map filters out DEAD/QUARANTINED so a dying backend
+        # never gets picked for a query. The router refuses with an explicit
+        # reason instead of silently downgrading.
+        decision = self._router.route(
+            model=model,
+            capabilities=capabilities,
+            health_map=self._health.all() or None,
+        )
 
         if not decision.model_name:
             return [TextContent(type="text", text=f"No model available: {decision.reason}")]
+
+        # Router refuses unhealthy backends explicitly via decision.reason —
+        # surface that to the caller as "no model available" rather than the
+        # generic "not loaded" message, so an agent loop can stop retrying.
+        if "unhealthy" in decision.reason:
+            return [TextContent(
+                type="text",
+                text=f"No model available: {decision.reason}",
+            )]
 
         if not decision.loaded:
             # TODO: trigger scheduler to load model
@@ -349,7 +404,7 @@ class LamuMcpServer:
                 data = json.loads(resp_data)
                 elapsed = time.monotonic() - t0
         except _BACKEND_HTTP_ERRORS as exc:
-            self._health.get_or_create(decision.model_name).record_error(exc)
+            self._report_failure(decision.model_name, exc)
             _log.warning(
                 "mcp_query_backend_error model=%s err=%s",
                 decision.model_name, exc,
@@ -359,8 +414,9 @@ class LamuMcpServer:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-        # Mark backend healthy on success.
-        self._health.get_or_create(decision.model_name).record_success()
+        # Mark backend healthy on success — routes through the funnel so any
+        # supervisor wired up for this backend sees the success too.
+        self._report_success(decision.model_name)
 
         msg = data["choices"][0]["message"]
         content = msg.get("content") or ""
@@ -395,7 +451,11 @@ class LamuMcpServer:
         if caps_raw:
             capabilities = [Capability(c) for c in caps_raw]
 
-        decision = self._router.route(model=model, capabilities=capabilities)
+        decision = self._router.route(
+            model=model,
+            capabilities=capabilities,
+            health_map=self._health.all() or None,
+        )
 
         import json
         result = {
@@ -419,9 +479,99 @@ class LamuMcpServer:
             )
         return [TextContent(type="text", text="\n".join(lines))]
 
+    def _spawn_backend(self, entry: ModelEntry, port: int) -> int:
+        """Spawn llama-server for ``entry`` on ``port``. Return the PID.
+
+        Pure spawn — no eviction, no scheduler accounting. The caller is
+        responsible for scheduler.mark_loading + confirm_loaded. Used by both
+        ``_handle_load_model`` (initial spawn) and ``Supervisor.restart_fn``
+        (post-failure restart).
+
+        Raises:
+            BackendUnavailable: llama-server binary missing, or backend
+                failed to come up healthy within 45s.
+        """
+        import subprocess
+        import time as _time
+        import urllib.request
+        import json
+
+        from lamu.core.config import LLAMA_BIN
+
+        if not LLAMA_BIN.exists():
+            raise BackendUnavailable(f"llama-server not found at {LLAMA_BIN}")
+
+        cmd = [
+            str(LLAMA_BIN), "-m", str(entry.path),
+            "--host", "0.0.0.0", "--port", str(port),
+            "--ctx-size", str(min(entry.context_max, 32768)),
+            "-ngl", "99", "--flash-attn", "on",
+            "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
+            "--parallel", "1",
+        ]
+
+        try:
+            help_out = subprocess.run(
+                [str(LLAMA_BIN), "--help"], capture_output=True, text=True, timeout=5,
+            )
+            has_ngram = "--spec-ngram-mod-n-match" in help_out.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            _log.debug("ngram_probe_failed err=%s", exc)
+            has_ngram = False
+
+        if has_ngram and entry.arch in ("qwen35", "qwen3"):
+            cmd.extend(["--spec-type", "ngram-mod",
+                       "--spec-ngram-mod-n-match", "24",
+                       "--spec-ngram-mod-n-min", "12",
+                       "--spec-ngram-mod-n-max", "48"])
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=open("/tmp/lamu-load.log", "w"))
+
+        for _ in range(45):
+            _time.sleep(1)
+            try:
+                req = urllib.request.Request(f"http://localhost:{port}/health")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    health_payload = json.loads(resp.read())
+            except _BACKEND_HTTP_ERRORS as exc:
+                _log.debug("spawn_health_probe_failed port=%d err=%s", port, exc)
+                continue
+            if health_payload.get("status") == "ok":
+                return proc.pid
+
+        # Timeout — kill the orphan and surface a typed error.
+        proc.kill()
+        raise BackendUnavailable(
+            f"backend '{entry.name}' did not come up healthy on :{port} "
+            "within 45s; check /tmp/lamu-load.log"
+        )
+
+    def _restart_backend(self, name: str) -> None:
+        """Supervisor restart hook. Re-spawns a dead backend with same args.
+
+        Looks up the (entry, port) the backend was originally loaded with,
+        re-runs ``_spawn_backend``, and updates the scheduler with the new
+        PID. Raises whatever ``_spawn_backend`` raises so the supervisor's
+        backoff sees the failure and either retries or quarantines.
+        """
+        loaded = self._scheduler.get_loaded(name)
+        if loaded is None:
+            raise BackendUnavailable(f"'{name}' is not registered in scheduler")
+        entry = loaded.entry
+        port = loaded.port
+        new_pid = self._spawn_backend(entry, port)
+
+        # Refresh actual VRAM from nvidia-smi if possible, else keep the prior
+        # estimate. Don't let a transient nvidia-smi miss reset us to 0.
+        pids = self._scheduler.query_gpu_pids()
+        vram = next((m for p, m in pids if p == new_pid), 0) or loaded.vram_actual_mb
+        self._scheduler.confirm_loaded(name, new_pid, port, vram)
+
     def _handle_load_model(self, args: dict) -> list[TextContent]:
         """Load a model onto GPU."""
-        import subprocess
+        import os
+        import signal
         import time as _time
 
         name = args["name"]
@@ -448,94 +598,54 @@ class LamuMcpServer:
         for evict_name in to_evict:
             loaded = self._scheduler.get_loaded(evict_name)
             if loaded and loaded.pid:
-                import signal
                 try:
-                    import os
                     os.kill(loaded.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
             self._scheduler.mark_unloaded(evict_name)
+            # Tear down the supervisor and quarantine bookkeeping for the
+            # evicted backend — its lifetime ends here.
+            self._supervisors.pop(evict_name, None)
 
         if to_evict:
             _time.sleep(3)  # wait for VRAM to free
 
         # Pick a port
         from lamu.core.config import PORT_MAIN, PORT_SIDECAR
-        port = PORT_SIDECAR  # default to sidecar port
+        port = PORT_SIDECAR
         if not self._scheduler.loaded_models():
-            port = PORT_MAIN  # if nothing loaded, use main port
-
-        # Start llama-server
-        from lamu.core.config import LLAMA_BIN
-        if not LLAMA_BIN.exists():
-            return [TextContent(type="text", text=f"llama-server not found at {LLAMA_BIN}")]
-
-        cmd = [
-            str(LLAMA_BIN), "-m", str(entry.path),
-            "--host", "0.0.0.0", "--port", str(port),
-            "--ctx-size", str(min(entry.context_max, 32768)),
-            "-ngl", "99", "--flash-attn", "on",
-            "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
-            "--parallel", "1",
-        ]
-
-        # Detect ngram-mod support (not available on DFlash PR branch).
-        try:
-            help_out = subprocess.run(
-                [str(LLAMA_BIN), "--help"], capture_output=True, text=True, timeout=5,
-            )
-            has_ngram = "--spec-ngram-mod-n-match" in help_out.stdout
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-            _log.debug("ngram_probe_failed err=%s", exc)
-            has_ngram = False
-
-        if has_ngram and entry.arch in ("qwen35", "qwen3"):
-            cmd.extend(["--spec-type", "ngram-mod",
-                       "--spec-ngram-mod-n-match", "24",
-                       "--spec-ngram-mod-n-min", "12",
-                       "--spec-ngram-mod-n-max", "48"])
+            port = PORT_MAIN
 
         self._scheduler.mark_loading(entry)
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=open("/tmp/lamu-load.log", "w"))
+        try:
+            pid = self._spawn_backend(entry, port)
+        except BackendUnavailable as exc:
+            self._scheduler.mark_unloaded(entry.name)
+            return [TextContent(type="text", text=f"Failed to load '{entry.name}': {exc}")]
 
-        # Wait for health
-        import urllib.request
-        import json
-        for _ in range(45):
-            _time.sleep(1)
-            try:
-                req = urllib.request.Request(f"http://localhost:{port}/health")
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    health_payload = json.loads(resp.read())
-            except _BACKEND_HTTP_ERRORS as exc:
-                _log.debug("load_health_probe_failed port=%d err=%s", port, exc)
-                continue
+        pids = self._scheduler.query_gpu_pids()
+        vram = next((m for p, m in pids if p == pid), 0) or entry.vram_mb
+        self._scheduler.confirm_loaded(entry.name, pid, port, vram)
 
-            if health_payload.get("status") != "ok":
-                continue
+        # Loading clears any prior quarantine (manual recovery path) and
+        # registers a fresh Supervisor whose restart hook re-spawns this
+        # exact backend with the same (entry, port).
+        h = self._health.get_or_create(entry.name)
+        if h.state.value == "quarantined":
+            # Reset by replacing the BackendHealth wholesale.
+            self._health._by_id[entry.name] = type(h)(backend_id=entry.name)
+            h = self._health.get_or_create(entry.name)
+        h.record_success()
+        self._supervisors[entry.name] = Supervisor(
+            health=h,
+            restart_fn=lambda name=entry.name: self._restart_backend(name),
+        )
 
-            from lamu.core.scheduler import _query_gpu_pids
-            pids = _query_gpu_pids()
-            vram = 0
-            for pid, mem in pids:
-                if pid == proc.pid:
-                    vram = mem
-                    break
-            if vram == 0:
-                vram = entry.vram_mb
-
-            self._scheduler.confirm_loaded(entry.name, proc.pid, port, vram)
-            evict_msg = f" (evicted: {to_evict})" if to_evict else ""
-            return [TextContent(
-                type="text",
-                text=f"Loaded '{entry.name}' on :{port} ({vram}MB VRAM){evict_msg}",
-            )]
-
-        # Timeout
-        proc.kill()
-        self._scheduler.mark_unloaded(entry.name)
-        return [TextContent(type="text", text=f"Failed to load '{entry.name}' (timeout after 45s). Check /tmp/lamu-load.log")]
+        evict_msg = f" (evicted: {to_evict})" if to_evict else ""
+        return [TextContent(
+            type="text",
+            text=f"Loaded '{entry.name}' on :{port} ({vram}MB VRAM){evict_msg}",
+        )]
 
     def _handle_unload_model(self, args: dict) -> list[TextContent]:
         """Unload a model from GPU."""
@@ -562,6 +672,8 @@ class LamuMcpServer:
                 pass
 
         self._scheduler.mark_unloaded(target)
+        # Stop watching this backend — its lifetime ends here.
+        self._supervisors.pop(target, None)
         return [TextContent(type="text", text=f"Unloaded '{target}'. VRAM freed.")]
 
     def _handle_vram_status(self) -> list[TextContent]:

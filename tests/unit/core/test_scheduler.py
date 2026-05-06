@@ -6,6 +6,7 @@ import time
 import pytest
 
 from lamu.core import scheduler as sched_mod
+from lamu.core.errors import GpuUnavailableError
 from lamu.core.scheduler import VramScheduler, _query_gpu_pids, _query_vram
 from lamu.core.types import ModelState
 
@@ -20,34 +21,62 @@ def test_init_queries_total(sched, mock_nvidia_smi):
     assert sched.total_mb == mock_nvidia_smi["vram_total_mb"]
 
 
-def test_query_vram_failure_returns_zero(mock_nvidia_smi):
+def test_query_vram_raises_on_smi_failure(mock_nvidia_smi):
+    """Module-level probe is pure: raises GpuUnavailableError on failure."""
     mock_nvidia_smi["should_fail"] = True
-    assert _query_vram() == (0, 0)
+    with pytest.raises(GpuUnavailableError):
+        _query_vram()
 
 
-def test_query_vram_timeout_returns_zero(mock_nvidia_smi):
+def test_query_vram_raises_on_timeout(mock_nvidia_smi):
     mock_nvidia_smi["should_timeout"] = True
-    assert _query_vram() == (0, 0)
+    with pytest.raises(GpuUnavailableError):
+        _query_vram()
 
 
 def test_require_gpu_raises_after_smi_failure(mock_nvidia_smi):
-    """Phase C: nvidia-smi failure flips the GPU-unavailable flag; subsequent
-    `require_gpu()` calls raise GpuUnavailableError instead of letting the
-    program silently keep operating with `total_mb=0`."""
-    from lamu.core.errors import GpuUnavailableError
-    from lamu.core.scheduler import require_gpu
+    """nvidia-smi failure marks the scheduler instance unavailable; subsequent
+    `require_gpu()` calls raise GpuUnavailableError. State is per-instance — no
+    module-level globals — so two schedulers can be in different states.
+    """
     mock_nvidia_smi["should_fail"] = True
-    _query_vram()  # marks GPU unavailable
+    s = VramScheduler(reserved_mb=1500)
+    # Construction calls _refresh_total which probes; a failed probe marks state.
+    assert not s.gpu_available
     with pytest.raises(GpuUnavailableError):
-        require_gpu()
+        s.require_gpu()
 
 
 def test_require_gpu_silent_when_healthy(mock_nvidia_smi):
-    """A successful nvidia-smi query clears the unavailable flag."""
-    from lamu.core.scheduler import require_gpu
+    """A successful nvidia-smi query keeps the unavailable flag clear."""
     mock_nvidia_smi["should_fail"] = False
-    _query_vram()  # success path
-    require_gpu()  # should NOT raise
+    s = VramScheduler(reserved_mb=1500)
+    assert s.gpu_available
+    s.require_gpu()  # should NOT raise
+
+
+def test_two_schedulers_have_independent_state(mock_nvidia_smi):
+    """Instance-level state: failures on one scheduler don't leak to another."""
+    mock_nvidia_smi["should_fail"] = True
+    failing = VramScheduler(reserved_mb=1500)
+    assert not failing.gpu_available
+
+    mock_nvidia_smi["should_fail"] = False
+    healthy = VramScheduler(reserved_mb=1500)
+    assert healthy.gpu_available
+    # The first scheduler's state stays as captured at its own probe time.
+    assert not failing.gpu_available
+
+
+def test_scheduler_query_vram_recovers(mock_nvidia_smi):
+    """After a failure, a successful re-probe clears the unavailable flag."""
+    mock_nvidia_smi["should_fail"] = True
+    s = VramScheduler(reserved_mb=1500)
+    assert not s.gpu_available
+
+    mock_nvidia_smi["should_fail"] = False
+    s.query_vram()
+    assert s.gpu_available
 
 
 def test_query_gpu_pids_parses(mock_nvidia_smi):
@@ -55,9 +84,18 @@ def test_query_gpu_pids_parses(mock_nvidia_smi):
     assert _query_gpu_pids() == [(123, 4000), (456, 8000)]
 
 
-def test_query_gpu_pids_failure_returns_empty(mock_nvidia_smi):
+def test_query_gpu_pids_raises_on_failure(mock_nvidia_smi):
     mock_nvidia_smi["should_fail"] = True
-    assert _query_gpu_pids() == []
+    with pytest.raises(GpuUnavailableError):
+        _query_gpu_pids()
+
+
+def test_scheduler_query_gpu_pids_returns_empty_on_failure(mock_nvidia_smi):
+    """The instance method swallows the error into state; never raises."""
+    mock_nvidia_smi["should_fail"] = True
+    s = VramScheduler(reserved_mb=1500)
+    assert s.query_gpu_pids() == []
+    assert not s.gpu_available
 
 
 def test_register_loaded_records_state(sched, make_model_entry):
