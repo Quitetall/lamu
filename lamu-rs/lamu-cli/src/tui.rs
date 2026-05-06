@@ -669,6 +669,51 @@ fn run_loop<B: ratatui::backend::Backend>(
                             state.recompute_views();
                             state.status_msg = "showing all sources".into();
                         }
+                        KeyCode::Char('e') => {
+                            // Open the cloud-models YAML in $EDITOR so the user
+                            // can add models / set api_key_env / flip quota
+                            // states. After exit, reload from disk.
+                            let path = cloud_models::config_path();
+                            let editor = std::env::var("EDITOR")
+                                .or_else(|_| std::env::var("VISUAL"))
+                                .unwrap_or_else(|_| "vi".into());
+                            let path_clone = path.clone();
+                            run_subprocess_in_tui(terminal, move || -> Result<()> {
+                                println!("\n→ Editing {}\n", path_clone.display());
+                                let _ = std::process::Command::new(&editor)
+                                    .arg(&path_clone)
+                                    .status();
+                                Ok(())
+                            })?;
+                            state.cloud_models = cloud_models::load();
+                            state.recompute_views();
+                            state.status_msg = format!("Reloaded {}", path.display());
+                        }
+                        KeyCode::Char('K') => {
+                            // Show the API-key status for the selected cloud
+                            // row. Bifrost actually uses the keys; lamu just
+                            // tells the user whether the env var is exported.
+                            if let Some(cm) = state.selected_cloud() {
+                                state.status_msg = match cm.api_key_env.as_deref() {
+                                    None => format!(
+                                        "{}: routes via Bifrost provider keys (no per-model env var).",
+                                        cm.full_id()
+                                    ),
+                                    Some(var) => {
+                                        if std::env::var(var).is_ok() {
+                                            format!("{}: ${} is SET ✓", cm.full_id(), var)
+                                        } else {
+                                            format!(
+                                                "{}: ${} is unset. `export {}=<key>` then [r].",
+                                                cm.full_id(), var, var
+                                            )
+                                        }
+                                    }
+                                };
+                            } else {
+                                state.status_msg = "key status — select a [CLOUD] row first.".into();
+                            }
+                        }
                         KeyCode::Char('o') => {
                             state.model_sort = state.model_sort.cycle();
                             state.recompute_views();
@@ -1131,7 +1176,8 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 let m = &state.cloud_models[*i];
                 let id = m.full_id();
                 let fav = state.favorites.has_model(&id);
-                let glyph = if fav { "★" } else { " " };
+                let key_ok = m.key_present();
+                let glyph = if !key_ok { "🔒" } else if fav { "★" } else { " " };
                 let line = format!(
                     "{} {:<7} {:<40}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
                     glyph,
@@ -1143,16 +1189,20 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                     "—",
                     m.notes,
                 );
-                // Color by quota state — distinct from local-deployed-green:
-                //   Available → blue
-                //   Low       → amber (term yellow)
-                //   Exhausted → red
-                // Favorited cloud rows add Bold without changing the
-                // color so users can still see the quota signal.
-                let base = match m.quota {
-                    QuotaState::Available => Color::Blue,
-                    QuotaState::Low => Color::Yellow,
-                    QuotaState::Exhausted => Color::Red,
+                // Color rule for cloud rows:
+                //   key missing               → red (can't auth at all)
+                //   quota Exhausted           → red (used up)
+                //   quota Low                 → yellow (running out)
+                //   quota Available + key ok  → blue
+                //   favorited                 → + bold
+                let base = if !key_ok {
+                    Color::Red
+                } else {
+                    match m.quota {
+                        QuotaState::Available => Color::Blue,
+                        QuotaState::Low => Color::Yellow,
+                        QuotaState::Exhausted => Color::Red,
+                    }
                 };
                 let mut style = Style::default().fg(base);
                 if fav {
@@ -1250,6 +1300,10 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
         Span::raw(" fav "),
         Span::styled("[L/C/A]", Style::default().fg(Color::Cyan)),
         Span::raw(" source "),
+        Span::styled("[K]", Style::default().fg(Color::Cyan)),
+        Span::raw(" key "),
+        Span::styled("[e]", Style::default().fg(Color::Cyan)),
+        Span::raw(" edit-cloud "),
         Span::styled("[/]", Style::default().fg(Color::Cyan)),
         Span::raw(" filter "),
         Span::styled("[o]", Style::default().fg(Color::Cyan)),
@@ -1258,10 +1312,6 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
         Span::raw(" harness "),
         Span::styled("[m]", Style::default().fg(Color::Cyan)),
         Span::raw(" mcp "),
-        Span::styled("[s]", Style::default().fg(Color::Cyan)),
-        Span::raw(" serve "),
-        Span::styled("[b]", Style::default().fg(Color::Cyan)),
-        Span::raw(" bifrost "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" quit"),
     ]))

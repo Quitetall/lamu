@@ -58,6 +58,12 @@ pub struct CloudModel {
     /// Quota status — colors the row.
     #[serde(default)]
     pub quota: QuotaState,
+    /// Name of the environment variable holding the API key for this
+    /// provider. lamu doesn't read the key — Bifrost does — but we
+    /// surface "key missing" in the TUI when the env var is unset so
+    /// the user knows why a request will 401.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 impl CloudModel {
@@ -65,6 +71,16 @@ impl CloudModel {
         self.model_id
             .clone()
             .unwrap_or_else(|| format!("{}/{}", self.provider, self.name))
+    }
+
+    /// True iff `api_key_env` is unset OR the named env var is present.
+    /// Models without an `api_key_env` are assumed routed through
+    /// Bifrost's own key store and report `true` here.
+    pub fn key_present(&self) -> bool {
+        match &self.api_key_env {
+            None => true,
+            Some(var) => std::env::var(var).is_ok(),
+        }
     }
 }
 
@@ -86,6 +102,7 @@ pub fn config_path() -> PathBuf {
 
 pub fn default_seed() -> Vec<CloudModel> {
     vec![
+        // Anthropic — kept. Bifrost route handles auth.
         CloudModel {
             name: "claude-opus-4-7".into(),
             provider: "anthropic".into(),
@@ -93,6 +110,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             context_max: 200_000,
             notes: "Anthropic Claude Opus 4.7 (best reasoning)".into(),
             quota: QuotaState::Available,
+            api_key_env: Some("ANTHROPIC_API_KEY".into()),
         },
         CloudModel {
             name: "claude-sonnet-4-6".into(),
@@ -101,6 +119,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             context_max: 200_000,
             notes: "Anthropic Claude Sonnet 4.6 (workhorse)".into(),
             quota: QuotaState::Available,
+            api_key_env: Some("ANTHROPIC_API_KEY".into()),
         },
         CloudModel {
             name: "claude-haiku-4-5".into(),
@@ -109,30 +128,46 @@ pub fn default_seed() -> Vec<CloudModel> {
             context_max: 200_000,
             notes: "Anthropic Claude Haiku 4.5 (fast)".into(),
             quota: QuotaState::Available,
+            api_key_env: Some("ANTHROPIC_API_KEY".into()),
+        },
+        // GLM 5.1 (Zhipu / Z.AI)
+        CloudModel {
+            name: "glm-5.1".into(),
+            provider: "zhipu".into(),
+            model_id: None,
+            context_max: 200_000,
+            notes: "Zhipu GLM 5.1 (open-weights flagship)".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("ZHIPU_API_KEY".into()),
+        },
+        // Kimi K2.6 (Moonshot)
+        CloudModel {
+            name: "kimi-k2.6".into(),
+            provider: "moonshot".into(),
+            model_id: None,
+            context_max: 256_000,
+            notes: "Moonshot Kimi K2.6 (long-context agentic)".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MOONSHOT_API_KEY".into()),
+        },
+        // Qwen3 large via Alibaba DashScope (>100B params).
+        CloudModel {
+            name: "qwen3-235b-a22b-thinking-2507".into(),
+            provider: "alibaba".into(),
+            model_id: None,
+            context_max: 262_144,
+            notes: "Alibaba Qwen3 235B-A22B Thinking (DashScope)".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("DASHSCOPE_API_KEY".into()),
         },
         CloudModel {
-            name: "gpt-4.1".into(),
-            provider: "openai".into(),
+            name: "qwen3-max".into(),
+            provider: "alibaba".into(),
             model_id: None,
             context_max: 1_000_000,
-            notes: "OpenAI GPT-4.1".into(),
+            notes: "Alibaba Qwen3-Max (DashScope, >1T params)".into(),
             quota: QuotaState::Available,
-        },
-        CloudModel {
-            name: "gpt-4.1-mini".into(),
-            provider: "openai".into(),
-            model_id: None,
-            context_max: 1_000_000,
-            notes: "OpenAI GPT-4.1 mini".into(),
-            quota: QuotaState::Available,
-        },
-        CloudModel {
-            name: "gpt-4.5-preview".into(),
-            provider: "openai".into(),
-            model_id: None,
-            context_max: 128_000,
-            notes: "OpenAI GPT-4.5 preview".into(),
-            quota: QuotaState::Available,
+            api_key_env: Some("DASHSCOPE_API_KEY".into()),
         },
     ]
 }
@@ -173,29 +208,30 @@ pub fn load() -> Vec<CloudModel> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn full_id_defaults_to_provider_slash_name() {
-        let m = CloudModel {
-            name: "claude-opus-4-7".into(),
-            provider: "anthropic".into(),
+    fn dummy(name: &str, provider: &str) -> CloudModel {
+        CloudModel {
+            name: name.into(),
+            provider: provider.into(),
             model_id: None,
             context_max: 200_000,
-            notes: "x".into(),
+            notes: String::new(),
             quota: QuotaState::Available,
-        };
-        assert_eq!(m.full_id(), "anthropic/claude-opus-4-7");
+            api_key_env: None,
+        }
+    }
+
+    #[test]
+    fn full_id_defaults_to_provider_slash_name() {
+        assert_eq!(
+            dummy("claude-opus-4-7", "anthropic").full_id(),
+            "anthropic/claude-opus-4-7"
+        );
     }
 
     #[test]
     fn full_id_honours_explicit_model_id() {
-        let m = CloudModel {
-            name: "name".into(),
-            provider: "p".into(),
-            model_id: Some("custom/path".into()),
-            context_max: 0,
-            notes: "".into(),
-            quota: QuotaState::Available,
-        };
+        let mut m = dummy("name", "p");
+        m.model_id = Some("custom/path".into());
         assert_eq!(m.full_id(), "custom/path");
     }
 
@@ -206,6 +242,35 @@ mod tests {
             assert!(!m.provider.is_empty());
             assert!(m.context_max >= 100_000);
         }
+    }
+
+    #[test]
+    fn seed_drops_old_gpt_entries() {
+        for m in default_seed() {
+            assert!(!m.name.starts_with("gpt-"), "stale entry survived: {}", m.name);
+        }
+    }
+
+    #[test]
+    fn seed_includes_glm_kimi_qwen_large() {
+        let names: Vec<String> = default_seed().into_iter().map(|m| m.name).collect();
+        assert!(names.iter().any(|n| n.contains("glm-5.1")));
+        assert!(names.iter().any(|n| n.contains("kimi-k2.6")));
+        assert!(names.iter().any(|n| n.contains("235b")));
+        assert!(names.iter().any(|n| n.contains("qwen3-max")));
+    }
+
+    #[test]
+    fn key_present_when_no_env_required() {
+        let m = dummy("x", "y");
+        assert!(m.key_present());
+    }
+
+    #[test]
+    fn key_absent_when_env_unset() {
+        let mut m = dummy("x", "y");
+        m.api_key_env = Some("LAMU_TEST_NEVER_SET_VAR_xyz123".into());
+        assert!(!m.key_present());
     }
 
     #[test]
