@@ -244,6 +244,10 @@ pub struct AppState {
     pub model_view: Vec<ModelRef>,
     pub config: LamuConfig,
     pub settings_state: ListState,
+    /// Live snapshot of nvidia-smi compute-apps. (pid, mem_mb, name).
+    /// Refreshed on every tick so the status pane can show what's
+    /// actually eating VRAM — including processes lamu didn't spawn.
+    pub gpu_procs: Vec<(u32, u32, String)>,
 }
 
 impl AppState {
@@ -301,9 +305,27 @@ impl AppState {
             model_view: Vec::new(),
             config,
             settings_state,
+            gpu_procs: Vec::new(),
         };
         s.recompute_views();
+        s.refresh_gpu_procs();
         Ok(s)
+    }
+
+    /// Snapshot the GPU process list. Looks up each PID's command name
+    /// from /proc/<pid>/comm so the user can identify the offender.
+    fn refresh_gpu_procs(&mut self) {
+        let scheduler = VramScheduler::new();
+        let pairs = scheduler.query_gpu_pids();
+        self.gpu_procs = pairs
+            .into_iter()
+            .map(|(pid, mb)| {
+                let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                (pid, mb, name)
+            })
+            .collect();
     }
 
     fn settings_items(&self) -> Vec<(String, SettingAction)> {
@@ -504,6 +526,7 @@ impl AppState {
         self.serve_up = probe_port(8020);
         self.bifrost_up = probe_port(8080);
         self.harness_installed = HARNESSES.iter().map(|h| which_exists(h.bin)).collect();
+        self.refresh_gpu_procs();
         self.last_refresh = Instant::now();
     }
 
@@ -1409,7 +1432,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, state: &AppState) {
             Constraint::Length(3),  // header
             Constraint::Min(8),     // models
             Constraint::Length(3),  // vram
-            Constraint::Length(4),  // status / health
+            Constraint::Length(6),  // status / health (loaded + GPU procs)
             Constraint::Length(5),  // help footer (3 rows of keys)
         ])
         .split(f.area());
@@ -1600,6 +1623,30 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         if loaded_count == 0 { "  (no model in scheduler)" } else { "" }
     )));
 
+    // GPU process snapshot: shows what's eating VRAM, even if lamu's
+    // scheduler didn't spawn it. Untracked → orange so user can spot
+    // orphans (`just swap`-style externally-launched llama-server, etc.).
+    if state.gpu_procs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "GPU procs: (none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (pid, mb, name) in &state.gpu_procs {
+            // Tracked = scheduler.loaded has any model with matching pid (we
+            // don't have that mapping here, so approximate: if loaded_models
+            // is empty, EVERY proc is untracked).
+            let untracked = state.vram.loaded_models.is_empty();
+            let line = format!("GPU proc: pid={pid:<7} {name:<24} {mb:>6} MB");
+            let style = if untracked {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(line, style)));
+        }
+    }
+
     if !state.status_msg.is_empty() {
         lines.push(Line::from(Span::styled(
             state.status_msg.clone(),
@@ -1607,7 +1654,9 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         )));
     }
 
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Status"));
+    let p = Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).title("Status — what's on the GPU"),
+    );
     f.render_widget(p, area);
 }
 
