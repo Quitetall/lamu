@@ -42,6 +42,24 @@ impl VramScheduler {
         self.total_mb.saturating_sub(used).saturating_sub(self.reserved_mb)
     }
 
+    /// True when NVML is reachable and reports a non-zero total. Mirrors
+    /// the Python `gpu_available` property.
+    pub fn gpu_available(&self) -> bool {
+        self.nvml.is_some() && self.total_mb > 0
+    }
+
+    /// Human-readable reason when the GPU is in unavailable state. None
+    /// means healthy. Mirrors Python `gpu_unavailable_reason`.
+    pub fn gpu_unavailable_reason(&self) -> Option<&str> {
+        if self.gpu_available() {
+            None
+        } else if self.nvml.is_none() {
+            Some("nvml unavailable (driver missing or no CUDA device)")
+        } else {
+            Some("nvml reports total_mb=0 (no device 0?)")
+        }
+    }
+
     /// Query current VRAM usage from NVML. Returns (used_mb, total_mb).
     pub fn query_vram(&self) -> (u32, u32) {
         let Some(nvml) = &self.nvml else {

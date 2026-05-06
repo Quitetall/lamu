@@ -195,7 +195,22 @@ async fn chat_completions(
     if let Some(k) = req.top_k { payload["top_k"] = json!(k); }
     if let Some(p) = req.top_p { payload["top_p"] = json!(p); }
 
-    let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
+    // Routing: by default, forward straight to the loaded backend on its
+    // local port. If LAMU_GATEWAY_URL is set (e.g. a Bifrost endpoint),
+    // forward through that instead — Bifrost then dispatches to the
+    // backend keyed by `model`. Bifrost expects `provider/model` ids
+    // (e.g. `qwen/qwen3.6-27b-uncensored`); we override the payload's
+    // `model` field with whatever the user sent so client-side mappings
+    // pass through unchanged.
+    let backend_url = if let Ok(gw) = std::env::var("LAMU_GATEWAY_URL") {
+        let trimmed = gw.trim_end_matches('/');
+        if let Some(model) = req.model.as_deref() {
+            payload["model"] = json!(model);
+        }
+        format!("{}/chat/completions", trimmed)
+    } else {
+        format!("http://localhost:{}/v1/chat/completions", port)
+    };
 
     if req.stream {
         return stream_response(state.client.clone(), backend_url, payload,

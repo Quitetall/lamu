@@ -1,6 +1,7 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
 mod repl;
+mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -14,8 +15,9 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(name = "lamu", version, about = "LAMU — MCP-first model management")]
 struct Cli {
+    /// Subcommand. Bare `lamu` (no subcommand) drops into the TUI dashboard.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -48,16 +50,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan => cmd_scan().await,
-        Command::Status => cmd_status().await,
-        Command::Start => cmd_start().await,
-        Command::Serve { port } => cmd_serve(port).await,
-        Command::Repl { api_url } => {
-            // REPL is a blocking I/O loop — run it on a dedicated thread so
-            // tokio's runtime keeps moving for any background tasks the
-            // reqwest::blocking client might trigger internally.
-            tokio::task::spawn_blocking(move || repl::run_repl(api_url))
-                .await??;
+        None => {
+            // Bare `lamu` → ratatui dashboard. Run on a blocking thread so
+            // tokio's runtime stays free for any IO the TUI's status pings
+            // might kick off in the background.
+            tokio::task::spawn_blocking(tui::run).await??;
+            Ok(())
+        }
+        Some(Command::Scan) => cmd_scan().await,
+        Some(Command::Status) => cmd_status().await,
+        Some(Command::Start) => cmd_start().await,
+        Some(Command::Serve { port }) => cmd_serve(port).await,
+        Some(Command::Repl { api_url }) => {
+            tokio::task::spawn_blocking(move || repl::run_repl(api_url)).await??;
             Ok(())
         }
     }

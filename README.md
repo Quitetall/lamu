@@ -33,12 +33,15 @@ cd ~/local-llm
 just setup-qwen36     # ~16 GB download — Qwen3.6-27B-uncensored Q4_K_M
 just install          # cargo install --path lamu-rs/lamu-cli --locked
 
+lamu                  # ratatui dashboard (default — registry, VRAM, status)
 lamu scan             # discover GGUFs in ~/models/ → config/models.yaml
 lamu start            # MCP daemon on stdio (point Claude Code at this)
 lamu serve            # OpenAI HTTP on :8020
 lamu repl             # interactive chat against `lamu serve`
 lamu status           # what's running, VRAM, registry size
 ```
+
+Bare `lamu` opens a dashboard — model list (j/k navigate), live VRAM gauge, queue depths, MCP/HTTP/Bifrost status indicators. First-run-aware: an empty registry triggers a `[Y/n]` to download Qwen3.6-27B; if `LAMU_GATEWAY_URL` is set but Bifrost is down, prompts to `just serve-bifrost`.
 
 That's the whole onboarding. `lamu` is your interface; everything else is plumbing.
 
@@ -115,7 +118,11 @@ Reload Claude Code, then `/mcp` should show `local-llm` connected. Tools exposed
 
 ## OpenAI HTTP
 
-`lamu serve` boots the FastAPI/axum compat layer. Drop-in for any OpenAI client:
+`lamu serve` boots the FastAPI/axum compat layer. Drop-in for any OpenAI client.
+
+**Bifrost passthrough (optional):** Set `LAMU_GATEWAY_URL=http://localhost:8080/v1` and `lamu serve` forwards every chat completion through Bifrost (`just serve-bifrost`) instead of hitting the backend directly. Bifrost dispatches by `provider/model` id (e.g. `qwen/qwen3.6-27b-uncensored` → `:8020`, `dflash/luce-dflash` → `:8000`, `anthropic/claude-opus-4-7` → cloud). 1.67% latency cost, gain a unified cloud + local OpenAI surface plus Bifrost's logging/key-rotation. Default off; opt in when you want it.
+
+Drop-in for any OpenAI client:
 
 ```bash
 curl http://localhost:8020/v1/chat/completions \

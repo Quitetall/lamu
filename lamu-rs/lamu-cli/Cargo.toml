@@ -25,3 +25,5 @@ reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 serde_json.workspace = true
 futures-util = "0.3"
 rustyline = "14"
+ratatui = "0.28"
+crossterm = "0.28"
