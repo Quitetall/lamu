@@ -363,7 +363,14 @@ fn stream_chat(
 }
 
 pub fn run_repl(api_url: String) -> Result<()> {
+    run_repl_with_model(api_url, None)
+}
+
+pub fn run_repl_with_model(api_url: String, model: Option<String>) -> Result<()> {
     let mut state = ReplState::new(api_url);
+    if let Some(m) = model {
+        state.model = m;
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
         .build()?;

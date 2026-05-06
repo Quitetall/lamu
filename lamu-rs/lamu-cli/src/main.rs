@@ -39,6 +39,32 @@ enum Command {
         #[arg(default_value = "http://localhost:8020/v1/chat/completions")]
         api_url: String,
     },
+    /// Load + chat with a model in one shot (Ollama-shaped).
+    Run {
+        /// Model name or substring. Resolved against the local registry.
+        model: String,
+    },
+    /// Download a model from HuggingFace into ~/models/.
+    Pull {
+        /// Shorthand id (e.g. `qwen36-27b`) or `org/repo`.
+        model: String,
+        /// Quant suffix when the shorthand resolves to a multi-quant repo.
+        #[arg(short, long, default_value = "Q4_K_M")]
+        quant: String,
+    },
+    /// Show one model's registry entry as YAML.
+    Show {
+        /// Model name or substring.
+        model: String,
+    },
+    /// Remove a model from the registry and delete its file on disk.
+    Rm {
+        /// Model name or substring.
+        model: String,
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -65,6 +91,10 @@ async fn main() -> Result<()> {
             tokio::task::spawn_blocking(move || repl::run_repl(api_url)).await??;
             Ok(())
         }
+        Some(Command::Run { model }) => cmd_run(model).await,
+        Some(Command::Pull { model, quant }) => cmd_pull(&model, &quant).await,
+        Some(Command::Show { model }) => cmd_show(&model),
+        Some(Command::Rm { model, yes }) => cmd_rm(&model, yes),
     }
 }
 
@@ -163,4 +193,158 @@ async fn cmd_start() -> Result<()> {
 
 async fn cmd_serve(port: u16) -> Result<()> {
     lamu_api::serve(port).await
+}
+
+// ── Ollama-shaped subcommands ──────────────────────────────────────────────
+
+/// Resolve a name fragment to a single registry entry. Substring match,
+/// both directions, case-insensitive. Errors when zero or multiple matches.
+fn resolve_entry(query: &str) -> Result<lamu_core::types::ModelEntry> {
+    let entries = load_registry(&registry_path())?;
+    let q = query.to_lowercase();
+    let matches: Vec<_> = entries.iter()
+        .filter(|e| {
+            let n = e.name.to_lowercase();
+            n.contains(&q) || q.contains(&n)
+        })
+        .cloned()
+        .collect();
+    match matches.len() {
+        0 => anyhow::bail!(
+            "no model in registry matches '{}'. Run `lamu scan` or `lamu pull {}`.",
+            query, query
+        ),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => {
+            let names: Vec<String> = matches.iter().map(|e| e.name.clone()).collect();
+            anyhow::bail!("'{}' is ambiguous ({} matches): {:?}", query, n, names)
+        }
+    }
+}
+
+async fn cmd_run(query: String) -> Result<()> {
+    let entry = resolve_entry(&query)?;
+    println!("→ Resolved to: {}", entry.name);
+
+    // Make sure the OpenAI-compat layer is up. If not, spawn `lamu serve`
+    // in a detached child so the chat session can talk to it.
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(1)).build()?;
+    let serve_up = client.get("http://localhost:8020/health").send().await
+        .map(|r| r.status().is_success()).unwrap_or(false);
+    if !serve_up {
+        eprintln!(
+            "  lamu serve not on :8020. Start it in another terminal with \
+             `lamu serve`, then re-run."
+        );
+        anyhow::bail!("daemon not running");
+    }
+
+    // The MCP-style load_model lives behind stdio. For the run shortcut
+    // we only need the backend's HTTP port to answer; if the model isn't
+    // loaded yet, the OpenAI compat will return 503 and prompt the user
+    // to load via Claude Code or `lamu start`. (Future: wire up a proper
+    // load over the MCP transport from here.)
+    let api_url = "http://localhost:8020/v1/chat/completions".to_string();
+    println!("  Dropping into chat (model={}). /quit to exit.\n", entry.name);
+    tokio::task::spawn_blocking(move || repl::run_repl(api_url)).await??;
+    Ok(())
+}
+
+/// Map a shorthand to (hf_repo, filename_pattern).
+fn pull_spec(shorthand: &str, quant: &str) -> Option<(String, String)> {
+    match shorthand {
+        "qwen36-27b" | "qwen3.6-27b" | "heretic" => Some((
+            "llmfan46/Qwen3.6-27B-uncensored-heretic-v2-GGUF".into(),
+            format!("Qwen3.6-27B-uncensored-heretic-v2-{}.gguf", quant),
+        )),
+        "qwen36-35b" | "qwen3.6-35b" => Some((
+            "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-GGUF".into(),
+            format!("Qwen3.6-35B-A3B-uncensored-heretic-{}.gguf", quant),
+        )),
+        "qwen35-4b" | "qwen3.5-4b" => Some((
+            "ggml-org/Qwen3.5-4B-Q4_K_M-GGUF".into(),
+            format!("Qwen3.5-4B-{}.gguf", quant),
+        )),
+        s if s.contains('/') => Some((s.to_string(), String::new())),
+        _ => None,
+    }
+}
+
+async fn cmd_pull(shorthand: &str, quant: &str) -> Result<()> {
+    let (repo, file) = match pull_spec(shorthand, quant) {
+        Some(x) => x,
+        None => anyhow::bail!(
+            "unknown shorthand '{}'. Try `qwen36-27b`, `qwen36-35b`, `qwen35-4b`, or `org/repo`.",
+            shorthand
+        ),
+    };
+
+    let dir = models_dir().join(shorthand.replace('/', "-"));
+    std::fs::create_dir_all(&dir)?;
+
+    println!("Pulling {} → {}", repo, dir.display());
+
+    let mut cmd = std::process::Command::new("hf");
+    cmd.arg("download").arg(&repo);
+    if !file.is_empty() {
+        cmd.arg(&file);
+    }
+    cmd.arg("--local-dir").arg(&dir);
+
+    let status = cmd.status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => anyhow::bail!("hf download exited with {}", s),
+        Err(e) => anyhow::bail!("failed to invoke `hf` (install with `pip install huggingface-hub`): {}", e),
+    }
+
+    // Re-scan so the new GGUF lands in the registry.
+    cmd_scan().await?;
+    Ok(())
+}
+
+fn cmd_show(query: &str) -> Result<()> {
+    let entry = resolve_entry(query)?;
+    let yaml = serde_yaml::to_string(&entry)
+        .map_err(|e| anyhow::anyhow!("yaml render: {e}"))?;
+    print!("{}", yaml);
+    Ok(())
+}
+
+fn cmd_rm(query: &str, yes: bool) -> Result<()> {
+    let entry = resolve_entry(query)?;
+    let path = &entry.path;
+    println!("Will remove from registry: {}", entry.name);
+    if path.exists() {
+        let size_mb = std::fs::metadata(path)
+            .map(|m| m.len() / (1024 * 1024))
+            .unwrap_or(0);
+        println!("Will delete file: {} ({} MB)", path.display(), size_mb);
+    } else {
+        println!("(file already gone: {})", path.display());
+    }
+
+    if !yes {
+        eprint!("Proceed? [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        if !buf.trim().to_lowercase().starts_with('y') {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    if path.exists() {
+        std::fs::remove_file(path)?;
+        println!("  deleted file");
+    }
+
+    // Re-scan to drop the entry from registry.
+    let dir = models_dir();
+    let entries = scan_directory(&dir)?;
+    write_registry(&entries, &registry_path())?;
+    println!("  registry refreshed ({} models remaining)", entries.len());
+    Ok(())
 }

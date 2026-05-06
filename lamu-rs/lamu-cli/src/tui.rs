@@ -184,9 +184,29 @@ fn run_loop<B: ratatui::backend::Backend>(
                         }
                     }
                     KeyCode::Char('c') | KeyCode::Enter => {
-                        // Drop into chat — close TUI, run `lamu repl` in this terminal.
-                        if let Some(_e) = state.selected_entry() {
-                            state.status_msg = "Press ENTER again to confirm: launching `lamu repl`...".into();
+                        // Drop into chat — tear down TUI, run repl bound to
+                        // the selected model, then restore the dashboard
+                        // when /quit returns. Stage left/right via stdout
+                        // directly so the generic backend doesn't need an
+                        // io::Write bound.
+                        if let Some(model_name) = state.selected_entry().map(|e| e.name.clone()) {
+                            disable_raw_mode().ok();
+                            let mut out = io::stdout();
+                            execute!(out, LeaveAlternateScreen, DisableMouseCapture).ok();
+                            terminal.show_cursor().ok();
+
+                            println!("\n→ Chat with {} (/quit returns to dashboard)\n", model_name);
+                            let api_url = "http://localhost:8020/v1/chat/completions".to_string();
+                            if let Err(e) = crate::repl::run_repl_with_model(api_url, Some(model_name)) {
+                                eprintln!("repl error: {e}");
+                            }
+
+                            // Restore dashboard
+                            enable_raw_mode()?;
+                            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+                            terminal.clear()?;
+                            state.refresh();
+                            state.status_msg = "Returned from chat.".into();
                         }
                     }
                     KeyCode::Char('l') => {

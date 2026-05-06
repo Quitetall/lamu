@@ -30,18 +30,29 @@ LAMU ships a single canonical binary, `lamu` (Rust). Install once and use it fro
 git clone https://github.com/Quitetall/lamu ~/local-llm
 cd ~/local-llm
 
-just setup-qwen36     # ~16 GB download — Qwen3.6-27B-uncensored Q4_K_M
 just install          # cargo install --path lamu-rs/lamu-cli --locked
-
-lamu                  # ratatui dashboard (default — registry, VRAM, status)
-lamu scan             # discover GGUFs in ~/models/ → config/models.yaml
-lamu start            # MCP daemon on stdio (point Claude Code at this)
-lamu serve            # OpenAI HTTP on :8020
-lamu repl             # interactive chat against `lamu serve`
-lamu status           # what's running, VRAM, registry size
+lamu pull qwen36-27b  # ~16 GB GGUF from HuggingFace → ~/models/
+lamu scan             # discover GGUFs → config/models.yaml
+lamu serve &          # OpenAI HTTP on :8020 (background)
+lamu run heretic      # one-shot: resolve, drop into chat
 ```
 
-Bare `lamu` opens a dashboard — model list (j/k navigate), live VRAM gauge, queue depths, MCP/HTTP/Bifrost status indicators. First-run-aware: an empty registry triggers a `[Y/n]` to download Qwen3.6-27B; if `LAMU_GATEWAY_URL` is set but Bifrost is down, prompts to `just serve-bifrost`.
+Or just type `lamu` — opens a ratatui dashboard with model list (j/k navigate, Enter chats), live VRAM gauge, MCP/HTTP/Bifrost status. First-run-aware: empty registry triggers a `[Y/n]` to download Qwen3.6-27B; if `LAMU_GATEWAY_URL` set + Bifrost down, prompts to `just serve-bifrost`.
+
+Full Ollama-shaped surface:
+
+| Command | Effect |
+|---------|--------|
+| `lamu` | TUI dashboard |
+| `lamu run <model>` | Drop into chat with a model (substring match) |
+| `lamu pull <id> [--quant Q4_K_M]` | Download a GGUF from HuggingFace; auto re-scan |
+| `lamu show <model>` | Print full registry entry as YAML |
+| `lamu rm <model>` | Remove from registry + delete file on disk |
+| `lamu list` / `lamu scan` | Re-discover models |
+| `lamu status` | VRAM + which port answers |
+| `lamu start` | MCP daemon on stdio (Claude Code) |
+| `lamu serve [port]` | OpenAI HTTP (default :8020) |
+| `lamu repl [url]` | Chat REPL against a running serve |
 
 That's the whole onboarding. `lamu` is your interface; everything else is plumbing.
 
