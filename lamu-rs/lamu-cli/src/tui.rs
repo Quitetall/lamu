@@ -755,19 +755,45 @@ fn run_loop<B: ratatui::backend::Backend>(
                             state.status_msg = "filter: type to refine, Enter to apply, Esc to cancel".into();
                         }
                         KeyCode::Enter => {
-                            // Branch on local vs cloud. Local hits the
-                            // OpenAI compat at :8020 with the model name.
-                            // Cloud routes via Bifrost (LAMU_GATEWAY_URL or
-                            // localhost:8080) with `provider/model` id.
+                            // Branch on local vs cloud. Local goes to the
+                            // user's default harness (if set + installed)
+                            // or falls back to the built-in lamu repl on
+                            // OpenAI compat :8020. Cloud always goes via
+                            // the gateway URL.
                             if let Some(local_name) = state.selected_entry().map(|e| e.name.clone()) {
-                                run_subprocess_in_tui(terminal, || -> Result<()> {
-                                    println!("\n→ Chat with {} (/quit returns to dashboard)\n", local_name);
-                                    let api_url = "http://localhost:8020/v1/chat/completions".to_string();
-                                    crate::repl::run_repl_with_model(api_url, Some(local_name.clone()))
-                                })?;
-                                state.last_harness = Some("lamu repl");
-                                state.refresh();
-                                state.status_msg = "Returned from chat.".into();
+                                // Resolve default harness: lookup by name in
+                                // HARNESSES, ensure binary is on $PATH.
+                                let default = state
+                                    .favorites
+                                    .default_harness()
+                                    .and_then(|n| HARNESSES.iter().find(|h| h.name == n))
+                                    .filter(|h| which_exists(h.bin));
+                                if let Some(h) = default {
+                                    let argv: Vec<String> = h.launch_argv.iter().map(|s| s.to_string()).collect();
+                                    let label = h.name;
+                                    let model_for_env = local_name.clone();
+                                    run_subprocess_in_tui(terminal, move || -> Result<()> {
+                                        println!("\n→ Launching {label} (default harness, model={})\n", model_for_env);
+                                        // Pass the selected model name in env so harnesses
+                                        // that read it (claude/codex via env override) pick it up.
+                                        let mut cmd = std::process::Command::new(&argv[0]);
+                                        cmd.args(&argv[1..]).env("LAMU_MODEL", &model_for_env);
+                                        let _ = cmd.status();
+                                        Ok(())
+                                    })?;
+                                    state.last_harness = Some(label);
+                                    state.refresh();
+                                    state.status_msg = format!("Returned from {} (default harness).", label);
+                                } else {
+                                    run_subprocess_in_tui(terminal, || -> Result<()> {
+                                        println!("\n→ Chat with {} (/quit returns to dashboard)\n", local_name);
+                                        let api_url = "http://localhost:8020/v1/chat/completions".to_string();
+                                        crate::repl::run_repl_with_model(api_url, Some(local_name.clone()))
+                                    })?;
+                                    state.last_harness = Some("lamu repl");
+                                    state.refresh();
+                                    state.status_msg = "Returned from chat.".into();
+                                }
                             } else if let Some(cloud) = state.selected_cloud().cloned() {
                                 let gateway = std::env::var("LAMU_GATEWAY_URL")
                                     .unwrap_or_else(|_| "http://localhost:8080/v1".into());
@@ -795,7 +821,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                     },
                     Mode::McpServers => match key.code {
                         KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Esc | KeyCode::Char('d') => {
+                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('d') => {
                             state.mode = Mode::Dashboard;
                             state.status_msg.clear();
                         }
@@ -843,13 +869,35 @@ fn run_loop<B: ratatui::backend::Backend>(
                     },
                     Mode::Launchers => match key.code {
                         KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Esc | KeyCode::Char('d') => {
+                        // Back-to-dashboard: any of Esc, Backspace, lower 'd'.
+                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('d') => {
                             state.mode = Mode::Dashboard;
                             state.status_msg.clear();
                         }
                         KeyCode::Char('j') | KeyCode::Down => state.move_launcher(1),
                         KeyCode::Char('k') | KeyCode::Up => state.move_launcher(-1),
                         KeyCode::Char('r') => state.refresh(),
+                        // Set the selected harness as the default one
+                        // launched on Dashboard Enter. Toggle off if it's
+                        // already the default.
+                        KeyCode::Char('D') => {
+                            if let Some(h) = state.selected_harness() {
+                                let name = h.name.to_string();
+                                if state.favorites.default_harness() == Some(&name) {
+                                    state.favorites.set_default_harness(None);
+                                    state.status_msg = format!(
+                                        "default harness cleared (was {})",
+                                        name
+                                    );
+                                } else {
+                                    state.favorites.set_default_harness(Some(name.clone()));
+                                    state.status_msg = format!(
+                                        "default harness = {} — Dashboard Enter now launches it.",
+                                        name
+                                    );
+                                }
+                            }
+                        }
                         KeyCode::Char('*') | KeyCode::Char('f') => {
                             if let Some(h) = state.selected_harness() {
                                 let name = h.name.to_string();
@@ -1401,10 +1449,17 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
             let h = &HARNESSES[i];
             let installed = *state.harness_installed.get(i).unwrap_or(&false);
             let status_label = if installed { "✓ on PATH" } else { "✗ missing" };
-            let star = if state.favorites.has_harness(h.name) { "★" } else { " " };
+            let is_default = state.favorites.default_harness() == Some(h.name);
+            let glyph = if is_default {
+                "▶"
+            } else if state.favorites.has_harness(h.name) {
+                "★"
+            } else {
+                " "
+            };
             let line = format!(
                 "{} {:<18}  {:<10}  {:<8}  {}",
-                star,
+                glyph,
                 h.name,
                 h.bin,
                 status_label,
@@ -1417,6 +1472,9 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
             };
             if state.favorites.has_harness(h.name) {
                 style = style.add_modifier(Modifier::BOLD);
+            }
+            if is_default {
+                style = style.add_modifier(Modifier::UNDERLINED);
             }
             ListItem::new(line).style(style)
         })
@@ -1476,12 +1534,12 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
 
     // Footer keybinds
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" "),
         Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
         Span::raw(" launch "),
         Span::styled("[i]", Style::default().fg(Color::Cyan)),
         Span::raw(" install "),
+        Span::styled("[D]", Style::default().fg(Color::Cyan)),
+        Span::raw(" default "),
         Span::styled("[*]", Style::default().fg(Color::Yellow)),
         Span::raw(" fav "),
         Span::styled("[/]", Style::default().fg(Color::Cyan)),
@@ -1490,7 +1548,7 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
         Span::raw(" sort "),
         Span::styled("[r]", Style::default().fg(Color::Cyan)),
         Span::raw(" refresh "),
-        Span::styled("[d/Esc]", Style::default().fg(Color::Cyan)),
+        Span::styled("[d/Esc/Backspace]", Style::default().fg(Color::Cyan)),
         Span::raw(" back "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" quit"),

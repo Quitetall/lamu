@@ -5,6 +5,7 @@ mod favorites;
 mod mcp_servers;
 mod md_stream;
 mod repl;
+mod theme;
 mod tui;
 
 use anyhow::Result;

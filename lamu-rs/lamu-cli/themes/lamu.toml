@@ -1,0 +1,70 @@
+name = "lamu"
+description = "Default lamu theme — cyan accents on dark, calm and neutral"
+
+[colors]
+banner_border = "#00BCD4"
+banner_title = "#4DD0E1"
+banner_accent = "#00BCD4"
+banner_dim = "#006064"
+banner_text = "#CCCCCC"
+ui_accent = "#4DD0E1"
+ui_label = "#999999"
+ui_ok = "#4CAF50"
+ui_error = "#F44336"
+ui_warn = "#FFA000"
+prompt = "#CCCCCC"
+input_rule = "#00838F"
+response_border = "#00ACC1"
+status_bar_bg = "#003844"
+status_bar_text = "#CCCCCC"
+status_bar_strong = "#4DD0E1"
+status_bar_dim = "#005662"
+status_bar_good = "#4CAF50"
+status_bar_warn = "#FFA000"
+status_bar_bad = "#F44336"
+status_bar_critical = "#FF1744"
+voice_status_bg = "#003844"
+completion_menu_bg = "#002A33"
+completion_menu_current_bg = "#00BCD4"
+completion_menu_meta_bg = "#003844"
+completion_menu_meta_current_bg = "#00838F"
+session_label = "#4DD0E1"
+session_border = "#006064"
+
+[spinner]
+waiting_faces = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+thinking_faces = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+thinking_verbs = ["thinking", "reasoning", "considering", "computing"]
+
+[branding]
+agent_name = "lamu"
+welcome = "lamu chat — type a message or /help for commands."
+goodbye = "session ended."
+response_label = " lamu "
+prompt_symbol = "❯ "
+help_header = "lamu commands"
+
+tool_prefix = "│"
+
+[tool_emojis]
+terminal = "$"
+web_search = "🔍"
+read_file = "📄"
+write_file = "✎"
+search_files = "🔎"
+execute_code = "⚡"
+browser_navigate = "🌐"
+delegate_task = "▶"
+mixture_of_agents = "⚗"
+memory = "◐"
+clarify = "?"
+cronjob = "↻"
+process = "⚙"
+todo = "☐"
+
+banner_logo = """
+  ┓
+  ┃ ┏━┓ ┏┳┓ ┏━┓
+  ┃ ┃━┫ ┃┃┃ ┃ ┃
+  ┻ ┛ ┛ ┛ ┛ ┛━┛
+"""

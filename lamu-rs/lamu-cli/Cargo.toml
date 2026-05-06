@@ -31,3 +31,4 @@ serde_yaml = "0.9"
 serde = { version = "1", features = ["derive"] }
 dirs = "5"
 termimad = "0.31"
+toml = "0.8"

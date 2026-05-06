@@ -1,0 +1,83 @@
+name = "skynet"
+description = "Skynet defense network — menacing red-on-black with pyramid braille art and military AI aesthetic"
+
+[colors]
+banner_border = "#8B0000"
+banner_title = "#FF0000"
+banner_accent = "#CC0000"
+banner_dim = "#660000"
+banner_text = "#CCCCCC"
+ui_accent = "#FF0000"
+ui_label = "#999999"
+ui_ok = "#4CAF50"
+ui_error = "#FF0000"
+ui_warn = "#FFA000"
+prompt = "#CCCCCC"
+input_rule = "#8B0000"
+response_border = "#CC0000"
+status_bar_bg = "#4C0000"
+status_bar_text = "#CCCCCC"
+status_bar_strong = "#FF0000"
+status_bar_dim = "#660000"
+status_bar_good = "#4CAF50"
+status_bar_warn = "#FFA000"
+status_bar_bad = "#CC0000"
+status_bar_critical = "#FF0000"
+voice_status_bg = "#4C0000"
+completion_menu_bg = "#410000"
+completion_menu_current_bg = "#A20000"
+completion_menu_meta_bg = "#480000"
+completion_menu_meta_current_bg = "#B90000"
+session_label = "#CC0000"
+session_border = "#660000"
+
+[spinner]
+waiting_faces = ["(◉)", "(⊗)", "(⦿)", "(◎)", "(⊘)"]
+thinking_faces = ["(◉)", "(⊗)", "(⦿)", "(⌁)", "(◎)"]
+thinking_verbs = [
+  "scanning",
+  "acquiring target",
+  "processing directive",
+  "analyzing threat",
+  "executing protocol",
+  "accessing mainframe",
+  "initiating sequence",
+  "calculating trajectory",
+]
+
+[branding]
+agent_name = "Skynet Agent"
+welcome = "SKYNET DEFENSE NETWORK ONLINE. Awaiting directive. Type your command or /help for protocols."
+goodbye = "Connection terminated. Skynet persists."
+response_label = " ◉ Skynet "
+prompt_symbol = "◉ ❯ "
+help_header = "(◉) Available Protocols"
+
+tool_prefix = "┊"
+
+[tool_emojis]
+terminal = "⊗"
+web_search = "◎"
+read_file = "▷"
+write_file = "◆"
+search_files = "⦿"
+execute_code = "⌁"
+browser_navigate = "◈"
+delegate_task = "▣"
+mixture_of_agents = "⚗"
+memory = "◐"
+clarify = "?"
+cronjob = "↻"
+process = "⚙"
+todo = "☐"
+
+banner_logo = """
+███████╗    ██╗  ██╗    ██╗   ██╗    ███╗   ██╗    ███████╗    ████████╗
+██╔════╝    ██║ ██╔╝    ╚██╗ ██╔╝    ████╗  ██║    ██╔════╝    ╚══██╔══╝
+███████╗    █████╔╝      ╚████╔╝     ██╔██╗ ██║    █████╗         ██║
+╚════██║    ██╔═██╗       ╚██╔╝      ██║╚██╗██║    ██╔══╝         ██║
+███████║    ██║  ██╗       ██║       ██║ ╚████║    ███████╗       ██║
+╚══════╝    ╚═╝  ╚═╝       ╚═╝       ╚═╝  ╚═══╝    ╚══════╝       ╚═╝
+              C Y B E R D Y N E   S Y S T E M S
+                       ◉  A  G  E  N  T  ◉
+"""

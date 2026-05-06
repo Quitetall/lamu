@@ -18,6 +18,13 @@ pub struct Favorites {
     pub models: BTreeSet<String>,
     #[serde(default)]
     pub harnesses: BTreeSet<String>,
+    /// Harness used by Dashboard Enter when set. None → falls back to
+    /// the built-in `lamu repl` (chat with the selected model).
+    /// Stored as the harness `name` field, not the binary, so the
+    /// resolver can pull the launch_argv at run time even if the
+    /// binary path drifts.
+    #[serde(default)]
+    pub default_harness: Option<String>,
 }
 
 impl Favorites {
@@ -86,6 +93,16 @@ impl Favorites {
 
     pub fn has_harness(&self, name: &str) -> bool {
         self.harnesses.contains(name)
+    }
+
+    /// Set or clear the default harness. Pass `None` to unset.
+    pub fn set_default_harness(&mut self, name: Option<String>) {
+        self.default_harness = name;
+        self.save();
+    }
+
+    pub fn default_harness(&self) -> Option<&str> {
+        self.default_harness.as_deref()
     }
 }
 
