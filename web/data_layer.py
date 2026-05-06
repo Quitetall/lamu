@@ -4,9 +4,11 @@ Persists threads (chat sessions) and steps (messages/tool calls) locally.
 """
 import asyncio
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import chainlit as cl
@@ -21,7 +23,12 @@ from chainlit.types import (
 )
 from chainlit.user import PersistedUser, User
 
-DB_PATH = "/home/brianklam/local-llm/web/chats.db"
+# Phase C: DB_PATH overridable via env so CI runners + contributors don't
+# inherit the original developer's home directory hardcoded.
+DB_PATH = os.environ.get(
+    "CHAINLIT_DB",
+    str(Path.home() / "local-llm" / "web" / "chats.db"),
+)
 
 
 def _now() -> str:
@@ -47,6 +54,9 @@ def _run(fn):
 
 
 def _init_db():
+    # Ensure the parent directory exists — CI runners and fresh checkouts
+    # don't have it pre-created.
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA foreign_keys = ON")
     con.executescript("""

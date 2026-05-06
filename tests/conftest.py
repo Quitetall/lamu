@@ -30,6 +30,8 @@ _HEAVY_MODULES: tuple[str, ...] = (
     "torch",
     "torch.nn",
     "torch.nn.functional",
+    "torch.optim",
+    "torch.optim.lr_scheduler",
     "torch.cuda",
     "torch.utils",
     "torch.utils.data",
