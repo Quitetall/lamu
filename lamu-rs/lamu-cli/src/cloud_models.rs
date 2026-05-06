@@ -172,6 +172,157 @@ pub fn default_seed() -> Vec<CloudModel> {
     ]
 }
 
+/// Sensible defaults for a known provider. The wizard pre-fills these
+/// so adding a model is mostly hitting Enter to accept defaults.
+/// Returns None for unknown / "custom" provider — caller fills every
+/// field by hand.
+pub fn provider_template(provider: &str) -> Option<CloudModel> {
+    let make = |provider: &str, env: &str, ctx: u32, notes: &str| CloudModel {
+        name: String::new(),
+        provider: provider.to_string(),
+        model_id: None,
+        context_max: ctx,
+        notes: notes.to_string(),
+        quota: QuotaState::Available,
+        api_key_env: Some(env.to_string()),
+    };
+    match provider {
+        "anthropic" => Some(make("anthropic", "ANTHROPIC_API_KEY", 200_000, "Anthropic Claude")),
+        "openai" => Some(make("openai", "OPENAI_API_KEY", 200_000, "OpenAI")),
+        "zhipu" => Some(make("zhipu", "ZHIPU_API_KEY", 200_000, "Zhipu / Z.AI GLM")),
+        "moonshot" => Some(make("moonshot", "MOONSHOT_API_KEY", 256_000, "Moonshot Kimi")),
+        "alibaba" => Some(make("alibaba", "DASHSCOPE_API_KEY", 262_144, "Alibaba Qwen via DashScope")),
+        "deepseek" => Some(make("deepseek", "DEEPSEEK_API_KEY", 128_000, "DeepSeek")),
+        "mistral" => Some(make("mistral", "MISTRAL_API_KEY", 128_000, "Mistral")),
+        "openrouter" => Some(make("openrouter", "OPENROUTER_API_KEY", 128_000, "OpenRouter aggregator")),
+        "google" => Some(make("google", "GOOGLE_API_KEY", 1_000_000, "Google Gemini")),
+        "xai" => Some(make("xai", "XAI_API_KEY", 256_000, "xAI Grok")),
+        _ => None,
+    }
+}
+
+pub const KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic", "openai", "zhipu", "moonshot", "alibaba",
+    "deepseek", "mistral", "openrouter", "google", "xai",
+];
+
+/// Run an interactive add-cloud-model wizard on plain stdin/stdout.
+/// Caller must have torn down the alt-screen first. Returns the new
+/// model on confirm, or `None` on cancel / failure.
+pub fn add_via_wizard() -> Option<CloudModel> {
+    use std::io::{self, Write};
+
+    fn ask(prompt: &str) -> String {
+        eprint!("{}", prompt);
+        let _ = io::stderr().flush();
+        let mut buf = String::new();
+        let _ = io::stdin().read_line(&mut buf);
+        buf.trim().to_string()
+    }
+
+    println!();
+    println!("──────────────────────────────────────────────");
+    println!(" Add a cloud model");
+    println!("──────────────────────────────────────────────");
+    println!();
+    println!("Known provider presets (autofills env var, ctx, notes):");
+    for p in KNOWN_PROVIDERS {
+        println!("  • {p}");
+    }
+    println!("  • custom  (enter all fields by hand)");
+    println!();
+
+    let provider_input = ask("Provider [anthropic]: ");
+    let provider = if provider_input.is_empty() { "anthropic".to_string() } else { provider_input };
+
+    let mut entry = if provider == "custom" {
+        CloudModel {
+            name: String::new(),
+            provider: ask("Provider key (e.g. some-new-vendor): "),
+            model_id: None,
+            context_max: 128_000,
+            notes: String::new(),
+            quota: QuotaState::Available,
+            api_key_env: None,
+        }
+    } else {
+        match provider_template(&provider) {
+            Some(t) => t,
+            None => {
+                eprintln!("Unknown provider '{provider}'. Use one of the listed presets or 'custom'.");
+                return None;
+            }
+        }
+    };
+
+    let name = ask("Display name (e.g. claude-opus-4-7) [required]: ");
+    if name.is_empty() {
+        eprintln!("Cancelled (empty name).");
+        return None;
+    }
+    entry.name = name;
+
+    let model_id = ask(&format!("Model ID for request body [enter = {}/{} default]: ", entry.provider, entry.name));
+    if !model_id.is_empty() {
+        entry.model_id = Some(model_id);
+    }
+
+    let ctx_input = ask(&format!("Context window in tokens [{}]: ", entry.context_max));
+    if let Ok(n) = ctx_input.parse::<u32>() {
+        entry.context_max = n;
+    }
+
+    let env_default = entry.api_key_env.clone().unwrap_or_default();
+    let env_input = ask(&format!("API key env var [{}]: ", if env_default.is_empty() { "(none — Bifrost handles auth)" } else { &env_default }));
+    if !env_input.is_empty() {
+        entry.api_key_env = Some(env_input);
+    } else if env_default.is_empty() {
+        entry.api_key_env = None;
+    }
+
+    let notes = ask(&format!("Notes [{}]: ", entry.notes));
+    if !notes.is_empty() {
+        entry.notes = notes;
+    }
+
+    println!();
+    println!("Will add:");
+    println!("  name:        {}", entry.name);
+    println!("  provider:    {}", entry.provider);
+    println!("  full_id:     {}", entry.full_id());
+    println!("  context_max: {}", entry.context_max);
+    if let Some(env) = &entry.api_key_env {
+        let set = std::env::var(env).is_ok();
+        println!("  api_key_env: {} ({})", env, if set { "set ✓" } else { "unset ✗" });
+    } else {
+        println!("  api_key_env: (none — routed via Bifrost)");
+    }
+    println!("  notes:       {}", entry.notes);
+    println!();
+
+    let confirm = ask("Confirm? [Y/n]: ");
+    if confirm.to_lowercase().starts_with('n') {
+        eprintln!("Cancelled.");
+        return None;
+    }
+
+    Some(entry)
+}
+
+/// Persist the full model list to disk, preserving the user's existing
+/// list shape. Errors swallowed → a write failure leaves the in-memory
+/// state untouched and the next `load()` returns the old file.
+pub fn save(models: &[CloudModel]) -> std::io::Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let list = CloudModelList { models: models.to_vec() };
+    let buf = serde_yaml::to_string(&list)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, buf)
+}
+
 /// Load cloud models. Missing file → seed list written to disk for
 /// users to edit. Bad YAML → empty list + a stderr warning.
 pub fn load() -> Vec<CloudModel> {
@@ -279,5 +430,25 @@ mod tests {
         let s = serde_yaml::to_string(&list).unwrap();
         let back: CloudModelList = serde_yaml::from_str(&s).unwrap();
         assert_eq!(back.models.len(), default_seed().len());
+    }
+
+    #[test]
+    fn known_providers_all_have_templates() {
+        for p in KNOWN_PROVIDERS {
+            assert!(provider_template(p).is_some(), "missing template: {p}");
+        }
+    }
+
+    #[test]
+    fn provider_template_anthropic_sane() {
+        let t = provider_template("anthropic").unwrap();
+        assert_eq!(t.provider, "anthropic");
+        assert_eq!(t.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(t.context_max >= 100_000);
+    }
+
+    #[test]
+    fn provider_template_unknown_returns_none() {
+        assert!(provider_template("definitely-fake-provider").is_none());
     }
 }

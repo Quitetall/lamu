@@ -669,6 +669,36 @@ fn run_loop<B: ratatui::backend::Backend>(
                             state.recompute_views();
                             state.status_msg = "showing all sources".into();
                         }
+                        KeyCode::Char('n') => {
+                            // Interactive add-cloud-model wizard. Tear down
+                            // alt-screen so the prompts render normally,
+                            // then append + save + reload.
+                            let mut new_entry: Option<CloudModel> = None;
+                            run_subprocess_in_tui(terminal, || -> Result<()> {
+                                new_entry = cloud_models::add_via_wizard();
+                                Ok(())
+                            })?;
+                            if let Some(entry) = new_entry {
+                                let mut all = state.cloud_models.clone();
+                                all.push(entry.clone());
+                                match cloud_models::save(&all) {
+                                    Ok(()) => {
+                                        state.cloud_models = all;
+                                        state.recompute_views();
+                                        state.status_msg = format!(
+                                            "✓ added {} → {}",
+                                            entry.full_id(),
+                                            cloud_models::config_path().display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        state.status_msg = format!("save failed: {e}");
+                                    }
+                                }
+                            } else {
+                                state.status_msg = "add cancelled.".into();
+                            }
+                        }
                         KeyCode::Char('e') => {
                             // Open the cloud-models YAML in $EDITOR so the user
                             // can add models / set api_key_env / flip quota
@@ -1300,6 +1330,8 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
         Span::raw(" fav "),
         Span::styled("[L/C/A]", Style::default().fg(Color::Cyan)),
         Span::raw(" source "),
+        Span::styled("[n]", Style::default().fg(Color::Cyan)),
+        Span::raw(" add-cloud "),
         Span::styled("[K]", Style::default().fg(Color::Cyan)),
         Span::raw(" key "),
         Span::styled("[e]", Style::default().fg(Color::Cyan)),
