@@ -87,6 +87,9 @@ pub struct ChatTui {
     rx: Option<Receiver<StreamEvent>>,
     show_thinking: bool,
     status_msg: String,
+    /// Set by /quit (or /exit//q). run_loop polls this each iteration
+    /// and breaks out cleanly so the alt-screen tear-down still runs.
+    quit_requested: bool,
 }
 
 impl ChatTui {
@@ -108,6 +111,7 @@ impl ChatTui {
             rx: None,
             show_thinking: false,
             status_msg: String::new(),
+            quit_requested: false,
         }
     }
 
@@ -164,7 +168,7 @@ impl ChatTui {
         let head = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next().unwrap_or("").trim();
         match head.as_str() {
-            "quit" | "exit" | "q" => self.status_msg = "(use Esc or Ctrl+C to exit)".into(),
+            "quit" | "exit" | "q" => self.quit_requested = true,
             "clear" => {
                 self.history.clear();
                 self.pending.clear();
@@ -186,7 +190,7 @@ impl ChatTui {
                 }
             }
             "help" => {
-                self.status_msg = "/clear  /think  /model [name]  /save FILE  /help  Esc=quit".into();
+                self.status_msg = "/quit  /clear  /think  /model [name]  /save FILE  /help  Esc=quit".into();
             }
             "save" => {
                 if arg.is_empty() {
@@ -471,6 +475,7 @@ fn run_loop<B: ratatui::backend::Backend>(
         let _ = state.drain_stream();
         state.tick_spinner();
         terminal.draw(|f| draw(f, state))?;
+        if state.quit_requested { return Ok(()); }
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
@@ -849,6 +854,26 @@ mod tests {
         let before = s.show_thinking;
         s.handle_slash("think");
         assert_ne!(s.show_thinking, before);
+    }
+
+    #[test]
+    fn slash_quit_sets_quit_requested() {
+        let mut s = ChatTui::new(
+            "model".into(),
+            Theme::pick(Some("lamu")),
+            LamuConfig::default(),
+        );
+        assert!(!s.quit_requested);
+        s.handle_slash("quit");
+        assert!(s.quit_requested);
+
+        let mut s2 = ChatTui::new(
+            "m".into(),
+            Theme::pick(Some("lamu")),
+            LamuConfig::default(),
+        );
+        s2.handle_slash("q");
+        assert!(s2.quit_requested);
     }
 
     #[test]
