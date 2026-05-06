@@ -5,6 +5,7 @@
 //! Logs to stderr. Tools dispatched via `tools::*`.
 
 use anyhow::Result;
+use lamu_core::health::HealthRegistry;
 use lamu_core::queue::{QueueRequest, RequestQueue, Strategy as QueueStrategy};
 use lamu_core::reasoning::get_extractor;
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
 pub struct LamuMcpServer {
@@ -35,6 +37,14 @@ pub struct ServerState {
     pub entries: HashMap<String, ModelEntry>,
     pub router: Router,
     pub client: reqwest::Client,
+    /// Health for every loaded backend. Shared with the router via
+    /// `route(..., health_map=Some(health.all()))` so DEAD/QUARANTINED
+    /// backends never get picked.
+    pub health: HealthRegistry,
+    /// Owned child processes per loaded backend. Replaces the old
+    /// `std::mem::forget(child)` + `libc::kill` pattern — `start_kill()`
+    /// on these is the only path that ends a backend now.
+    pub loaded_procs: HashMap<String, Child>,
 }
 
 impl LamuMcpServer {
@@ -71,6 +81,8 @@ impl LamuMcpServer {
                 entries,
                 router,
                 client,
+                health: HealthRegistry::new(),
+                loaded_procs: HashMap::new(),
             })),
             queues: Arc::new(AsyncMutex::new(HashMap::new())),
             queue_strategy,
@@ -204,7 +216,7 @@ impl LamuMcpServer {
         // Route + collect target info under lock
         let (port, model_name, marker, client) = {
             let st = self.state.lock();
-            let decision = st.router.route(&st.scheduler, model, caps_opt);
+            let decision = st.router.route(&st.scheduler, model, caps_opt, Some(st.health.all()));
 
             if decision.model_name.is_empty() {
                 return format!("No model available: {}", decision.reason);
@@ -305,7 +317,7 @@ impl LamuMcpServer {
         let caps_opt = if caps.is_empty() { None } else { Some(caps.as_slice()) };
 
         let st = self.state.lock();
-        let decision = st.router.route(&st.scheduler, model, caps_opt);
+        let decision = st.router.route(&st.scheduler, model, caps_opt, Some(st.health.all()));
         serde_json::to_string_pretty(&json!({
             "would_route_to": decision.model_name,
             "reason": decision.reason,
@@ -367,18 +379,16 @@ impl LamuMcpServer {
             (entry, evict)
         };
 
-        // Evict
+        // Evict — start_kill on the owned Child, then drop it. Health entry
+        // for the evicted backend is removed so its supervisor lifecycle ends.
         if !to_evict.is_empty() {
             let mut st = self.state.lock();
             for evict_name in &to_evict {
-                if let Some(loaded) = st.scheduler.get_loaded(evict_name) {
-                    if let Some(pid) = loaded.pid {
-                        if pid > 0 {
-                            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                        }
-                    }
+                if let Some(mut child) = st.loaded_procs.remove(evict_name) {
+                    let _ = child.start_kill();
                 }
                 st.scheduler.mark_unloaded(evict_name);
+                st.health.drop(evict_name);
             }
         }
         if !to_evict.is_empty() {
@@ -418,8 +428,12 @@ impl LamuMcpServer {
             }
         };
         let pid = child.id().unwrap_or(0);
-        // Detach — keep PID and kill later via libc
-        std::mem::forget(child);
+        // Take ownership of the Child — kill is now `start_kill()` on the
+        // stored value, no more libc::kill on a leaked PID.
+        {
+            let mut st = self.state.lock();
+            st.loaded_procs.insert(entry.name.clone(), child);
+        }
 
         // Health poll
         let client = self.state.lock().client.clone();
@@ -447,6 +461,9 @@ impl LamuMcpServer {
                     .map(|(_, m)| *m)
                     .unwrap_or(entry.vram_mb);
                 let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
+                // Healthy from the moment it answered; supervisor restart
+                // path will record_error on subsequent failures.
+                st.health.get_or_create(&entry.name).record_success();
                 let evict_msg = if to_evict.is_empty() {
                     String::new()
                 } else {
@@ -459,10 +476,13 @@ impl LamuMcpServer {
             }
         }
 
-        // Timeout
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // Timeout — kill the stored Child and unregister scheduler/health.
         let mut st = self.state.lock();
+        if let Some(mut child) = st.loaded_procs.remove(&entry.name) {
+            let _ = child.start_kill();
+        }
         st.scheduler.mark_unloaded(&entry.name);
+        st.health.drop(&entry.name);
         format!("Failed to load '{}' (timeout {}s)", entry.name, max_wait_secs)
     }
 
@@ -481,14 +501,11 @@ impl LamuMcpServer {
             return format!("Model '{}' not loaded.", name);
         };
 
-        if let Some(loaded) = st.scheduler.get_loaded(&target) {
-            if let Some(pid) = loaded.pid {
-                if pid > 0 {
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                }
-            }
+        if let Some(mut child) = st.loaded_procs.remove(&target) {
+            let _ = child.start_kill();
         }
         st.scheduler.mark_unloaded(&target);
+        st.health.drop(&target);
         format!("Unloaded '{}'. VRAM freed.", target)
     }
 

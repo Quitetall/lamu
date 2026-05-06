@@ -1,6 +1,7 @@
 //! Request router — capability-based model selection.
 //! Direct port of `lamu/core/router.py`.
 
+use crate::health::BackendHealth;
 use crate::scheduler::VramScheduler;
 use crate::types::{Capability, LoadedModel, ModelEntry, RouteDecision};
 use std::collections::{HashMap, HashSet};
@@ -22,12 +23,25 @@ impl Router {
     }
 
     /// Select best model. Does NOT load — just decides.
+    ///
+    /// `health_map` lets the caller filter out DEAD/QUARANTINED backends —
+    /// when present, an explicit-model request against an unhealthy backend
+    /// is refused with `unhealthy:<state>` in the reason; capability-based
+    /// routing skips them silently and falls through to the next candidate.
     pub fn route(
         &self,
         scheduler: &VramScheduler,
         model: Option<&str>,
         capabilities: Option<&[Capability]>,
+        health_map: Option<&HashMap<String, BackendHealth>>,
     ) -> RouteDecision {
+        let is_usable = |name: &str| -> bool {
+            match health_map {
+                None => true,
+                Some(m) => m.get(name).map_or(true, |h| h.usable()),
+            }
+        };
+
         // Explicit model override
         if let Some(name) = model {
             let Some(entry) = self.find_model(name) else {
@@ -38,6 +52,19 @@ impl Router {
                     would_evict: vec![],
                 };
             };
+
+            if !is_usable(&entry.name) {
+                let state = health_map
+                    .and_then(|m| m.get(&entry.name))
+                    .map(|h| format!("{:?}", h.state).to_lowercase())
+                    .unwrap_or_else(|| "unhealthy".to_string());
+                return RouteDecision {
+                    model_name: entry.name.clone(),
+                    reason: format!("model '{}' is unhealthy: {}", entry.name, state),
+                    loaded: false,
+                    would_evict: vec![],
+                };
+            }
 
             if scheduler.is_loaded(&entry.name) {
                 return RouteDecision {
@@ -71,8 +98,12 @@ impl Router {
             _ => [Capability::Chat].into_iter().collect(),
         };
 
-        // Try loaded models first
-        let loaded_matches = self.find_loaded_matching(scheduler, &required);
+        // Try loaded models first (filter unhealthy)
+        let loaded_matches: Vec<&LoadedModel> = self
+            .find_loaded_matching(scheduler, &required)
+            .into_iter()
+            .filter(|m| is_usable(&m.entry.name))
+            .collect();
         if let Some(best) = self.rank_loaded(loaded_matches) {
             return RouteDecision {
                 model_name: best.entry.name.clone(),
@@ -82,12 +113,24 @@ impl Router {
             };
         }
 
-        // Find best unloaded candidate
-        let mut candidates = self.find_registry_matching(&required);
+        // Find best unloaded candidate (also filter unhealthy)
+        let mut candidates: Vec<&ModelEntry> = self
+            .find_registry_matching(&required)
+            .into_iter()
+            .filter(|e| is_usable(&e.name))
+            .collect();
         if candidates.is_empty() {
+            let suffix = if health_map.is_some() {
+                " (after health filtering)"
+            } else {
+                ""
+            };
             return RouteDecision {
                 model_name: String::new(),
-                reason: format!("no model in registry has capabilities {:?}", required_vec(&required)),
+                reason: format!(
+                    "no model in registry has capabilities {:?}{}",
+                    required_vec(&required), suffix
+                ),
                 loaded: false,
                 would_evict: vec![],
             };

@@ -13,5 +13,6 @@ pub mod error;
 pub mod health;
 pub mod backends;
 pub mod queue;
+pub mod supervisor;
 
 pub use error::{Error, Result};

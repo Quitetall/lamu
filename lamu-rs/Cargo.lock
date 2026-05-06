@@ -910,7 +910,6 @@ dependencies = [
  "dirs",
  "futures-util",
  "lamu-core",
- "libc",
  "parking_lot",
  "reqwest",
  "serde",

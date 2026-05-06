@@ -118,7 +118,10 @@ async fn chat_completions(
     let (port, model_name, marker) = {
         let scheduler = state.scheduler.lock();
         let router = state.router.lock();
-        let decision = router.route(&scheduler, req.model.as_deref(), None);
+        // No HealthRegistry on lamu-api yet — daemon owns the registry and
+        // shares it with MCP. lamu-api still gates on `decision.loaded` so
+        // QUARANTINED-but-running backends are caught at the next layer.
+        let decision = router.route(&scheduler, req.model.as_deref(), None, None);
 
         if decision.model_name.is_empty() || !decision.loaded {
             let body = ErrorResponse {
