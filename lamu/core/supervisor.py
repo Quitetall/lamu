@@ -14,14 +14,13 @@ log line, every restart attempt is countable, and quarantine is sticky.
 """
 from __future__ import annotations
 
-import json as _json
 import logging
-import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from lamu.core.health import BackendHealth, HealthState
+from lamu.core.observability import emit
 
 
 _log = logging.getLogger(__name__)
@@ -35,9 +34,9 @@ class RestartPolicy:
 
 
 def _emit_event(event: str, **fields: object) -> None:
-    """Structured JSON event to stderr — operator-readable + grep-able."""
-    line = _json.dumps({"event": event, **fields}, default=str, sort_keys=True)
-    print(line, file=sys.stderr, flush=True)
+    """Backwards-compatible shim. Routes through the observability sink so
+    the file/OTLP exporters see every event the supervisor produces."""
+    emit(event, **fields)
 
 
 class Supervisor:
