@@ -1,12 +1,12 @@
 # Graph Report - local-llm  (2026-05-06)
 
 ## Corpus Check
-- 141 files · ~68,462 words
+- 141 files · ~69,351 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1818 nodes · 4352 edges · 152 communities detected
-- Extraction: 43% EXTRACTED · 57% INFERRED · 0% AMBIGUOUS · INFERRED: 2498 edges (avg confidence: 0.56)
+- 1825 nodes · 4381 edges · 152 communities detected
+- Extraction: 43% EXTRACTED · 57% INFERRED · 0% AMBIGUOUS · INFERRED: 2510 edges (avg confidence: 0.57)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -180,78 +180,78 @@
   lamu/core/errors.py → tests/unit/server/test_mcp_qwen.py
 - `BackendError` --uses--> `Phase C: connection failures raise BackendError, not silent strings.`  [INFERRED]
   lamu/core/errors.py → tests/unit/server/test_mcp_qwen.py
-- `_query_vram()` --calls--> `test_query_vram_raises_on_timeout()`  [INFERRED]
-  lamu/core/scheduler.py → tests/unit/core/test_scheduler.py
-- `_query_gpu_pids()` --calls--> `test_query_gpu_pids_parses()`  [INFERRED]
-  lamu/core/scheduler.py → tests/unit/core/test_scheduler.py
-- `_query_gpu_pids()` --calls--> `test_query_gpu_pids_raises_on_failure()`  [INFERRED]
-  lamu/core/scheduler.py → tests/unit/core/test_scheduler.py
+- `VramScheduler` --uses--> `Tests for lamu.api.openai_compat — FastAPI / OpenAI shim.`  [INFERRED]
+  lamu/core/scheduler.py → tests/unit/api/test_openai_compat.py
+- `VramScheduler` --uses--> `Backend dies mid-request → 503 within timeout, daemon stays up.`  [INFERRED]
+  lamu/core/scheduler.py → tests/integration/test_backend_death.py
+- `VramScheduler` --uses--> `When the backend refuses connection, API returns 502 in <1s     (NOT a hang wait`  [INFERRED]
+  lamu/core/scheduler.py → tests/integration/test_backend_death.py
 
 ## Communities
 
 ### Community 0 - "Community 0"
-Cohesion: 0.03
-Nodes (121): make_backend(), _detect_quant(), _estimate_params_b(), _estimate_vram_mb(), _parse_gguf_metadata(), scan_directory(), write_registry(), test_get_extractor_picks_correct_type() (+113 more)
+Cohesion: 0.05
+Nodes (199): ChatRequest, Message, OpenAI-compatible HTTP API layer.  Translates /v1/chat/completions → internal ro, Start the OpenAI-compat server., Start the OpenAI-compat server., Start the OpenAI-compat server., Start the OpenAI-compat server., Create the OpenAI-compatible FastAPI app. (+191 more)
 
 ### Community 1 - "Community 1"
-Cohesion: 0.08
-Nodes (137): LamuMetrics, Prometheus metrics for the OpenAI-compat layer.  All metrics live on a process-l, Pull instantaneous values into the gauges. Call from /metrics., Serialise to Prometheus text. Returns `(body, content_type)`., Bundle of collectors keyed to a single registry. The OpenAI compat     app holds, ChatRequest, create_app(), Message (+129 more)
+Cohesion: 0.03
+Nodes (104): make_backend(), test_get_extractor_picks_correct_type(), test_write_then_load_roundtrip(), Corrupt YAML registry → load_registry raises (no silent fallback)., test_corrupt_yaml_raises(), test_missing_required_field_raises(), test_unknown_capability_raises(), server() (+96 more)
 
 ### Community 2 - "Community 2"
-Cohesion: 0.05
-Nodes (88): Malformed GGUF — emitted via warnings.warn during scan., Think-block streaming buffer exceeded the configured cap (64 KB)., ReasoningOverflow, RegistryParseWarning, get_extractor(), NullReasoningExtractor, Reasoning extractor — per-model-family think-block detection and stripping., Handles think-block detection, stripping, and structured extraction.      Regist (+80 more)
+Cohesion: 0.04
+Nodes (96): Tests for lamu.api.metrics — Prometheus collectors + refresh., BackendTimeout, ConfigError, LamuError, Typed exception hierarchy for LAMU.  Every place the codebase used to write `exc, Root of every LAMU exception. Never raise directly — use a subclass., Invalid or missing configuration., Backend did not respond within the configured timeout. (+88 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.05
-Nodes (86): Tests for lamu.api.metrics — Prometheus collectors + refresh., BackendHealth, HealthState, Backend health state machine.  The whole point: if a backend dies, NEVER let use, Health state for a single backend identified by `backend_id`., Reset error counter; do NOT clear QUARANTINED — that is sticky., Record a failure. Promotes state per thresholds.          QUARANTINED is termina, Hard-quarantine a backend (e.g. supervisor exhausted all restarts). (+78 more)
+Nodes (91): Malformed GGUF — emitted via warnings.warn during scan., Think-block streaming buffer exceeded the configured cap (64 KB)., ReasoningOverflow, RegistryParseWarning, get_extractor(), NullReasoningExtractor, Reasoning extractor — per-model-family think-block detection and stripping., Handles think-block detection, stripping, and structured extraction.      Regist (+83 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.03
-Nodes (54): app(), _fake_resp(), Tests for lamu.api.openai_compat — FastAPI / OpenAI shim., test_chat_completions_502_on_backend_unreachable(), test_chat_completions_extracts_reasoning_when_present(), test_chat_completions_routes_to_loaded(), _fake_health_response(), Tests for lamu.backends.llamacpp — llama-server subprocess wrapper. (+46 more)
-
-### Community 5 - "Community 5"
-Cohesion: 0.06
-Nodes (72): GpuUnavailableError, nvidia-smi missing, returned non-zero, or timed out.      Raise this any time GP, _query_gpu_pids(), _query_vram(), VRAM Budget Scheduler — bin-packing for GPU model management., Register a model that's already loaded (e.g. from startup)., Budget-aware VRAM scheduler with bin-packing and LRU eviction., True if the last GPU probe succeeded. (+64 more)
-
-### Community 6 - "Community 6"
-Cohesion: 0.03
 Nodes (31): ABC, Backend, Backend, Backend protocol — interface that all model backends implement., Abstract base for model backends.      Each backend manages one model process (o, DflashBackend, LlamaCppBackend, llama.cpp backend — manages llama-server subprocess. (+23 more)
 
-### Community 7 - "Community 7"
+### Community 5 - "Community 5"
+Cohesion: 0.04
+Nodes (45): _fake_health_response(), Tests for lamu.backends.llamacpp — llama-server subprocess wrapper., When model arch is qwen35, ngram-mod flags must be added., test_is_healthy_true_on_status_ok(), test_load_command_includes_qwen_speculation(), test_load_command_skips_speculation_for_other_arch(), test_load_timeout_unloads_and_raises(), test_load_uses_typed_error_class() (+37 more)
+
+### Community 6 - "Community 6"
 Cohesion: 0.04
 Nodes (58): BaseModel, apply_chat_template(), aread_tokens(), chat_completions(), ChatRequest, get_tokenizer(), DFlash server for 24 GB GPUs (RTX 4090) with VRAM park/unpark dance.  The stock, Send command to daemon stdin. (+50 more)
 
-### Community 8 - "Community 8"
+### Community 7 - "Community 7"
 Cohesion: 0.04
-Nodes (40): metrics(), sched(), test_health_state_gauge_uses_numeric_encoding(), test_queue_depth_gauge_per_model(), test_render_contains_lamu_metrics(), test_vram_total_gauge_reflects_scheduler(), test_dead_threshold_at_three(), test_first_error_promotes_to_degraded() (+32 more)
+Nodes (39): sched(), test_health_state_gauge_uses_numeric_encoding(), test_queue_depth_gauge_per_model(), test_render_contains_lamu_metrics(), test_vram_total_gauge_reflects_scheduler(), test_dead_threshold_at_three(), test_first_error_promotes_to_degraded(), test_quarantine_is_sticky_to_record_error() (+31 more)
 
-### Community 9 - "Community 9"
+### Community 8 - "Community 8"
 Cohesion: 0.04
 Nodes (68): get_config(), Return a LangChain RunnableConfig dict with active callbacks., compare(), load_swebench_tasks(), main(), Agentic benchmark runner — compare Opus solo vs swarm on coding tasks.  Three mo, Load SWE-bench Lite tasks. Requires swebench package., Run a task with just Opus (cloud-only, no local workers). (+60 more)
 
-### Community 10 - "Community 10"
-Cohesion: 0.04
-Nodes (47): Tests for lamu.core.config — path constants + ports., test_ports_distinct_and_in_range(), test_null_extractor_passthrough(), test_stream_filter_buffer_cap_raises(), test_stream_filter_no_reasoning_block(), test_scan_directory_finds_gguf(), chat(), get_default() (+39 more)
-
-### Community 11 - "Community 11"
+### Community 9 - "Community 9"
 Cohesion: 0.05
-Nodes (57): Command, filter_think(), handle_command(), http_get_json(), iter_sse_deltas(), main(), Message, parse_command() (+49 more)
+Nodes (46): Tests for lamu.core.config — path constants + ports., test_ports_distinct_and_in_range(), test_null_extractor_passthrough(), test_stream_filter_no_reasoning_block(), test_scan_directory_finds_gguf(), chat(), get_default(), LocalLLM (+38 more)
 
-### Community 12 - "Community 12"
+### Community 10 - "Community 10"
 Cohesion: 0.05
 Nodes (37): BaseDataLayer, DataLayerError, SQLite / persistence layer error.      All raw `sqlite3.Error` instances should, build_llm(), extract_think(), on_chat_resume(), on_message(), python_repl() (+29 more)
 
-### Community 13 - "Community 13"
+### Community 11 - "Community 11"
 Cohesion: 0.05
 Nodes (41): corpus(), _load_corpus(), normalise(), python_mcp_cmd(), Shared scaffolding for cross-language MCP contract tests.  Spawn either Python o, Strip fields that legitimately differ between implementations.      - `id`: drop, How to launch the Python MCP server.      Uses the project venv's interpreter; s, How to launch the Rust MCP server.      Looks for the release binary; skips when (+33 more)
 
-### Community 14 - "Community 14"
+### Community 12 - "Community 12"
+Cohesion: 0.05
+Nodes (28): app(), _fake_resp(), Tests for lamu.api.openai_compat — FastAPI / OpenAI shim., test_chat_completions_502_on_backend_unreachable(), test_chat_completions_extracts_reasoning_when_present(), test_chat_completions_routes_to_loaded(), marker(), test_loaded_model_mutable() (+20 more)
+
+### Community 13 - "Community 13"
 Cohesion: 0.07
 Nodes (29): emit(), new_trace_id(), Single funnel for structured events. Stderr by default; optional file sink.  Eve, Emit a structured event.      Stderr always gets a single JSON line. If LAMU_EVE, Generate a 16-hex-char trace id. Compatible with W3C TraceContext     middle 16, Tests for lamu.core.observability — structured event sink., A broken file sink must not block the stderr emit., test_emit_appends_to_file_sink() (+21 more)
 
+### Community 14 - "Community 14"
+Cohesion: 0.07
+Nodes (42): Command, filter_think(), handle_command(), http_get_json(), iter_sse_deltas(), main(), Message, parse_command() (+34 more)
+
 ### Community 15 - "Community 15"
-Cohesion: 0.09
-Nodes (27): Tests for agents.trainer — pure helpers (collect/status/prepare)., Phase C: MissingDependency exists for ImportError propagation., test_missing_dependency_class_exists(), collect(), export(), main(), prepare(), Training pipeline — collect swarm data + QLoRA fine-tune local models.  Feedback (+19 more)
+Cohesion: 0.07
+Nodes (28): LamuMetrics, Prometheus metrics for the OpenAI-compat layer.  All metrics live on a process-l, Pull instantaneous values into the gauges. Call from /metrics., Serialise to Prometheus text. Returns `(body, content_type)`., Bundle of collectors keyed to a single registry. The OpenAI compat     app holds, create_app(), serve(), metrics() (+20 more)
 
 ### Community 16 - "Community 16"
 Cohesion: 0.08
@@ -266,36 +266,36 @@ Cohesion: 0.09
 Nodes (11): Dataset, DS, EagleV2, EAGLE v2 training — standalone script, no datasets library., draft_multi(), EagleV3, HiddenStateDataset, main() (+3 more)
 
 ### Community 19 - "Community 19"
+Cohesion: 0.13
+Nodes (17): Tests for agents.trainer — pure helpers (collect/status/prepare)., Phase C: MissingDependency exists for ImportError propagation., test_missing_dependency_class_exists(), collect(), export(), main(), prepare(), Training pipeline — collect swarm data + QLoRA fine-tune local models.  Feedback (+9 more)
+
+### Community 20 - "Community 20"
+Cohesion: 0.15
+Nodes (15): filter_think(), filter_think_carries_state_across_chunks(), filter_think_pass_through_when_show_enabled(), filter_think_within_single_chunk(), handle_command(), http_get_json(), Message, parse_command() (+7 more)
+
+### Community 21 - "Community 21"
 Cohesion: 0.15
 Nodes (13): _load_module(), mod(), Tests for cli.chat_repl — endpoint discovery + streaming logic., Load cli/chat_repl.py as a regular module (no package init present)., Currently swallows everything to []. Phase C will narrow to URLError., Pinned: function should print without crashing even if every endpoint fails., Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a, _resp() (+5 more)
 
-### Community 20 - "Community 20"
+### Community 22 - "Community 22"
 Cohesion: 0.17
 Nodes (12): create_poincare_plot(), load_graphify_json(), load_networkx_from_codebase(), main(), PoincareBallEmbedding, Poincaré ball embedding for knowledge graphs.  Takes graphify's graph.json and e, Load graphify's graph.json into a NetworkX graph., Build a graph from Python AST. Filters stdlib/third-party noise by default. (+4 more)
 
-### Community 21 - "Community 21"
+### Community 23 - "Community 23"
 Cohesion: 0.12
 Nodes (5): Tests for server.serve — pure helpers + ASGI middleware shape., Phase C: _think_done initialized in __init__ — middleware usable     standalone, Malformed SSE chunks pass through verbatim — filtering is best-effort     and mu, test_filter_sse_passthrough_on_bad_json(), test_filter_sse_works_without_priming()
 
-### Community 22 - "Community 22"
+### Community 24 - "Community 24"
 Cohesion: 0.23
 Nodes (15): auto_start(), cmd_models(), cmd_status(), discover_models(), get_available_models(), main(), probe_endpoint(), Return flat list of available model names from all endpoints. (+7 more)
 
-### Community 23 - "Community 23"
+### Community 25 - "Community 25"
 Cohesion: 0.17
 Nodes (11): app_mod(), _call_tool(), Tests for web.app — Chainlit frontend pure helpers., Import web/app.py — it does `from data_layer import ...` so the web/     directo, python_repl is decorated with @tool → StructuredTool. Unwrap to .func., Phase C: error message includes exception class name so the model     can act on, python_repl is a model-facing tool — syntax errors come back as text     so the, test_python_repl_no_output() (+3 more)
 
-### Community 24 - "Community 24"
-Cohesion: 0.23
-Nodes (7): ctx_for_quant(), find_gguf(), kv_type_for_quant(), main(), Production Qwen3.6 server — think-block stripping via ASGI middleware., Wraps the llama-cpp-python ASGI app and strips think blocks from responses., ThinkStripASGI
-
-### Community 25 - "Community 25"
+### Community 26 - "Community 26"
 Cohesion: 0.17
 Nodes (5): Tests for lamu.daemon — CLI dispatch., All probe ports refused — current bare-except prints '⚪ :port'.     Phase C will, Phase C: cmd_status uses typed catches. RuntimeError is NOT in the     expected, test_cmd_status_no_running_servers(), test_cmd_status_typed_errors()
-
-### Community 26 - "Community 26"
-Cohesion: 0.44
-Nodes (7): health_state_gauge_uses_numeric_encoding(), health_to_numeric(), LamuMetrics, quarantine_force_updates_health_struct(), queue_depth_gauge_per_model(), render_contains_lamu_series(), request_counter_increments()
 
 ### Community 27 - "Community 27"
 Cohesion: 0.29
@@ -1038,11 +1038,11 @@ Nodes (1): List available models.
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `BackendError` connect `Community 1` to `Community 3`, `Community 4`, `Community 6`, `Community 10`, `Community 14`, `Community 15`, `Community 16`?**
-  _High betweenness centrality (0.109) - this node is a cross-community bridge._
-- **Why does `VramScheduler` connect `Community 1` to `Community 3`, `Community 11`, `Community 4`, `Community 5`?**
-  _High betweenness centrality (0.104) - this node is a cross-community bridge._
-- **Why does `DataLayerError` connect `Community 12` to `Community 15`?**
+- **Why does `BackendError` connect `Community 0` to `Community 2`, `Community 4`, `Community 5`, `Community 9`, `Community 13`, `Community 16`?**
+  _High betweenness centrality (0.111) - this node is a cross-community bridge._
+- **Why does `VramScheduler` connect `Community 0` to `Community 2`, `Community 5`, `Community 12`, `Community 14`, `Community 15`?**
+  _High betweenness centrality (0.097) - this node is a cross-community bridge._
+- **Why does `DataLayerError` connect `Community 10` to `Community 2`?**
   _High betweenness centrality (0.086) - this node is a cross-community bridge._
 - **Are the 198 inferred relationships involving `ModelEntry` (e.g. with `Router` and `Request router — capability-based model selection with dry-run support.`) actually correct?**
   _`ModelEntry` has 198 INFERRED edges - model-reasoned connections that need verification._
