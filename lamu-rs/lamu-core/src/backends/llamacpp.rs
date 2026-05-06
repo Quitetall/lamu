@@ -68,16 +68,39 @@ impl Backend for LlamaCppBackend {
             )));
         }
 
+        // Don't allocate the full advertised context unless the model
+        // really needs it. KV cache scales linearly with --ctx-size and
+        // dominates per-token attention bandwidth, so capping at 32K by
+        // default cuts TTFT dramatically while still fitting normal
+        // chat. Override per model via env var.
+        let ctx_default = std::env::var("LAMU_DEFAULT_CTX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(32768);
+        let ctx = entry.context_max.min(ctx_default);
+
+        // Q8_0 KV is the speed/VRAM sweet spot; Q4_0 KV saved memory but
+        // dequant added prompt-eval cost. Override with LAMU_KV.
+        let kv_type = std::env::var("LAMU_KV").unwrap_or_else(|_| "q8_0".into());
+
         let mut cmd = Command::new(&self.bin_path);
         cmd.arg("-m").arg(&entry.path)
             .arg("--host").arg("0.0.0.0")
             .arg("--port").arg(port.to_string())
-            .arg("--ctx-size").arg(std::cmp::min(entry.context_max, 131072).to_string())
+            .arg("--ctx-size").arg(ctx.to_string())
             .arg("-ngl").arg("99")
             .arg("--flash-attn").arg("on")
-            .arg("--cache-type-k").arg("q4_0")
-            .arg("--cache-type-v").arg("q4_0")
-            .arg("--parallel").arg("1");
+            .arg("--cache-type-k").arg(&kv_type)
+            .arg("--cache-type-v").arg(&kv_type)
+            .arg("--parallel").arg("1")
+            // Larger prompt-eval batches = fewer kernel launches per
+            // turn. 4096/512 keeps VRAM stable on a 24GB card.
+            .arg("--batch-size").arg("4096")
+            .arg("--ubatch-size").arg("512")
+            // Reuse shared prefixes across multi-turn chat — the next
+            // turn's KV starts where the last one ended, so re-eval
+            // skips the system prompt + history.
+            .arg("--cache-reuse").arg("256");
 
         if self.supports_ngram_mod().await
             && (entry.arch == "qwen35" || entry.arch == "qwen3") {
@@ -103,6 +126,22 @@ impl Backend for LlamaCppBackend {
         for _ in 0..60 {
             sleep(Duration::from_secs(1)).await;
             if self.is_healthy().await {
+                // Warmup: one-token completion so cuBLAS / cuDNN
+                // handles + kv slot are JIT-compiled before the user's
+                // first real prompt. Otherwise TTFT for the first
+                // message bakes in 2–4s of kernel build cost.
+                let warm_url = format!("http://localhost:{}/v1/chat/completions", port);
+                let _ = self.client
+                    .post(&warm_url)
+                    .timeout(Duration::from_secs(30))
+                    .json(&json!({
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                        "stream": false,
+                    }))
+                    .send()
+                    .await;
                 return Ok(pid);
             }
         }

@@ -90,6 +90,20 @@ pub struct ChatTui {
     /// Set by /quit (or /exit//q). run_loop polls this each iteration
     /// and breaks out cleanly so the alt-screen tear-down still runs.
     quit_requested: bool,
+
+    // ── streaming timing ───────────────────────────────────────────
+    /// Monotonic start of the current request. None when idle.
+    req_started: Option<Instant>,
+    /// First token arrival. (now - req_started) is TTFT (≈ prompt eval).
+    first_token_at: Option<Instant>,
+    /// Most recent token arrival — used for live tok/s.
+    last_token_at: Option<Instant>,
+    /// Tokens received this request. llama.cpp emits one delta per token.
+    tokens_this_req: usize,
+    /// Last completed request's TTFT in seconds.
+    last_prompt_secs: Option<f32>,
+    /// Last completed request's generation tok/s.
+    last_gen_tps: Option<f32>,
 }
 
 impl ChatTui {
@@ -112,6 +126,12 @@ impl ChatTui {
             show_thinking: false,
             status_msg: String::new(),
             quit_requested: false,
+            req_started: None,
+            first_token_at: None,
+            last_token_at: None,
+            tokens_this_req: 0,
+            last_prompt_secs: None,
+            last_gen_tps: None,
         }
     }
 
@@ -151,6 +171,13 @@ impl ChatTui {
         self.history.push(Message { role: Role::User, content: text.clone() });
         self.input.clear();
         self.cursor = 0;
+
+        // Reset per-request timers. last_* fields stay until the next
+        // request finishes so the previous metrics keep showing.
+        self.req_started = Some(Instant::now());
+        self.first_token_at = None;
+        self.last_token_at = None;
+        self.tokens_this_req = 0;
 
         let (tx, rx) = mpsc::channel::<StreamEvent>();
         self.rx = Some(rx);
@@ -217,6 +244,12 @@ impl ChatTui {
             loop {
                 match rx.try_recv() {
                     Ok(StreamEvent::Token(t)) => {
+                        let now = Instant::now();
+                        if self.first_token_at.is_none() {
+                            self.first_token_at = Some(now);
+                        }
+                        self.last_token_at = Some(now);
+                        self.tokens_this_req += 1;
                         self.pending.push_str(&t);
                         changed = true;
                     }
@@ -232,6 +265,20 @@ impl ChatTui {
             }
         }
         if close {
+            // Snapshot timing before we drop req state so the status
+            // bar can keep showing the last numbers.
+            if let (Some(start), Some(first)) = (self.req_started, self.first_token_at) {
+                self.last_prompt_secs = Some(first.duration_since(start).as_secs_f32());
+                if let Some(last) = self.last_token_at {
+                    let gen_secs = last.duration_since(first).as_secs_f32();
+                    let gen_tokens = self.tokens_this_req.saturating_sub(1);
+                    if gen_secs > 0.0 && gen_tokens > 0 {
+                        self.last_gen_tps = Some(gen_tokens as f32 / gen_secs);
+                    } else {
+                        self.last_gen_tps = None;
+                    }
+                }
+            }
             let mut content = std::mem::take(&mut self.pending);
             if !self.show_thinking {
                 content = strip_think_blocks(&content);
@@ -240,6 +287,7 @@ impl ChatTui {
                 self.history.push(Message { role: Role::Assistant, content });
             }
             self.rx = None;
+            self.req_started = None;
             changed = true;
         }
         changed
@@ -770,6 +818,39 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &ChatTui) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(state.spinner_glyph(), Style::default().fg(good).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled(" streaming…", Style::default().fg(good)));
+
+        // Live timing while we wait. Before first token: count up the
+        // prompt-eval clock. After first token: show TTFT + live tok/s.
+        match (state.req_started, state.first_token_at, state.last_token_at) {
+            (Some(start), None, _) => {
+                let dt = start.elapsed().as_secs_f32();
+                spans.push(Span::styled(
+                    format!("  prompt {:.1}s", dt),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            (Some(start), Some(first), Some(last)) => {
+                let prompt_s = first.duration_since(start).as_secs_f32();
+                let gen_s = last.duration_since(first).as_secs_f32();
+                let gen_n = state.tokens_this_req.saturating_sub(1);
+                let tps = if gen_s > 0.0 && gen_n > 0 { gen_n as f32 / gen_s } else { 0.0 };
+                spans.push(Span::styled(
+                    format!("  prompt {:.1}s · {:.1} tok/s", prompt_s, tps),
+                    Style::default().fg(bar_strong),
+                ));
+            }
+            _ => {}
+        }
+    } else if let (Some(p), Some(g)) = (state.last_prompt_secs, state.last_gen_tps) {
+        spans.push(Span::styled(
+            format!("  last: prompt {:.1}s · {:.1} tok/s", p, g),
+            Style::default().fg(bar_text),
+        ));
+    } else if let Some(p) = state.last_prompt_secs {
+        spans.push(Span::styled(
+            format!("  last: prompt {:.1}s", p),
+            Style::default().fg(bar_text),
+        ));
     }
     if state.show_thinking {
         spans.push(Span::styled("  [think:ON]", Style::default().fg(Color::Yellow)));
