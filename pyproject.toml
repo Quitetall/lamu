@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn",
     "pyyaml",
     "pydantic",
+    "prometheus-client",
 ]
 
 [project.optional-dependencies]

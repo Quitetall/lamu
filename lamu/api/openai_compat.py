@@ -14,10 +14,11 @@ from typing import AsyncIterator, Optional
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from lamu.api.errors import backend_error_response, no_backend_response
+from lamu.api.metrics import LamuMetrics
 from lamu.core.errors import ReasoningOverflow
 from lamu.core.health import HealthRegistry
 from lamu.core.reasoning import get_extractor
@@ -77,10 +78,19 @@ def create_app(
     router = Router(scheduler, registry)
     entries_map: dict[str, ModelEntry] = {e.name: e for e in registry}
     health_reg = health or HealthRegistry()
+    metrics = LamuMetrics()
 
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok", "models_loaded": len(scheduler.loaded_models())}
+
+    @app.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        # Refresh instantaneous gauges before serialising so the scrape
+        # reflects the current scheduler + health snapshot.
+        metrics.refresh(scheduler, health_reg)
+        body, ctype = metrics.render()
+        return Response(content=body, media_type=ctype)
 
     @app.get("/v1/models")
     async def list_models() -> dict:
@@ -102,6 +112,7 @@ def create_app(
     async def chat_completions(req: ChatRequest) -> JSONResponse | StreamingResponse:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
+        t_start = time.monotonic()
 
         # Route
         capabilities: Optional[list[Capability]] = None
@@ -112,6 +123,9 @@ def create_app(
         )
 
         if not decision.model_name or not decision.loaded:
+            metrics.requests_total.labels(
+                model=req.model or "unknown", status="no_backend",
+            ).inc()
             return no_backend_response(
                 reason=f"No loaded model available: {decision.reason}",
             )
@@ -291,11 +305,29 @@ def create_app(
             if timings:
                 response["timings"] = timings
 
+            # Metrics: success path
+            metrics.requests_total.labels(
+                model=decision.model_name, status="ok",
+            ).inc()
+            metrics.request_duration_seconds.labels(
+                model=decision.model_name, phase="total",
+            ).observe(time.monotonic() - t_start)
+            metrics.tokens_generated_total.labels(
+                model=decision.model_name, kind="content",
+            ).inc(usage.get("completion_tokens", 0))
+            if reasoning:
+                metrics.tokens_generated_total.labels(
+                    model=decision.model_name, kind="reasoning",
+                ).inc(len(reasoning) // 4)  # rough char→token
+
             return JSONResponse(response)
 
         except urllib.error.URLError as e:
             # Record the failure against the model that was about to serve.
             health_reg.get_or_create(decision.model_name).record_error(e)
+            metrics.requests_total.labels(
+                model=decision.model_name, status="backend_error",
+            ).inc()
             return backend_error_response(
                 reason=f"Backend unreachable: {e}", status_code=502,
             )

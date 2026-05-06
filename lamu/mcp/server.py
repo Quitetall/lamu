@@ -24,6 +24,7 @@ from mcp.types import TextContent, Tool
 
 from lamu.core.errors import BackendError, BackendUnavailable
 from lamu.core.health import HealthRegistry
+from lamu.core.observability import emit, new_trace_id
 from lamu.core.queue import QueueRequest, RequestQueue, Strategy as QueueStrategy
 from lamu.core.reasoning import get_extractor
 from lamu.core.registry import load_registry, scan_directory, write_registry
@@ -324,6 +325,28 @@ class LamuMcpServer:
         priority = args.get("priority", 0)
         origin = args.get("origin", "anonymous")
 
+        # Trace ID: accept from MCP `_meta.traceparent` (W3C) middle 16 hex
+        # if present, else generate. Same id flows through every emit() in
+        # this request.
+        meta = args.get("_meta") or {}
+        traceparent = meta.get("traceparent") if isinstance(meta, dict) else None
+        if isinstance(traceparent, str) and len(traceparent) >= 35:
+            # W3C: version-traceid-spanid-flags. Take middle 32 hex,
+            # truncate to 16 to fit our internal id width.
+            parts = traceparent.split("-")
+            trace_id = parts[1][:16] if len(parts) >= 4 and len(parts[1]) >= 16 else new_trace_id()
+        else:
+            trace_id = new_trace_id()
+        emit(
+            "mcp_query_start",
+            trace_id=trace_id,
+            model_hint=model,
+            capabilities=caps_raw,
+            origin=origin,
+            priority=priority,
+            prompt_len=len(prompt),
+        )
+
         # Parse capabilities
         capabilities: Optional[list[Capability]] = None
         if caps_raw:
@@ -398,6 +421,13 @@ class LamuMcpServer:
                 data = json.loads(resp_data)
         except _BACKEND_HTTP_ERRORS as exc:
             self._report_failure(decision.model_name, exc)
+            emit(
+                "mcp_query_failed",
+                trace_id=trace_id,
+                model=decision.model_name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             _log.warning(
                 "mcp_query_backend_error model=%s err=%s",
                 decision.model_name, exc,
@@ -433,6 +463,13 @@ class LamuMcpServer:
                 f"[Model thinking truncated — reasoning: {len(reasoning)} chars]"
             )
 
+        emit(
+            "mcp_query_done",
+            trace_id=trace_id,
+            model=decision.model_name,
+            content_len=len(content),
+            reasoning_len=len(reasoning) if reasoning else 0,
+        )
         return [TextContent(type="text", text=result_text)]
 
     def _handle_plan_query(self, args: dict) -> list[TextContent]:

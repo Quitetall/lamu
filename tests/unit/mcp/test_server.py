@@ -283,3 +283,64 @@ def test_vram_status_reports_gpu_unavailable(server, mock_nvidia_smi):
     server._scheduler.query_vram()
     out = _text(server._handle_vram_status())
     assert "GPU unavailable" in out
+
+
+# ── v3 phase D3: trace IDs ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_query_emits_trace_id_events(server, sample_registry, capsys):
+    """Phase D3: every query emits start + done events with the same trace_id."""
+    import json
+    qwen = sample_registry[0]
+    server._scheduler.register_loaded(qwen, pid=1, port=8020, vram_actual_mb=18000)
+
+    payload = {
+        "choices": [{
+            "message": {"content": "ok", "reasoning_content": ""},
+            "finish_reason": "stop",
+        }],
+    }
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode()
+    resp.__enter__ = lambda self: resp
+    resp.__exit__ = lambda *_: None
+
+    with patch("urllib.request.urlopen", return_value=resp):
+        await server._handle_query({"prompt": "hi", "model": qwen.name})
+
+    err = capsys.readouterr().err
+    start_lines = [l for l in err.splitlines() if '"event": "mcp_query_start"' in l]
+    done_lines = [l for l in err.splitlines() if '"event": "mcp_query_done"' in l]
+    assert start_lines and done_lines, f"missing events in: {err}"
+    start = json.loads(start_lines[0])
+    done = json.loads(done_lines[0])
+    assert start["trace_id"] == done["trace_id"]
+    assert len(start["trace_id"]) == 16
+
+
+@pytest.mark.asyncio
+async def test_query_accepts_traceparent_meta(server, sample_registry, capsys):
+    """Phase D3: W3C traceparent in `_meta` propagates as the trace_id."""
+    import json
+    qwen = sample_registry[0]
+    server._scheduler.register_loaded(qwen, pid=1, port=8020, vram_actual_mb=18000)
+
+    payload = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode()
+    resp.__enter__ = lambda self: resp
+    resp.__exit__ = lambda *_: None
+
+    # Format: 00-<32 hex traceid>-<16 hex spanid>-<2 hex flags>
+    traceparent = "00-0123456789abcdef0123456789abcdef-0011223344556677-01"
+    with patch("urllib.request.urlopen", return_value=resp):
+        await server._handle_query({
+            "prompt": "hi", "model": qwen.name,
+            "_meta": {"traceparent": traceparent},
+        })
+
+    err = capsys.readouterr().err
+    start = next(json.loads(l) for l in err.splitlines() if '"event": "mcp_query_start"' in l)
+    # First 16 hex of the traceid become our internal id.
+    assert start["trace_id"] == "0123456789abcdef"
