@@ -4,30 +4,162 @@
 set dotenv-load
 
 root := env("HOME") / "local-llm"
+lamu_bin := root / "lamu-rs" / "target" / "release" / "lamu"
 
-# ── Stack lifecycle ──────────────────────────────────────────────────────
 
-# Start production stack (27B + 0.8B megakernel)
-start ctx="med":
-    bash {{root}}/scripts/swap-model.sh 3.6 {{ctx}}
+# ═══════════════════════════════════════════════════════════════════════════
+# v3 — `lamu` (Rust). Canonical path. Use these.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Install `lamu` to ~/.cargo/bin (one-time)
+install:
+    cd {{root}}/lamu-rs && cargo install --path lamu-cli --locked
+    @echo "✓ lamu installed to ~/.cargo/bin (ensure on \$PATH)"
+
+# Build the release binary in-tree (no cargo install)
+build:
+    cd {{root}}/lamu-rs && cargo build --release -p lamu-cli
+
+# Discover GGUFs in ~/models/ → config/models.yaml
+scan:
+    {{lamu_bin}} scan
+
+# Show registry + VRAM + which backend ports answer
+status:
+    {{lamu_bin}} status
+
+# Boot the MCP server (stdio — for Claude Code)
+start:
+    {{lamu_bin}} start
+
+# Boot the OpenAI-compat HTTP server on :8020 (override with `just serve PORT`)
+serve port="8020":
+    {{lamu_bin}} serve --port {{port}}
+
+# Interactive REPL chatting against `lamu serve`
+repl url="http://localhost:8020/v1/chat/completions":
+    {{lamu_bin}} repl {{url}}
+
+# ── Setup (still needed by quick start) ─────────────────────────────────────
+
+# Download Qwen3.6-27B dense uncensored GGUF (~16 GB). Run before `lamu scan`.
+setup-qwen36:
+    bash {{root}}/scripts/setup-qwen36-dense.sh
+
+# Download Qwen3.6-35B-A3B MoE uncensored GGUF (~21 GB)
+setup-qwen36-moe:
+    bash {{root}}/scripts/setup-qwen36-moe.sh
+
+# Clone + set up club-3090 for vLLM serving (~20 GB download)
+setup-vllm:
+    bash {{root}}/scripts/setup-club3090.sh
+
+# Set up ComfyUI + video nodes (image/video generation)
+setup-comfyui:
+    bash {{root}}/scripts/setup-comfyui.sh
+
+# ── Tests + lint ────────────────────────────────────────────────────────────
+
+# Default test target: fast unit suite (skips slow/gpu/network/rust/contract)
+test:
+    cd {{root}} && .venv/bin/python -m pytest
+
+test-fast:
+    cd {{root}} && .venv/bin/python -m pytest
+
+test-slow:
+    cd {{root}} && .venv/bin/python -m pytest tests/integration --override-ini="addopts="
+
+test-gpu:
+    cd {{root}} && .venv/bin/python -m pytest -m gpu --override-ini="addopts="
+
+test-rust:
+    cd {{root}}/lamu-rs && cargo test --workspace
+
+# Cross-language MCP contract tests (Python ↔ Rust parity)
+test-contract:
+    cd {{root}} && .venv/bin/python -m pytest tests/contract -m contract --override-ini="addopts="
+
+coverage:
+    cd {{root}} && .venv/bin/python -m pytest --cov=lamu --cov=agents --cov=cli --cov=web --cov=server --cov-report=term-missing
+
+lint:
+    -cd {{root}} && .venv/bin/python -m ruff check lamu agents cli web server tests
+    cd {{root}}/lamu-rs && cargo clippy --workspace -- -D warnings
+
+# Install dev dependencies (pytest etc.)
+test-setup:
+    cd {{root}} && uv pip install --python .venv/bin/python -e ".[dev]"
+
+# ── Swarm + training (still v1 surface) ─────────────────────────────────────
+
+swarm task repo test_cmd="python -m pytest tests/ -v --tb=short":
+    cd {{root}} && .venv/bin/python -m agents.swarm "{{task}}" --repo "{{repo}}" --test "{{test_cmd}}"
+
+bench-list:
+    cd {{root}} && .venv/bin/python -m agents.bench list
+
+bench-opus:
+    cd {{root}} && .venv/bin/python -m agents.bench run --suite builtin --config opus-solo
+
+bench-swarm:
+    cd {{root}} && .venv/bin/python -m agents.bench run --suite builtin --config swarm
+
+bench-swebench config limit="10":
+    cd {{root}} && .venv/bin/python -m agents.bench run --suite swebench --config {{config}} --limit {{limit}}
+
+bench-compare run_a run_b:
+    cd {{root}} && .venv/bin/python -m agents.bench compare {{run_a}} {{run_b}}
+
+train-status:
+    cd {{root}} && .venv/bin/python -m agents.trainer status
+
+train-prepare:
+    cd {{root}} && .venv/bin/python -m agents.trainer prepare
+
+train model="Qwen/Qwen3.5-27B" epochs="3":
+    cd {{root}} && .venv/bin/python -m agents.trainer train --model "{{model}}" --epochs {{epochs}}
+
+train-export-gguf:
+    cd {{root}} && .venv/bin/python -m agents.trainer export --format gguf
+
+train-export-hf:
+    cd {{root}} && .venv/bin/python -m agents.trainer export --format hf
+
+setup-web:
+    bash {{root}}/web/setup.sh
+
+setup-agents:
+    bash {{root}}/agents/setup.sh
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Legacy v1 — script-driven launchers. Preserved in legacy/.
+# Prefer `lamu` for new work. These are kept for perf-table reproducibility
+# and DFlash/megakernel custom-server invocation.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Boot the v1 stack (Qwen3.6 + megakernel + Bifrost + Langfuse + Chainlit).
+start-v1 ctx="med":
+    bash {{root}}/legacy/scripts/swap-model.sh 3.6 {{ctx}}
     @echo "Starting megakernel 0.8B on :8001..."
     @nohup {{root}}/.venv/bin/python {{root}}/server/megakernel_server.py --port 8001 > /tmp/megakernel.log 2>&1 &
     @sleep 8 && curl -sf http://localhost:8001/health > /dev/null && echo "  0.8B ready on :8001" || echo "  0.8B failed (check /tmp/megakernel.log)"
 
-# Stop everything
-stop:
+# Stop everything spawned by start-v1.
+stop-v1:
     -pkill -f "llama-server" 2>/dev/null
     -pkill -f "megakernel_server" 2>/dev/null
-    @echo "All models stopped."
+    @echo "All v1 models stopped."
 
-# Diagnose all problems
-doctor:
-    bash {{root}}/scripts/doctor.sh
+# v1 doctor — diagnostic for the legacy stack.
+doctor-v1:
+    bash {{root}}/legacy/scripts/doctor.sh
 
-# Show what's running
-status:
+# v1 status — every port the legacy stack used.
+status-v1:
     @echo "DFlash  :8000  $(curl -sf http://localhost:8000/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
-    @echo "vLLM    :8020  $(curl -sf http://localhost:8020/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
+    @echo "Qwen3.6 :8020  $(curl -sf http://localhost:8020/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
     @echo "Bifrost :8080  $(curl -sf http://localhost:8080/health >/dev/null 2>&1 && echo '✓' || echo '✗')"
     @echo "Langfuse:3000  $(curl -sf http://localhost:3000/api/public/health >/dev/null 2>&1 && echo '✓' || echo '✗')"
     @echo "SGLang  :8001  $(curl -sf http://localhost:8001/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
@@ -35,9 +167,7 @@ status:
     @echo "Chainlit:7860  $(curl -sf http://localhost:7860 >/dev/null 2>&1 && echo '✓' || echo '✗')"
     @echo "ComfyUI :8188  $(curl -sf http://localhost:8188/system_stats >/dev/null 2>&1 && echo '✓' || echo '✗')"
 
-# ── Individual services ──────────────────────────────────────────────────
-
-# Sidecar: small model on :8001 alongside 27B
+# Sidecar small model on :8001 alongside 27B (v1 path).
 sidecar tier="fast":
     #!/usr/bin/env bash
     pkill -f "megakernel_server\|llama-server.*8001" 2>/dev/null; sleep 2
@@ -60,253 +190,75 @@ sidecar tier="fast":
         ;;
       *)
         echo "Usage: just sidecar [fast|lobo|off]"
-        echo "  fast/4b  — Qwen3.5-4B (~200 t/s, smart)"
-        echo "  lobo/0.8b — 0.8B megakernel (494 t/s, lobotomized)"
-        echo "  off       — kill sidecar"
         ;;
     esac
 
-# Start DFlash (Qwen3.5-27B, 130-200+ t/s speculative decoding on :8000)
-serve-dflash:
-    bash {{root}}/scripts/serve-dflash.sh
-
-# Swap between 27B models (can't run both — shared GPU). 0.8B stays running.
-# Options: qwen36, qwen35, dflash, status
+# Hot-swap the model on :8020.
 swap model="status" ctx="":
-    bash {{root}}/scripts/swap-model.sh {{model}} {{ctx}}
+    bash {{root}}/legacy/scripts/swap-model.sh {{model}} {{ctx}}
 
-# Start Qwen3.6 ngram-mod production (40+ t/s warm, 131K ctx on :8020)
+# Start DFlash (Qwen3.5-27B speculative on :8000 — 106 t/s).
+serve-dflash:
+    bash {{root}}/legacy/scripts/serve-dflash.sh
+
+# Start Qwen3.6 ngram-mod on :8020 (40+ t/s warm).
 serve-qwen36:
-    bash {{root}}/scripts/serve-qwen36.sh
+    bash {{root}}/legacy/scripts/serve-qwen36.sh
 
-# Start Qwen3.6-27B dense specifically (best benchmarks)
 serve-qwen36-dense:
-    bash {{root}}/scripts/serve-qwen36.sh dense
+    bash {{root}}/legacy/scripts/serve-qwen36.sh dense
 
-# Start Qwen3.6-35B-A3B MoE specifically (faster per-token)
 serve-qwen36-moe:
-    bash {{root}}/scripts/serve-qwen36.sh moe
+    bash {{root}}/legacy/scripts/serve-qwen36.sh moe
 
-# Start Qwen3.6-27B uncensored via vLLM — full 262K context, tool calling, reasoning parser
+# DFlash one-shot (uses full GPU).
+serve-fast prompt="Write Python quicksort.":
+    bash {{root}}/legacy/scripts/serve-qwen36-fast.sh "{{prompt}}"
+
+# Qwen3.6 via vLLM with full 262K context.
 serve-vllm ctx="262144":
-    bash {{root}}/scripts/serve-vllm-qwen36.sh {{ctx}}
+    bash {{root}}/legacy/scripts/serve-vllm-qwen36.sh {{ctx}}
 
-# Start Bifrost gateway (:8080)
+# Bifrost gateway (:8080) — pending Phase 1 benchmark.
 serve-bifrost:
     bash {{root}}/scripts/serve-bifrost.sh
 
-# Start Langfuse observability (:3000)
+stop-bifrost:
+    bash {{root}}/scripts/stop-bifrost.sh
+
 serve-langfuse:
-    bash {{root}}/scripts/serve-langfuse.sh
+    bash {{root}}/legacy/scripts/serve-langfuse.sh
 
-# GPT-2 XL with 2021-era presets (shitty-best2021, shitty-inferkit, etc.)
+# GPT-2 XL with 2021-era presets (timemachine mode).
 serve-timemachine:
-    bash {{root}}/scripts/serve-sglang.sh gpt2-xl && bash {{root}}/scripts/serve-sglang-presets.sh
+    bash {{root}}/legacy/scripts/serve-sglang.sh gpt2-xl && bash {{root}}/legacy/scripts/serve-sglang-presets.sh
 
-# Start Chainlit web UI (:7860)
 serve-web:
     bash {{root}}/web/serve.sh
 
-# Start ComfyUI for image/video generation (:8188)
 serve-comfyui:
-    bash {{root}}/scripts/serve-comfyui.sh
+    bash {{root}}/legacy/scripts/serve-comfyui.sh
 
-# ── Model swap ───────────────────────────────────────────────────────────
+# v1 chat (talked direct to backends + Bifrost). Use `lamu repl` instead.
+chat:
+    bash {{root}}/legacy/scripts/chat.sh
 
-# Hot-swap to Qwen3.5-27B (DFlash)
-swap-qwen:
-    bash {{root}}/scripts/swap.sh qwen
+ask +prompt:
+    bash {{root}}/legacy/scripts/chat.sh {{prompt}}
 
-# Hot-swap to GPT-2 XL (SGLang)
-swap-gpt2:
-    bash {{root}}/scripts/swap.sh gpt2
+# EAGLE speculative decoding research server.
+serve-eagle:
+    bash {{root}}/legacy/scripts/serve-eagle.sh
 
-# Swap GPU to ComfyUI (kills LLM, starts ComfyUI)
-swap-comfyui:
-    #!/usr/bin/env bash
-    echo -e "\033[1mSwapping GPU to ComfyUI\033[0m"
-    kill $(cat /tmp/qwen36-server.pid 2>/dev/null) 2>/dev/null && echo "  Qwen3.6 stopped" || true
-    kill $(cat /tmp/dflash-server.pid 2>/dev/null) 2>/dev/null && echo "  DFlash stopped" || true
-    rm -f /tmp/qwen36-server.pid /tmp/dflash-server.pid
-    sleep 2
-    bash {{root}}/scripts/serve-comfyui.sh
-
-# Swap GPU back to LLM (kills ComfyUI, starts Qwen3.6)
-swap-llm:
-    #!/usr/bin/env bash
-    echo -e "\033[1mSwapping GPU to LLM\033[0m"
-    kill $(cat /tmp/comfyui.pid 2>/dev/null) 2>/dev/null && echo "  ComfyUI stopped" || true
-    rm -f /tmp/comfyui.pid
-    sleep 2
-    bash {{root}}/scripts/serve-qwen36.sh
-
-# Hot-reload to Q4_K_M (262K context, max context)
+# Hot-reload Qwen3.6 quant via legacy reload endpoint.
 reload-max-ctx:
     @curl -s -X POST http://localhost:8020/reload -H "Content-Type: application/json" -d '{"quant":"Q4_K_M"}' | python3 -c "import sys,json; r=json.load(sys.stdin); print(f'Reloading: {r.get(\"from\",\"?\")} → {r.get(\"to\",\"?\")} ({r.get(\"context\",\"?\")} ctx)')"
 
-# Hot-reload to Q5_K_S (108K context, best quality)
 reload-quality:
     @curl -s -X POST http://localhost:8020/reload -H "Content-Type: application/json" -d '{"quant":"Q5_K_S"}' | python3 -c "import sys,json; r=json.load(sys.stdin); print(f'Reloading: {r.get(\"from\",\"?\")} → {r.get(\"to\",\"?\")} ({r.get(\"context\",\"?\")} ctx)')"
 
-# ── Chat ─────────────────────────────────────────────────────────────────
-
-# Interactive REPL (auto-starts models if needed)
-chat:
-    bash {{root}}/scripts/chat.sh
-
-# One-shot prompt (no REPL)
-ask +prompt:
-    bash {{root}}/scripts/chat.sh {{prompt}}
-
-# Chat with a specific model
-chat-with model:
-    bash {{root}}/scripts/chat.sh -m {{model}}
-
-# ── Swarm ────────────────────────────────────────────────────────────────
-
-# Run the agent swarm on a task
-swarm task repo test_cmd="python -m pytest tests/ -v --tb=short":
-    cd {{root}} && .venv/bin/python -m agents.swarm "{{task}}" --repo "{{repo}}" --test "{{test_cmd}}"
-
-# ── Benchmarks ───────────────────────────────────────────────────────────
-
-# List available builtin benchmark tasks
-bench-list:
-    cd {{root}} && .venv/bin/python -m agents.bench list
-
-# Run builtin benchmark with Opus solo (cloud-only baseline)
-bench-opus:
-    cd {{root}} && .venv/bin/python -m agents.bench run --suite builtin --config opus-solo
-
-# Run builtin benchmark with the full swarm
-bench-swarm:
-    cd {{root}} && .venv/bin/python -m agents.bench run --suite builtin --config swarm
-
-# Run SWE-bench Lite (real GitHub issues, requires datasets package)
-bench-swebench config limit="10":
-    cd {{root}} && .venv/bin/python -m agents.bench run --suite swebench --config {{config}} --limit {{limit}}
-
-# Compare two benchmark runs
-bench-compare run_a run_b:
-    cd {{root}} && .venv/bin/python -m agents.bench compare {{run_a}} {{run_b}}
-
-# ── Training ─────────────────────────────────────────────────────────────
-
-# Show training data stats
-train-status:
-    cd {{root}} && .venv/bin/python -m agents.trainer status
-
-# Prepare dataset from collected swarm data
-train-prepare:
-    cd {{root}} && .venv/bin/python -m agents.trainer prepare
-
-# Run QLoRA fine-tuning (default: Qwen3.5-27B, 3 epochs)
-train model="Qwen/Qwen3.5-27B" epochs="3":
-    cd {{root}} && .venv/bin/python -m agents.trainer train --model "{{model}}" --epochs {{epochs}}
-
-# Export fine-tuned model to GGUF (for DFlash)
-train-export-gguf:
-    cd {{root}} && .venv/bin/python -m agents.trainer export --format gguf
-
-# Export fine-tuned model to HF format (for vLLM)
-train-export-hf:
-    cd {{root}} && .venv/bin/python -m agents.trainer export --format hf
-
-# ── Setup ────────────────────────────────────────────────────────────────
-
-# Set up Chainlit web frontend (create venv + install deps)
-setup-web:
-    bash {{root}}/web/setup.sh
-
-# Set up LangGraph agents (create venv + install deps)
-setup-agents:
-    bash {{root}}/agents/setup.sh
-
-# Set up ComfyUI + video nodes (image/video generation)
-setup-comfyui:
-    bash {{root}}/scripts/setup-comfyui.sh
-
-# Download Qwen3.6-27B dense uncensored GGUF (~16 GB) — recommended
-setup-qwen36:
-    bash {{root}}/scripts/setup-qwen36-dense.sh
-
-# Download Qwen3.6-27B dense specifically
-setup-qwen36-dense:
-    bash {{root}}/scripts/setup-qwen36-dense.sh
-
-# Download Qwen3.6-35B-A3B MoE uncensored GGUF (~21 GB)
-setup-qwen36-moe:
-    bash {{root}}/scripts/setup-qwen36-moe.sh
-
-# Clone + set up club-3090 for vLLM serving (~20 GB download)
-setup-vllm:
-    bash {{root}}/scripts/setup-club3090.sh
-
-# ── MCP (Claude Code integration) ────────────────────────────────────────
-
-# Test the MCP server (checks if local LLM is reachable)
+# v1 MCP server (server/mcp_qwen.py). Use `lamu start` instead.
 mcp-test:
     @echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"test","version":"1"},"protocolVersion":"2024-11-05"}}' \
       | timeout 3 {{root}}/.venv/bin/python {{root}}/server/mcp_qwen.py 2>/dev/null \
       && echo "MCP server responds OK" || echo "MCP server OK (timeout expected on stdin)"
-
-# ── Quick test ───────────────────────────────────────────────────────────
-
-# Smoke test: send a quick prompt through Bifrost → DFlash
-test-dflash:
-    @curl -s http://localhost:8080/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer sk-local" \
-      -d '{"model":"dflash/luce-dflash","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
-      | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
-
-# Smoke test: send a prompt through Bifrost → Qwen3.6 uncensored
-test-qwen36:
-    @curl -s http://localhost:8080/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer sk-local" \
-      -d '{"model":"qwen/qwen3.6-27b-uncensored","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":50}' \
-      | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
-
-# DFlash one-shot (106 t/s, uses full GPU)
-serve-dflash-oneshot prompt="Write Python quicksort.":
-    bash {{root}}/scripts/serve-qwen36-fast.sh "{{prompt}}"
-
-# Start EAGLE speculative decoding server (main model + trained EAGLE head)
-serve-eagle:
-    bash {{root}}/scripts/serve-eagle.sh
-
-# ── Tests + lint ─────────────────────────────────────────────────────────
-
-# Default test target: fast unit suite (skips slow/gpu/network/rust markers)
-test:
-    cd {{root}} && .venv/bin/python -m pytest
-
-# Same as `test` but explicit alias.
-test-fast:
-    cd {{root}} && .venv/bin/python -m pytest
-
-# Run integration tests (kill backend mid-stream, OOM quarantine, no-hang)
-test-slow:
-    cd {{root}} && .venv/bin/python -m pytest tests/integration --override-ini="addopts="
-
-# GPU smoke tests — require CUDA
-test-gpu:
-    cd {{root}} && .venv/bin/python -m pytest -m gpu --override-ini="addopts="
-
-# Run the Rust workspace test suite
-test-rust:
-    cd {{root}}/lamu-rs && cargo test --workspace
-
-# Coverage report (terminal output, no enforced gate)
-coverage:
-    cd {{root}} && .venv/bin/python -m pytest --cov=lamu --cov=agents --cov=cli --cov=web --cov=server --cov-report=term-missing
-
-# Lint Python (ruff if installed) + Rust (clippy)
-lint:
-    -cd {{root}} && .venv/bin/python -m ruff check lamu agents cli web server tests
-    cd {{root}}/lamu-rs && cargo clippy --workspace -- -D warnings
-
-# Install dev dependencies (pytest etc.)
-test-setup:
-    cd {{root}} && uv pip install --python .venv/bin/python pytest pytest-asyncio pytest-mock pytest-cov httpx respx freezegun hypothesis ruff

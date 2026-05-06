@@ -102,6 +102,9 @@ case "${1:-}" in
     echo "  swap-model.sh 3.6 big         # Qwen3.6 @ 262K (max context)"
     echo "  swap-model.sh 3.6 65536       # raw number also works"
     echo ""
-    echo "  Note: 0.8B megakernel (:8001) runs alongside any 27B model"
+    echo ""
+    echo "Sidecar (runs alongside 27B on :8001):"
+    echo "  Use 'just sidecar fast' for 4B (200 t/s, smart)"
+    echo "  Use 'just sidecar lobo' for 0.8B megakernel (494 t/s, lobotomized)"
     ;;
 esac

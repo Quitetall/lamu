@@ -15,8 +15,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _load_module():
-    """Load cli/chat_repl.py as a regular module (no package init present)."""
-    src = _REPO_ROOT / "cli" / "chat_repl.py"
+    """Load legacy/cli/chat_repl.py as a regular module.
+
+    The v1 REPL was moved to legacy/cli/ when Rust `lamu repl` became the
+    canonical chat client. The test still validates legacy behaviour so
+    refactors there don't silently break old workflows.
+    """
+    src = _REPO_ROOT / "legacy" / "cli" / "chat_repl.py"
     spec = importlib.util.spec_from_file_location("chat_repl", src)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["chat_repl"] = mod

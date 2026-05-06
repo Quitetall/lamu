@@ -1,5 +1,7 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
+mod repl;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use lamu_core::config::{models_dir, registry_path, PORT_MAIN, PORT_SIDECAR};
@@ -29,6 +31,12 @@ enum Command {
         #[arg(short, long, default_value_t = 8020)]
         port: u16,
     },
+    /// Interactive chat REPL talking to a running `lamu serve`.
+    Repl {
+        /// OpenAI-compat URL. Defaults to localhost:8020/v1/chat/completions.
+        #[arg(default_value = "http://localhost:8020/v1/chat/completions")]
+        api_url: String,
+    },
 }
 
 #[tokio::main]
@@ -44,6 +52,14 @@ async fn main() -> Result<()> {
         Command::Status => cmd_status().await,
         Command::Start => cmd_start().await,
         Command::Serve { port } => cmd_serve(port).await,
+        Command::Repl { api_url } => {
+            // REPL is a blocking I/O loop — run it on a dedicated thread so
+            // tokio's runtime keeps moving for any background tasks the
+            // reqwest::blocking client might trigger internally.
+            tokio::task::spawn_blocking(move || repl::run_repl(api_url))
+                .await??;
+            Ok(())
+        }
     }
 }
 

@@ -277,7 +277,7 @@ def export(
         gguf_files = list(out.glob("*.gguf"))
         if gguf_files:
             print(f"GGUF ready: {gguf_files[0]}")
-            print(f"To serve with DFlash, update scripts/serve-dflash.sh --target to point here.")
+            print(f"To serve with DFlash, update legacy/scripts/serve-dflash.sh --target to point here.")
         return out
     else:
         out = MERGED_DIR / f"hf_{ts}"

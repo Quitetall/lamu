@@ -1,6 +1,6 @@
 # LAMU
 
-**Local Agent Model Utility** — a single-process MCP-first daemon that auto-discovers your GGUF models, schedules them on a budgeted GPU, and serves them over MCP and OpenAI-compatible HTTP. Three speed tiers up to **106 t/s** on one RTX 4090. Python prototype, Rust drop-in.
+**Local Agent Model Utility** — single-process MCP-first daemon. Auto-discovers GGUF models, schedules them on a budgeted GPU, serves them over MCP and OpenAI-compatible HTTP. Three speed tiers up to **106 t/s** on one RTX 4090.
 
 ```
                      ┌──────── lamu ────────┐
@@ -9,7 +9,7 @@
                      └────────┬─────────────┘
                               ▼
                           OpenAI HTTP
-                          for everyone else
+                          for everything else
 ```
 
 | Tier | Speed | Engine | Use |
@@ -24,38 +24,31 @@ Started from 2021 InferKit / GPT-2 nostalgia — the GPT-2 proxy is still in the
 
 ## Quick Start
 
+LAMU ships a single canonical binary, `lamu` (Rust). Install once and use it from anywhere on `$PATH`.
+
 ```bash
 git clone https://github.com/Quitetall/lamu ~/local-llm
 cd ~/local-llm
-python3.12 -m venv .venv && uv pip install -e . --python .venv/bin/python
 
-python -m lamu scan                   # discover GGUFs in ~/models
-python -m lamu start                  # MCP daemon on stdio
-python -m lamu serve [port=8020]      # OpenAI-compat HTTP
-python -m lamu repl  [api_url]        # chat REPL
+just setup-qwen36     # ~16 GB download — Qwen3.6-27B-uncensored Q4_K_M
+just install          # cargo install --path lamu-rs/lamu-cli --locked
+
+lamu scan             # discover GGUFs in ~/models/ → config/models.yaml
+lamu start            # MCP daemon on stdio (point Claude Code at this)
+lamu serve            # OpenAI HTTP on :8020
+lamu repl             # interactive chat against `lamu serve`
+lamu status           # what's running, VRAM, registry size
 ```
 
-Rust drop-in (same CLI surface):
-
-```bash
-cd lamu-rs && cargo build --release
-./target/release/lamu start            # same MCP behaviour, lower overhead
-./target/release/lamu serve --port 8020
-```
-
-For the **106 t/s** DFlash one-shot:
-
-```bash
-just serve-fast "Write quicksort in Python"
-```
+That's the whole onboarding. `lamu` is your interface; everything else is plumbing.
 
 ---
 
-## v2 Architecture
+## Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  lamu daemon (single process)                              │
+│  lamu daemon (single process, single binary)               │
 │                                                            │
 │  ┌───────────┐  ┌────────────┐  ┌─────────────────────┐    │
 │  │ MCP stdio │  │ OpenAI :*  │  │ CLI REPL (lamu repl)│    │
@@ -66,6 +59,7 @@ just serve-fast "Write quicksort in Python"
 │  │  Router  — capability routing (chat/code/...)      │    │
 │  │  Queue   — FIFO/LIFO/Priority, bounded concurrency │    │
 │  │  Reasoning extractor — per-family <think> handling │    │
+│  │  Health + Supervisor — restart-with-backoff        │    │
 │  └────────────────────────┬───────────────────────────┘    │
 │                           │                                │
 │  ┌────────────────────────▼───────────────────────────┐    │
@@ -80,13 +74,13 @@ just serve-fast "Write quicksort in Python"
 └────────────────────────────────────────────────────────────┘
 ```
 
-Key v2 invariants:
-
+Invariants:
 - **MCP first.** OpenAI HTTP is a compat shim. The CLI also targets the daemon, not the backends directly.
 - **Capabilities are requirements, not preferences.** `capabilities=["code"]` will load a code model, evicting LRU if needed. The router never silently downgrades.
 - **`plan_query` dry-run.** Returns `{would_route_to, reason, loaded, would_evict}` for debugging agent loops.
-- **Per-model request queue.** Concurrent agents calling the same model serialise on a configurable strategy (FIFO default). Set `LAMU_QUEUE_STRATEGY=priority` and pass `priority`/`origin` per request when ordering matters.
+- **Per-model request queue.** Concurrent agents calling the same model serialise on a configurable strategy (FIFO default). Set `LAMU_QUEUE_STRATEGY=priority` and pass `priority` / `origin` per request when ordering matters.
 - **Reasoning extractor lives in the model entry.** `<think>...</think>` is buffered and stripped (or annotated) per family — Qwen3.5/3.6, DeepSeek, o1.
+- **Backend death is loud, not silent.** Health state machine (HEALTHY → DEGRADED → DEAD → QUARANTINED) plus Supervisor with 1s/2s/4s backoff, structured JSON events to stderr or `$LAMU_EVENT_LOG`.
 
 ---
 
@@ -98,18 +92,14 @@ Key v2 invariants:
   "mcpServers": {
     "local-llm": {
       "type": "stdio",
-      "command": "/home/YOU/local-llm/.venv/bin/python",
-      "args": ["-m", "lamu", "start"],
-      "cwd": "/home/YOU/local-llm"
+      "command": "lamu",
+      "args": ["start"]
     }
-    // — or, drop-in Rust binary —
-    // "command": "/home/YOU/local-llm/lamu-rs/target/release/lamu",
-    // "args": ["start"]
   }
 }
 ```
 
-**Tools exposed:**
+Reload Claude Code, then `/mcp` should show `local-llm` connected. Tools exposed:
 
 | Tool | Purpose |
 |------|---------|
@@ -125,7 +115,7 @@ Key v2 invariants:
 
 ## OpenAI HTTP
 
-Drop-in compat:
+`lamu serve` boots the FastAPI/axum compat layer. Drop-in for any OpenAI client:
 
 ```bash
 curl http://localhost:8020/v1/chat/completions \
@@ -133,13 +123,20 @@ curl http://localhost:8020/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":1000,"stream":true}'
 ```
 
-Streaming, models list, health — all standard. Reasoning is stripped from `content` and exposed in `reasoning_content` (Qwen extension). Both Python (FastAPI) and Rust (axum) implementations validated for end-to-end SSE: identical chunk format, identical `[DONE]` terminator.
+Streaming, models list, health — all standard. Reasoning is stripped from `content` and exposed in `reasoning_content` (Qwen extension).
+
+Observability:
+
+- `GET /metrics` — Prometheus text. `lamu_requests_total`, `lamu_request_duration_seconds`, `lamu_tokens_generated_total`, `lamu_vram_used_mb`, `lamu_queue_depth`, `lamu_backend_health_state`, `lamu_backend_restarts_total`.
+- `GET /health` — `{"status":"ok","models_loaded":N}` for liveness.
+- W3C `traceparent` on requests gets propagated through `lamu`'s structured event stream (mid-16 hex of the traceid as the internal trace_id).
+- `LAMU_EVENT_LOG=/path/to/jsonl` appends every event to a file alongside stderr.
 
 ---
 
 ## Model Registry
 
-`python -m lamu scan` walks `~/models/`, parses GGUF headers, and emits `config/models.yaml`:
+`lamu scan` walks `~/models/`, parses GGUF headers, writes `config/models.yaml`:
 
 ```yaml
 - name: qwen3.6-27b-uncensored-heretic-v2-q4_k_m
@@ -159,11 +156,11 @@ Streaming, models list, health — all standard. Reasoning is stripped from `con
     draft_max: 8
 ```
 
-Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` — chosen per-entry. Adding a new backend is a single file in `lamu/backends/` (or `lamu-rs/lamu-core/src/backends/`) plus one `make_backend` arm.
+Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` — chosen per-entry. Adding a new backend is one file in `lamu-rs/lamu-core/src/backends/` (mirrored in `lamu/backends/`) plus one `make_backend` arm.
 
 ---
 
-## Three Speed Tiers (v1 perf legacy, still authoritative)
+## Three Speed Tiers (perf legacy, still authoritative)
 
 RTX 4090, 24 GB VRAM, Qwen3.6-27B-uncensored-heretic-v2 Q4_K_M:
 
@@ -177,39 +174,25 @@ RTX 4090, 24 GB VRAM, Qwen3.6-27B-uncensored-heretic-v2 Q4_K_M:
 
 Q4_K_M draft outperforms F16 (77.6 vs 72.7 t/s) — bandwidth beats accuracy on the draft path.
 
+For the **106 t/s DFlash one-shot** run via the legacy stack: `just serve-fast "Write quicksort in Python"` (requires the custom DFlash llama.cpp branch built — see [`wiki/pages/dflash-speculative.md`](wiki/pages/dflash-speculative.md)).
+
 ---
 
-## Testing
+## Hacking on LAMU — the Python prototype
 
-`pytest` with stubbed heavy deps so the unit layer runs CPU-only (no torch/transformers/llama_cpp imported):
+The Python package at `lamu/` is the iteration surface. Every Rust module in `lamu-rs/` started as a Python prototype that got translated mechanically once the design stabilised. The two run in lock-step — cross-language MCP contract tests in `tests/contract/` lock the wire format.
+
+Use Python when:
+- You're sketching a new module.
+- You want a stack trace.
+- You're debugging health / scheduler / queue behaviour interactively.
+
+Use Rust (`lamu`) for everything else. Mirror surface is identical:
 
 ```bash
-pytest tests/ -q
-# → 264 passed, 15 deselected (GPU-marked)
-
-cargo test --workspace
-# → 50 passed across 9 crates
+python -m lamu scan|status|start|serve|repl     # prototype
+lamu               scan|status|start|serve|repl  # canonical
 ```
-
-Layout:
-
-```
-tests/
-├── unit/        — 250 tests, modules stubbed at conftest level
-│   ├── core/    — registry, scheduler, router, reasoning, types, health, supervisor
-│   ├── backends/, mcp/, api/, daemon/, cli/
-│   └── server/, agents/, scripts/, web/
-└── integration/ — 14 tests, real subprocesses
-    ├── test_backend_death.py        — process kill, scheduler reconciles
-    ├── test_oom_quarantine.py       — VRAM exhausted → quarantine path
-    ├── test_bad_registry.py         — corrupt YAML, missing files
-    ├── test_no_hang.py              — load/unload/query never blocks indefinitely
-    └── test_concurrent_health.py    — N agents probing health at once
-```
-
-Heavy modules (`torch`, `transformers`, `llama_cpp`, `langchain*`, `chainlit`, …) are replaced with `_StubModule` instances at conftest import — the runtime never touches them. Real subprocesses are guarded by `no_real_subprocess`. `nvidia-smi` is intercepted by the `mock_nvidia_smi` fixture which simulates VRAM state, PIDs, timeouts, and failures.
-
-GGUF tests use a synthesised binary from `make_gguf_bytes(arch, file_type, truncate=, bad_magic=)` — covers happy path + corruption.
 
 ---
 
@@ -218,48 +201,56 @@ GGUF tests use a synthesised binary from `make_gguf_bytes(arch, file_type, trunc
 - **GPU:** NVIDIA RTX 4090 (24 GB) or larger
 - **OS:** Linux (Arch / CachyOS tested)
 - **CUDA:** 13.2 with **gcc-14** as host compiler (`CUDAHOSTCXX=g++-14`). gcc-16 + nvcc 13.2 do not link.
-- **Python:** 3.12+
-- **Rust:** 1.85+ (edition 2024)
+- **Rust:** 1.85+ (edition 2024) — `cargo install` lands `lamu` at `~/.cargo/bin/lamu`.
+- **Python:** 3.12+ (only needed for the prototype + agents)
 - **Tools:** `just`, `cmake`, `git`, `uv`
 
 ---
 
-## Commands
+## Testing
 
 ```bash
-# v2 daemon
-python -m lamu scan|start|status|serve|repl
-lamu  scan|start|status|serve|repl                  # rust binary, same surface
-
-# v1 servers (still wired through justfile)
-just swap 3.6 | 3.5 | dflash                        # rotate :8020 / :8000
-just serve-fast ["prompt"]                          # 106 t/s DFlash, optional one-shot
-just serve-megakernel                               # 494 t/s on :8001
-just status                                         # all endpoints
-
-# Chat
-llm                                                 # legacy direct REPL
-python -m lamu repl                                 # v2 daemon-routed REPL
-
-# Agent swarm + training
-just swarm "task" /path/to/repo
-just bench-swarm
-just train-status | train
-
-# Tests
-pytest tests/ -q
-cargo test --workspace
+pytest tests/ -q          # 288 unit + 14 integration, heavy deps stubbed
+cargo test --workspace    # 56 Rust tests across 9 crates
+just test-contract        # Python ↔ Rust MCP wire-format parity
+ruff check lamu           # strict on lamu/, soft on legacy paths
 ```
+
+CI gates on coverage (`fail_under = 70`), strict ruff over `lamu/`, full Python + Rust suites, and the cross-language contract diff.
+
+`tests/conftest.py` stubs `torch`, `transformers`, `llama_cpp`, `langchain*`, `chainlit`, etc. with `_StubModule` instances at import time — the unit layer never touches a GPU. `mock_nvidia_smi` simulates VRAM/PIDs/failures; `no_real_subprocess` is autouse-guarded so a stray Popen can't escape a test.
+
+---
+
+## Legacy v1 stack
+
+The script-driven v1 workflow (swap a model into `:8020`, sidecar a small one into `:8001`, run Bifrost on `:8080`) lives under `legacy/`. See [`legacy/README.md`](legacy/README.md) for the full inventory and what each script does.
+
+`just` exposes both:
+
+```bash
+just install            # v3 — lamu binary
+just start              # v3 — MCP daemon
+just serve              # v3 — OpenAI HTTP
+just repl               # v3 — chat REPL
+
+just start-v1           # v1 — full Qwen3.6 + megakernel + Bifrost stack
+just swap 3.6 | 3.5     # v1 — rotate model on :8020
+just sidecar fast|lobo  # v1 — small sidecar on :8001
+just serve-fast "..."   # v1 — DFlash 106 t/s one-shot
+```
+
+Bifrost (`:8080`) is dead on the v3 request path — kept under `scripts/serve-bifrost.sh` only because [`wiki/pages/bifrost-bench.md`](wiki/pages/bifrost-bench.md) hasn't been run yet to settle whether it's worth keeping. Run `bash scripts/bench-bifrost.sh` to decide.
 
 ---
 
 ## Wiki
 
-13 pages of hard-won optimization knowledge in `wiki/pages/`:
+13 pages in `wiki/pages/`:
 
-`dflash-speculative.md` · `build-requirements.md` · `262k-context.md` · `ngram-speculation.md` · `vram-budget.md` · `eagle-training.md` · `eagle-cpp-integration.md` · `mcp-setup.md` · `model-selection.md` · `serving-engine.md` · `token-efficiency.md` · `training-loop.md` · `vllm-limitations.md`.
+`dflash-speculative.md` · `build-requirements.md` · `262k-context.md` · `ngram-speculation.md` · `vram-budget.md` · `eagle-training.md` · `eagle-cpp-integration.md` · `mcp-setup.md` · `model-selection.md` · `serving-engine.md` · `token-efficiency.md` · `training-loop.md` · `vllm-limitations.md` · `bifrost-bench.md`.
 
-Knowledge graph (~1,000 nodes) in `graphify-out/graph.html`. Query with `/graphify query "<question>"`.
+Knowledge graph (~1,600 nodes, 162 communities) in `graphify-out/graph.html`. Query with `/graphify query "<question>"`.
 
 ---
 

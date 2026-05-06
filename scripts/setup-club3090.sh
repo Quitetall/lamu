@@ -30,5 +30,5 @@ else
 fi
 
 echo -e "\n${GREEN}club-3090 ready.${R}"
-echo -e "  Start vLLM:  ${GRY}bash $ROOT/scripts/serve-vllm.sh${R}"
+echo -e "  Start vLLM:  ${GRY}bash $ROOT/legacy/scripts/serve-vllm.sh${R}"
 echo -e "  Or use:      ${GRY}bash $CLUB_DIR/scripts/launch.sh${R}"
