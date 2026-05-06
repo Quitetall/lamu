@@ -1,7 +1,6 @@
 """Reasoning extractor — per-model-family think-block detection and stripping."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterator, Optional
 
 from lamu.core.errors import ReasoningOverflow

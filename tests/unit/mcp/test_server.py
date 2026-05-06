@@ -263,3 +263,23 @@ async def test_query_refuses_quarantined_model(server, sample_registry):
     )
     out = _text(await server._handle_query({"prompt": "hi", "model": qwen.name}))
     assert "No model available" in out or "unhealthy" in out
+
+
+# ── v3 phase C: typed errors surfaced ───────────────────────────────────────
+
+
+def test_load_model_refuses_when_gpu_unavailable(server, mock_nvidia_smi):
+    """Phase C3: GPU unavailability surfaces; load_model never falls back to CPU."""
+    mock_nvidia_smi["should_fail"] = True
+    server._scheduler.query_vram()  # poisons scheduler with the failure
+    assert not server._scheduler.gpu_available
+    out = _text(server._handle_load_model({"name": "qwen35-27b"}))
+    assert "GPU unavailable" in out
+
+
+def test_vram_status_reports_gpu_unavailable(server, mock_nvidia_smi):
+    """Phase C3: vram_status reports the typed reason, not zeros silently."""
+    mock_nvidia_smi["should_fail"] = True
+    server._scheduler.query_vram()
+    out = _text(server._handle_vram_status())
+    assert "GPU unavailable" in out

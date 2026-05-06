@@ -7,22 +7,48 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from lamu.api.errors import backend_error_response, no_backend_response
+from lamu.core.errors import ReasoningOverflow
 from lamu.core.health import HealthRegistry
 from lamu.core.reasoning import get_extractor
 from lamu.core.registry import load_registry
 from lamu.core.router import Router
 from lamu.core.scheduler import VramScheduler
 from lamu.core.types import Capability, ModelEntry
+
+
+# Errors expected from a backend over HTTP. Anything outside this set is a
+# real bug and must propagate.
+_BACKEND_HTTP_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    json.JSONDecodeError,
+    KeyError,
+    IndexError,
+)
+
+# Errors expected when probing a possibly-not-running service for auto-register.
+_PROBE_EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    json.JSONDecodeError,
+    KeyError,
+    IndexError,
+)
 
 
 class Message(BaseModel):
@@ -130,7 +156,6 @@ def create_app(
                         headers={"Content-Type": "application/json"},
                     )
                     with urllib.request.urlopen(http_req, timeout=300) as resp:
-                        reasoning_buf: list[str] = []
                         in_reasoning = False
                         reasoning_done = False
                         open_tag = extractor.marker.open_tag if hasattr(extractor, '_marker') else "<think>"
@@ -195,8 +220,16 @@ def create_app(
                             chunk = _make_chunk(completion_id, created, decision.model_name, pending)
                             yield f"data: {json.dumps(chunk)}\n\n"
 
-                except Exception as e:
-                    error_chunk = {"error": str(e)}
+                except _BACKEND_HTTP_ERRORS as e:
+                    error_chunk = {"error": {"type": "backend_error", "message": str(e)}}
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                except ReasoningOverflow as e:
+                    error_chunk = {
+                        "error": {
+                            "type": "reasoning_overflow",
+                            "message": str(e),
+                        }
+                    }
                     yield f"data: {json.dumps(error_chunk)}\n\n"
 
                 done_chunk = {
@@ -216,10 +249,8 @@ def create_app(
                 data=json.dumps(payload).encode(),
                 headers={"Content-Type": "application/json"},
             )
-            t0 = time.monotonic()
             with urllib.request.urlopen(http_req, timeout=300) as resp:
                 data = json.loads(resp.read())
-            elapsed_ms = (time.monotonic() - t0) * 1000
 
             msg = data["choices"][0]["message"]
             raw_content = msg.get("content") or ""
@@ -301,7 +332,9 @@ def serve(port: int = 8020) -> None:
             with urllib.request.urlopen(req, timeout=2) as resp:
                 data = json.loads(resp.read())
             model_id = data["data"][0]["id"].lower()
-        except Exception:
+        except _PROBE_EXPECTED_ERRORS:
+            # Probe of a possibly-down backend — expected. Anything else is a
+            # real bug and must propagate.
             continue
 
         for entry in entries:

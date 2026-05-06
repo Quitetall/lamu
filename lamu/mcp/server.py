@@ -14,10 +14,9 @@ from __future__ import annotations
 import json as _json
 import logging
 import os
-import time
 import urllib.error
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -34,10 +33,6 @@ from lamu.core.supervisor import Supervisor
 from lamu.core.types import (
     Capability,
     ModelEntry,
-    QueryResult,
-    QueryStats,
-    RouteDecision,
-    VramBudget,
 )
 
 
@@ -398,11 +393,9 @@ class LamuMcpServer:
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json"},
                 )
-                t0 = time.monotonic()
                 import asyncio as _asyncio
                 resp_data = await _asyncio.to_thread(_urlopen_read, req)
                 data = json.loads(resp_data)
-                elapsed = time.monotonic() - t0
         except _BACKEND_HTTP_ERRORS as exc:
             self._report_failure(decision.model_name, exc)
             _log.warning(
@@ -574,7 +567,19 @@ class LamuMcpServer:
         import signal
         import time as _time
 
+        from lamu.core.errors import GpuUnavailableError
+
         name = args["name"]
+
+        # No silent CPU fallback: refuse load if the GPU is in unavailable
+        # state. The scheduler tracks this — see VramScheduler.require_gpu().
+        try:
+            self._scheduler.require_gpu()
+        except GpuUnavailableError as exc:
+            return [TextContent(
+                type="text",
+                text=f"GPU unavailable: {exc}. Cannot load '{name}'.",
+            )]
 
         # Find in registry (partial match)
         entry: Optional[ModelEntry] = None
@@ -677,8 +682,16 @@ class LamuMcpServer:
         return [TextContent(type="text", text=f"Unloaded '{target}'. VRAM freed.")]
 
     def _handle_vram_status(self) -> list[TextContent]:
-        """VRAM budget snapshot."""
+        """VRAM budget snapshot. Surfaces GPU unavailability as a typed reason."""
         budget = self._scheduler.budget()
+        if not self._scheduler.gpu_available:
+            return [TextContent(
+                type="text",
+                text=(
+                    f"GPU unavailable: {self._scheduler.gpu_unavailable_reason}\n"
+                    f"VRAM data is stale (last known total: {budget.total_mb} MB)."
+                ),
+            )]
         lines = [
             f"VRAM: {budget.used_mb}/{budget.total_mb} MB ({budget.free_mb} MB free)",
             f"Available for models: {budget.available_mb} MB",

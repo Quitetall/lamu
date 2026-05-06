@@ -15,9 +15,7 @@ from enum import Enum
 from typing import Iterator, Optional
 
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.rule import Rule
-from rich.text import Text
 
 
 DEFAULT_API_URL = "http://localhost:8020/v1/chat/completions"
@@ -81,12 +79,25 @@ def parse_command(line: str) -> Optional[tuple[Command, str]]:
     return None
 
 
+_HTTP_PROBE_ERRORS: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    json.JSONDecodeError,
+)
+
+
 def http_get_json(url: str, timeout: float = 3.0) -> Optional[dict]:
+    """Fetch + parse JSON. Returns None on expected probe failures.
+
+    Anything outside `_HTTP_PROBE_ERRORS` is a real bug and propagates.
+    """
     try:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_KEY}"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
-    except Exception:
+    except _HTTP_PROBE_ERRORS:
         return None
 
 

@@ -4,9 +4,8 @@ from __future__ import annotations
 import logging
 import struct
 import warnings
-from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import yaml
 
@@ -189,10 +188,8 @@ def scan_directory(
         vram_mb = _estimate_vram_mb(file_size_mb, quant)
         params_b = _estimate_params_b(meta)
 
-        # Determine context max from metadata
-        ctx_key = f"{arch}.block_count"
-        block_count = meta.get(ctx_key, 0)
-        # Default context by architecture
+        # Default context by architecture (override via per-arch metadata
+        # later if the GGUF surfaces a real value).
         context_max = 131072  # safe default for modern models
 
         # Name from filename

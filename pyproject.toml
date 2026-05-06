@@ -61,6 +61,9 @@ omit = [
 ]
 
 [tool.coverage.report]
+# Gate at the current floor so regressions fail CI loudly. Raise as
+# coverage improves — see v3 plan §B2. Don't lower without justification.
+fail_under = 70
 exclude_lines = [
     "pragma: no cover",
     "raise NotImplementedError",

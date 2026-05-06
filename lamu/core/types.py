@@ -1,10 +1,10 @@
 """Core types for LAMU — strict dataclasses, enums, no **kwargs."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 
 class Capability(Enum):

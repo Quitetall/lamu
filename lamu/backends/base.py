@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, Iterator, Optional
+from typing import Iterator
 
 from lamu.core.types import ModelEntry
 
