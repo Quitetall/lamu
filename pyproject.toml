@@ -39,8 +39,9 @@ markers = [
     "gpu: requires CUDA / heavy ML deps",
     "network: hits external network",
     "rust: shells out to cargo",
+    "contract: spawns real MCP subprocesses (Python and/or Rust binary)",
 ]
-addopts = "-m 'not slow and not gpu and not network and not rust' --strict-markers --tb=short"
+addopts = "-m 'not slow and not gpu and not network and not rust and not contract' --strict-markers --tb=short"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 filterwarnings = [
