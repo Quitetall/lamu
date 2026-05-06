@@ -9,19 +9,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Strategy {
     /// First-in, first-out. Default.
+    #[default]
     Fifo,
     /// Last-in, first-out.
     Lifo,
     /// Higher priority served first; ties FIFO.
     Priority,
-}
-
-impl Default for Strategy {
-    fn default() -> Self { Self::Fifo }
 }
 
 #[derive(Debug)]

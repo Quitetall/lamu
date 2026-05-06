@@ -16,6 +16,12 @@ from unittest.mock import MagicMock
 import pytest
 
 
+# Repo root — absolute paths are computed from this so tests work on any
+# checkout (CI runners, contributor laptops, etc.) instead of hardcoding
+# the original developer's home directory.
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+
+
 # ---------------------------------------------------------------------------
 # Heavy-import shims — installed at conftest import (before any fixture runs).
 # ---------------------------------------------------------------------------
@@ -63,6 +69,7 @@ _HEAVY_MODULES: tuple[str, ...] = (
     "plotly.graph_objects",
     "networkx",
     "dotenv",
+    "numpy",
     "rich",
     "rich.console",
     "rich.markdown",

@@ -16,7 +16,7 @@ import pytest
 pytestmark = pytest.mark.gpu
 
 
-SERVER_DIR = Path("/home/brianklam/local-llm/server")
+SERVER_DIR = Path(__file__).resolve().parents[3] / "server"
 
 
 @pytest.fixture

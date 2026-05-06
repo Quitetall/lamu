@@ -11,9 +11,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
 def _load_module():
     """Load cli/chat_repl.py as a regular module (no package init present)."""
-    src = Path("/home/brianklam/local-llm/cli/chat_repl.py")
+    src = _REPO_ROOT / "cli" / "chat_repl.py"
     spec = importlib.util.spec_from_file_location("chat_repl", src)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["chat_repl"] = mod

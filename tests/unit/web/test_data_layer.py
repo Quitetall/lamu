@@ -9,17 +9,20 @@ import sys
 import pytest
 
 
+_REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parents[3]
+
+
 @pytest.fixture
 def data_layer(tmp_path, monkeypatch):
     """Load web/data_layer.py via importlib (web/ has no __init__.py)."""
     db = tmp_path / "chats.db"
-    web_dir = "/home/brianklam/local-llm/web"
+    web_dir = str(_REPO_ROOT / "web")
     monkeypatch.syspath_prepend(web_dir)
     for name in ("web.data_layer", "web", "data_layer"):
         sys.modules.pop(name, None)
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "data_layer", f"{web_dir}/data_layer.py",
+        "data_layer", str(_REPO_ROOT / "web" / "data_layer.py"),
     )
     dl = importlib.util.module_from_spec(spec)
     sys.modules["data_layer"] = dl

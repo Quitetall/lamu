@@ -15,7 +15,7 @@ import pytest
 pytestmark = pytest.mark.gpu
 
 
-SCRIPTS_DIR = Path("/home/brianklam/local-llm/scripts")
+SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
 
 
 @pytest.mark.parametrize(

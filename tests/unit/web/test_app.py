@@ -7,11 +7,14 @@ import sys
 import pytest
 
 
+_REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parents[3]
+
+
 @pytest.fixture
 def app_mod(monkeypatch, tmp_path):
     """Import web/app.py — it does `from data_layer import ...` so the web/
     directory must be on sys.path."""
-    web_dir = "/home/brianklam/local-llm/web"
+    web_dir = str(_REPO_ROOT / "web")
     if web_dir not in sys.path:
         monkeypatch.syspath_prepend(web_dir)
     for name in ("web.app", "web.data_layer", "web", "data_layer", "app"):

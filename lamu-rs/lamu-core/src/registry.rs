@@ -7,7 +7,6 @@ use crate::types::{
 use crate::Result;
 use byteorder::{LittleEndian, ReadBytesExt};
 use once_cell::sync::Lazy;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
