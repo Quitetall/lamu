@@ -36,7 +36,9 @@ use std::time::{Duration, Instant};
 
 use crate::cloud_models::{self, CloudModel, QuotaState};
 use crate::favorites::Favorites;
+use crate::lamu_config::LamuConfig;
 use crate::mcp_servers::{self, McpServerEntry, ProbeStatus};
+use crate::theme::Theme;
 
 const REFRESH_MS: u64 = 1000;
 
@@ -45,6 +47,30 @@ pub enum Mode {
     Dashboard,
     Launchers,
     McpServers,
+    Settings,
+}
+
+/// One row in the Settings screen. Action runs when Enter is pressed.
+#[derive(Debug, Clone, Copy)]
+pub enum SettingAction {
+    /// Cycle backend_url through direct/bifrost.
+    CycleBackend,
+    /// Open a config file in $EDITOR.
+    EditFile(SettingFile),
+    /// Theme.install_bundled() — copies bundled themes to user dir.
+    InstallBundledThemes,
+    /// Delete cloud-models.yaml so the seed regenerates on next load.
+    ResetCloudSeed,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SettingFile {
+    LamuConfig,
+    CloudModels,
+    LocalModels,
+    McpServers,
+    Favorites,
+    ThemesDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +242,8 @@ pub struct AppState {
     /// or a cloud entry. Replaces the previous `Vec<usize>` so cloud
     /// models can sit alongside local ones in the same scroll buffer.
     pub model_view: Vec<ModelRef>,
+    pub config: LamuConfig,
+    pub settings_state: ListState,
 }
 
 impl AppState {
@@ -241,6 +269,9 @@ impl AppState {
             mcp_state.select(Some(0));
         }
         let cloud_models = cloud_models::load();
+        let config = LamuConfig::load();
+        let mut settings_state = ListState::default();
+        settings_state.select(Some(0));
 
         let mut s = Self {
             entries,
@@ -268,9 +299,36 @@ impl AppState {
             cloud_models,
             source_filter: SourceFilter::All,
             model_view: Vec::new(),
+            config,
+            settings_state,
         };
         s.recompute_views();
         Ok(s)
+    }
+
+    fn settings_items(&self) -> Vec<(String, SettingAction)> {
+        vec![
+            (
+                format!("Backend URL  [{}]  ({})", self.config.backend_label(), self.config.backend_url),
+                SettingAction::CycleBackend,
+            ),
+            ("Edit lamu config (~/.config/lamu/config.toml)".into(), SettingAction::EditFile(SettingFile::LamuConfig)),
+            ("Edit cloud models (~/.config/lamu/cloud-models.yaml)".into(), SettingAction::EditFile(SettingFile::CloudModels)),
+            ("Edit local models registry (~/local-llm/config/models.yaml)".into(), SettingAction::EditFile(SettingFile::LocalModels)),
+            ("Edit MCP servers (~/.claude.json)".into(), SettingAction::EditFile(SettingFile::McpServers)),
+            ("Edit favorites (~/.config/lamu/favorites.json)".into(), SettingAction::EditFile(SettingFile::Favorites)),
+            ("Open themes directory (~/.config/lamu/themes/)".into(), SettingAction::EditFile(SettingFile::ThemesDir)),
+            ("Install bundled themes to user dir".into(), SettingAction::InstallBundledThemes),
+            ("Reset cloud-models.yaml to bundled seed".into(), SettingAction::ResetCloudSeed),
+        ]
+    }
+
+    fn move_settings(&mut self, delta: i32) {
+        let n = self.settings_items().len() as i32;
+        if n == 0 { return; }
+        let cur = self.settings_state.selected().unwrap_or(0) as i32;
+        let next = ((cur + delta).rem_euclid(n)) as usize;
+        self.settings_state.select(Some(next));
     }
 
     fn move_mcp(&mut self, delta: i32) {
@@ -580,7 +638,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             match state.mode {
                                 Mode::Dashboard => state.model_filter.clear(),
                                 Mode::Launchers => state.harness_filter.clear(),
-                                Mode::McpServers => {}
+                                Mode::McpServers | Mode::Settings => {}
                             }
                             state.recompute_views();
                         }
@@ -591,7 +649,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             match state.mode {
                                 Mode::Dashboard => { state.model_filter.pop(); }
                                 Mode::Launchers => { state.harness_filter.pop(); }
-                                Mode::McpServers => {}
+                                Mode::McpServers | Mode::Settings => {}
                             }
                             state.recompute_views();
                         }
@@ -599,7 +657,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             match state.mode {
                                 Mode::Dashboard => state.model_filter.push(c),
                                 Mode::Launchers => state.harness_filter.push(c),
-                                Mode::McpServers => {}
+                                Mode::McpServers | Mode::Settings => {}
                             }
                             state.recompute_views();
                         }
@@ -616,6 +674,13 @@ fn run_loop<B: ratatui::backend::Backend>(
                         KeyCode::Char('k') | KeyCode::Up => state.move_cursor(-1),
                         KeyCode::Char('r') => state.refresh(),
                         KeyCode::Char('s') => {
+                            // 's' is the settings entry — most-used so it
+                            // gets the lowercase. Capital 'S' kept for the
+                            // muscle-memory "start lamu serve" action.
+                            state.mode = Mode::Settings;
+                            state.status_msg.clear();
+                        }
+                        KeyCode::Char('S') => {
                             if !state.serve_up {
                                 state.status_msg = "Starting `lamu serve` on :8020 in background...".into();
                                 spawn_detached(&["lamu", "serve"]);
@@ -787,7 +852,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 } else {
                                     run_subprocess_in_tui(terminal, || -> Result<()> {
                                         println!("\n→ Chat with {} (/quit returns to dashboard)\n", local_name);
-                                        let api_url = "http://localhost:8020/v1/chat/completions".to_string();
+                                        let api_url = state.config.backend_url.clone();
                                         crate::repl::run_repl_with_model(api_url, Some(local_name.clone()))
                                     })?;
                                     state.last_harness = Some("lamu repl");
@@ -864,6 +929,74 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 healthy,
                                 state.mcp_servers.len() - healthy,
                             );
+                        }
+                        _ => {}
+                    },
+                    Mode::Settings => match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('d') => {
+                            state.mode = Mode::Dashboard;
+                            state.status_msg.clear();
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => state.move_settings(1),
+                        KeyCode::Char('k') | KeyCode::Up => state.move_settings(-1),
+                        KeyCode::Enter => {
+                            let items = state.settings_items();
+                            let sel = state.settings_state.selected().unwrap_or(0);
+                            if let Some((_, action)) = items.get(sel).cloned() {
+                                match action {
+                                    SettingAction::CycleBackend => {
+                                        state.config.cycle_backend();
+                                        let _ = state.config.save();
+                                        state.status_msg = format!(
+                                            "backend → {} ({})",
+                                            state.config.backend_label(),
+                                            state.config.backend_url
+                                        );
+                                    }
+                                    SettingAction::EditFile(which) => {
+                                        let path = settings_file_path(which);
+                                        let editor = pick_editor();
+                                        run_subprocess_in_tui(terminal, move || -> Result<()> {
+                                            println!("\n→ Editing {}\n", path.display());
+                                            let _ = std::process::Command::new(&editor)
+                                                .arg(&path).status();
+                                            Ok(())
+                                        })?;
+                                        // Reload anything we know about — some files affect runtime.
+                                        state.config = LamuConfig::load();
+                                        state.cloud_models = cloud_models::load();
+                                        state.favorites = Favorites::load();
+                                        state.recompute_views();
+                                        state.status_msg = "Settings reloaded.".into();
+                                    }
+                                    SettingAction::InstallBundledThemes => {
+                                        match Theme::install_bundled() {
+                                            Ok(n) => state.status_msg = format!(
+                                                "Installed {} bundled theme(s) → {}.",
+                                                n,
+                                                Theme::user_themes_dir()
+                                                    .map(|p| p.display().to_string())
+                                                    .unwrap_or_else(|| "?".into())
+                                            ),
+                                            Err(e) => state.status_msg = format!("install failed: {e}"),
+                                        }
+                                    }
+                                    SettingAction::ResetCloudSeed => {
+                                        let path = cloud_models::config_path();
+                                        match std::fs::remove_file(&path) {
+                                            Ok(()) | Err(_) => {
+                                                state.cloud_models = cloud_models::load();
+                                                state.recompute_views();
+                                                state.status_msg = format!(
+                                                    "Cloud seed reset → {} entries.",
+                                                    state.cloud_models.len()
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     },
@@ -1019,7 +1152,112 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         Mode::Dashboard => draw_dashboard(f, state),
         Mode::Launchers => draw_launchers(f, state),
         Mode::McpServers => draw_mcp(f, state),
+        Mode::Settings => draw_settings(f, state),
     }
+}
+
+/// Resolve the on-disk path for a Settings "Edit ..." item.
+fn settings_file_path(which: SettingFile) -> std::path::PathBuf {
+    match which {
+        SettingFile::LamuConfig => LamuConfig::path(),
+        SettingFile::CloudModels => cloud_models::config_path(),
+        SettingFile::LocalModels => lamu_core::config::registry_path(),
+        SettingFile::McpServers => mcp_servers::config_path(),
+        SettingFile::Favorites => Favorites::path(),
+        SettingFile::ThemesDir => {
+            Theme::user_themes_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.config/lamu/themes"))
+        }
+    }
+}
+
+fn pick_editor() -> String {
+    let cfg = LamuConfig::load();
+    if !cfg.editor.is_empty() {
+        return cfg.editor;
+    }
+    std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".into())
+}
+
+fn draw_settings(f: &mut ratatui::Frame, state: &AppState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(4),
+            Constraint::Length(5),
+        ])
+        .split(f.area());
+
+    // Header
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("SETTINGS", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(format!("  config={}  ", LamuConfig::path().display())),
+        Span::raw("[d/Esc] back"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(header, chunks[0]);
+
+    // List
+    let items_data = state.settings_items();
+    let items: Vec<ListItem> = items_data
+        .iter()
+        .map(|(label, _)| ListItem::new(label.clone()))
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Configurables"))
+        .highlight_style(
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("→ ");
+    let mut s = state.settings_state.clone();
+    f.render_stateful_widget(list, chunks[1], &mut s);
+
+    // Detail
+    let mut detail: Vec<Line> = Vec::new();
+    detail.push(Line::from(format!(
+        "Backend URL: {}  ({})",
+        state.config.backend_url, state.config.backend_label()
+    )));
+    detail.push(Line::from(format!(
+        "Theme:       {}",
+        if state.config.theme.is_empty() { "lamu (default)".into() } else { state.config.theme.clone() }
+    )));
+    if !state.status_msg.is_empty() {
+        detail.push(Line::from(Span::styled(
+            state.status_msg.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Detail")),
+        chunks[2],
+    );
+
+    // Footer (3 rows simple → advanced)
+    let row_basics = Line::from(vec![
+        key_span("j/k"), key_lbl("move"),
+        key_span("Enter"), key_lbl("activate selected"),
+        key_span("d/Esc/Bksp"), key_lbl("back to dashboard"),
+        key_span("q"), key_lbl("quit"),
+    ]);
+    let row_actions = Line::from(vec![
+        Span::styled("Items: ", Style::default().fg(Color::DarkGray)),
+        Span::raw("Backend cycles direct↔bifrost. "),
+        Span::raw("Edit-* opens $EDITOR. "),
+        Span::raw("Reset deletes cloud-models.yaml then reloads seed."),
+    ]);
+    let row_advanced = Line::from(vec![
+        Span::styled(
+            "Editor resolves: lamu_config.editor → $EDITOR → $VISUAL → vi",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let footer = Paragraph::new(vec![row_basics, row_actions, row_advanced])
+        .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
+    f.render_widget(footer, chunks[3]);
 }
 
 fn draw_mcp(f: &mut ratatui::Frame, state: &AppState) {
@@ -1029,7 +1267,7 @@ fn draw_mcp(f: &mut ratatui::Frame, state: &AppState) {
             Constraint::Length(3), // header
             Constraint::Min(8),    // list
             Constraint::Length(5), // detail
-            Constraint::Length(3), // help footer
+            Constraint::Length(5), // help footer (3 rows)
         ])
         .split(f.area());
 
@@ -1142,22 +1380,25 @@ fn draw_mcp(f: &mut ratatui::Frame, state: &AppState) {
         chunks[2],
     );
 
-    // Footer
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" "),
-        Span::styled("[p/Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" probe "),
-        Span::styled("[a]", Style::default().fg(Color::Cyan)),
-        Span::raw(" probe all "),
-        Span::styled("[r]", Style::default().fg(Color::Cyan)),
-        Span::raw(" reload .claude.json "),
-        Span::styled("[d/Esc]", Style::default().fg(Color::Cyan)),
-        Span::raw(" back "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit"),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
+    let row_basics = Line::from(vec![
+        key_span("j/k"), key_lbl("move"),
+        key_span("Enter"), key_lbl("probe selected"),
+        key_span("d/Esc/Bksp"), key_lbl("back to dashboard"),
+        key_span("q"), key_lbl("quit"),
+    ]);
+    let row_actions = Line::from(vec![
+        key_span("p"), key_lbl("re-probe selected"),
+        key_span("a"), key_lbl("probe all"),
+        key_span("r"), key_lbl("reload ~/.claude.json"),
+    ]);
+    let row_advanced = Line::from(vec![
+        Span::styled(
+            "(stdio probe sends initialize JSON-RPC, 3s timeout) ",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let footer = Paragraph::new(vec![row_basics, row_actions, row_advanced])
+        .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
     f.render_widget(footer, chunks[3]);
 }
 
@@ -1169,7 +1410,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, state: &AppState) {
             Constraint::Min(8),     // models
             Constraint::Length(3),  // vram
             Constraint::Length(4),  // status / health
-            Constraint::Length(3),  // help footer
+            Constraint::Length(5),  // help footer (3 rows of keys)
         ])
         .split(f.area());
 
@@ -1370,32 +1611,47 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     f.render_widget(p, area);
 }
 
+/// Cyan `[key]` chip span — used in every footer for visual consistency.
+fn key_span(k: &str) -> Span<'static> {
+    Span::styled(format!("[{k}]"), Style::default().fg(Color::Cyan))
+}
+/// Yellow chip — for actions like ★ fav that we want to call out.
+fn key_span_warn(k: &str) -> Span<'static> {
+    Span::styled(format!("[{k}]"), Style::default().fg(Color::Yellow))
+}
+/// Inline footer label after a key chip. Renamed from `label` so it
+/// doesn't shadow any local `let label = ...` bindings in draw_*.
+fn key_lbl(text: &str) -> Span<'static> {
+    Span::raw(format!(" {text}  "))
+}
+
 fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" chat "),
-        Span::styled("[*]", Style::default().fg(Color::Yellow)),
-        Span::raw(" fav "),
-        Span::styled("[L/C/A]", Style::default().fg(Color::Cyan)),
-        Span::raw(" source "),
-        Span::styled("[n]", Style::default().fg(Color::Cyan)),
-        Span::raw(" add-cloud "),
-        Span::styled("[K]", Style::default().fg(Color::Cyan)),
-        Span::raw(" key "),
-        Span::styled("[e]", Style::default().fg(Color::Cyan)),
-        Span::raw(" edit-cloud "),
-        Span::styled("[/]", Style::default().fg(Color::Cyan)),
-        Span::raw(" filter "),
-        Span::styled("[o]", Style::default().fg(Color::Cyan)),
-        Span::raw(" sort "),
-        Span::styled("[h]", Style::default().fg(Color::Cyan)),
-        Span::raw(" harness "),
-        Span::styled("[m]", Style::default().fg(Color::Cyan)),
-        Span::raw(" mcp "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit"),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
+    // Three rows, simple → advanced. Same shape on every screen so users
+    // build muscle memory for where each tier of action lives.
+    let row_basics = Line::from(vec![
+        key_span("j/k"), key_lbl("move"),
+        key_span("Enter"), key_lbl("chat"),
+        key_span("r"), key_lbl("refresh"),
+        key_span("q"), key_lbl("quit"),
+    ]);
+    let row_list_ops = Line::from(vec![
+        key_span_warn("*"), key_lbl("fav"),
+        key_span("/"), key_lbl("filter"),
+        key_span("o"), key_lbl("sort"),
+        key_span("L/C/A"), key_lbl("source local/cloud/all"),
+    ]);
+    let row_advanced = Line::from(vec![
+        key_span("h"), key_lbl("harnesses"),
+        key_span("m"), key_lbl("mcp servers"),
+        key_span("s"), key_lbl("settings"),
+        key_span("S"), key_lbl("start lamu serve"),
+        key_span("b"), key_lbl("start bifrost"),
+        key_span("n"), key_lbl("add cloud"),
+        key_span("K"), key_lbl("key status"),
+        key_span("e"), key_lbl("edit cloud yaml"),
+    ]);
+    let footer = Paragraph::new(vec![row_basics, row_list_ops, row_advanced])
+        .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
     f.render_widget(footer, area);
 }
 
@@ -1406,7 +1662,7 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
             Constraint::Length(3), // header (last harness tag)
             Constraint::Min(8),    // list
             Constraint::Length(4), // detail / status
-            Constraint::Length(3), // help footer
+            Constraint::Length(5), // help footer (3 rows)
         ])
         .split(f.area());
 
@@ -1532,28 +1788,24 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
         chunks[2],
     );
 
-    // Footer keybinds
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" launch "),
-        Span::styled("[i]", Style::default().fg(Color::Cyan)),
-        Span::raw(" install "),
-        Span::styled("[D]", Style::default().fg(Color::Cyan)),
-        Span::raw(" default "),
-        Span::styled("[*]", Style::default().fg(Color::Yellow)),
-        Span::raw(" fav "),
-        Span::styled("[/]", Style::default().fg(Color::Cyan)),
-        Span::raw(" filter "),
-        Span::styled("[o]", Style::default().fg(Color::Cyan)),
-        Span::raw(" sort "),
-        Span::styled("[r]", Style::default().fg(Color::Cyan)),
-        Span::raw(" refresh "),
-        Span::styled("[d/Esc/Backspace]", Style::default().fg(Color::Cyan)),
-        Span::raw(" back "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit"),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
+    let row_basics = Line::from(vec![
+        key_span("j/k"), key_lbl("move"),
+        key_span("Enter"), key_lbl("launch selected"),
+        key_span("d/Esc/Bksp"), key_lbl("back to dashboard"),
+        key_span("q"), key_lbl("quit"),
+    ]);
+    let row_list_ops = Line::from(vec![
+        key_span_warn("*"), key_lbl("fav"),
+        key_span("/"), key_lbl("filter"),
+        key_span("o"), key_lbl("sort"),
+        key_span("r"), key_lbl("refresh PATH detection"),
+    ]);
+    let row_advanced = Line::from(vec![
+        key_span("i"), key_lbl("install missing harness"),
+        key_span("D"), key_lbl("set/unset default harness for Dashboard Enter"),
+    ]);
+    let footer = Paragraph::new(vec![row_basics, row_list_ops, row_advanced])
+        .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
     f.render_widget(footer, chunks[3]);
 }
 
