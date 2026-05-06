@@ -14,7 +14,8 @@
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -65,10 +66,22 @@ pub struct ChatTui {
     history: Vec<Message>,
     pending: String,
     /// Plain string input + cursor index (byte offset). Multi-line via
-    /// embedded `\n`. Shift+Enter inserts newline; Enter sends.
+    /// embedded `\n`. Shift+Enter / Alt+Enter inserts newline; Enter sends.
     input: String,
     cursor: usize,
+    /// Top-line offset into the wrapped conversation. Capped at
+    /// `max_scroll` each draw so it can't run past content.
     scroll: u16,
+    /// Last content-height observed during draw. Used by handle_key
+    /// to clamp PgUp/PgDn without re-laying-out.
+    content_height: u16,
+    /// Last conversation-area height (excluding borders).
+    visible_height: u16,
+    /// When true, scroll snaps to the bottom on every redraw so new
+    /// streamed tokens stay in view. Any explicit upward scroll
+    /// (PgUp / Ctrl+K) flips this off; End / Ctrl+End / PgDn-at-bottom
+    /// flips it back on.
+    follow_tail: bool,
     spinner_frame: usize,
     last_spinner_tick: Instant,
     rx: Option<Receiver<StreamEvent>>,
@@ -87,6 +100,9 @@ impl ChatTui {
             input: String::new(),
             cursor: 0,
             scroll: 0,
+            content_height: 0,
+            visible_height: 0,
+            follow_tail: true,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             rx: None,
@@ -97,6 +113,23 @@ impl ChatTui {
 
     fn streaming(&self) -> bool {
         self.rx.is_some()
+    }
+
+    fn max_scroll(&self) -> u16 {
+        self.content_height.saturating_sub(self.visible_height)
+    }
+
+    fn scroll_up(&mut self, n: u16) {
+        self.follow_tail = false;
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    fn scroll_down(&mut self, n: u16) {
+        let max = self.max_scroll();
+        self.scroll = self.scroll.saturating_add(n).min(max);
+        if self.scroll >= max {
+            self.follow_tail = true;
+        }
     }
 
     fn dispatch_send(&mut self) {
@@ -405,12 +438,25 @@ pub fn run(model: String, theme: Theme, config: LamuConfig) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Best-effort kitty keyboard protocol — lets us see Shift+Enter,
+    // Alt+Enter, Ctrl+Enter as distinct events. Falls back silently on
+    // terminals that don't support it (xterm/linux/tmux <3.4).
+    let kitty_pushed = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    ).is_ok();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = ChatTui::new(model, theme, config);
     let res = run_loop(&mut terminal, &mut state);
 
+    if kitty_pushed {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
@@ -439,6 +485,7 @@ fn run_loop<B: ratatui::backend::Backend>(
 fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Esc => {
             if state.streaming() {
@@ -457,24 +504,38 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
             return Ok(false);
         }
         KeyCode::PageUp => {
-            state.scroll = state.scroll.saturating_sub(8);
+            state.scroll_up(state.visible_height.max(1));
             return Ok(false);
         }
         KeyCode::PageDown => {
-            state.scroll = state.scroll.saturating_add(8);
+            state.scroll_down(state.visible_height.max(1));
             return Ok(false);
         }
         KeyCode::Char('k') if ctrl => {
-            state.scroll = state.scroll.saturating_sub(1);
+            state.scroll_up(1);
             return Ok(false);
         }
         KeyCode::Char('j') if ctrl => {
-            state.scroll = state.scroll.saturating_add(1);
+            state.scroll_down(1);
+            return Ok(false);
+        }
+        KeyCode::Char('g') if ctrl => {
+            // Ctrl+G — jump to bottom + resume follow.
+            state.follow_tail = true;
+            state.scroll = state.max_scroll();
+            return Ok(false);
+        }
+        KeyCode::Char('t') if ctrl => {
+            // Ctrl+T — jump to top.
+            state.follow_tail = false;
+            state.scroll = 0;
             return Ok(false);
         }
         KeyCode::Enter => {
-            if shift {
-                // Shift+Enter inserts a newline.
+            if shift || alt {
+                // Shift+Enter / Alt+Enter inserts a newline. Kitty
+                // keyboard protocol delivers Shift+Enter; vt-style
+                // terminals usually deliver Alt+Enter (Meta+Enter).
                 state.input.insert(state.cursor, '\n');
                 state.cursor += 1;
             } else {
@@ -596,17 +657,36 @@ fn draw_banner(f: &mut ratatui::Frame, area: Rect, state: &ChatTui) {
     f.render_widget(p, area);
 }
 
-fn draw_conversation(f: &mut ratatui::Frame, area: Rect, state: &ChatTui) {
+fn draw_conversation(f: &mut ratatui::Frame, area: Rect, state: &mut ChatTui) {
     let response_border = theme::hex_to_color(&state.theme.colors.response_border, Color::Cyan);
 
     let lines = state.build_lines();
-    let content_height = lines.len() as u16;
+    // Estimate wrapped content height. Without re-doing Paragraph's
+    // wrapping we approximate: each logical line takes
+    // ceil(len / inner_width) visual rows, min 1.
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let mut content_h: u16 = 0;
+    for line in &lines {
+        let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        let rows = (chars / inner_w + if chars % inner_w == 0 { 0 } else { 1 }).max(1);
+        content_h = content_h.saturating_add(rows as u16);
+    }
     let visible = area.height.saturating_sub(2);
-    // Auto-scroll to bottom if user hasn't scrolled up.
-    let scroll = if state.scroll == 0 {
-        content_height.saturating_sub(visible)
+    state.content_height = content_h;
+    state.visible_height = visible;
+
+    let max = content_h.saturating_sub(visible);
+    let scroll = if state.follow_tail {
+        state.scroll = max;
+        max
     } else {
-        state.scroll.min(content_height.saturating_sub(visible))
+        state.scroll.min(max)
+    };
+
+    let title = if state.follow_tail || max == 0 {
+        " conversation ".to_string()
+    } else {
+        format!(" conversation  [{}/{}] ", scroll, max)
     };
 
     let p = Paragraph::new(lines)
@@ -616,7 +696,7 @@ fn draw_conversation(f: &mut ratatui::Frame, area: Rect, state: &ChatTui) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(response_border))
-                .title(" conversation "),
+                .title(title),
         );
     f.render_widget(p, area);
 }
@@ -705,14 +785,15 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let lbl = |t: &str| Span::raw(format!(" {t}  "));
     let row1 = Line::from(vec![
         key("Enter"), lbl("send"),
-        key("Shift+Enter"), lbl("newline"),
+        key("Shift+Enter / Alt+Enter"), lbl("newline"),
         key("Esc / Ctrl+C"), lbl("quit"),
         key("PgUp/PgDn"), lbl("scroll"),
     ]);
     let row2 = Line::from(vec![
         key("Ctrl+O"), lbl("toggle <think>…</think>"),
-        key("Ctrl+J/K"), lbl("scroll one line"),
-        key("←/→  Home/End"), lbl("cursor"),
+        key("Ctrl+J/K"), lbl("scroll line"),
+        key("Ctrl+G / Ctrl+T"), lbl("jump bottom / top"),
+        key("←/→ Home/End"), lbl("cursor"),
     ]);
     let row3 = Line::from(vec![
         key("/help"), lbl("commands"),
@@ -791,6 +872,72 @@ mod tests {
         s.cursor += '😀'.len_utf8();
         assert_eq!(s.cursor, 6);
         assert_eq!(s.input, "hi😀");
+    }
+
+    #[test]
+    fn scroll_up_breaks_follow() {
+        let mut s = ChatTui::new("m".into(), Theme::pick(Some("lamu")), LamuConfig::default());
+        s.content_height = 100;
+        s.visible_height = 20;
+        s.scroll = 80;
+        assert!(s.follow_tail);
+        s.scroll_up(8);
+        assert!(!s.follow_tail);
+        assert_eq!(s.scroll, 72);
+    }
+
+    #[test]
+    fn scroll_down_to_bottom_resumes_follow() {
+        let mut s = ChatTui::new("m".into(), Theme::pick(Some("lamu")), LamuConfig::default());
+        s.content_height = 100;
+        s.visible_height = 20;
+        s.follow_tail = false;
+        s.scroll = 70;
+        s.scroll_down(20);
+        assert_eq!(s.scroll, 80);
+        assert!(s.follow_tail);
+    }
+
+    #[test]
+    fn scroll_down_clamps_at_max() {
+        let mut s = ChatTui::new("m".into(), Theme::pick(Some("lamu")), LamuConfig::default());
+        s.content_height = 30;
+        s.visible_height = 20;
+        s.follow_tail = false;
+        s.scroll = 5;
+        s.scroll_down(99);
+        assert_eq!(s.scroll, 10);
+        assert!(s.follow_tail);
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline() {
+        let mut s = ChatTui::new("m".into(), Theme::pick(Some("lamu")), LamuConfig::default());
+        s.input.push_str("hi");
+        s.cursor = 2;
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let _ = handle_key(&mut s, key).unwrap();
+        assert_eq!(s.input, "hi\n");
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline() {
+        let mut s = ChatTui::new("m".into(), Theme::pick(Some("lamu")), LamuConfig::default());
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        let _ = handle_key(&mut s, key).unwrap();
+        assert_eq!(s.input, "\n");
+    }
+
+    #[test]
+    fn plain_enter_does_not_newline() {
+        let mut s = ChatTui::new("m".into(), Theme::pick(Some("lamu")), LamuConfig::default());
+        s.input.push_str("hi");
+        s.cursor = 2;
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let _ = handle_key(&mut s, key).unwrap();
+        // dispatch_send tried to POST; no newline got inserted regardless.
+        assert!(!s.input.contains('\n'));
     }
 
     #[test]
