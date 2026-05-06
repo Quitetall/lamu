@@ -873,10 +873,11 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     state.refresh();
                                     state.status_msg = format!("Returned from {} (default harness).", label);
                                 } else {
-                                    run_subprocess_in_tui(terminal, || -> Result<()> {
-                                        println!("\n→ Chat with {} (/quit returns to dashboard)\n", local_name);
-                                        let api_url = state.config.backend_url.clone();
-                                        crate::repl::run_repl_with_model(api_url, Some(local_name.clone()))
+                                    let cfg = state.config.clone();
+                                    let theme = Theme::pick(Some(&cfg.theme));
+                                    let name = local_name.clone();
+                                    run_subprocess_in_tui(terminal, move || -> Result<()> {
+                                        crate::chat_tui::run(name, theme, cfg)
                                     })?;
                                     state.last_harness = Some("lamu repl");
                                     state.refresh();
@@ -887,10 +888,12 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     .unwrap_or_else(|_| "http://localhost:8080/v1".into());
                                 let trimmed = gateway.trim_end_matches('/').to_string();
                                 let api_url = format!("{}/chat/completions", trimmed);
+                                let mut cfg = state.config.clone();
+                                cfg.backend_url = api_url;
+                                let theme = Theme::pick(Some(&cfg.theme));
                                 let model_id = cloud.full_id();
-                                run_subprocess_in_tui(terminal, || -> Result<()> {
-                                    println!("\n→ Chat with {} via {} (/quit returns)\n", model_id, trimmed);
-                                    crate::repl::run_repl_with_model(api_url, Some(model_id.clone()))
+                                run_subprocess_in_tui(terminal, move || -> Result<()> {
+                                    crate::chat_tui::run(model_id, theme, cfg)
                                 })?;
                                 state.last_harness = Some("lamu repl");
                                 state.refresh();

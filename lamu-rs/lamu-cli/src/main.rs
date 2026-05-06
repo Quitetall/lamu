@@ -1,5 +1,6 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
+mod chat_tui;
 mod cloud_models;
 mod favorites;
 mod lamu_config;
@@ -94,7 +95,14 @@ async fn main() -> Result<()> {
         Some(Command::Start) => cmd_start().await,
         Some(Command::Serve { port }) => cmd_serve(port).await,
         Some(Command::Repl { api_url }) => {
-            tokio::task::spawn_blocking(move || repl::run_repl(api_url)).await??;
+            // Themed ratatui chat. chat_tui::run falls back to the
+            // legacy line REPL when stdout is not a TTY.
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut config = lamu_config::LamuConfig::load();
+                config.backend_url = api_url;
+                let theme = theme::Theme::pick(Some(&config.theme));
+                chat_tui::run("default".into(), theme, config)
+            }).await??;
             Ok(())
         }
         Some(Command::Run { model }) => cmd_run(model).await,
@@ -250,9 +258,13 @@ async fn cmd_run(query: String) -> Result<()> {
     // loaded yet, the OpenAI compat will return 503 and prompt the user
     // to load via Claude Code or `lamu start`. (Future: wire up a proper
     // load over the MCP transport from here.)
-    let api_url = "http://localhost:8020/v1/chat/completions".to_string();
-    println!("  Dropping into chat (model={}). /quit to exit.\n", entry.name);
-    tokio::task::spawn_blocking(move || repl::run_repl(api_url)).await??;
+    let model_name = entry.name.clone();
+    println!("  Dropping into chat (model={}). Esc/Ctrl+C to exit.\n", entry.name);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let config = lamu_config::LamuConfig::load();
+        let theme = theme::Theme::pick(Some(&config.theme));
+        chat_tui::run(model_name, theme, config)
+    }).await??;
     Ok(())
 }
 
