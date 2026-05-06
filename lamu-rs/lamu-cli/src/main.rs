@@ -1,5 +1,6 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
+mod favorites;
 mod repl;
 mod tui;
 

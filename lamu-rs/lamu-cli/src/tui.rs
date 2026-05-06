@@ -34,12 +34,54 @@ use ratatui::Terminal;
 use std::io;
 use std::time::{Duration, Instant};
 
+use crate::favorites::Favorites;
+
 const REFRESH_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Dashboard,
     Launchers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// Favorites pinned, then by registry order (alphabetical from scan).
+    Default,
+    Name,
+    Params,
+    Vram,
+    Ctx,
+}
+
+impl SortKey {
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Default => "fav+name",
+            SortKey::Name => "name",
+            SortKey::Params => "params",
+            SortKey::Vram => "vram",
+            SortKey::Ctx => "ctx",
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            SortKey::Default => SortKey::Name,
+            SortKey::Name => SortKey::Params,
+            SortKey::Params => SortKey::Vram,
+            SortKey::Vram => SortKey::Ctx,
+            SortKey::Ctx => SortKey::Default,
+        }
+    }
+}
+
+/// Filter input mode — when active, key presses go to the filter buffer
+/// instead of triggering keybinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Filter,
 }
 
 /// External CLI harness the TUI can launch. Each entry is detected with
@@ -128,6 +170,17 @@ pub struct AppState {
     pub launcher_state: ListState,
     pub harness_installed: Vec<bool>,
     pub last_harness: Option<&'static str>,
+    pub favorites: Favorites,
+    pub model_sort: SortKey,
+    pub model_filter: String,
+    pub harness_sort: SortKey,
+    pub harness_filter: String,
+    pub input_mode: InputMode,
+    /// Cached sorted+filtered indices into `entries` / `HARNESSES`.
+    /// Recomputed on every state change. The `list_state.selected()`
+    /// indexes INTO these vecs, not the underlying slices.
+    pub model_view: Vec<usize>,
+    pub harness_view: Vec<usize>,
 }
 
 impl AppState {
@@ -145,8 +198,9 @@ impl AppState {
         let mut launcher_state = ListState::default();
         launcher_state.select(Some(0));
         let harness_installed = HARNESSES.iter().map(|h| which_exists(h.bin)).collect();
+        let favorites = Favorites::load();
 
-        Ok(Self {
+        let mut s = Self {
             entries,
             list_state,
             vram,
@@ -160,7 +214,114 @@ impl AppState {
             launcher_state,
             harness_installed,
             last_harness: None,
-        })
+            favorites,
+            model_sort: SortKey::Default,
+            model_filter: String::new(),
+            harness_sort: SortKey::Default,
+            harness_filter: String::new(),
+            input_mode: InputMode::Normal,
+            model_view: Vec::new(),
+            harness_view: Vec::new(),
+        };
+        s.recompute_views();
+        Ok(s)
+    }
+
+    /// Build sorted+filtered index vectors. Favorites pinned at the top
+    /// regardless of sort key (unless sort=Name and the user wants pure
+    /// alpha — then we still pin: deliberate UX call).
+    pub fn recompute_views(&mut self) {
+        // Models
+        let filter = self.model_filter.to_lowercase();
+        let mut idx: Vec<usize> = (0..self.entries.len())
+            .filter(|i| {
+                if filter.is_empty() {
+                    return true;
+                }
+                let e = &self.entries[*i];
+                if e.name.to_lowercase().contains(&filter) {
+                    return true;
+                }
+                if e.quant.to_lowercase().contains(&filter) {
+                    return true;
+                }
+                e.capabilities.iter().any(|c| {
+                    let cs = match c {
+                        lamu_core::types::Capability::Chat => "chat",
+                        lamu_core::types::Capability::Code => "code",
+                        lamu_core::types::Capability::Reasoning => "reasoning",
+                        lamu_core::types::Capability::Routing => "routing",
+                        lamu_core::types::Capability::Vision => "vision",
+                        lamu_core::types::Capability::LongContext => "long",
+                    };
+                    cs.contains(&filter)
+                })
+            })
+            .collect();
+
+        let sort = self.model_sort;
+        let entries = &self.entries;
+        let favs = &self.favorites;
+        idx.sort_by(|a, b| {
+            // Favorites always first.
+            let fa = favs.has_model(&entries[*a].name);
+            let fb = favs.has_model(&entries[*b].name);
+            if fa != fb {
+                return fb.cmp(&fa); // fa=true should come first → reverse cmp
+            }
+            match sort {
+                SortKey::Default | SortKey::Name => entries[*a].name.cmp(&entries[*b].name),
+                SortKey::Params => entries[*b]
+                    .params_b
+                    .partial_cmp(&entries[*a].params_b)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SortKey::Vram => entries[*b].vram_mb.cmp(&entries[*a].vram_mb),
+                SortKey::Ctx => entries[*b].context_max.cmp(&entries[*a].context_max),
+            }
+        });
+        self.model_view = idx;
+
+        // Harnesses
+        let h_filter = self.harness_filter.to_lowercase();
+        let mut hidx: Vec<usize> = (0..HARNESSES.len())
+            .filter(|i| {
+                if h_filter.is_empty() {
+                    return true;
+                }
+                let h = &HARNESSES[*i];
+                h.name.to_lowercase().contains(&h_filter)
+                    || h.bin.to_lowercase().contains(&h_filter)
+            })
+            .collect();
+
+        let installed = &self.harness_installed;
+        hidx.sort_by(|a, b| {
+            let fa = favs.has_harness(HARNESSES[*a].name);
+            let fb = favs.has_harness(HARNESSES[*b].name);
+            if fa != fb {
+                return fb.cmp(&fa);
+            }
+            // Then installed-before-missing.
+            let ia = *installed.get(*a).unwrap_or(&false);
+            let ib = *installed.get(*b).unwrap_or(&false);
+            if ia != ib {
+                return ib.cmp(&ia);
+            }
+            HARNESSES[*a].name.cmp(HARNESSES[*b].name)
+        });
+        self.harness_view = hidx;
+
+        // Clamp selection to view length.
+        if let Some(sel) = self.list_state.selected() {
+            if sel >= self.model_view.len() {
+                self.list_state.select(if self.model_view.is_empty() { None } else { Some(0) });
+            }
+        }
+        if let Some(sel) = self.launcher_state.selected() {
+            if sel >= self.harness_view.len() {
+                self.launcher_state.select(if self.harness_view.is_empty() { None } else { Some(0) });
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -175,31 +336,43 @@ impl AppState {
     }
 
     fn move_launcher(&mut self, delta: i32) {
-        if HARNESSES.is_empty() {
+        if self.harness_view.is_empty() {
             return;
         }
-        let n = HARNESSES.len() as i32;
+        let n = self.harness_view.len() as i32;
         let cur = self.launcher_state.selected().unwrap_or(0) as i32;
         let next = ((cur + delta).rem_euclid(n)) as usize;
         self.launcher_state.select(Some(next));
     }
 
     fn selected_harness(&self) -> Option<&'static Harness> {
-        self.launcher_state.selected().and_then(|i| HARNESSES.get(i))
+        self.launcher_state
+            .selected()
+            .and_then(|i| self.harness_view.get(i).copied())
+            .and_then(|orig| HARNESSES.get(orig))
+    }
+
+    fn selected_harness_orig_idx(&self) -> Option<usize> {
+        self.launcher_state
+            .selected()
+            .and_then(|i| self.harness_view.get(i).copied())
     }
 
     fn move_cursor(&mut self, delta: i32) {
-        if self.entries.is_empty() {
+        if self.model_view.is_empty() {
             return;
         }
-        let n = self.entries.len() as i32;
+        let n = self.model_view.len() as i32;
         let cur = self.list_state.selected().unwrap_or(0) as i32;
         let next = ((cur + delta).rem_euclid(n)) as usize;
         self.list_state.select(Some(next));
     }
 
     fn selected_entry(&self) -> Option<&ModelEntry> {
-        self.list_state.selected().and_then(|i| self.entries.get(i))
+        self.list_state
+            .selected()
+            .and_then(|i| self.model_view.get(i).copied())
+            .and_then(|orig| self.entries.get(orig))
     }
 }
 
@@ -264,6 +437,40 @@ fn run_loop<B: ratatui::backend::Backend>(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                // Filter input mode: keys go to the filter buffer until Enter/Esc.
+                if state.input_mode == InputMode::Filter {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.input_mode = InputMode::Normal;
+                            // Clear the buffer on cancel — the user wanted out.
+                            match state.mode {
+                                Mode::Dashboard => state.model_filter.clear(),
+                                Mode::Launchers => state.harness_filter.clear(),
+                            }
+                            state.recompute_views();
+                        }
+                        KeyCode::Enter => {
+                            state.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            match state.mode {
+                                Mode::Dashboard => { state.model_filter.pop(); }
+                                Mode::Launchers => { state.harness_filter.pop(); }
+                            }
+                            state.recompute_views();
+                        }
+                        KeyCode::Char(c) => {
+                            match state.mode {
+                                Mode::Dashboard => state.model_filter.push(c),
+                                Mode::Launchers => state.harness_filter.push(c),
+                            }
+                            state.recompute_views();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match state.mode {
                     Mode::Dashboard => match key.code {
                         KeyCode::Char('q') => return Ok(()),
@@ -290,6 +497,27 @@ fn run_loop<B: ratatui::backend::Backend>(
                         KeyCode::Char('h') => {
                             state.mode = Mode::Launchers;
                             state.status_msg.clear();
+                        }
+                        KeyCode::Char('*') | KeyCode::Char('f') => {
+                            if let Some(name) = state.selected_entry().map(|e| e.name.clone()) {
+                                let added = state.favorites.toggle_model(&name);
+                                state.recompute_views();
+                                state.status_msg = if added {
+                                    format!("★ favorited {}", name)
+                                } else {
+                                    format!("☆ unfavorited {}", name)
+                                };
+                            }
+                        }
+                        KeyCode::Char('o') => {
+                            state.model_sort = state.model_sort.cycle();
+                            state.recompute_views();
+                            state.status_msg = format!("sort: {}", state.model_sort.label());
+                        }
+                        KeyCode::Char('/') => {
+                            state.input_mode = InputMode::Filter;
+                            state.model_filter.clear();
+                            state.status_msg = "filter: type to refine, Enter to apply, Esc to cancel".into();
                         }
                         KeyCode::Char('c') | KeyCode::Enter => {
                             if let Some(model_name) = state.selected_entry().map(|e| e.name.clone()) {
@@ -325,10 +553,32 @@ fn run_loop<B: ratatui::backend::Backend>(
                         KeyCode::Char('j') | KeyCode::Down => state.move_launcher(1),
                         KeyCode::Char('k') | KeyCode::Up => state.move_launcher(-1),
                         KeyCode::Char('r') => state.refresh(),
+                        KeyCode::Char('*') | KeyCode::Char('f') => {
+                            if let Some(h) = state.selected_harness() {
+                                let name = h.name.to_string();
+                                let added = state.favorites.toggle_harness(&name);
+                                state.recompute_views();
+                                state.status_msg = if added {
+                                    format!("★ favorited {}", name)
+                                } else {
+                                    format!("☆ unfavorited {}", name)
+                                };
+                            }
+                        }
+                        KeyCode::Char('o') => {
+                            state.harness_sort = state.harness_sort.cycle();
+                            state.recompute_views();
+                            state.status_msg = format!("sort: {}", state.harness_sort.label());
+                        }
+                        KeyCode::Char('/') => {
+                            state.input_mode = InputMode::Filter;
+                            state.harness_filter.clear();
+                            state.status_msg = "filter: type to refine, Enter to apply, Esc to cancel".into();
+                        }
                         KeyCode::Enter => {
                             if let Some(h) = state.selected_harness() {
-                                let idx = state.launcher_state.selected().unwrap_or(0);
-                                let installed = *state.harness_installed.get(idx).unwrap_or(&false);
+                                let orig = state.selected_harness_orig_idx().unwrap_or(0);
+                                let installed = *state.harness_installed.get(orig).unwrap_or(&false);
                                 if installed {
                                     let argv: Vec<String> = h.launch_argv.iter().map(|s| s.to_string()).collect();
                                     let label = h.name;
@@ -352,8 +602,8 @@ fn run_loop<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Char('i') => {
                             if let Some(h) = state.selected_harness() {
-                                let idx = state.launcher_state.selected().unwrap_or(0);
-                                let installed = *state.harness_installed.get(idx).unwrap_or(&false);
+                                let orig = state.selected_harness_orig_idx().unwrap_or(0);
+                                let installed = *state.harness_installed.get(orig).unwrap_or(&false);
                                 if installed {
                                     state.status_msg = format!("{} already installed at {}.", h.name, h.bin);
                                 } else if h.install.starts_with('(') {
@@ -467,7 +717,7 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .split(area);
 
     let header_label = format!(
-        "  {:<48}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
+        "   {:<46}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
         "NAME", "PARAMS", "QUANT", "CTX", "VRAM (MB)", "CAPABILITIES",
     );
     let header_widget = Paragraph::new(header_label).style(
@@ -478,9 +728,10 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     f.render_widget(header_widget, split[0]);
 
     let items: Vec<ListItem> = state
-        .entries
+        .model_view
         .iter()
-        .map(|e| {
+        .map(|&i| {
+            let e = &state.entries[i];
             let caps = e.capabilities.iter().map(|c| match c {
                 lamu_core::types::Capability::Chat => "chat",
                 lamu_core::types::Capability::Code => "code",
@@ -489,21 +740,43 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 lamu_core::types::Capability::Vision => "vision",
                 lamu_core::types::Capability::LongContext => "long",
             }).collect::<Vec<_>>().join(",");
+            let star = if state.favorites.has_model(&e.name) { "★" } else { " " };
             let line = format!(
-                "{:<48}  {:>4}B  {:<6}  {:>5}  {:>9}  [{}]",
-                truncate(&e.name, 48),
+                "{} {:<46}  {:>4}B  {:<6}  {:>5}  {:>9}  [{}]",
+                star,
+                truncate(&e.name, 46),
                 format_params(e.params_b),
                 e.quant,
                 format_ctx(e.context_max),
                 e.vram_mb,
                 caps,
             );
-            ListItem::new(line)
+            let style = if state.favorites.has_model(&e.name) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
         })
         .collect();
 
+    let title = if state.model_filter.is_empty() {
+        format!(
+            "Models  [{}]  sort={}  /filter  *favorite  o sort",
+            state.model_view.len(),
+            state.model_sort.label()
+        )
+    } else {
+        format!(
+            "Models  [{}]  filter='{}'  sort={}  Esc clears",
+            state.model_view.len(),
+            state.model_filter,
+            state.model_sort.label()
+        )
+    };
+
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Models — j/k to move"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
         .highlight_symbol("→ ");
 
@@ -567,17 +840,23 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" move  "),
+        Span::raw(" "),
         Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" chat  "),
+        Span::raw(" chat "),
+        Span::styled("[*]", Style::default().fg(Color::Yellow)),
+        Span::raw(" fav "),
+        Span::styled("[/]", Style::default().fg(Color::Cyan)),
+        Span::raw(" filter "),
+        Span::styled("[o]", Style::default().fg(Color::Cyan)),
+        Span::raw(" sort "),
         Span::styled("[h]", Style::default().fg(Color::Cyan)),
-        Span::raw(" harnesses  "),
+        Span::raw(" harness "),
         Span::styled("[s]", Style::default().fg(Color::Cyan)),
-        Span::raw(" serve  "),
+        Span::raw(" serve "),
         Span::styled("[b]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Bifrost  "),
+        Span::raw(" bifrost "),
         Span::styled("[r]", Style::default().fg(Color::Cyan)),
-        Span::raw(" refresh  "),
+        Span::raw(" refresh "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" quit"),
     ]))
@@ -628,30 +907,50 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
         split[0],
     );
 
-    let items: Vec<ListItem> = HARNESSES
+    let items: Vec<ListItem> = state
+        .harness_view
         .iter()
-        .enumerate()
-        .map(|(i, h)| {
+        .map(|&i| {
+            let h = &HARNESSES[i];
             let installed = *state.harness_installed.get(i).unwrap_or(&false);
             let status_label = if installed { "✓ on PATH" } else { "✗ missing" };
+            let star = if state.favorites.has_harness(h.name) { "★" } else { " " };
             let line = format!(
-                "{:<18}  {:<10}  {:<8}  {}",
+                "{} {:<18}  {:<10}  {:<8}  {}",
+                star,
                 h.name,
                 h.bin,
                 status_label,
                 h.notes,
             );
-            let style = if installed {
+            let mut style = if installed {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::Red)
             };
+            if state.favorites.has_harness(h.name) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
             ListItem::new(line).style(style)
         })
         .collect();
 
+    let title = if state.harness_filter.is_empty() {
+        format!(
+            "Harnesses  [{}]  sort={}  /filter  *favorite",
+            state.harness_view.len(),
+            state.harness_sort.label()
+        )
+    } else {
+        format!(
+            "Harnesses  [{}]  filter='{}'  Esc clears",
+            state.harness_view.len(),
+            state.harness_filter
+        )
+    };
+
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Harnesses — j/k move, Enter launch, i install"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -691,15 +990,21 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
     // Footer keybinds
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" move  "),
+        Span::raw(" "),
         Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" launch  "),
+        Span::raw(" launch "),
         Span::styled("[i]", Style::default().fg(Color::Cyan)),
-        Span::raw(" install  "),
+        Span::raw(" install "),
+        Span::styled("[*]", Style::default().fg(Color::Yellow)),
+        Span::raw(" fav "),
+        Span::styled("[/]", Style::default().fg(Color::Cyan)),
+        Span::raw(" filter "),
+        Span::styled("[o]", Style::default().fg(Color::Cyan)),
+        Span::raw(" sort "),
         Span::styled("[r]", Style::default().fg(Color::Cyan)),
-        Span::raw(" refresh  "),
+        Span::raw(" refresh "),
         Span::styled("[d/Esc]", Style::default().fg(Color::Cyan)),
-        Span::raw(" dashboard  "),
+        Span::raw(" back "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" quit"),
     ]))
@@ -832,6 +1137,7 @@ mod tests {
         let mut s = AppState::new().unwrap();
         // Synthesise three entries so the wrap logic has something to chew on.
         s.entries = (0..3).map(|i| dummy_entry(i)).collect();
+        s.recompute_views();
         s.list_state.select(Some(0));
         s.move_cursor(-1);
         assert_eq!(s.list_state.selected(), Some(2));
@@ -879,6 +1185,80 @@ mod tests {
         // `sh` is on every POSIX box including the CI image.
         assert!(which_exists("sh"));
         assert!(!which_exists("definitely-not-a-real-binary-xyz123"));
+    }
+
+    #[test]
+    fn sortkey_cycles_through_all() {
+        let mut k = SortKey::Default;
+        let mut seen: Vec<SortKey> = Vec::new();
+        for _ in 0..6 {
+            if !seen.contains(&k) {
+                seen.push(k);
+            }
+            k = k.cycle();
+        }
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[test]
+    fn filter_substring_narrows_view() {
+        let mut s = AppState::new().unwrap();
+        s.entries = vec![
+            dummy_entry_named("alpha-7b"),
+            dummy_entry_named("beta-13b"),
+            dummy_entry_named("gamma-7b"),
+        ];
+        s.model_filter = "7b".into();
+        s.recompute_views();
+        assert_eq!(s.model_view.len(), 2);
+        // Both names contain "7b"; default sort = alpha.
+        assert_eq!(s.entries[s.model_view[0]].name, "alpha-7b");
+        assert_eq!(s.entries[s.model_view[1]].name, "gamma-7b");
+    }
+
+    #[test]
+    fn sort_by_params_descending() {
+        let mut s = AppState::new().unwrap();
+        let mut a = dummy_entry_named("small"); a.params_b = 1.0;
+        let mut b = dummy_entry_named("medium"); b.params_b = 7.0;
+        let mut c = dummy_entry_named("large"); c.params_b = 70.0;
+        s.entries = vec![a, b, c];
+        s.model_sort = SortKey::Params;
+        s.recompute_views();
+        let names: Vec<_> = s.model_view.iter().map(|&i| s.entries[i].name.clone()).collect();
+        assert_eq!(names, vec!["large", "medium", "small"]);
+    }
+
+    #[test]
+    fn favorites_pin_to_top_regardless_of_sort() {
+        let mut s = AppState::new().unwrap();
+        s.entries = vec![
+            dummy_entry_named("alpha"),
+            dummy_entry_named("beta"),
+            dummy_entry_named("gamma"),
+        ];
+        s.favorites.models.insert("gamma".to_string());
+        s.recompute_views();
+        // Gamma pinned even though alphabetically last.
+        assert_eq!(s.entries[s.model_view[0]].name, "gamma");
+        // Order of the rest stays alphabetical.
+        assert_eq!(s.entries[s.model_view[1]].name, "alpha");
+        assert_eq!(s.entries[s.model_view[2]].name, "beta");
+    }
+
+    #[test]
+    fn empty_filter_shows_everything() {
+        let mut s = AppState::new().unwrap();
+        s.entries = (0..5).map(|i| dummy_entry_named(&format!("e{i}"))).collect();
+        s.model_filter.clear();
+        s.recompute_views();
+        assert_eq!(s.model_view.len(), 5);
+    }
+
+    fn dummy_entry_named(name: &str) -> ModelEntry {
+        let mut e = dummy_entry(0);
+        e.name = name.to_string();
+        e
     }
 
     fn dummy_entry(i: usize) -> ModelEntry {
