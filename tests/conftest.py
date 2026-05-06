@@ -144,6 +144,31 @@ _ensure_real_class("langchain_core.messages", "SystemMessage")
 _ensure_real_class("langchain_core.messages", "ToolMessage")
 
 
+# When real langchain_core is missing, `@tool` becomes a MagicMock that wraps
+# the decorated function in another MagicMock — breaking any test that calls
+# the underlying logic. Replace it with an identity decorator that exposes
+# the original callable on `.func` (the attribute the real StructuredTool uses).
+def _identity_tool(*dargs, **dkwargs):
+    if dargs and callable(dargs[0]) and len(dargs) == 1:
+        fn = dargs[0]
+        fn.func = fn
+        fn.name = getattr(fn, "__name__", "tool")
+        return fn
+
+    def _wrap(fn):
+        fn.func = fn
+        fn.name = getattr(fn, "__name__", "tool")
+        return fn
+    return _wrap
+
+
+_lc_tools = sys.modules.get("langchain_core.tools")
+if _lc_tools is not None and not callable(getattr(_lc_tools, "tool", None).__class__.__call__ if False else None):
+    pass  # placeholder to avoid eager attribute checks
+if _lc_tools is not None:
+    setattr(_lc_tools, "tool", _identity_tool)
+
+
 # Some libraries probe attributes on import — give them sane shapes.
 if hasattr(sys.modules.get("torch", object()), "cuda"):
     try:
