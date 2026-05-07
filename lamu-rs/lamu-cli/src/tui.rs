@@ -2142,9 +2142,11 @@ fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
         anyhow::bail!("llama-server not found at {}", bin.display());
     }
 
-    let ctx_default: u32 = std::env::var("LAMU_DEFAULT_CTX")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(32768);
-    let ctx = entry.context_max.min(ctx_default);
+    // Use the model's full advertised context by default. Set
+    // LAMU_DEFAULT_CTX to cap manually if VRAM is tight.
+    let ctx_cap: u32 = std::env::var("LAMU_DEFAULT_CTX")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
+    let ctx = entry.context_max.min(ctx_cap);
     let kv = std::env::var("LAMU_KV").unwrap_or_else(|_| "q8_0".into());
 
     std::process::Command::new(&bin)

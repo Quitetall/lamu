@@ -181,7 +181,7 @@ impl Provider for OpenAiCompatProvider {
             "model": model,
             "messages": messages,
             "stream": true,
-            "max_tokens": 16384,
+            "max_tokens": 65536,
             "temperature": 0.7,
         });
         if search {
@@ -350,7 +350,7 @@ impl Provider for AnthropicProvider {
             "model": model,
             "messages": messages,
             "stream": true,
-            "max_tokens": 16384,
+            "max_tokens": 65536,
             "temperature": 0.7,
         });
         if !system_text.is_empty() {

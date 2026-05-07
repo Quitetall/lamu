@@ -68,16 +68,14 @@ impl Backend for LlamaCppBackend {
             )));
         }
 
-        // Don't allocate the full advertised context unless the model
-        // really needs it. KV cache scales linearly with --ctx-size and
-        // dominates per-token attention bandwidth, so capping at 32K by
-        // default cuts TTFT dramatically while still fitting normal
-        // chat. Override per model via env var.
-        let ctx_default = std::env::var("LAMU_DEFAULT_CTX")
+        // Default: model's full advertised context. KV cache scales
+        // linearly with --ctx-size, so set LAMU_DEFAULT_CTX to cap if
+        // VRAM is tight or if you want lower TTFT for short prompts.
+        let ctx_cap = std::env::var("LAMU_DEFAULT_CTX")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(32768);
-        let ctx = entry.context_max.min(ctx_default);
+            .unwrap_or(u32::MAX);
+        let ctx = entry.context_max.min(ctx_cap);
 
         // Q8_0 KV is the speed/VRAM sweet spot; Q4_0 KV saved memory but
         // dequant added prompt-eval cost. Override with LAMU_KV.
