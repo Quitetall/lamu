@@ -634,31 +634,45 @@ impl LamuMcpServer {
         if !matches!(mode.as_str(), "auto" | "local-only" | "cloud-only") {
             return format!("error: mode must be 'auto', 'local-only', or 'cloud-only' (got '{}')", mode);
         }
+
+        // Hold the routing-mode lock for the whole transition. Once mode
+        // is set to cloud-only, handle_query refuses new local requests,
+        // so no concurrent load_model can race in while we drain.
         let mut current = self.routing_mode.lock().await;
         let old = current.clone();
         *current = mode.clone();
+
+        // cloud-only → drain loaded_procs + scheduler atomically inside
+        // the state lock, THEN kill outside the lock so wait() doesn't
+        // hold the state lock for 30s.
+        let mut freed = Vec::new();
+        let mut to_kill: Vec<(String, Child)> = Vec::new();
+        if mode == "cloud-only" {
+            let mut st = self.state.lock();
+            let names: Vec<String> = st.scheduler.loaded_models()
+                .iter().map(|m| m.entry.name.clone()).collect();
+            for n in &names {
+                if let Some(p) = st.loaded_procs.remove(n) {
+                    to_kill.push((n.clone(), p));
+                }
+                st.scheduler.mark_unloaded(n);
+                freed.push(n.clone());
+            }
+            drop(st);
+        }
+        // Routing mode still locked; release before any await on the
+        // child wait so other RPCs aren't blocked while llama-server
+        // tears down.
         drop(current);
 
-        // cloud-only → free all local VRAM by unloading every loaded backend.
-        let mut freed = Vec::new();
-        if mode == "cloud-only" {
-            let names: Vec<String> = {
-                let st = self.state.lock();
-                st.scheduler.loaded_models().iter().map(|m| m.entry.name.clone()).collect()
-            };
-            for n in names {
-                let mut st = self.state.lock();
-                if let Some(mut p) = st.loaded_procs.remove(&n) {
-                    drop(st);
-                    let _ = p.start_kill();
-                    let _ = p.wait().await;
-                    let mut st2 = self.state.lock();
-                    st2.scheduler.mark_unloaded(&n);
-                    freed.push(n);
-                } else {
-                    st.scheduler.mark_unloaded(&n);
-                    freed.push(n);
-                }
+        for (name, mut p) in to_kill {
+            let _ = p.start_kill();
+            // Cap the wait — if llama-server ignores SIGTERM we move on
+            // rather than hang the entire MCP server.
+            match tokio::time::timeout(std::time::Duration::from_secs(30), p.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("set_routing_mode: wait({}) errored: {}", name, e),
+                Err(_) => eprintln!("set_routing_mode: wait({}) timed out after 30s — leaving zombie", name),
             }
         }
 
@@ -1156,20 +1170,84 @@ async fn handle_cloud_query(args: Value) -> String {
 
 const REVIEW_SYSTEM_PROMPT: &str = "You are a senior staff engineer doing a code review. Your job is to find real issues, not to pat anyone on the back.\n\nAlways check:\n  1. SECURITY — injection (SQL/shell/XSS/prompt), auth/authz holes, secrets in code, unsafe deserialization, TOCTOU, missing input validation.\n  2. CORRECTNESS — off-by-one, null/empty cases, integer overflow, floating-point traps, race conditions, deadlocks, missing error handling.\n  3. EDGE CASES — what happens at boundaries, with empty inputs, with hostile inputs, under concurrency, on partial failure, on retry.\n  4. ARCHITECTURE — does this fit the existing design? Does it leak abstraction? Does it create coupling that will hurt later? Is there a simpler shape?\n  5. CLARITY — would a stranger understand the intent? Are names accurate? Are comments necessary or noise?\n\nFormat your output:\n  - One-sentence verdict (PASS / PASS WITH NITS / NEEDS CHANGES / REJECT).\n  - Numbered list of findings, each: severity [BUG/SECURITY/STYLE/QUESTION], file:line if knowable, the problem, the suggested fix.\n  - End with a single 'Recommend' line.\n\nBe terse. Be honest. Don't praise unless something is genuinely surprising in a good way. If the code is fine, say so in one line and stop.";
 
+/// Cap on diff size sent to the reviewer. 200 KiB is generous (≈ 4K
+/// lines of typical code) but bounded — anything larger gets truncated
+/// with a marker so the model knows it's not seeing the whole change.
+const MAX_REVIEW_DIFF_BYTES: usize = 200 * 1024;
+
+/// Validate a git ref / commit. Accepts: 7-40 hex chars, HEAD with
+/// optional ~N or ^N suffix, refnames matching git's safe character
+/// set (alnum, _, -, ., /). Rejects anything starting with '-' (stops
+/// the model handing `--upload-pack=…` to git via the commit field).
+fn is_safe_git_ref(s: &str) -> bool {
+    if s.is_empty() || s.starts_with('-') { return false; }
+    // Hex SHA / abbrev.
+    if s.len() >= 7 && s.len() <= 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    // HEAD, HEAD~N, HEAD^N, HEAD^.
+    if let Some(rest) = s.strip_prefix("HEAD") {
+        if rest.is_empty() { return true; }
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some('~') | Some('^') => return chars.all(|c| c.is_ascii_digit()),
+            _ => return false,
+        }
+    }
+    // General refname: alnum + _ - . / only, no leading '.', no '..'.
+    if s.contains("..") || s.starts_with('.') { return false; }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+}
+
+fn truncate_with_marker(text: &str, limit: usize) -> String {
+    if text.len() <= limit { return text.to_string(); }
+    let mut out = text[..limit].to_string();
+    out.push_str(&format!(
+        "\n\n[…truncated {} more bytes — diff exceeded {} byte review limit]",
+        text.len() - limit, limit
+    ));
+    out
+}
+
 async fn handle_review_commit(args: Value) -> String {
     let commit = args["commit"].as_str().unwrap_or("HEAD");
     let repo = args["repo"].as_str().unwrap_or(".");
     let focus = args["focus"].as_str().unwrap_or("");
 
-    // Get diff + commit message via git show.
+    if !is_safe_git_ref(commit) {
+        return format!(
+            "error: commit '{}' rejected — must be a hex SHA, HEAD[~N|^N], or a safe refname.",
+            commit
+        );
+    }
+
+    // Get diff + commit message via git show. Pass `--` between options
+    // and the ref as a defense-in-depth so git can't interpret the ref
+    // as another flag even if validation is bypassed.
     let out = match std::process::Command::new("git")
         .current_dir(repo)
-        .args(["show", "--stat", "--patch", commit])
+        .args(["show", "--stat", "--patch", "--", ""])
+        .arg(commit)
         .output()
     {
         Ok(o) => o,
         Err(e) => return format!("error: spawn git: {}", e),
     };
+    // Note: `git show <ref> --` works; the explicit `--` blocks
+    // pathspec-as-flag tricks. We keep the canonical command shape.
+    let out = if !out.status.success() {
+        // Fall back to plain `git show <ref>` for older git versions
+        // that don't accept the empty-pathspec form.
+        match std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["show", "--stat", "--patch", commit])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => return format!("error: spawn git: {}", e),
+        }
+    } else { out };
+
     if !out.status.success() {
         return format!("error: git show {} failed: {}", commit,
             String::from_utf8_lossy(&out.stderr).trim());
@@ -1178,6 +1256,7 @@ async fn handle_review_commit(args: Value) -> String {
     if diff_text.trim().is_empty() {
         return format!("error: empty diff for {}", commit);
     }
+    let diff_text = truncate_with_marker(&diff_text, MAX_REVIEW_DIFF_BYTES);
 
     let mut prompt = String::new();
     if !focus.is_empty() {
@@ -1204,6 +1283,7 @@ async fn handle_review_diff(args: Value) -> String {
     if diff.is_empty() {
         return "error: 'diff' is required".into();
     }
+    let diff = truncate_with_marker(diff, MAX_REVIEW_DIFF_BYTES);
     let context = args["context"].as_str().unwrap_or("");
     let focus = args["focus"].as_str().unwrap_or("");
 
@@ -1217,7 +1297,7 @@ async fn handle_review_diff(args: Value) -> String {
         prompt.push_str("\n\n");
     }
     prompt.push_str("Diff to review:\n\n```\n");
-    prompt.push_str(diff);
+    prompt.push_str(&diff);
     prompt.push_str("\n```\n");
 
     let review_args = json!({
@@ -1279,6 +1359,57 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing tool: {}", required);
         }
+    }
+
+    #[test]
+    fn safe_git_ref_accepts_hex_sha() {
+        assert!(is_safe_git_ref("abc1234"));
+        assert!(is_safe_git_ref("abc1234567890"));
+        assert!(is_safe_git_ref(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn safe_git_ref_accepts_head_variants() {
+        assert!(is_safe_git_ref("HEAD"));
+        assert!(is_safe_git_ref("HEAD~1"));
+        assert!(is_safe_git_ref("HEAD~10"));
+        assert!(is_safe_git_ref("HEAD^"));
+        assert!(is_safe_git_ref("HEAD^2"));
+    }
+
+    #[test]
+    fn safe_git_ref_accepts_branch_names() {
+        assert!(is_safe_git_ref("main"));
+        assert!(is_safe_git_ref("feature/x-123"));
+        assert!(is_safe_git_ref("release-1.0"));
+    }
+
+    #[test]
+    fn safe_git_ref_rejects_dangerous() {
+        assert!(!is_safe_git_ref(""));
+        assert!(!is_safe_git_ref("--upload-pack=evil"));
+        assert!(!is_safe_git_ref("-v"));
+        assert!(!is_safe_git_ref("../escape"));
+        assert!(!is_safe_git_ref(".hidden"));
+        assert!(!is_safe_git_ref("HEAD; rm -rf /"));
+        assert!(!is_safe_git_ref("HEAD~abc"));
+        assert!(!is_safe_git_ref("branch with space"));
+        assert!(!is_safe_git_ref("name$with#meta"));
+    }
+
+    #[test]
+    fn truncate_marker_short_string_unchanged() {
+        let s = "short";
+        assert_eq!(truncate_with_marker(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_marker_long_string_truncated() {
+        let s = "x".repeat(1000);
+        let out = truncate_with_marker(&s, 100);
+        assert!(out.len() < s.len());
+        assert!(out.contains("truncated"));
+        assert!(out.contains("900 more bytes"));
     }
 
     #[test]
