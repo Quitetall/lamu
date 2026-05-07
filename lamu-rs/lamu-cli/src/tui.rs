@@ -111,6 +111,7 @@ impl SortKey {
 pub enum InputMode {
     Normal,
     Filter,
+    ApiKey,
 }
 
 /// Restricts the dashboard list to a subset of model sources.
@@ -230,6 +231,10 @@ pub struct AppState {
     pub harness_sort: SortKey,
     pub harness_filter: String,
     pub input_mode: InputMode,
+    pub quit_confirm: bool,
+    pub api_key_input: String,
+    /// (env_var_name, model_display_name) for the in-progress ApiKey input.
+    pub api_key_for: Option<(String, String)>,
     /// Cached sorted+filtered indices into `entries` / `HARNESSES`.
     /// Recomputed on every state change. The `list_state.selected()`
     /// indexes INTO these vecs, not the underlying slices.
@@ -297,6 +302,9 @@ impl AppState {
             harness_sort: SortKey::Default,
             harness_filter: String::new(),
             input_mode: InputMode::Normal,
+            quit_confirm: false,
+            api_key_input: String::new(),
+            api_key_for: None,
             harness_view: Vec::new(),
             mcp_servers,
             mcp_state,
@@ -653,6 +661,52 @@ fn run_loop<B: ratatui::backend::Backend>(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                // ApiKey input mode: keys go to the api_key_input buffer until Enter/Esc.
+                if state.input_mode == InputMode::ApiKey {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.input_mode = InputMode::Normal;
+                            state.api_key_input.clear();
+                            state.api_key_for = None;
+                            state.status_msg = "api key entry cancelled.".into();
+                        }
+                        KeyCode::Enter => {
+                            let key_val = state.api_key_input.trim().to_string();
+                            if let Some((var, model)) = state.api_key_for.take() {
+                                if key_val.is_empty() {
+                                    state.status_msg = "api key entry cancelled (empty).".into();
+                                } else {
+                                    match save_api_key(&var, &key_val) {
+                                        Ok(path) => {
+                                            // SAFETY: single-threaded TUI event loop; no concurrent threads read env.
+                                            unsafe { std::env::set_var(&var, &key_val); }
+                                            state.status_msg = format!(
+                                                "✓ {} key saved to {} and set for this session.",
+                                                model, path.display()
+                                            );
+                                        }
+                                        Err(e) => state.status_msg = format!("save failed: {e}"),
+                                    }
+                                }
+                            }
+                            state.api_key_input.clear();
+                            state.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            state.api_key_input.pop();
+                            let var = state.api_key_for.as_ref().map(|(v, _)| v.clone()).unwrap_or_default();
+                            state.status_msg = format!("API key for {}: [{}]", var, "*".repeat(state.api_key_input.len()));
+                        }
+                        KeyCode::Char(c) => {
+                            state.api_key_input.push(c);
+                            let var = state.api_key_for.as_ref().map(|(v, _)| v.clone()).unwrap_or_default();
+                            state.status_msg = format!("API key for {}: [{}]", var, "*".repeat(state.api_key_input.len()));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Filter input mode: keys go to the filter buffer until Enter/Esc.
                 if state.input_mode == InputMode::Filter {
                     match key.code {
@@ -691,11 +745,18 @@ fn run_loop<B: ratatui::backend::Backend>(
 
                 match state.mode {
                     Mode::Dashboard => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('j') | KeyCode::Down => state.move_cursor(1),
-                        KeyCode::Char('k') | KeyCode::Up => state.move_cursor(-1),
-                        KeyCode::Char('r') => state.refresh(),
+                        KeyCode::Char('q') => {
+                            if state.quit_confirm {
+                                return Ok(());
+                            } else {
+                                state.quit_confirm = true;
+                                state.status_msg = "Press q again to exit (x = instant exit)".into();
+                            }
+                        }
+                        KeyCode::Char('x') => return Ok(()),
+                        KeyCode::Char('j') | KeyCode::Down => { state.quit_confirm = false; state.move_cursor(1); }
+                        KeyCode::Char('k') | KeyCode::Up => { state.quit_confirm = false; state.move_cursor(-1); }
+                        KeyCode::Char('r') => { state.quit_confirm = false; state.refresh(); }
                         KeyCode::Char('s') => {
                             // 's' is the settings entry — most-used so it
                             // gets the lowercase. Capital 'S' kept for the
@@ -712,6 +773,11 @@ fn run_loop<B: ratatui::backend::Backend>(
                             }
                         }
                         KeyCode::Char('b') => {
+                            // back — no parent from dashboard; just clear quit_confirm
+                            state.quit_confirm = false;
+                        }
+                        KeyCode::Char('B') => {
+                            state.quit_confirm = false;
                             if !state.bifrost_up {
                                 state.status_msg = "Starting Bifrost (just serve-bifrost)...".into();
                                 spawn_detached(&["just", "serve-bifrost"]);
@@ -808,6 +874,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             state.status_msg = format!("Reloaded {}", path.display());
                         }
                         KeyCode::Char('K') => {
+                            state.quit_confirm = false;
                             // Show the API-key status for the selected cloud
                             // row. Bifrost actually uses the keys; lamu just
                             // tells the user whether the env var is exported.
@@ -830,6 +897,25 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 };
                             } else {
                                 state.status_msg = "key status — select a [CLOUD] row first.".into();
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            state.quit_confirm = false;
+                            if let Some(cm) = state.selected_cloud() {
+                                match cm.api_key_env.clone() {
+                                    Some(var) => {
+                                        let model = cm.full_id();
+                                        state.api_key_for = Some((var.clone(), model.clone()));
+                                        state.api_key_input.clear();
+                                        state.input_mode = InputMode::ApiKey;
+                                        state.status_msg = format!("Enter API key for {} ({}): type key, Enter to save, Esc to cancel", model, var);
+                                    }
+                                    None => {
+                                        state.status_msg = "this model has no api_key_env configured.".into();
+                                    }
+                                }
+                            } else {
+                                state.status_msg = "select a [CLOUD] model first.".into();
                             }
                         }
                         KeyCode::Char('o') => {
@@ -901,6 +987,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                             }
                         }
                         KeyCode::Char('l') => {
+                            state.quit_confirm = false;
                             if let Some(e) = state.selected_entry() {
                                 state.status_msg = format!(
                                     "Use `lamu start` (MCP) and `load_model('{}')` from Claude Code to load.",
@@ -908,11 +995,15 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 );
                             }
                         }
-                        _ => {}
+                        _ => { state.quit_confirm = false; }
                     },
                     Mode::McpServers => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('d') => {
+                        KeyCode::Char('q') | KeyCode::Char('b') => {
+                            state.mode = Mode::Dashboard;
+                            state.status_msg.clear();
+                        }
+                        KeyCode::Char('x') => return Ok(()),
+                        KeyCode::Esc | KeyCode::Backspace => {
                             state.mode = Mode::Dashboard;
                             state.status_msg.clear();
                         }
@@ -959,8 +1050,12 @@ fn run_loop<B: ratatui::backend::Backend>(
                         _ => {}
                     },
                     Mode::Settings => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('d') => {
+                        KeyCode::Char('q') | KeyCode::Char('b') => {
+                            state.mode = Mode::Dashboard;
+                            state.status_msg.clear();
+                        }
+                        KeyCode::Char('x') => return Ok(()),
+                        KeyCode::Esc | KeyCode::Backspace => {
                             state.mode = Mode::Dashboard;
                             state.status_msg.clear();
                         }
@@ -1027,9 +1122,13 @@ fn run_loop<B: ratatui::backend::Backend>(
                         _ => {}
                     },
                     Mode::Launchers => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        // Back-to-dashboard: any of Esc, Backspace, lower 'd'.
-                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('d') => {
+                        KeyCode::Char('q') | KeyCode::Char('b') => {
+                            state.mode = Mode::Dashboard;
+                            state.status_msg.clear();
+                        }
+                        KeyCode::Char('x') => return Ok(()),
+                        // Back-to-dashboard: any of Esc, Backspace.
+                        KeyCode::Esc | KeyCode::Backspace => {
                             state.mode = Mode::Dashboard;
                             state.status_msg.clear();
                         }
@@ -1684,20 +1783,22 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
         key_span("j/k"), key_lbl("move"),
         key_span("Enter"), key_lbl("chat"),
         key_span("r"), key_lbl("refresh"),
-        key_span("q"), key_lbl("quit"),
+        key_span("q"), key_lbl("quit (×2)"),
+        key_span("x"), key_lbl("instant exit"),
     ]);
     let row_list_ops = Line::from(vec![
         key_span_warn("*"), key_lbl("fav"),
         key_span("/"), key_lbl("filter"),
         key_span("o"), key_lbl("sort"),
         key_span("L/C/A"), key_lbl("source local/cloud/all"),
+        key_span("a"), key_lbl("set api key"),
     ]);
     let row_advanced = Line::from(vec![
         key_span("h"), key_lbl("harnesses"),
         key_span("m"), key_lbl("mcp servers"),
         key_span("s"), key_lbl("settings"),
         key_span("S"), key_lbl("start lamu serve"),
-        key_span("b"), key_lbl("start bifrost"),
+        key_span("B"), key_lbl("start bifrost"),
         key_span("n"), key_lbl("add cloud"),
         key_span("K"), key_lbl("key status"),
         key_span("e"), key_lbl("edit cloud yaml"),
@@ -1875,6 +1976,30 @@ fn format_params(p: f32) -> String {
     } else {
         format!("{:.1}", p)
     }
+}
+
+fn save_api_key(var_name: &str, key_val: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::config_dir()
+        .map(|d| d.join("lamu"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("api-keys.env");
+    // Read existing, replace or append.
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let prefix = format!("export {}=", var_name);
+    let new_line = format!("export {}={}", var_name, key_val);
+    let updated: String = if existing.lines().any(|l| l.starts_with(&prefix)) {
+        existing
+            .lines()
+            .map(|l| if l.starts_with(&prefix) { new_line.as_str() } else { l })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    } else {
+        format!("{}{}\n", existing, new_line)
+    };
+    std::fs::write(&path, updated)?;
+    Ok(path)
 }
 
 fn spawn_detached(argv: &[&str]) {
