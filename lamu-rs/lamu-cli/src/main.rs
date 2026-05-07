@@ -81,6 +81,8 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    load_api_keys_env();
+
     let cli = Cli::parse();
     match cli.command {
         None => {
@@ -365,4 +367,29 @@ fn cmd_rm(query: &str, yes: bool) -> Result<()> {
     write_registry(&entries, &registry_path())?;
     println!("  registry refreshed ({} models remaining)", entries.len());
     Ok(())
+}
+
+/// Load `~/.config/lamu/api-keys.env` into the process environment.
+/// Parses `export VAR=value` or `VAR=value` lines.
+/// Existing env vars are NOT overwritten — shell exports take priority.
+fn load_api_keys_env() {
+    let path = if let Some(d) = dirs::config_dir() {
+        d.join("lamu").join("api-keys.env")
+    } else {
+        return;
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else { return };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !k.is_empty() && std::env::var(k).is_err() {
+                // SAFETY: single-threaded before tokio runtime starts.
+                unsafe { std::env::set_var(k, v); }
+            }
+        }
+    }
 }
