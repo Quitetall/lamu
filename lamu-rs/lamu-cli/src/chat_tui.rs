@@ -384,13 +384,25 @@ impl ChatTui {
                 format!("{} streaming", asst_label.trim_end()),
                 Style::default().fg(Color::Black).bg(asst_color).add_modifier(Modifier::BOLD),
             )));
-            let display = if self.show_thinking {
-                self.pending.clone()
+            if self.show_thinking {
+                for body_line in self.pending.split('\n') {
+                    out.push(Line::from(body_line.to_string()));
+                }
             } else {
-                strip_think_blocks(&self.pending)
-            };
-            for body_line in display.split('\n') {
-                out.push(Line::from(body_line.to_string()));
+                let visible = strip_think_blocks(&self.pending);
+                if visible.trim().is_empty() && self.in_think {
+                    // Still inside the think block — strip returns nothing
+                    // because there's no closing tag yet. Show a dim
+                    // placeholder so the user knows the model is working.
+                    out.push(Line::from(Span::styled(
+                        format!("  [ thinking… {} tokens  Ctrl+O to show ]", self.tokens_this_req),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    for body_line in visible.split('\n') {
+                        out.push(Line::from(body_line.to_string()));
+                    }
+                }
             }
         }
         out
