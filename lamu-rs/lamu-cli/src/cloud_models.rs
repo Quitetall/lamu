@@ -58,12 +58,16 @@ pub struct CloudModel {
     /// Quota status — colors the row.
     #[serde(default)]
     pub quota: QuotaState,
-    /// Name of the environment variable holding the API key for this
-    /// provider. lamu doesn't read the key — Bifrost does — but we
-    /// surface "key missing" in the TUI when the env var is unset so
-    /// the user knows why a request will 401.
+    /// Name of the environment variable holding the API key.
+    /// chat_tui reads this and passes it as the Bearer token so
+    /// direct-to-provider requests (no Bifrost needed) work.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Full OpenAI-compat base URL for the provider's API.
+    /// e.g. "https://api.deepseek.com" — the `/v1/chat/completions`
+    /// suffix is appended automatically. Omit for Bifrost-routed models.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl CloudModel {
@@ -74,12 +78,25 @@ impl CloudModel {
     }
 
     /// True iff `api_key_env` is unset OR the named env var is present.
-    /// Models without an `api_key_env` are assumed routed through
-    /// Bifrost's own key store and report `true` here.
     pub fn key_present(&self) -> bool {
         match &self.api_key_env {
             None => true,
             Some(var) => std::env::var(var).is_ok(),
+        }
+    }
+
+    /// Resolve the API key from the named env var. Returns None when
+    /// no env var is configured or the var is unset.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok())
+    }
+
+    /// Full chat-completions URL. Uses base_url when set, otherwise
+    /// falls back to the Bifrost gateway or a default.
+    pub fn chat_url(&self, gateway_fallback: &str) -> String {
+        match &self.base_url {
+            Some(base) => format!("{}/chat/completions", base.trim_end_matches('/')),
+            None => gateway_fallback.to_string(),
         }
     }
 }
@@ -111,6 +128,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Anthropic Claude Opus 4.7 (best reasoning)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            base_url: None,
         },
         CloudModel {
             name: "claude-sonnet-4-6".into(),
@@ -120,6 +138,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Anthropic Claude Sonnet 4.6 (workhorse)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            base_url: None,
         },
         CloudModel {
             name: "claude-haiku-4-5".into(),
@@ -129,6 +148,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Anthropic Claude Haiku 4.5 (fast)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            base_url: None,
         },
         // GLM 5.1 (Zhipu / Z.AI)
         CloudModel {
@@ -139,6 +159,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Zhipu GLM 5.1 (open-weights flagship)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ZHIPU_API_KEY".into()),
+            base_url: None,
         },
         // Kimi K2.6 (Moonshot)
         CloudModel {
@@ -149,6 +170,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Moonshot Kimi K2.6 (long-context agentic)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("MOONSHOT_API_KEY".into()),
+            base_url: None,
         },
         // Qwen3 large via Alibaba DashScope (>100B params).
         CloudModel {
@@ -159,6 +181,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Alibaba Qwen3 235B-A22B Thinking (DashScope)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("DASHSCOPE_API_KEY".into()),
+            base_url: None,
         },
         CloudModel {
             name: "qwen3-max".into(),
@@ -168,16 +191,28 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Alibaba Qwen3-Max (DashScope, >1T params)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("DASHSCOPE_API_KEY".into()),
+            base_url: None,
         },
-        // DeepSeek V4 (DeepSeek API)
+        // DeepSeek V4 — direct API (no Bifrost needed)
         CloudModel {
-            name: "deepseek-v4".into(),
+            name: "deepseek-v4-flash".into(),
             provider: "deepseek".into(),
-            model_id: Some("deepseek-v4".into()),
+            model_id: Some("deepseek-v4-flash".into()),
             context_max: 128_000,
-            notes: "DeepSeek V4 — flagship reasoning/chat model".into(),
+            notes: "DeepSeek V4 Flash — fast, non-thinking (direct API)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            base_url: Some("https://api.deepseek.com".into()),
+        },
+        CloudModel {
+            name: "deepseek-v4-pro".into(),
+            provider: "deepseek".into(),
+            model_id: Some("deepseek-v4-pro".into()),
+            context_max: 128_000,
+            notes: "DeepSeek V4 Pro — thinking mode (direct API)".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            base_url: Some("https://api.deepseek.com".into()),
         },
     ]
 }
@@ -195,6 +230,7 @@ pub fn provider_template(provider: &str) -> Option<CloudModel> {
         notes: notes.to_string(),
         quota: QuotaState::Available,
         api_key_env: Some(env.to_string()),
+        base_url: None,
     };
     match provider {
         "anthropic" => Some(make("anthropic", "ANTHROPIC_API_KEY", 200_000, "Anthropic Claude")),
@@ -254,6 +290,7 @@ pub fn add_via_wizard() -> Option<CloudModel> {
             notes: String::new(),
             quota: QuotaState::Available,
             api_key_env: None,
+            base_url: None,
         }
     } else {
         match provider_template(&provider) {
@@ -378,6 +415,7 @@ mod tests {
             notes: String::new(),
             quota: QuotaState::Available,
             api_key_env: None,
+            base_url: None,
         }
     }
 

@@ -194,12 +194,14 @@ impl ChatTui {
         let (tx, rx) = mpsc::channel::<StreamEvent>();
         self.rx = Some(rx);
         let url = self.config.backend_url.clone();
+        let api_key = self.config.api_key.clone()
+            .unwrap_or_else(|| API_KEY.to_string());
         let model = self.model.clone();
         let history: Vec<Value> = self.history.iter().map(|m| {
             let role = match m.role { Role::User => "user", Role::Assistant => "assistant", Role::System => "system" };
             json!({"role": role, "content": m.content})
         }).collect();
-        thread::spawn(move || stream_worker(url, model, history, tx));
+        thread::spawn(move || stream_worker(url, api_key, model, history, tx));
     }
 
     fn handle_slash(&mut self, cmd: &str) {
@@ -453,6 +455,7 @@ fn utf8_char_len(b: u8) -> usize {
 
 fn stream_worker(
     url: String,
+    api_key: String,
     model: String,
     messages: Vec<Value>,
     tx: Sender<StreamEvent>,
@@ -476,7 +479,7 @@ fn stream_worker(
     };
     let resp = match client
         .post(&url)
-        .bearer_auth(API_KEY)
+        .bearer_auth(&api_key)
         .json(&payload)
         .send()
     {

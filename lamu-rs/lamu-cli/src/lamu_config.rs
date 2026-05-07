@@ -30,6 +30,12 @@ pub struct LamuConfig {
     /// $EDITOR / $VISUAL / "vi" at run time when this is empty.
     #[serde(default)]
     pub editor: String,
+
+    /// Resolved API key for the current session — NOT persisted to disk
+    /// (serde skip). Set at runtime when launching cloud chat so
+    /// chat_tui can send Bearer auth without storing keys in the file.
+    #[serde(skip)]
+    pub api_key: Option<String>,
 }
 
 fn default_backend_url() -> String { BACKEND_DIRECT.to_string() }
@@ -41,6 +47,7 @@ impl Default for LamuConfig {
             backend_url: default_backend_url(),
             theme: default_theme(),
             editor: String::new(),
+            api_key: None,
         }
     }
 }

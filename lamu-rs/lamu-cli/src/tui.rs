@@ -971,11 +971,13 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 }
                             } else if let Some(cloud) = state.selected_cloud().cloned() {
                                 let gateway = std::env::var("LAMU_GATEWAY_URL")
-                                    .unwrap_or_else(|_| "http://localhost:8080/v1".into());
-                                let trimmed = gateway.trim_end_matches('/').to_string();
-                                let api_url = format!("{}/chat/completions", trimmed);
+                                    .unwrap_or_else(|_| "http://localhost:8080/v1/chat/completions".into());
                                 let mut cfg = state.config.clone();
-                                cfg.backend_url = api_url;
+                                // Use the model's own base_url when set (e.g. DeepSeek
+                                // direct), otherwise fall back to the Bifrost gateway.
+                                cfg.backend_url = cloud.chat_url(&gateway);
+                                // Resolve API key from env so chat_tui can auth directly.
+                                cfg.api_key = cloud.resolved_api_key();
                                 let theme = Theme::pick(Some(&cfg.theme));
                                 let model_id = cloud.full_id();
                                 run_subprocess_in_tui(terminal, move || -> Result<()> {
