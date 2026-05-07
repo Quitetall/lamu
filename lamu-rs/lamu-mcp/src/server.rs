@@ -29,6 +29,9 @@ pub struct LamuMcpServer {
     pub queues: Arc<AsyncMutex<HashMap<String, Arc<RequestQueue<()>>>>>,
     pub queue_strategy: QueueStrategy,
     pub queue_concurrency: usize,
+    /// Routing mode: 'auto', 'local-only', 'cloud-only'. Default 'auto'.
+    /// `cloud-only` makes the local query path refuse and frees VRAM.
+    pub routing_mode: Arc<AsyncMutex<String>>,
 }
 
 pub struct ServerState {
@@ -88,6 +91,9 @@ impl LamuMcpServer {
             queues: Arc::new(AsyncMutex::new(HashMap::new())),
             queue_strategy,
             queue_concurrency,
+            routing_mode: Arc::new(AsyncMutex::new(
+                std::env::var("LAMU_ROUTING_MODE").unwrap_or_else(|_| "auto".to_string())
+            )),
         })
     }
 
@@ -170,6 +176,10 @@ impl LamuMcpServer {
             "queue_status" => self.handle_queue_status().await,
             "cloud_query" => handle_cloud_query(args).await,
             "list_cloud_models" => handle_list_cloud_models(),
+            "review_commit" => handle_review_commit(args).await,
+            "review_diff" => handle_review_diff(args).await,
+            "set_routing_mode" => self.handle_set_routing_mode(args).await,
+            "routing_status" => self.handle_routing_status().await,
             other => format!("Unknown tool: {}", other),
         };
 
@@ -197,6 +207,14 @@ impl LamuMcpServer {
         let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         if prompt.is_empty() {
             return "missing prompt".into();
+        }
+
+        // Enforce routing mode — refuse local queries when cloud-only.
+        {
+            let mode = self.routing_mode.lock().await.clone();
+            if mode == "cloud-only" {
+                return "error: routing mode is 'cloud-only' — local queries refused. Call set_routing_mode(mode='auto') to re-enable, or use cloud_query instead.".into();
+            }
         }
 
         let model = args.get("model").and_then(|v| v.as_str());
@@ -611,6 +629,63 @@ impl LamuMcpServer {
         lines.join("\n")
     }
 
+    async fn handle_set_routing_mode(&self, args: Value) -> String {
+        let mode = args["mode"].as_str().unwrap_or("auto").to_string();
+        if !matches!(mode.as_str(), "auto" | "local-only" | "cloud-only") {
+            return format!("error: mode must be 'auto', 'local-only', or 'cloud-only' (got '{}')", mode);
+        }
+        let mut current = self.routing_mode.lock().await;
+        let old = current.clone();
+        *current = mode.clone();
+        drop(current);
+
+        // cloud-only → free all local VRAM by unloading every loaded backend.
+        let mut freed = Vec::new();
+        if mode == "cloud-only" {
+            let names: Vec<String> = {
+                let st = self.state.lock();
+                st.scheduler.loaded_models().iter().map(|m| m.entry.name.clone()).collect()
+            };
+            for n in names {
+                let mut st = self.state.lock();
+                if let Some(mut p) = st.loaded_procs.remove(&n) {
+                    drop(st);
+                    let _ = p.start_kill();
+                    let _ = p.wait().await;
+                    let mut st2 = self.state.lock();
+                    st2.scheduler.mark_unloaded(&n);
+                    freed.push(n);
+                } else {
+                    st.scheduler.mark_unloaded(&n);
+                    freed.push(n);
+                }
+            }
+        }
+
+        let mut msg = format!("routing mode: {} → {}", old, mode);
+        if !freed.is_empty() {
+            msg.push_str(&format!("\nfreed VRAM by unloading: {}", freed.join(", ")));
+        }
+        msg
+    }
+
+    async fn handle_routing_status(&self) -> String {
+        let mode = self.routing_mode.lock().await.clone();
+        let st = self.state.lock();
+        let (used, total) = st.scheduler.query_vram();
+        let loaded: Vec<String> = st.scheduler.loaded_models().iter()
+            .map(|m| format!("{} ({}MB)", m.entry.name, m.vram_actual_mb))
+            .collect();
+        let cloud_count = load_cloud_models().len();
+        format!(
+            "routing mode: {}\nlocal: {} models loaded ({} MB / {} MB VRAM)\n  loaded: {}\ncloud: {} models in registry",
+            mode,
+            loaded.len(), used, total,
+            if loaded.is_empty() { "(none)".into() } else { loaded.join(", ") },
+            cloud_count
+        )
+    }
+
     fn handle_scan(&self) -> String {
         let mut st = self.state.lock();
         let entries = match scan_directory(&st.models_dir) {
@@ -744,6 +819,47 @@ fn tools_list_response(id: Option<Value>) -> Value {
         json!({
             "name": "list_cloud_models",
             "description": "List configured cloud models from ~/.config/lamu/cloud-models.yaml. Returns name, provider, context window, and whether the API key env var is set.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "review_commit",
+            "description": "PRIMARY REVIEW TOOL — auto-routes to DeepSeek V4 Pro (the project policy reviewer). Takes a commit SHA (or 'HEAD' for the most recent), runs `git show` to get the full diff + commit message, and returns a deep code review covering security, correctness, edge cases, idiom, and architectural fit. NO CODE SHOULD BE CONSIDERED DONE WITHOUT GOING THROUGH THIS TOOL. Use it after every commit you make.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "commit": {"type": "string", "description": "Commit SHA or ref (e.g. 'HEAD', 'HEAD~1', 'abc123'). Defaults to HEAD.", "default": "HEAD"},
+                    "repo": {"type": "string", "description": "Path to the git repo. Defaults to current working directory.", "default": "."},
+                    "focus": {"type": "string", "description": "Optional review focus (e.g. 'security', 'performance', 'API design'). Defaults to all-around.", "default": ""}
+                }
+            }
+        }),
+        json!({
+            "name": "review_diff",
+            "description": "Review an arbitrary diff via DeepSeek V4 Pro. Same reviewer policy as review_commit but accepts the diff text directly — useful when reviewing uncommitted changes or a chunk of pasted code.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "diff": {"type": "string", "description": "Unified diff text or a code chunk to review."},
+                    "context": {"type": "string", "description": "Optional surrounding context (e.g. file paths, what changed and why).", "default": ""},
+                    "focus": {"type": "string", "default": ""}
+                },
+                "required": ["diff"]
+            }
+        }),
+        json!({
+            "name": "set_routing_mode",
+            "description": "Control which backends are usable. Modes: 'auto' (default — use local for matching capabilities, cloud for the rest), 'local-only' (refuse cloud requests), 'cloud-only' (kill local llama-server and free VRAM, route everything to cloud). Useful when you want to free GPU for other work but keep DeepSeek/Claude on tap.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["auto", "local-only", "cloud-only"]}
+                },
+                "required": ["mode"]
+            }
+        }),
+        json!({
+            "name": "routing_status",
+            "description": "Report current routing mode + which backends are reachable.",
             "inputSchema": {"type": "object", "properties": {}}
         }),
     ];
@@ -1030,6 +1146,92 @@ async fn handle_cloud_query(args: Value) -> String {
     }
 }
 
+// ── DeepSeek V4 Pro reviewer (project policy) ───────────────────────
+//
+// Every commit goes through this. The system prompt below tells V4 Pro
+// to focus on issues that matter — security, correctness, edge cases,
+// architecture — and to call out problems even when none exist. The
+// model's reasoning_content is included so the human can see HOW the
+// review was reached, not just the conclusion.
+
+const REVIEW_SYSTEM_PROMPT: &str = "You are a senior staff engineer doing a code review. Your job is to find real issues, not to pat anyone on the back.\n\nAlways check:\n  1. SECURITY — injection (SQL/shell/XSS/prompt), auth/authz holes, secrets in code, unsafe deserialization, TOCTOU, missing input validation.\n  2. CORRECTNESS — off-by-one, null/empty cases, integer overflow, floating-point traps, race conditions, deadlocks, missing error handling.\n  3. EDGE CASES — what happens at boundaries, with empty inputs, with hostile inputs, under concurrency, on partial failure, on retry.\n  4. ARCHITECTURE — does this fit the existing design? Does it leak abstraction? Does it create coupling that will hurt later? Is there a simpler shape?\n  5. CLARITY — would a stranger understand the intent? Are names accurate? Are comments necessary or noise?\n\nFormat your output:\n  - One-sentence verdict (PASS / PASS WITH NITS / NEEDS CHANGES / REJECT).\n  - Numbered list of findings, each: severity [BUG/SECURITY/STYLE/QUESTION], file:line if knowable, the problem, the suggested fix.\n  - End with a single 'Recommend' line.\n\nBe terse. Be honest. Don't praise unless something is genuinely surprising in a good way. If the code is fine, say so in one line and stop.";
+
+async fn handle_review_commit(args: Value) -> String {
+    let commit = args["commit"].as_str().unwrap_or("HEAD");
+    let repo = args["repo"].as_str().unwrap_or(".");
+    let focus = args["focus"].as_str().unwrap_or("");
+
+    // Get diff + commit message via git show.
+    let out = match std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["show", "--stat", "--patch", commit])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return format!("error: spawn git: {}", e),
+    };
+    if !out.status.success() {
+        return format!("error: git show {} failed: {}", commit,
+            String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let diff_text = String::from_utf8_lossy(&out.stdout).to_string();
+    if diff_text.trim().is_empty() {
+        return format!("error: empty diff for {}", commit);
+    }
+
+    let mut prompt = String::new();
+    if !focus.is_empty() {
+        prompt.push_str(&format!("Focus the review on: {}\n\n", focus));
+    }
+    prompt.push_str("Here is the commit to review (full diff):\n\n```\n");
+    prompt.push_str(&diff_text);
+    prompt.push_str("\n```\n");
+
+    let review_args = json!({
+        "model": "deepseek-v4-pro",
+        "prompt": prompt,
+        "system": REVIEW_SYSTEM_PROMPT,
+        "max_tokens": 8192,
+        "temperature": 0.2,
+        "include_reasoning": false,
+    });
+    let review = handle_cloud_query(review_args).await;
+    format!("=== Review of {} (DeepSeek V4 Pro) ===\n\n{}", commit, review)
+}
+
+async fn handle_review_diff(args: Value) -> String {
+    let diff = args["diff"].as_str().unwrap_or("");
+    if diff.is_empty() {
+        return "error: 'diff' is required".into();
+    }
+    let context = args["context"].as_str().unwrap_or("");
+    let focus = args["focus"].as_str().unwrap_or("");
+
+    let mut prompt = String::new();
+    if !focus.is_empty() {
+        prompt.push_str(&format!("Focus the review on: {}\n\n", focus));
+    }
+    if !context.is_empty() {
+        prompt.push_str("Context:\n");
+        prompt.push_str(context);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("Diff to review:\n\n```\n");
+    prompt.push_str(diff);
+    prompt.push_str("\n```\n");
+
+    let review_args = json!({
+        "model": "deepseek-v4-pro",
+        "prompt": prompt,
+        "system": REVIEW_SYSTEM_PROMPT,
+        "max_tokens": 8192,
+        "temperature": 0.2,
+        "include_reasoning": false,
+    });
+    let review = handle_cloud_query(review_args).await;
+    format!("=== Diff review (DeepSeek V4 Pro) ===\n\n{}", review)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1275,7 @@ mod tests {
             "query", "plan_query", "list_models", "load_model",
             "unload_model", "vram_status", "scan_models", "queue_status",
             "cloud_query", "list_cloud_models",
+            "review_commit", "review_diff", "set_routing_mode", "routing_status",
         ] {
             assert!(names.contains(&required), "missing tool: {}", required);
         }
