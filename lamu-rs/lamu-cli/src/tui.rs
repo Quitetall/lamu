@@ -975,7 +975,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     let cfg = state.config.clone();
                                     let theme = Theme::pick(Some(&cfg.theme));
                                     let name = local_name.clone();
+                                    let entry = state.selected_entry().unwrap().clone();
                                     run_subprocess_in_tui(terminal, move || -> Result<()> {
+                                        swap_to_model_if_needed(&entry)?;
                                         crate::chat_tui::run(name, theme, cfg)
                                     })?;
                                     state.last_harness = Some("lamu repl");
@@ -2091,6 +2093,110 @@ fn run_blocking(argv: &[&str]) {
         Ok(s) => eprintln!("  command exited with {}", s),
         Err(e) => eprintln!("  failed to run {:?}: {}", argv, e),
     }
+}
+
+/// Check which model is loaded on :8020 and swap if it doesn't match
+/// `entry`. Kills the existing llama-server, spawns a new one with the
+/// optimised flags, health-polls, then warms up one token so cuBLAS is
+/// ready before the chat TUI opens.
+///
+/// Runs inside `run_subprocess_in_tui` so stdout is visible — progress
+/// lines print to the terminal while the model loads.
+fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+
+    // Check what's loaded.
+    let loaded_id: Option<String> = client
+        .get("http://localhost:8020/v1/models")
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| {
+            v["data"][0]["id"]
+                .as_str()
+                .map(|s| s.to_lowercase())
+        });
+
+    let already_loaded = loaded_id.as_deref().map(|id| {
+        id.contains(&entry.name.to_lowercase())
+            || entry.name.to_lowercase().contains(id)
+    }).unwrap_or(false);
+
+    if already_loaded {
+        println!("  ✓ {} already loaded", entry.name);
+        return Ok(());
+    }
+
+    // Kill existing llama-server on :8020.
+    println!("\n→ Swapping model → {} ({}B {}, ~{}MB VRAM)", entry.name, entry.params_b, entry.quant, entry.vram_mb);
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "llama-server.*--port 8020"])
+        .status();
+    // Give it a moment to release GPU mem.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let bin = lamu_core::config::llama_bin();
+    if !bin.exists() {
+        anyhow::bail!("llama-server not found at {}", bin.display());
+    }
+
+    let ctx_default: u32 = std::env::var("LAMU_DEFAULT_CTX")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(32768);
+    let ctx = entry.context_max.min(ctx_default);
+    let kv = std::env::var("LAMU_KV").unwrap_or_else(|_| "q8_0".into());
+
+    std::process::Command::new(&bin)
+        .arg("-m").arg(&entry.path)
+        .arg("--host").arg("0.0.0.0")
+        .arg("--port").arg("8020")
+        .arg("--ctx-size").arg(ctx.to_string())
+        .arg("-ngl").arg("99")
+        .arg("--flash-attn").arg("on")
+        .arg("--cache-type-k").arg(&kv)
+        .arg("--cache-type-v").arg(&kv)
+        .arg("--parallel").arg("1")
+        .arg("--batch-size").arg("4096")
+        .arg("--ubatch-size").arg("512")
+        .arg("--cache-reuse").arg("256")
+        .env("CUDA_VISIBLE_DEVICES", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    // Health poll — print progress every 5s.
+    let slow_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    print!("  loading");
+    for i in 1..=60u32 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let healthy = slow_client
+            .get("http://localhost:8020/health")
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|v| v["status"].as_str().map(|s| s == "ok"))
+            .unwrap_or(false);
+        if healthy {
+            println!(" ✓ ({}s)", i);
+            // Warmup — fires cuBLAS kernel build so first real prompt is fast.
+            let _ = slow_client
+                .post("http://localhost:8020/v1/chat/completions")
+                .timeout(std::time::Duration::from_secs(30))
+                .json(&serde_json::json!({
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1, "stream": false,
+                }))
+                .send();
+            return Ok(());
+        }
+        if i % 5 == 0 { print!(" {}s", i); }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    anyhow::bail!("timeout waiting for {} to load", entry.name)
 }
 
 #[cfg(test)]
