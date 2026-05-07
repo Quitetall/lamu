@@ -94,9 +94,15 @@ pub struct ChatTui {
     show_thinking: bool,
     status_msg: String,
     last_save_path: Option<String>,
-    /// Set by /quit (or /exit//q). run_loop polls this each iteration
-    /// and breaks out cleanly so the alt-screen tear-down still runs.
+    /// Conversation has unsaved messages. Flipped true on each assistant
+    /// response, false when saved. Drop auto-saves if still true so
+    /// unexpected exits preserve the transcript.
+    is_dirty: bool,
+    /// Set by /quit or any exit key path. run_loop shows the save
+    /// prompt instead of returning immediately.
     quit_requested: bool,
+    /// True while the "Save transcript? [y/n/Esc]" prompt is active.
+    save_prompt: bool,
 
     // ── streaming timing ───────────────────────────────────────────
     /// Monotonic start of the current request. None when idle.
@@ -137,7 +143,9 @@ impl ChatTui {
             show_thinking: false,
             status_msg: String::new(),
             last_save_path: None,
+            is_dirty: false,
             quit_requested: false,
+            save_prompt: false,
             req_started: None,
             first_token_at: None,
             last_token_at: None,
@@ -211,7 +219,9 @@ impl ChatTui {
         let head = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next().unwrap_or("").trim();
         match head.as_str() {
-            "quit" | "exit" | "q" => self.quit_requested = true,
+            "quit" | "exit" | "q" => {
+                self.quit_requested = true;
+            }
             "clear" => {
                 self.history.clear();
                 self.pending.clear();
@@ -323,6 +333,7 @@ impl ChatTui {
             }
             if !content.trim().is_empty() {
                 self.history.push(Message { role: Role::Assistant, content });
+                self.is_dirty = true;
             }
             self.rx = None;
             self.req_started = None;
@@ -446,8 +457,39 @@ impl ChatTui {
                 let p = path.display().to_string();
                 self.last_save_path = Some(p.clone());
                 self.status_msg = format!("saved → {}", p);
+                self.is_dirty = false;
             }
             Err(e) => self.status_msg = format!("save failed: {e}"),
+        }
+    }
+
+    /// Silent save for Drop / unexpected-exit path — no status_msg update.
+    fn auto_save_silent(&mut self) {
+        if self.history.is_empty() { return; }
+        let dir = match dirs::data_local_dir() {
+            Some(d) => d.join("lamu").join("conversations"),
+            None => return,
+        };
+        if std::fs::create_dir_all(&dir).is_err() { return; }
+        let ts = chrono_or_timestamp();
+        let filename = format!("crash-{}-{}.md", ts, self.model.replace(['/', ':'], "-"));
+        let path = dir.join(&filename);
+        let body: String = self.history.iter().map(|m| {
+            let r = match m.role {
+                Role::User => "**You**",
+                Role::Assistant => "**Assistant**",
+                Role::System => "**System**",
+            };
+            format!("{}\n\n{}\n\n---\n\n", r, m.content)
+        }).collect();
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+impl Drop for ChatTui {
+    fn drop(&mut self) {
+        if self.is_dirty && !self.history.is_empty() {
+            self.auto_save_silent();
         }
     }
 }
@@ -644,8 +686,19 @@ fn run_loop<B: ratatui::backend::Backend>(
     loop {
         let _ = state.drain_stream();
         state.tick_spinner();
+
+        // Intercept quit: show save prompt if history is dirty.
+        if state.quit_requested {
+            state.quit_requested = false;
+            if state.is_dirty && !state.history.is_empty() {
+                state.save_prompt = true;
+                state.status_msg = "Save transcript? [y] yes  [n] no  [Esc] cancel".into();
+            } else {
+                return Ok(());
+            }
+        }
+
         terminal.draw(|f| draw(f, state))?;
-        if state.quit_requested { return Ok(()); }
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
@@ -661,15 +714,43 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // ── save prompt intercept ───────────────────────────────────────
+    if state.save_prompt {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                state.auto_save();
+                state.is_dirty = false;
+                state.save_prompt = false;
+                return Ok(true); // exit after save
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.is_dirty = false; // skip Drop auto-save
+                state.save_prompt = false;
+                return Ok(true); // exit without save
+            }
+            KeyCode::Esc => {
+                state.save_prompt = false;
+                state.status_msg = "exit cancelled.".into();
+                return Ok(false);
+            }
+            _ => return Ok(false), // consume all other keys during prompt
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
             if state.streaming() {
                 state.status_msg = "(streaming — Esc again to abort)".into();
                 return Ok(false);
             }
-            return Ok(true);
+            state.quit_requested = true;
+            return Ok(false);
         }
-        KeyCode::Char('c') if ctrl => return Ok(true),
+        KeyCode::Char('c') if ctrl => {
+            state.quit_requested = true;
+            return Ok(false);
+        }
         KeyCode::Char('o') if ctrl => {
             state.show_thinking = !state.show_thinking;
             state.status_msg = format!(
