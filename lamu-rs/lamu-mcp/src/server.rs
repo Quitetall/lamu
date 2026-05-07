@@ -1175,36 +1175,58 @@ const REVIEW_SYSTEM_PROMPT: &str = "You are a senior staff engineer doing a code
 /// with a marker so the model knows it's not seeing the whole change.
 const MAX_REVIEW_DIFF_BYTES: usize = 200 * 1024;
 
-/// Validate a git ref / commit. Accepts: 7-40 hex chars, HEAD with
-/// optional ~N or ^N suffix, refnames matching git's safe character
-/// set (alnum, _, -, ., /). Rejects anything starting with '-' (stops
-/// the model handing `--upload-pack=…` to git via the commit field).
+/// Validate a git ref / commit. Accepts: hex SHA (7-40 chars), HEAD
+/// followed by any sequence of `~N` / `^[N]` suffixes (HEAD^^,
+/// HEAD~1^2, HEAD^^^, etc. — all valid git refs), or a plain refname
+/// matching git's safe character set (alnum + _ - . /, no leading
+/// '-' or '.', no '..').
 fn is_safe_git_ref(s: &str) -> bool {
     if s.is_empty() || s.starts_with('-') { return false; }
     // Hex SHA / abbrev.
     if s.len() >= 7 && s.len() <= 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
     }
-    // HEAD, HEAD~N, HEAD^N, HEAD^.
+    // HEAD with any chain of ~N and ^[N] suffixes.
     if let Some(rest) = s.strip_prefix("HEAD") {
-        if rest.is_empty() { return true; }
-        let mut chars = rest.chars();
-        match chars.next() {
-            Some('~') | Some('^') => return chars.all(|c| c.is_ascii_digit()),
-            _ => return false,
-        }
+        return parse_rev_suffix(rest);
     }
-    // General refname: alnum + _ - . / only, no leading '.', no '..'.
+    // General refname.
     if s.contains("..") || s.starts_with('.') { return false; }
     s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
 }
 
+/// Walk a sequence of `~N` and `^[N]` suffixes. `^` alone means parent;
+/// `^N` means Nth parent. Returns true iff the entire suffix consumes.
+fn parse_rev_suffix(mut s: &str) -> bool {
+    while !s.is_empty() {
+        let first = s.as_bytes()[0];
+        if first == b'~' || first == b'^' {
+            s = &s[1..];
+            // Optional digit run.
+            let digit_end = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+            s = &s[digit_end..];
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Truncate `text` to at most `limit` bytes, snapping back to the
+/// nearest UTF-8 char boundary so we never split a multi-byte
+/// codepoint mid-stream. Appends a marker describing how much was
+/// dropped so the reviewer LLM knows it didn't see the full diff.
 fn truncate_with_marker(text: &str, limit: usize) -> String {
     if text.len() <= limit { return text.to_string(); }
-    let mut out = text[..limit].to_string();
+    // Walk back to the last char boundary at or before `limit`.
+    let mut cut = limit;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text[..cut].to_string();
     out.push_str(&format!(
         "\n\n[…truncated {} more bytes — diff exceeded {} byte review limit]",
-        text.len() - limit, limit
+        text.len() - cut, limit
     ));
     out
 }
@@ -1216,37 +1238,21 @@ async fn handle_review_commit(args: Value) -> String {
 
     if !is_safe_git_ref(commit) {
         return format!(
-            "error: commit '{}' rejected — must be a hex SHA, HEAD[~N|^N], or a safe refname.",
+            "error: commit '{}' rejected — must be a hex SHA, HEAD with ~/^ suffixes, or a safe refname.",
             commit
         );
     }
 
-    // Get diff + commit message via git show. Pass `--` between options
-    // and the ref as a defense-in-depth so git can't interpret the ref
-    // as another flag even if validation is bypassed.
+    // is_safe_git_ref already rejects anything starting with '-', so
+    // git can't interpret commit as a flag. No defense-in-depth needed.
     let out = match std::process::Command::new("git")
         .current_dir(repo)
-        .args(["show", "--stat", "--patch", "--", ""])
-        .arg(commit)
+        .args(["show", "--stat", "--patch", commit])
         .output()
     {
         Ok(o) => o,
         Err(e) => return format!("error: spawn git: {}", e),
     };
-    // Note: `git show <ref> --` works; the explicit `--` blocks
-    // pathspec-as-flag tricks. We keep the canonical command shape.
-    let out = if !out.status.success() {
-        // Fall back to plain `git show <ref>` for older git versions
-        // that don't accept the empty-pathspec form.
-        match std::process::Command::new("git")
-            .current_dir(repo)
-            .args(["show", "--stat", "--patch", commit])
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => return format!("error: spawn git: {}", e),
-        }
-    } else { out };
 
     if !out.status.success() {
         return format!("error: git show {} failed: {}", commit,
@@ -1375,6 +1381,12 @@ mod tests {
         assert!(is_safe_git_ref("HEAD~10"));
         assert!(is_safe_git_ref("HEAD^"));
         assert!(is_safe_git_ref("HEAD^2"));
+        // Chained suffixes — all valid git revisions.
+        assert!(is_safe_git_ref("HEAD^^"));
+        assert!(is_safe_git_ref("HEAD~1^"));
+        assert!(is_safe_git_ref("HEAD~1^2"));
+        assert!(is_safe_git_ref("HEAD^^^"));
+        assert!(is_safe_git_ref("HEAD~3~2"));
     }
 
     #[test]
@@ -1410,6 +1422,19 @@ mod tests {
         assert!(out.len() < s.len());
         assert!(out.contains("truncated"));
         assert!(out.contains("900 more bytes"));
+    }
+
+    #[test]
+    fn truncate_marker_does_not_panic_on_utf8_boundary() {
+        // 4-byte UTF-8 codepoint (😀) at position 99 — limit=100 falls
+        // mid-codepoint. Naive slicing panics; we must snap back.
+        let mut s = "x".repeat(99);
+        s.push('😀');
+        s.push_str(&"y".repeat(50));
+        let out = truncate_with_marker(&s, 100);
+        // No panic = test passed. Verify content sane.
+        assert!(out.starts_with(&"x".repeat(99)));
+        assert!(out.contains("truncated"));
     }
 
     #[test]
