@@ -169,6 +169,16 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("DASHSCOPE_API_KEY".into()),
         },
+        // DeepSeek V4 (DeepSeek API)
+        CloudModel {
+            name: "deepseek-v4".into(),
+            provider: "deepseek".into(),
+            model_id: Some("deepseek-v4".into()),
+            context_max: 128_000,
+            notes: "DeepSeek V4 — flagship reasoning/chat model".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+        },
     ]
 }
 
@@ -409,6 +419,7 @@ mod tests {
         assert!(names.iter().any(|n| n.contains("kimi-k2.6")));
         assert!(names.iter().any(|n| n.contains("235b")));
         assert!(names.iter().any(|n| n.contains("qwen3-max")));
+        assert!(names.iter().any(|n| n.contains("deepseek-v4")));
     }
 
     #[test]
