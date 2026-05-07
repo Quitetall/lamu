@@ -91,13 +91,19 @@ impl CloudModel {
         self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok())
     }
 
-    /// Full chat-completions URL. Uses base_url when set, otherwise
-    /// falls back to the Bifrost gateway or a default.
+    /// Full chat URL. Provider-aware: Anthropic-shaped providers use
+    /// `/v1/messages`; everything else (OpenAI, DeepSeek, Moonshot,
+    /// Alibaba, Zhipu, etc.) uses `/chat/completions`. base_url is the
+    /// root (no path) — the provider router decides the path.
     pub fn chat_url(&self, gateway_fallback: &str) -> String {
-        match &self.base_url {
-            Some(base) => format!("{}/chat/completions", base.trim_end_matches('/')),
-            None => gateway_fallback.to_string(),
+        let base = match &self.base_url {
+            Some(b) => b.trim_end_matches('/').to_string(),
+            None => return gateway_fallback.to_string(),
+        };
+        if self.provider == "anthropic" {
+            return format!("{}/v1/messages", base);
         }
+        format!("{}/chat/completions", base)
     }
 }
 
@@ -119,36 +125,37 @@ pub fn config_path() -> PathBuf {
 
 pub fn default_seed() -> Vec<CloudModel> {
     vec![
-        // Anthropic — kept. Bifrost route handles auth.
+        // Anthropic — direct API (provider router uses /v1/messages,
+        // x-api-key header, native message format).
         CloudModel {
             name: "claude-opus-4-7".into(),
             provider: "anthropic".into(),
-            model_id: None,
+            model_id: Some("claude-opus-4-7".into()),
             context_max: 200_000,
             notes: "Anthropic Claude Opus 4.7 (best reasoning)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
-            base_url: None,
+            base_url: Some("https://api.anthropic.com".into()),
         },
         CloudModel {
             name: "claude-sonnet-4-6".into(),
             provider: "anthropic".into(),
-            model_id: None,
+            model_id: Some("claude-sonnet-4-6".into()),
             context_max: 200_000,
             notes: "Anthropic Claude Sonnet 4.6 (workhorse)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
-            base_url: None,
+            base_url: Some("https://api.anthropic.com".into()),
         },
         CloudModel {
             name: "claude-haiku-4-5".into(),
             provider: "anthropic".into(),
-            model_id: None,
+            model_id: Some("claude-haiku-4-5".into()),
             context_max: 200_000,
             notes: "Anthropic Claude Haiku 4.5 (fast)".into(),
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
-            base_url: None,
+            base_url: Some("https://api.anthropic.com".into()),
         },
         // GLM 5.1 (Zhipu / Z.AI)
         CloudModel {
@@ -460,6 +467,34 @@ mod tests {
         assert!(names.iter().any(|n| n.contains("235b")));
         assert!(names.iter().any(|n| n.contains("qwen3-max")));
         assert!(names.iter().any(|n| n.contains("deepseek-v4")));
+    }
+
+    #[test]
+    fn chat_url_anthropic_uses_v1_messages() {
+        let mut m = dummy("claude-opus", "anthropic");
+        m.base_url = Some("https://api.anthropic.com".into());
+        assert_eq!(m.chat_url("fallback"), "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn chat_url_openai_uses_chat_completions() {
+        let mut m = dummy("ds-flash", "deepseek");
+        m.base_url = Some("https://api.deepseek.com".into());
+        assert_eq!(m.chat_url("fallback"), "https://api.deepseek.com/chat/completions");
+    }
+
+    #[test]
+    fn chat_url_falls_back_when_no_base() {
+        let m = dummy("x", "y");
+        assert_eq!(m.chat_url("http://localhost:8080/v1/chat/completions"),
+                   "http://localhost:8080/v1/chat/completions");
+    }
+
+    #[test]
+    fn chat_url_strips_trailing_slash() {
+        let mut m = dummy("ds-flash", "deepseek");
+        m.base_url = Some("https://api.deepseek.com/".into());
+        assert_eq!(m.chat_url("fallback"), "https://api.deepseek.com/chat/completions");
     }
 
     #[test]
