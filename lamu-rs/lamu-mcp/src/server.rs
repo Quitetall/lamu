@@ -168,6 +168,8 @@ impl LamuMcpServer {
             "vram_status" => self.handle_vram_status(),
             "scan_models" => self.handle_scan(),
             "queue_status" => self.handle_queue_status().await,
+            "cloud_query" => handle_cloud_query(args).await,
+            "list_cloud_models" => handle_list_cloud_models(),
             other => format!("Unknown tool: {}", other),
         };
 
@@ -723,6 +725,27 @@ fn tools_list_response(id: Option<Value>) -> Value {
             "description": "Show per-model queue depth and scheduling strategy.",
             "inputSchema": {"type": "object", "properties": {}}
         }),
+        json!({
+            "name": "cloud_query",
+            "description": "Send prompt to a cloud model (DeepSeek V4, Claude, GLM, Kimi, Qwen-Max, etc.). Use this for tasks that need stronger reasoning than local, OR cheaper inference than the calling agent (e.g. Claude Code → DeepSeek V4 Flash for code generation at ~$0.07/M input, currently 75% off). Auto-routes via OpenAI/Anthropic format detection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "User prompt"},
+                    "model": {"type": "string", "description": "Cloud model name from cloud-models.yaml (e.g. 'deepseek-v4-flash', 'claude-haiku-4-5'). Defaults to 'deepseek-v4-flash'.", "default": "deepseek-v4-flash"},
+                    "system": {"type": "string", "description": "System prompt", "default": ""},
+                    "max_tokens": {"type": "integer", "default": 8192},
+                    "temperature": {"type": "number", "default": 0.3},
+                    "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."}
+                },
+                "required": ["prompt"]
+            }
+        }),
+        json!({
+            "name": "list_cloud_models",
+            "description": "List configured cloud models from ~/.config/lamu/cloud-models.yaml. Returns name, provider, context window, and whether the API key env var is set.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
     ];
 
     json!({
@@ -821,6 +844,192 @@ async fn build_spawn_cmd(
     }
 }
 
+// ── Cloud routing (DeepSeek, Anthropic, etc.) ───────────────────────
+//
+// MCP exposes `cloud_query` so an outer agent (Claude Code, etc.) can
+// fan tasks out to a cheaper / faster cloud model. Reads cloud config
+// from ~/.config/lamu/cloud-models.yaml. Auto-detects provider from
+// base_url (Anthropic → /v1/messages + x-api-key; everything else →
+// OpenAI compat /chat/completions + Bearer).
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct CloudYamlEntry {
+    name: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    context_max: u32,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct CloudYamlFile {
+    #[serde(default)]
+    models: Vec<CloudYamlEntry>,
+}
+
+fn load_cloud_models() -> Vec<CloudYamlEntry> {
+    let Some(dir) = dirs::config_dir() else { return Vec::new(); };
+    let path = dir.join("lamu").join("cloud-models.yaml");
+    let Ok(body) = std::fs::read_to_string(&path) else { return Vec::new(); };
+    serde_yaml::from_str::<CloudYamlFile>(&body)
+        .map(|f| f.models)
+        .unwrap_or_default()
+}
+
+fn handle_list_cloud_models() -> String {
+    let models = load_cloud_models();
+    if models.is_empty() {
+        return "(no cloud models — edit ~/.config/lamu/cloud-models.yaml or run `lamu` and press 'n' to add)".into();
+    }
+    let mut out = String::new();
+    for m in &models {
+        let key_status = match &m.api_key_env {
+            None => "(no key needed — gateway-routed)".to_string(),
+            Some(env) => if std::env::var(env).is_ok() { format!("${} ✓", env) } else { format!("${} unset ✗", env) },
+        };
+        let mid = m.model_id.clone().unwrap_or_else(|| format!("{}/{}", m.provider, m.name));
+        out.push_str(&format!(
+            "{}  ({})  ctx={}  {}  — {}\n",
+            m.name, mid, m.context_max, key_status, m.notes
+        ));
+    }
+    out
+}
+
+async fn handle_cloud_query(args: Value) -> String {
+    let prompt = args["prompt"].as_str().unwrap_or("");
+    if prompt.is_empty() { return "error: prompt is required".into(); }
+    let model_name = args["model"].as_str().unwrap_or("deepseek-v4-flash");
+    let system = args["system"].as_str().unwrap_or("");
+    let max_tokens = args["max_tokens"].as_u64().unwrap_or(8192) as u32;
+    let temperature = args["temperature"].as_f64().unwrap_or(0.3) as f32;
+    let include_reasoning = args["include_reasoning"].as_bool().unwrap_or(false);
+
+    let models = load_cloud_models();
+    let entry = match models.iter().find(|m| m.name == model_name) {
+        Some(m) => m.clone(),
+        None => return format!(
+            "error: cloud model '{}' not in cloud-models.yaml. Run `list_cloud_models` to see options.",
+            model_name
+        ),
+    };
+
+    let api_key = match entry.api_key_env.as_deref() {
+        Some(env) => match std::env::var(env) {
+            Ok(k) => k,
+            Err(_) => return format!(
+                "error: ${} is not set. Add it via `lamu` (press 'a' on the model row) or export it manually.",
+                env
+            ),
+        },
+        None => "no-key-needed".to_string(),
+    };
+
+    let base = match entry.base_url.as_deref() {
+        Some(b) => b.trim_end_matches('/').to_string(),
+        None => return format!(
+            "error: cloud model '{}' has no base_url. Edit ~/.config/lamu/cloud-models.yaml.",
+            model_name
+        ),
+    };
+    let model_id = entry.model_id.clone().unwrap_or_else(|| entry.name.clone());
+    let is_anthropic = entry.provider == "anthropic" || base.contains("anthropic");
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build() {
+        Ok(c) => c,
+        Err(e) => return format!("error: client init: {e}"),
+    };
+
+    if is_anthropic {
+        let url = format!("{}/v1/messages", base);
+        let mut payload = json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": false,
+        });
+        if !system.is_empty() { payload["system"] = json!(system); }
+
+        let resp = match client.post(&url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => return format!("error: post {url}: {e}"),
+        };
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return format!("error: parse: {e}"),
+        };
+        if let Some(err) = v.get("error") {
+            return format!("anthropic error: {}", err);
+        }
+        // content is an array of {type: "text"|"thinking", text|thinking: "..."}
+        let mut out = String::new();
+        let mut thinking = String::new();
+        if let Some(blocks) = v["content"].as_array() {
+            for b in blocks {
+                match b["type"].as_str() {
+                    Some("text") => out.push_str(b["text"].as_str().unwrap_or("")),
+                    Some("thinking") => thinking.push_str(b["thinking"].as_str().unwrap_or("")),
+                    _ => {}
+                }
+            }
+        }
+        if include_reasoning && !thinking.is_empty() {
+            return format!("<think>\n{}\n</think>\n{}", thinking, out);
+        }
+        out
+    } else {
+        let url = format!("{}/chat/completions", base);
+        let mut messages: Vec<Value> = Vec::new();
+        if !system.is_empty() {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+        messages.push(json!({"role": "user", "content": prompt}));
+        let payload = json!({
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": false,
+        });
+        let resp = match client.post(&url)
+            .bearer_auth(&api_key)
+            .json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => return format!("error: post {url}: {e}"),
+        };
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return format!("error: parse: {e}"),
+        };
+        if let Some(err) = v.get("error") {
+            return format!("provider error: {}", err);
+        }
+        let msg = &v["choices"][0]["message"];
+        let content = msg["content"].as_str().unwrap_or("");
+        let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
+        if include_reasoning && !reasoning.is_empty() {
+            format!("<think>\n{}\n</think>\n{}", reasoning, content)
+        } else {
+            content.to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +1072,7 @@ mod tests {
         for required in [
             "query", "plan_query", "list_models", "load_model",
             "unload_model", "vram_status", "scan_models", "queue_status",
+            "cloud_query", "list_cloud_models",
         ] {
             assert!(names.contains(&required), "missing tool: {}", required);
         }
