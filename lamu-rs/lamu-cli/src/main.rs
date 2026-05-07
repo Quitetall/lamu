@@ -6,6 +6,7 @@ mod favorites;
 mod lamu_config;
 mod mcp_servers;
 mod md_stream;
+mod providers;
 mod repl;
 mod theme;
 mod tui;

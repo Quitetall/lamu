@@ -27,93 +27,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use serde_json::{json, Value};
-use std::io::{self, BufRead, BufReader};
+use serde_json::Value;
+use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::lamu_config::LamuConfig;
+use crate::providers::{self, Message, Provider, Role, StreamEvent, ToolCallRef};
 use crate::theme::{self, Theme};
 
 const API_KEY: &str = "sk-local";
 const SPINNER_TICK_MS: u128 = 90;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Role {
-    User,
-    Assistant,
-    System,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCallRef {
-    pub id: String,
-    pub name: String,
-    /// JSON-encoded arguments string (as the model emits it).
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub role: Role,
-    pub content: String,
-    /// When set: this assistant message includes a tool_use block.
-    /// Both the visible content (any text the model also emitted)
-    /// and the tool call live on the same Message so we can
-    /// reconstruct the proper provider-specific representation.
-    pub tool_call: Option<ToolCallRef>,
-    /// When set: this message is a tool result. The id matches a
-    /// prior assistant Message.tool_call.id.
-    pub tool_result_for: Option<String>,
-}
-
-impl Message {
-    pub fn plain(role: Role, content: String) -> Self {
-        Self { role, content, tool_call: None, tool_result_for: None }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKind {
-    /// OpenAI chat-completions API. Covers OpenAI itself, DeepSeek,
-    /// Moonshot, Alibaba DashScope, Zhipu, Together, Groq, llama.cpp
-    /// server, vLLM, sglang, and anything else that speaks OpenAI.
-    OpenAiCompat,
-    /// Anthropic /v1/messages API. Different message format, different
-    /// streaming event names, different auth header.
-    Anthropic,
-}
-
-/// Sniff the provider from the URL. Anthropic detection is intentionally
-/// generous — anyone hosting an Anthropic-shaped endpoint gets routed
-/// through the Anthropic format builders + parser.
-pub fn detect_provider(backend_url: &str) -> ProviderKind {
-    let u = backend_url.to_lowercase();
-    if u.contains("anthropic.com")
-        || u.contains("/anthropic/")
-        || u.ends_with("/anthropic")
-        || u.ends_with("/v1/messages")
-    {
-        ProviderKind::Anthropic
-    } else {
-        ProviderKind::OpenAiCompat
-    }
-}
-
-#[derive(Debug)]
-enum StreamEvent {
-    /// Final-answer token (OpenAI: delta.content; Anthropic: text_delta).
-    Token(String),
-    /// Thinking token (OpenAI: delta.reasoning_content;
-    /// Anthropic: thinking_delta).
-    Reason(String),
-    /// Model wants to call a tool. Fired on stop_reason=tool_use
-    /// (Anthropic) or finish_reason=tool_calls (OpenAI).
-    ToolCall { id: String, name: String, arguments: String },
-    Done,
-    Error(String),
-}
+// Unified internal types (Message, Role, ToolCallRef, StreamEvent) and
+// the per-provider format adapters live in `crate::providers`.
 
 pub struct ChatTui {
     theme: Theme,
@@ -272,7 +200,7 @@ impl ChatTui {
         let model = self.model.clone();
         let search = self.search_enabled;
         let history = self.history.clone();
-        let provider = detect_provider(&url);
+        let provider = providers::detect(&url);
         thread::spawn(move || stream_worker(provider, url, api_key, model, history, search, tx));
     }
 
@@ -800,10 +728,14 @@ fn chrono_or_timestamp() -> String {
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", year, month.min(12), day.min(31), hour, min, sec)
 }
 
-/// Dispatcher. Builds the provider-specific payload + auth, fires the
-/// HTTP request, and hands the response stream to the matching parser.
+/// Dispatcher. Looks up the provider by URL, builds the wire payload
+/// through the provider's `build_payload`, attaches its auth headers,
+/// and hands the SSE response off to its `parse_stream`.
+///
+/// All format-specific code lives in `providers::*`. Adding a new
+/// provider means editing that module, not this function.
 fn stream_worker(
-    provider: ProviderKind,
+    provider: &'static (dyn Provider + Sync),
     url: String,
     api_key: String,
     model: String,
@@ -822,359 +754,19 @@ fn stream_worker(
         }
     };
 
-    match provider {
-        ProviderKind::OpenAiCompat => {
-            let payload = build_openai_payload(&model, &history, search_enabled);
-            let resp = match client
-                .post(&url)
-                .bearer_auth(&api_key)
-                .json(&payload)
-                .send()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(format!("connect {url}: {e}")));
-                    return;
-                }
-            };
-            parse_openai_stream(resp, tx);
+    let payload = provider.build_payload(&model, &history, search_enabled);
+    let req = client.post(&url).json(&payload);
+    let req = provider.auth(req, &api_key);
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(StreamEvent::Error(format!("connect {url}: {e}")));
+            return;
         }
-        ProviderKind::Anthropic => {
-            let payload = build_anthropic_payload(&model, &history, search_enabled);
-            let resp = match client
-                .post(&url)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&payload)
-                .send()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(format!("connect {url}: {e}")));
-                    return;
-                }
-            };
-            parse_anthropic_stream(resp, tx);
-        }
-    }
+    };
+    provider.parse_stream(resp, tx);
 }
 
-// ── OpenAI-compat builder ────────────────────────────────────────────
-
-fn build_openai_payload(model: &str, history: &[Message], search: bool) -> Value {
-    let messages: Vec<Value> = history.iter().map(|m| {
-        if let Some(tc) = &m.tool_call {
-            // Assistant message with tool_calls (OpenAI-style). content
-            // can be empty string when the model went straight to tool.
-            json!({
-                "role": "assistant",
-                "content": m.content,
-                "tool_calls": [{
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": tc.arguments,
-                    }
-                }]
-            })
-        } else if let Some(tid) = &m.tool_result_for {
-            // Tool result message — role=tool with tool_call_id.
-            json!({
-                "role": "tool",
-                "tool_call_id": tid,
-                "content": m.content,
-            })
-        } else {
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-            };
-            json!({"role": role, "content": m.content})
-        }
-    }).collect();
-
-    let mut payload = json!({
-        "model": model,
-        "messages": messages,
-        "stream": true,
-        "max_tokens": 16384,
-        "temperature": 0.7,
-    });
-    if search {
-        payload["tools"] = json!([{
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web for current information. Use when the user asks about recent events, facts you may not know, or anything that benefits from up-to-date sources.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "The search query"}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }]);
-        payload["tool_choice"] = json!("auto");
-    }
-    payload
-}
-
-fn parse_openai_stream(resp: reqwest::blocking::Response, tx: Sender<StreamEvent>) {
-    let reader = BufReader::new(resp);
-    let mut tool_id = String::new();
-    let mut tool_name = String::new();
-    let mut tool_args = String::new();
-    let mut finish_tool = false;
-
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = tx.send(StreamEvent::Error(format!("read: {e}")));
-                let _ = tx.send(StreamEvent::Done);
-                return;
-            }
-        };
-        let line = line.trim();
-        if !line.starts_with("data:") { continue; }
-        let data = line[5..].trim();
-        if data == "[DONE]" { break; }
-        let v: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let finish_reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("");
-        if finish_reason == "tool_calls" {
-            finish_tool = true;
-        }
-
-        let delta = v.get("choices").and_then(|c| c.get(0))
-            .and_then(|c| c.get("delta"));
-
-        if let Some(tc) = delta.and_then(|d| d["tool_calls"].get(0)) {
-            if let Some(id) = tc["id"].as_str() { if !id.is_empty() { tool_id = id.to_string(); } }
-            if let Some(n) = tc["function"]["name"].as_str() { if !n.is_empty() { tool_name = n.to_string(); } }
-            if let Some(a) = tc["function"]["arguments"].as_str() { tool_args.push_str(a); }
-        }
-
-        let reason = delta.and_then(|d| d.get("reasoning_content"))
-            .and_then(|s| s.as_str()).unwrap_or("").to_string();
-        if !reason.is_empty() {
-            if tx.send(StreamEvent::Reason(reason)).is_err() { return; }
-        }
-        let token = delta.and_then(|d| d.get("content"))
-            .and_then(|s| s.as_str()).unwrap_or("").to_string();
-        if !token.is_empty() {
-            if tx.send(StreamEvent::Token(token)).is_err() { return; }
-        }
-    }
-
-    if finish_tool && !tool_name.is_empty() {
-        let _ = tx.send(StreamEvent::ToolCall {
-            id: tool_id,
-            name: tool_name,
-            arguments: tool_args,
-        });
-    } else {
-        let _ = tx.send(StreamEvent::Done);
-    }
-}
-
-// ── Anthropic builder + parser ───────────────────────────────────────
-
-fn build_anthropic_payload(model: &str, history: &[Message], search: bool) -> Value {
-    let mut system_text = String::new();
-    let mut messages: Vec<Value> = Vec::new();
-
-    for m in history {
-        // System messages are top-level on Anthropic, not a role.
-        // Skip them here and accumulate into system_text. Tool results
-        // travel through their own branch below.
-        if matches!(m.role, Role::System) && m.tool_result_for.is_none() {
-            if !system_text.is_empty() { system_text.push_str("\n\n"); }
-            system_text.push_str(&m.content);
-            continue;
-        }
-
-        if let Some(tc) = &m.tool_call {
-            // Assistant message with a tool_use content block. Optional
-            // text block precedes it when the model also wrote prose.
-            let input: Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or_else(|_| json!({}));
-            let mut blocks: Vec<Value> = Vec::new();
-            if !m.content.trim().is_empty() {
-                blocks.push(json!({"type": "text", "text": m.content}));
-            }
-            blocks.push(json!({
-                "type": "tool_use",
-                "id": tc.id,
-                "name": tc.name,
-                "input": input,
-            }));
-            messages.push(json!({
-                "role": "assistant",
-                "content": blocks,
-            }));
-            continue;
-        }
-
-        if let Some(tid) = &m.tool_result_for {
-            // Tool result: a user message carrying a tool_result block.
-            messages.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tid,
-                    "content": m.content,
-                }],
-            }));
-            continue;
-        }
-
-        let role = match m.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::System => continue, // already handled above
-        };
-        messages.push(json!({"role": role, "content": m.content}));
-    }
-
-    let mut payload = json!({
-        "model": model,
-        "messages": messages,
-        "stream": true,
-        "max_tokens": 16384,
-        "temperature": 0.7,
-    });
-    if !system_text.is_empty() {
-        payload["system"] = json!(system_text);
-    }
-    if search {
-        // Anthropic tools schema: input_schema, not parameters.
-        payload["tools"] = json!([{
-            "name": "web_search",
-            "description": "Search the web for current information. Use when the user asks about recent events, facts you may not know, or anything that benefits from up-to-date sources.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"}
-                },
-                "required": ["query"]
-            }
-        }]);
-    }
-    payload
-}
-
-fn parse_anthropic_stream(resp: reqwest::blocking::Response, tx: Sender<StreamEvent>) {
-    let reader = BufReader::new(resp);
-    // Per-block accumulators. Anthropic emits multiple content blocks
-    // per message; each block has a type (text, thinking, tool_use)
-    // determined at content_block_start. content_block_delta lines
-    // carry partial data tagged with the matching delta type. We
-    // dispatch on the most recently started block.
-    let mut current_block_type = String::new();
-    let mut tool_id = String::new();
-    let mut tool_name = String::new();
-    let mut tool_args = String::new();
-    let mut got_tool = false;
-
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = tx.send(StreamEvent::Error(format!("read: {e}")));
-                let _ = tx.send(StreamEvent::Done);
-                return;
-            }
-        };
-        let line = line.trim();
-        // Anthropic emits both `event: <name>` and `data: {...}` lines.
-        // We don't need the event line — type lives inside each data
-        // payload too — so just look for data:.
-        if !line.starts_with("data:") { continue; }
-        let data = line[5..].trim();
-        if data.is_empty() { continue; }
-        let v: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let typ = v["type"].as_str().unwrap_or("");
-        match typ {
-            "message_start" => {
-                // Nothing to emit yet — usage info ignored for now.
-            }
-            "content_block_start" => {
-                let cb = &v["content_block"];
-                current_block_type = cb["type"].as_str().unwrap_or("").to_string();
-                if current_block_type == "tool_use" {
-                    tool_id = cb["id"].as_str().unwrap_or("").to_string();
-                    tool_name = cb["name"].as_str().unwrap_or("").to_string();
-                    tool_args.clear();
-                }
-            }
-            "content_block_delta" => {
-                let delta = &v["delta"];
-                let dt = delta["type"].as_str().unwrap_or("");
-                match dt {
-                    "text_delta" => {
-                        let t = delta["text"].as_str().unwrap_or("").to_string();
-                        if !t.is_empty() {
-                            if tx.send(StreamEvent::Token(t)).is_err() { return; }
-                        }
-                    }
-                    "thinking_delta" => {
-                        let t = delta["thinking"].as_str().unwrap_or("").to_string();
-                        if !t.is_empty() {
-                            if tx.send(StreamEvent::Reason(t)).is_err() { return; }
-                        }
-                    }
-                    "input_json_delta" => {
-                        if let Some(p) = delta["partial_json"].as_str() {
-                            tool_args.push_str(p);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "content_block_stop" => {
-                // Block finished. If it was tool_use, hold for message_delta
-                // which carries the stop_reason.
-            }
-            "message_delta" => {
-                if v["delta"]["stop_reason"].as_str() == Some("tool_use") {
-                    got_tool = true;
-                }
-            }
-            "message_stop" => {
-                break;
-            }
-            "error" => {
-                let msg = v["error"]["message"].as_str().unwrap_or("anthropic stream error");
-                let _ = tx.send(StreamEvent::Error(msg.to_string()));
-                let _ = tx.send(StreamEvent::Done);
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    if got_tool && !tool_name.is_empty() {
-        let _ = tx.send(StreamEvent::ToolCall {
-            id: tool_id,
-            name: tool_name,
-            arguments: tool_args,
-        });
-    } else {
-        let _ = tx.send(StreamEvent::Done);
-    }
-}
 
 pub fn run(model: String, theme: Theme, config: LamuConfig) -> Result<()> {
     use std::io::IsTerminal;
@@ -1816,160 +1408,6 @@ mod tests {
     fn strip_think_simple() {
         assert_eq!(strip_think_blocks("a<think>x</think>b"), "ab");
         assert_eq!(strip_think_blocks("hello"), "hello");
-    }
-
-    #[test]
-    fn detect_provider_anthropic_urls() {
-        assert_eq!(detect_provider("https://api.anthropic.com/v1/messages"), ProviderKind::Anthropic);
-        assert_eq!(detect_provider("https://api.deepseek.com/anthropic/v1/messages"), ProviderKind::Anthropic);
-        assert_eq!(detect_provider("https://gateway.example.com/anthropic"), ProviderKind::Anthropic);
-    }
-
-    #[test]
-    fn detect_provider_openai_urls() {
-        assert_eq!(detect_provider("https://api.deepseek.com/chat/completions"), ProviderKind::OpenAiCompat);
-        assert_eq!(detect_provider("https://api.openai.com/v1/chat/completions"), ProviderKind::OpenAiCompat);
-        assert_eq!(detect_provider("http://localhost:8020/v1/chat/completions"), ProviderKind::OpenAiCompat);
-    }
-
-    #[test]
-    fn openai_payload_plain_messages() {
-        let history = vec![
-            Message::plain(Role::User, "hi".into()),
-            Message::plain(Role::Assistant, "hello".into()),
-            Message::plain(Role::User, "how are you?".into()),
-        ];
-        let payload = build_openai_payload("gpt-4", &history, false);
-        let msgs = payload["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0]["role"], "user");
-        assert_eq!(msgs[0]["content"], "hi");
-        assert_eq!(msgs[2]["role"], "user");
-        assert!(payload["tools"].is_null() || !payload.as_object().unwrap().contains_key("tools"));
-    }
-
-    #[test]
-    fn openai_payload_with_tool_call_and_result() {
-        let history = vec![
-            Message::plain(Role::User, "weather?".into()),
-            Message {
-                role: Role::Assistant,
-                content: "looking it up".into(),
-                tool_call: Some(ToolCallRef {
-                    id: "call_1".into(),
-                    name: "web_search".into(),
-                    arguments: r#"{"query":"weather"}"#.into(),
-                }),
-                tool_result_for: None,
-            },
-            Message {
-                role: Role::User,
-                content: "sunny".into(),
-                tool_call: None,
-                tool_result_for: Some("call_1".into()),
-            },
-        ];
-        let payload = build_openai_payload("gpt-4", &history, true);
-        let msgs = payload["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "web_search");
-        assert_eq!(msgs[2]["role"], "tool");
-        assert_eq!(msgs[2]["tool_call_id"], "call_1");
-        assert_eq!(msgs[2]["content"], "sunny");
-        assert_eq!(payload["tools"][0]["function"]["name"], "web_search");
-    }
-
-    #[test]
-    fn anthropic_payload_promotes_system_to_top_level() {
-        let history = vec![
-            Message::plain(Role::System, "You are helpful.".into()),
-            Message::plain(Role::User, "hi".into()),
-        ];
-        let payload = build_anthropic_payload("claude-opus-4-7", &history, false);
-        assert_eq!(payload["system"], "You are helpful.");
-        let msgs = payload["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["role"], "user");
-    }
-
-    #[test]
-    fn anthropic_payload_tools_use_input_schema_not_parameters() {
-        let history = vec![Message::plain(Role::User, "hi".into())];
-        let payload = build_anthropic_payload("claude-opus-4-7", &history, true);
-        let tools = payload["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "web_search");
-        assert!(tools[0]["input_schema"].is_object());
-        assert!(tools[0]["parameters"].is_null());
-    }
-
-    #[test]
-    fn anthropic_payload_tool_use_and_result_blocks() {
-        let history = vec![
-            Message::plain(Role::User, "weather?".into()),
-            Message {
-                role: Role::Assistant,
-                content: String::new(),
-                tool_call: Some(ToolCallRef {
-                    id: "toolu_1".into(),
-                    name: "web_search".into(),
-                    arguments: r#"{"query":"weather"}"#.into(),
-                }),
-                tool_result_for: None,
-            },
-            Message {
-                role: Role::User,
-                content: "sunny".into(),
-                tool_call: None,
-                tool_result_for: Some("toolu_1".into()),
-            },
-        ];
-        let payload = build_anthropic_payload("claude-opus-4-7", &history, true);
-        let msgs = payload["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-
-        // Assistant tool_use
-        let asst = &msgs[1];
-        assert_eq!(asst["role"], "assistant");
-        let blocks = asst["content"].as_array().unwrap();
-        assert_eq!(blocks[0]["type"], "tool_use");
-        assert_eq!(blocks[0]["id"], "toolu_1");
-        assert_eq!(blocks[0]["name"], "web_search");
-        assert_eq!(blocks[0]["input"]["query"], "weather");
-
-        // User tool_result
-        let res = &msgs[2];
-        assert_eq!(res["role"], "user");
-        let res_blocks = res["content"].as_array().unwrap();
-        assert_eq!(res_blocks[0]["type"], "tool_result");
-        assert_eq!(res_blocks[0]["tool_use_id"], "toolu_1");
-        assert_eq!(res_blocks[0]["content"], "sunny");
-    }
-
-    #[test]
-    fn anthropic_payload_assistant_text_plus_tool_use() {
-        // Model wrote some text AND made a tool call — both blocks must be present.
-        let history = vec![
-            Message::plain(Role::User, "weather?".into()),
-            Message {
-                role: Role::Assistant,
-                content: "Let me check.".into(),
-                tool_call: Some(ToolCallRef {
-                    id: "toolu_1".into(),
-                    name: "web_search".into(),
-                    arguments: r#"{"query":"weather"}"#.into(),
-                }),
-                tool_result_for: None,
-            },
-        ];
-        let payload = build_anthropic_payload("claude-opus-4-7", &history, false);
-        let blocks = payload["messages"][1]["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "Let me check.");
-        assert_eq!(blocks[1]["type"], "tool_use");
     }
 
     #[test]
