@@ -194,12 +194,14 @@ pub fn default_seed() -> Vec<CloudModel> {
             base_url: None,
         },
         // DeepSeek V4 — direct API (no Bifrost needed)
+        // Both models: 128K ctx, chat+code+reasoning. Flash = fast/cheap
+        // (~$0.27/$1.10 per M tok in/out); Pro = higher quality thinking.
         CloudModel {
             name: "deepseek-v4-flash".into(),
             provider: "deepseek".into(),
             model_id: Some("deepseek-v4-flash".into()),
             context_max: 128_000,
-            notes: "DeepSeek V4 Flash — fast, non-thinking (direct API)".into(),
+            notes: "DeepSeek V4 Flash — chat/code/think, 128K ctx, ~$0.27/M in".into(),
             quota: QuotaState::Available,
             api_key_env: Some("DEEPSEEK_API_KEY".into()),
             base_url: Some("https://api.deepseek.com".into()),
@@ -209,7 +211,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             provider: "deepseek".into(),
             model_id: Some("deepseek-v4-pro".into()),
             context_max: 128_000,
-            notes: "DeepSeek V4 Pro — thinking mode (direct API)".into(),
+            notes: "DeepSeek V4 Pro — chat/code/think, 128K ctx, ~$0.55/M in".into(),
             quota: QuotaState::Available,
             api_key_env: Some("DEEPSEEK_API_KEY".into()),
             base_url: Some("https://api.deepseek.com".into()),

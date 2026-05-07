@@ -75,7 +75,7 @@ pub enum SettingFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
-    /// Favorites pinned, then by registry order (alphabetical from scan).
+    /// Favorites pinned, then local→cloud, params↑ vram↑ within group.
     Default,
     Name,
     Params,
@@ -86,11 +86,11 @@ pub enum SortKey {
 impl SortKey {
     fn label(self) -> &'static str {
         match self {
-            SortKey::Default => "fav+name",
+            SortKey::Default => "local→cloud params↑ vram↑",
             SortKey::Name => "name",
-            SortKey::Params => "params",
-            SortKey::Vram => "vram",
-            SortKey::Ctx => "ctx",
+            SortKey::Params => "params↑",
+            SortKey::Vram => "vram↑",
+            SortKey::Ctx => "ctx↑",
         }
     }
 
@@ -444,17 +444,29 @@ impl AppState {
                 return fb.cmp(&fa);
             }
             match sort {
-                SortKey::Default | SortKey::Name => entries[*a].name.cmp(&entries[*b].name),
-                SortKey::Params => entries[*b]
+                // Default: params asc → vram asc → name (smallest/cheapest first)
+                SortKey::Default => {
+                    let ea = &entries[*a];
+                    let eb = &entries[*b];
+                    let params_ord = ea.params_b
+                        .partial_cmp(&eb.params_b)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if params_ord != std::cmp::Ordering::Equal { return params_ord; }
+                    let vram_ord = ea.vram_mb.cmp(&eb.vram_mb);
+                    if vram_ord != std::cmp::Ordering::Equal { return vram_ord; }
+                    ea.name.cmp(&eb.name)
+                }
+                SortKey::Name => entries[*a].name.cmp(&entries[*b].name),
+                SortKey::Params => entries[*a]
                     .params_b
-                    .partial_cmp(&entries[*a].params_b)
+                    .partial_cmp(&entries[*b].params_b)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                SortKey::Vram => entries[*b].vram_mb.cmp(&entries[*a].vram_mb),
-                SortKey::Ctx => entries[*b].context_max.cmp(&entries[*a].context_max),
+                SortKey::Vram => entries[*a].vram_mb.cmp(&entries[*b].vram_mb),
+                SortKey::Ctx => entries[*a].context_max.cmp(&entries[*b].context_max),
             }
         });
 
-        // Sort cloud
+        // Sort cloud (ctx asc by default — smaller ctx = lighter/cheaper first)
         cloud_idx.sort_by(|a, b| {
             let fa = favs.has_model(&cloud_models[*a].full_id());
             let fb = favs.has_model(&cloud_models[*b].full_id());
@@ -462,12 +474,13 @@ impl AppState {
                 return fb.cmp(&fa);
             }
             match sort {
-                SortKey::Default | SortKey::Name => {
-                    cloud_models[*a].name.cmp(&cloud_models[*b].name)
-                }
-                SortKey::Ctx => cloud_models[*b]
+                SortKey::Default => cloud_models[*a]
                     .context_max
-                    .cmp(&cloud_models[*a].context_max),
+                    .cmp(&cloud_models[*b].context_max),
+                SortKey::Name => cloud_models[*a].name.cmp(&cloud_models[*b].name),
+                SortKey::Ctx => cloud_models[*a]
+                    .context_max
+                    .cmp(&cloud_models[*b].context_max),
                 // Cloud has no params/vram — fall back to name.
                 _ => cloud_models[*a].name.cmp(&cloud_models[*b].name),
             }
@@ -2201,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_by_params_descending() {
+    fn sort_by_params_ascending() {
         let mut s = AppState::new().unwrap();
         let mut a = dummy_entry_named("small"); a.params_b = 1.0;
         let mut b = dummy_entry_named("medium"); b.params_b = 7.0;
@@ -2213,7 +2226,23 @@ mod tests {
         let names: Vec<_> = (0..s.model_view.len())
             .map(|i| local_name_at(&s, i).to_string())
             .collect();
-        assert_eq!(names, vec!["large", "medium", "small"]);
+        assert_eq!(names, vec!["small", "medium", "large"]);
+    }
+
+    #[test]
+    fn default_sort_local_params_asc_then_vram_asc() {
+        let mut s = AppState::new().unwrap();
+        let mut a = dummy_entry_named("big-lowvram"); a.params_b = 70.0; a.vram_mb = 8000;
+        let mut b = dummy_entry_named("small"); b.params_b = 1.0; b.vram_mb = 1000;
+        let mut c = dummy_entry_named("medium"); c.params_b = 7.0; c.vram_mb = 4000;
+        s.entries = vec![a, b, c];
+        s.cloud_models.clear();
+        s.model_sort = SortKey::Default;
+        s.recompute_views();
+        let names: Vec<_> = (0..s.model_view.len())
+            .map(|i| local_name_at(&s, i).to_string())
+            .collect();
+        assert_eq!(names, vec!["small", "medium", "big-lowvram"]);
     }
 
     #[test]
