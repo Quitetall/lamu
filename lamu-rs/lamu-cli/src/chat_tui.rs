@@ -93,6 +93,7 @@ pub struct ChatTui {
     rx: Option<Receiver<StreamEvent>>,
     show_thinking: bool,
     status_msg: String,
+    last_save_path: Option<String>,
     /// Set by /quit (or /exit//q). run_loop polls this each iteration
     /// and breaks out cleanly so the alt-screen tear-down still runs.
     quit_requested: bool,
@@ -135,6 +136,7 @@ impl ChatTui {
             rx: None,
             show_thinking: false,
             status_msg: String::new(),
+            last_save_path: None,
             quit_requested: false,
             req_started: None,
             first_token_at: None,
@@ -373,8 +375,15 @@ impl ChatTui {
                 label,
                 Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD),
             )));
-            for body_line in msg.content.split('\n') {
-                out.push(Line::from(body_line.to_string()));
+            match msg.role {
+                Role::Assistant => {
+                    out.extend(render_markdown(&msg.content));
+                }
+                _ => {
+                    for body_line in msg.content.split('\n') {
+                        out.push(Line::from(body_line.to_string()));
+                    }
+                }
             }
             out.push(Line::from(""));
         }
@@ -406,6 +415,40 @@ impl ChatTui {
             }
         }
         out
+    }
+
+    fn auto_save(&mut self) {
+        if self.history.is_empty() {
+            self.status_msg = "nothing to save.".into();
+            return;
+        }
+        let dir = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("lamu")
+            .join("conversations");
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.status_msg = "save failed: could not create dir.".into();
+            return;
+        }
+        let ts = chrono_or_timestamp();
+        let filename = format!("{}-{}.md", ts, self.model.replace(['/', ':'], "-"));
+        let path = dir.join(&filename);
+        let body: String = self.history.iter().map(|m| {
+            let r = match m.role {
+                Role::User => "**You**",
+                Role::Assistant => "**Assistant**",
+                Role::System => "**System**",
+            };
+            format!("{}\n\n{}\n\n---\n\n", r, m.content)
+        }).collect();
+        match std::fs::write(&path, &body) {
+            Ok(()) => {
+                let p = path.display().to_string();
+                self.last_save_path = Some(p.clone());
+                self.status_msg = format!("saved → {}", p);
+            }
+            Err(e) => self.status_msg = format!("save failed: {e}"),
+        }
     }
 }
 
@@ -463,6 +506,28 @@ fn utf8_char_len(b: u8) -> usize {
     else if b < 0xE0 { 2 }
     else if b < 0xF0 { 3 }
     else { 4 }
+}
+
+fn chrono_or_timestamp() -> String {
+    // Use std time since we don't depend on chrono.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Format as YYYYMMDD-HHMMSS using manual arithmetic
+    let s = secs;
+    let sec = s % 60;
+    let min = (s / 60) % 60;
+    let hour = (s / 3600) % 24;
+    let days = s / 86400;
+    // Days since epoch (1970-01-01) to approximate date
+    // Close enough for filenames — not calendar-perfect.
+    let year = 1970 + days / 365;
+    let day_of_year = days % 365;
+    let month = day_of_year / 30 + 1;
+    let day = day_of_year % 30 + 1;
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", year, month.min(12), day.min(31), hour, min, sec)
 }
 
 fn stream_worker(
@@ -611,6 +676,10 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
                 "thinking display: {}",
                 if state.show_thinking { "ON" } else { "OFF" }
             );
+            return Ok(false);
+        }
+        KeyCode::Char('s') if ctrl => {
+            state.auto_save();
             return Ok(false);
         }
         KeyCode::PageUp => {
@@ -929,8 +998,9 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let row1 = Line::from(vec![
         key("Enter"), lbl("send"),
         key("Shift+Enter / Alt+Enter"), lbl("newline"),
-        key("Esc / Ctrl+C"), lbl("quit"),
         key("PgUp/PgDn"), lbl("scroll"),
+        key("Ctrl+S"), lbl("save"),
+        key("Esc / Ctrl+C"), lbl("quit"),
     ]);
     let row2 = Line::from(vec![
         key("Ctrl+O"), lbl("toggle <think>…</think>"),
@@ -948,6 +1018,173 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let p = Paragraph::new(vec![row1, row2, row3])
         .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
     f.render_widget(p, area);
+}
+
+/// Render a completed message body as styled ratatui Lines.
+/// Handles: ``` code blocks, # headers, **bold**, `inline code`, - lists, > blockquotes.
+/// Called only for finished messages, not pending (streaming stays plain).
+fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut in_code = false;
+
+    for raw in text.split('\n') {
+        // ── fenced code block ──
+        if raw.trim_start().starts_with("```") {
+            if in_code {
+                in_code = false;
+                lines.push(Line::from(Span::styled(
+                    "  ────────────────────────────────".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                in_code = true;
+                let lang = raw.trim_start().trim_start_matches('`').trim();
+                let label = if lang.is_empty() {
+                    "  ── code ──────────────────────────".to_string()
+                } else {
+                    format!("  ── {} ──────────────────────────────", lang)
+                };
+                lines.push(Line::from(Span::styled(label, Style::default().fg(Color::DarkGray))));
+            }
+            continue;
+        }
+        if in_code {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", raw),
+                Style::default().fg(Color::Green),
+            )));
+            continue;
+        }
+
+        // ── headers ──
+        if let Some(rest) = raw.strip_prefix("### ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if let Some(rest) = raw.strip_prefix("## ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+            continue;
+        }
+        if let Some(rest) = raw.strip_prefix("# ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+            continue;
+        }
+
+        // ── blockquote ──
+        if let Some(rest) = raw.strip_prefix("> ") {
+            lines.push(Line::from(Span::styled(
+                format!("│ {}", rest),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        // ── bullet list ──
+        let bullet_rest = if raw.starts_with("- ") || raw.starts_with("* ") {
+            Some(&raw[2..])
+        } else if raw.len() > 3 && raw.as_bytes()[0].is_ascii_digit() && raw.as_bytes()[1] == b'.' && raw.as_bytes()[2] == b' ' {
+            Some(&raw[3..])
+        } else {
+            None
+        };
+        if let Some(rest) = bullet_rest {
+            let mut spans = vec![Span::raw("  • ".to_string())];
+            spans.extend(parse_inline(rest));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // ── plain line with inline markup ──
+        if raw.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(parse_inline(raw)));
+        }
+    }
+    // close unclosed code block
+    if in_code {
+        lines.push(Line::from(Span::styled(
+            "  ────────────────────────────────".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+/// Parse inline markdown: **bold**, *italic*, `code`. Returns Vec<Span<'static>>.
+fn parse_inline(s: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // backtick inline code
+        if chars[i] == '`' {
+            if !buf.is_empty() {
+                spans.push(Span::raw(buf.clone()));
+                buf.clear();
+            }
+            i += 1;
+            let mut code = String::new();
+            while i < chars.len() && chars[i] != '`' {
+                code.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() { i += 1; } // skip closing `
+            spans.push(Span::styled(code, Style::default().fg(Color::Green)));
+            continue;
+        }
+        // **bold**
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i+1] == '*' {
+            if !buf.is_empty() {
+                spans.push(Span::raw(buf.clone()));
+                buf.clear();
+            }
+            i += 2;
+            let mut bold = String::new();
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i+1] == '*') {
+                bold.push(chars[i]);
+                i += 1;
+            }
+            if i + 1 < chars.len() { i += 2; }
+            spans.push(Span::styled(bold, Style::default().add_modifier(Modifier::BOLD)));
+            continue;
+        }
+        // *italic* (single star, not followed by another star)
+        if chars[i] == '*' && (i + 1 >= chars.len() || chars[i+1] != '*') {
+            if !buf.is_empty() {
+                spans.push(Span::raw(buf.clone()));
+                buf.clear();
+            }
+            i += 1;
+            let mut italic = String::new();
+            while i < chars.len() && chars[i] != '*' {
+                italic.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() { i += 1; }
+            spans.push(Span::styled(italic, Style::default().add_modifier(Modifier::ITALIC)));
+            continue;
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        spans.push(Span::raw(buf));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
 }
 
 #[cfg(test)]
