@@ -56,11 +56,10 @@ pub struct Message {
 enum StreamEvent {
     /// Final-answer token (delta.content).
     Token(String),
-    /// Thinking token (delta.reasoning_content). Qwen3-Thinking and
-    /// other reasoning models emit these *first*, before any content.
-    /// Wrapping them in `<think>…</think>` here lets the existing
-    /// strip_think_blocks logic gate them by show_thinking.
+    /// Thinking token (delta.reasoning_content).
     Reason(String),
+    /// Model wants to call a tool. Fired when finish_reason=tool_calls.
+    ToolCall { id: String, name: String, arguments: String },
     Done,
     Error(String),
 }
@@ -121,6 +120,10 @@ pub struct ChatTui {
     last_prompt_secs: Option<f32>,
     /// Last completed request's generation tok/s.
     last_gen_tps: Option<f32>,
+    /// Web search via tool calling. Toggled by /search on|off.
+    search_enabled: bool,
+    /// Short message shown while a tool call is executing (e.g. "🔍 searching…").
+    tool_status: String,
 }
 
 impl ChatTui {
@@ -153,6 +156,8 @@ impl ChatTui {
             in_think: false,
             last_prompt_secs: None,
             last_gen_tps: None,
+            search_enabled: true,
+            tool_status: String::new(),
         }
     }
 
@@ -201,17 +206,28 @@ impl ChatTui {
         self.tokens_this_req = 0;
         self.in_think = false;
 
+        self.fire_request();
+    }
+
+    /// Build and fire the next chat/completions request. Reusable so
+    /// tool-call continuations can re-enter without duplicating logic.
+    fn fire_request(&mut self) {
         let (tx, rx) = mpsc::channel::<StreamEvent>();
         self.rx = Some(rx);
         let url = self.config.backend_url.clone();
         let api_key = self.config.api_key.clone()
             .unwrap_or_else(|| API_KEY.to_string());
         let model = self.model.clone();
-        let history: Vec<Value> = self.history.iter().map(|m| {
-            let role = match m.role { Role::User => "user", Role::Assistant => "assistant", Role::System => "system" };
+        let search = self.search_enabled;
+        let messages: Vec<Value> = self.history.iter().map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+            };
             json!({"role": role, "content": m.content})
         }).collect();
-        thread::spawn(move || stream_worker(url, api_key, model, history, tx));
+        thread::spawn(move || stream_worker(url, api_key, model, messages, search, tx));
     }
 
     fn handle_slash(&mut self, cmd: &str) {
@@ -243,7 +259,7 @@ impl ChatTui {
                 }
             }
             "help" => {
-                self.status_msg = "/quit  /clear  /think  /model [name]  /save FILE  /help  Esc=quit".into();
+                self.status_msg = "/quit  /clear  /think  /model [name]  /save FILE  /search [on|off]  /help  Esc=quit".into();
             }
             "save" => {
                 if arg.is_empty() {
@@ -256,6 +272,16 @@ impl ChatTui {
                     match std::fs::write(arg, body) {
                         Ok(()) => self.status_msg = format!("saved → {arg}"),
                         Err(e) => self.status_msg = format!("save failed: {e}"),
+                    }
+                }
+            }
+            "search" => {
+                match arg {
+                    "on"  => { self.search_enabled = true;  self.status_msg = "web search: ON".into(); }
+                    "off" => { self.search_enabled = false; self.status_msg = "web search: OFF".into(); }
+                    _ => {
+                        self.search_enabled = !self.search_enabled;
+                        self.status_msg = format!("web search: {}", if self.search_enabled { "ON" } else { "OFF" });
                     }
                 }
             }
@@ -296,6 +322,42 @@ impl ChatTui {
                         }
                         self.pending.push_str(&t);
                         changed = true;
+                    }
+                    Ok(StreamEvent::ToolCall { id, name, arguments }) => {
+                        close = true;
+                        // Execute the tool, inject result, continue.
+                        if name == "web_search" {
+                            let query = serde_json::from_str::<Value>(&arguments)
+                                .ok()
+                                .and_then(|v| v["query"].as_str().map(String::from))
+                                .unwrap_or_else(|| arguments.clone());
+                            self.tool_status = format!("🔍 searching: {}", query);
+                            // Flush pending (assistant thinking/partial) as an assistant msg.
+                            let assistant_partial = std::mem::take(&mut self.pending);
+                            // Build the assistant message with tool_calls per OpenAI spec.
+                            self.history.push(Message {
+                                role: Role::Assistant,
+                                content: format!("[tool_call:web_search id={}] {}", id, assistant_partial.trim()),
+                            });
+                            let results = web_search(&query);
+                            // Inject tool result.
+                            self.history.push(Message {
+                                role: Role::System,
+                                content: format!("[tool_result id={id}]\n{results}"),
+                            });
+                            self.tool_status.clear();
+                            self.status_msg = format!("🔍 searched: {}", query);
+                            // Re-fire without clearing rx (close handles it).
+                            self.rx = None;
+                            self.req_started = Some(Instant::now());
+                            self.first_token_at = None;
+                            self.last_token_at = None;
+                            self.tokens_this_req = 0;
+                            self.in_think = false;
+                            self.fire_request();
+                            return true;
+                        }
+                        break;
                     }
                     Ok(StreamEvent::Done) => { close = true; break; }
                     Ok(StreamEvent::Error(e)) => {
@@ -494,6 +556,111 @@ impl Drop for ChatTui {
     }
 }
 
+/// Execute a web search. Uses Brave Search API if BRAVE_SEARCH_API_KEY
+/// is set, otherwise scrapes DuckDuckGo Lite HTML (no key required).
+/// Returns a plain-text summary of the top results for the model.
+fn web_search(query: &str) -> String {
+    if let Ok(key) = std::env::var("BRAVE_SEARCH_API_KEY") {
+        return brave_search(query, &key);
+    }
+    ddg_search(query)
+}
+
+fn brave_search(query: &str, key: &str) -> String {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build() { Ok(c) => c, Err(e) => return format!("[search error: {e}]") };
+    let url = format!(
+        "https://api.search.brave.com/res/v1/web/search?q={}&count=5",
+        urlenccode(query)
+    );
+    let resp = match client.get(&url)
+        .header("Accept", "application/json")
+        .header("X-Subscription-Token", key)
+        .send() { Ok(r) => r, Err(e) => return format!("[brave search error: {e}]") };
+    let v: Value = match resp.json() { Ok(v) => v, Err(e) => return format!("[parse error: {e}]") };
+    let mut out = String::new();
+    if let Some(results) = v["web"]["results"].as_array() {
+        for r in results.iter().take(5) {
+            let title = r["title"].as_str().unwrap_or("");
+            let url_s = r["url"].as_str().unwrap_or("");
+            let desc = r["description"].as_str().unwrap_or("");
+            out.push_str(&format!("**{}**\n{}\n{}\n\n", title, url_s, desc));
+        }
+    }
+    if out.is_empty() { out = "[no results]".into(); }
+    out
+}
+
+fn ddg_search(query: &str) -> String {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("Mozilla/5.0")
+        .build() { Ok(c) => c, Err(e) => return format!("[search error: {e}]") };
+    let url = format!("https://lite.duckduckgo.com/lite/?q={}", urlenccode(query));
+    let html = match client.get(&url).send().and_then(|r| r.text()) {
+        Ok(h) => h,
+        Err(e) => return format!("[ddg error: {e}]"),
+    };
+    // Pull out result snippets from the lite HTML — look for <td class="result-snippet">
+    // and <a class="result-link"> patterns.
+    let mut results: Vec<String> = Vec::new();
+    let mut title = String::new();
+    let mut link = String::new();
+    for line in html.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("result-link") {
+            // Extract href and text
+            if let Some(href_start) = trimmed.find("href=\"") {
+                let after = &trimmed[href_start + 6..];
+                if let Some(href_end) = after.find('"') {
+                    link = after[..href_end].to_string();
+                }
+            }
+            title = strip_html_tags(trimmed);
+        } else if trimmed.contains("result-snippet") {
+            let snippet = strip_html_tags(trimmed);
+            if !title.is_empty() && !snippet.is_empty() {
+                results.push(format!("**{}**\n{}\n{}\n", title, link, snippet));
+                title.clear(); link.clear();
+            }
+            if results.len() >= 5 { break; }
+        }
+    }
+    if results.is_empty() {
+        return "[no results from DuckDuckGo — try /search off or set BRAVE_SEARCH_API_KEY]".into();
+    }
+    results.join("\n")
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim()
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+fn urlenccode(s: &str) -> String {
+    s.chars().map(|c| match c {
+        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+        ' ' => "+".to_string(),
+        _ => format!("%{:02X}", c as u32),
+    }).collect()
+}
+
 fn strip_think_blocks(text: &str) -> String {
     let open = "<think>";
     let close = "</think>";
@@ -577,15 +744,39 @@ fn stream_worker(
     api_key: String,
     model: String,
     messages: Vec<Value>,
+    search_enabled: bool,
     tx: Sender<StreamEvent>,
 ) {
-    let payload = json!({
+    let tools = if search_enabled {
+        json!([{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information. Use when the user asks about recent events, facts you may not know, or anything that benefits from up-to-date sources.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }])
+    } else {
+        json!(null)
+    };
+
+    let mut payload = json!({
         "model": model,
         "messages": messages,
         "stream": true,
         "max_tokens": 16384,
         "temperature": 0.7,
     });
+    if search_enabled {
+        payload["tools"] = tools;
+        payload["tool_choice"] = json!("auto");
+    }
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
@@ -609,6 +800,12 @@ fn stream_worker(
         }
     };
     let reader = BufReader::new(resp);
+    // Accumulate tool_calls across chunks (arguments arrive incrementally).
+    let mut tool_id = String::new();
+    let mut tool_name = String::new();
+    let mut tool_args = String::new();
+    let mut finish_tool = false;
+
     for line_res in reader.lines() {
         let line = match line_res {
             Ok(l) => l,
@@ -626,10 +823,24 @@ fn stream_worker(
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Check finish_reason for tool_calls.
+        let finish_reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("");
+        if finish_reason == "tool_calls" {
+            finish_tool = true;
+        }
+
         let delta = v.get("choices").and_then(|c| c.get(0))
             .and_then(|c| c.get("delta"));
-        // reasoning_content first — Qwen3-Thinking emits these before
-        // any content during the prompt-eval-then-think phase.
+
+        // Accumulate streaming tool_calls chunks.
+        if let Some(tc) = delta.and_then(|d| d["tool_calls"].get(0)) {
+            if let Some(id) = tc["id"].as_str() { if !id.is_empty() { tool_id = id.to_string(); } }
+            if let Some(n) = tc["function"]["name"].as_str() { if !n.is_empty() { tool_name = n.to_string(); } }
+            if let Some(a) = tc["function"]["arguments"].as_str() { tool_args.push_str(a); }
+        }
+
+        // reasoning_content first — Qwen3/DeepSeek thinking phase.
         let reason = delta.and_then(|d| d.get("reasoning_content"))
             .and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !reason.is_empty() {
@@ -641,7 +852,16 @@ fn stream_worker(
             if tx.send(StreamEvent::Token(token)).is_err() { return; }
         }
     }
-    let _ = tx.send(StreamEvent::Done);
+
+    if finish_tool && !tool_name.is_empty() {
+        let _ = tx.send(StreamEvent::ToolCall {
+            id: tool_id,
+            name: tool_name,
+            arguments: tool_args,
+        });
+    } else {
+        let _ = tx.send(StreamEvent::Done);
+    }
 }
 
 pub fn run(model: String, theme: Theme, config: LamuConfig) -> Result<()> {
@@ -1062,6 +1282,13 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &ChatTui) {
     if state.show_thinking {
         spans.push(Span::styled("  [think:ON]", Style::default().fg(Color::Yellow)));
     }
+    if state.search_enabled {
+        spans.push(Span::styled("  [🔍search]", Style::default().fg(Color::Cyan)));
+    }
+    if !state.tool_status.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(state.tool_status.clone(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+    }
     if !state.status_msg.is_empty() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(state.status_msg.clone(), Style::default().fg(Color::Yellow)));
@@ -1092,9 +1319,10 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let row3 = Line::from(vec![
         key("/help"), lbl("commands"),
         key("/clear"), lbl("wipe"),
-        key("/think"), lbl("toggle"),
-        key("/model"), lbl("show or set model"),
-        key("/save FILE"), lbl("export transcript"),
+        key("/think"), lbl("toggle think"),
+        key("/search"), lbl("toggle web search"),
+        key("/model"), lbl("set model"),
+        key("/save FILE"), lbl("export"),
     ]);
     let p = Paragraph::new(vec![row1, row2, row3])
         .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
