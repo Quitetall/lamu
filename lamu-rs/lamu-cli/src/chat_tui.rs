@@ -14,8 +14,8 @@
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -466,7 +466,7 @@ impl ChatTui {
                     // because there's no closing tag yet. Show a dim
                     // placeholder so the user knows the model is working.
                     out.push(Line::from(Span::styled(
-                        format!("  [ thinking… {} tokens  Ctrl+O to show ]", self.tokens_this_req),
+                        format!("  [ thinking… {} tokens  /think to show ]", self.tokens_this_req),
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
@@ -775,6 +775,14 @@ pub fn run(model: String, theme: Theme, config: LamuConfig) -> Result<()> {
         return crate::repl::run_repl_with_model(config.backend_url, Some(model));
     }
 
+    // Layer 4 — capture a git snapshot at session start so the user
+    // can `lamu undo` if the agent makes unwanted changes. Best
+    // effort: failures are logged but don't block the chat.
+    match crate::sandbox::snap::Snapshot::capture(&model) {
+        Ok(snap) => eprintln!("[lamu] session {} snapshotted", snap.session_id),
+        Err(e) => eprintln!("[lamu] snapshot failed (non-fatal): {}", e),
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -825,66 +833,80 @@ fn run_loop<B: ratatui::backend::Backend>(
         terminal.draw(|f| draw(f, state))?;
 
         if event::poll(Duration::from_millis(50))? {
-            let ev = event::read()?;
-            if let Event::Key(key) = ev {
-                if key.kind != KeyEventKind::Press { continue; }
-                if handle_key(state, key)? { return Ok(()); }
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press { continue; }
+                    if handle_key(state, key)? { return Ok(()); }
+                }
+                Event::Mouse(m) => handle_mouse(state, m),
+                _ => {}
             }
         }
     }
 }
 
+fn handle_mouse(state: &mut ChatTui, m: MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollUp => state.scroll_up(3),
+        MouseEventKind::ScrollDown => state.scroll_down(3),
+        _ => {}
+    }
+}
+
+/// Simplified key scheme:
+/// - Ctrl+C: only main exit
+/// - Ctrl+S: save transcript
+/// - Enter: send / Shift+Enter / Alt+Enter: newline
+/// - Up/Down/PgUp/PgDn: scroll history (mouse wheel works too)
+/// - Left/Right/Home/End/Backspace/Delete: cursor in input
+/// - Esc: cancel exit prompt only — no other purpose
+/// - All other features via slash commands (/quit /exit /save /think /search /clear /model /help)
 fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // ── save prompt intercept ───────────────────────────────────────
+    // Save prompt intercept — only y/n/Esc respond.
     if state.save_prompt {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 state.auto_save();
                 state.is_dirty = false;
                 state.save_prompt = false;
-                return Ok(true); // exit after save
+                return Ok(true);
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                state.is_dirty = false; // skip Drop auto-save
+                state.is_dirty = false;
                 state.save_prompt = false;
-                return Ok(true); // exit without save
+                return Ok(true);
             }
             KeyCode::Esc => {
                 state.save_prompt = false;
                 state.status_msg = "exit cancelled.".into();
                 return Ok(false);
             }
-            _ => return Ok(false), // consume all other keys during prompt
+            _ => return Ok(false),
         }
     }
 
     match key.code {
-        KeyCode::Esc => {
-            if state.streaming() {
-                state.status_msg = "(streaming — Esc again to abort)".into();
-                return Ok(false);
-            }
-            state.quit_requested = true;
-            return Ok(false);
-        }
+        // ── Exit ────────────────────────────────────────────────────
         KeyCode::Char('c') if ctrl => {
             state.quit_requested = true;
             return Ok(false);
         }
-        KeyCode::Char('o') if ctrl => {
-            state.show_thinking = !state.show_thinking;
-            state.status_msg = format!(
-                "thinking display: {}",
-                if state.show_thinking { "ON" } else { "OFF" }
-            );
-            return Ok(false);
-        }
+        // ── Save ────────────────────────────────────────────────────
         KeyCode::Char('s') if ctrl => {
             state.auto_save();
+            return Ok(false);
+        }
+        // ── Scroll history ──────────────────────────────────────────
+        KeyCode::Up => {
+            state.scroll_up(1);
+            return Ok(false);
+        }
+        KeyCode::Down => {
+            state.scroll_down(1);
             return Ok(false);
         }
         KeyCode::PageUp => {
@@ -895,31 +917,9 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
             state.scroll_down(state.visible_height.max(1));
             return Ok(false);
         }
-        KeyCode::Char('k') if ctrl => {
-            state.scroll_up(1);
-            return Ok(false);
-        }
-        KeyCode::Char('j') if ctrl => {
-            state.scroll_down(1);
-            return Ok(false);
-        }
-        KeyCode::Char('g') if ctrl => {
-            // Ctrl+G — jump to bottom + resume follow.
-            state.follow_tail = true;
-            state.scroll = state.max_scroll();
-            return Ok(false);
-        }
-        KeyCode::Char('t') if ctrl => {
-            // Ctrl+T — jump to top.
-            state.follow_tail = false;
-            state.scroll = 0;
-            return Ok(false);
-        }
+        // ── Send / newline ──────────────────────────────────────────
         KeyCode::Enter => {
             if shift || alt {
-                // Shift+Enter / Alt+Enter inserts a newline. Kitty
-                // keyboard protocol delivers Shift+Enter; vt-style
-                // terminals usually deliver Alt+Enter (Meta+Enter).
                 state.input.insert(state.cursor, '\n');
                 state.cursor += 1;
             } else {
@@ -927,6 +927,7 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
             }
             return Ok(false);
         }
+        // ── Input editing ───────────────────────────────────────────
         KeyCode::Backspace => {
             if state.cursor > 0 {
                 let prev = prev_char_boundary(&state.input, state.cursor);
@@ -970,6 +971,57 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
         _ => {}
     }
     Ok(false)
+}
+
+/// Count display rows a string takes when word-wrapped at `width`.
+/// Mirrors ratatui's Paragraph wrapping behavior closely enough for
+/// scroll-position math. Empty string = 1 row (the line itself).
+fn count_wrapped_rows(text: &str, width: usize) -> u16 {
+    if width == 0 { return 1; }
+    if text.is_empty() { return 1; }
+    let mut rows: u32 = 0;
+    for hard_line in text.split('\n') {
+        if hard_line.is_empty() { rows += 1; continue; }
+        // Word-aware wrap: place words; overflow wraps to next row.
+        let mut col: usize = 0;
+        let mut row_count: u32 = 1;
+        let chars: Vec<char> = hard_line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            // Skip leading spaces only on row continuation, not at start.
+            // Walk one "word" (run of non-space chars).
+            let start = i;
+            while i < chars.len() && !chars[i].is_whitespace() { i += 1; }
+            let word_len = i - start;
+            // If adding the word would overflow this row, wrap first.
+            let would_be = if col == 0 { word_len } else { col + 1 + word_len };
+            if would_be > width && col > 0 {
+                row_count += 1;
+                col = 0;
+            }
+            // Place the word — long words that exceed width still
+            // occupy ceil(len/width) rows on their own.
+            if word_len > width {
+                let extra = (word_len.saturating_sub(1)) / width;
+                row_count += extra as u32;
+                col = word_len % width;
+                if col == 0 { col = width; }
+            } else {
+                col += if col == 0 { word_len } else { word_len + 1 };
+            }
+            // Skip the whitespace separator.
+            while i < chars.len() && chars[i].is_whitespace() && chars[i] != '\n' {
+                col += 1;
+                i += 1;
+            }
+            if col >= width {
+                row_count += 1;
+                col = 0;
+            }
+        }
+        rows += row_count;
+    }
+    rows.min(u16::MAX as u32) as u16
 }
 
 fn prev_char_boundary(s: &str, i: usize) -> usize {
@@ -1045,16 +1097,21 @@ fn draw_conversation(f: &mut ratatui::Frame, area: Rect, state: &mut ChatTui) {
     let response_border = theme::hex_to_color(&state.theme.colors.response_border, Color::Cyan);
 
     let lines = state.build_lines();
-    // Estimate wrapped content height. Without re-doing Paragraph's
-    // wrapping we approximate: each logical line takes
-    // ceil(len / inner_width) visual rows, min 1.
+    // Estimate wrapped content height. Word-wrap aware: walk each
+    // logical line, counting how many display rows it consumes when
+    // wrapped at word boundaries — same way Paragraph::wrap renders.
+    // Then add a small safety margin so follow_tail always scrolls
+    // past the actual bottom (better to over-scroll a hair than to
+    // leave the latest tokens off-screen).
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let mut content_h: u16 = 0;
     for line in &lines {
-        let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        let rows = (chars / inner_w + if chars % inner_w == 0 { 0 } else { 1 }).max(1);
-        content_h = content_h.saturating_add(rows as u16);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        content_h = content_h.saturating_add(count_wrapped_rows(&text, inner_w));
     }
+    // Safety margin — better to over-estimate by a few rows than to
+    // leave the bottom of the assistant's reply off-screen.
+    content_h = content_h.saturating_add(2);
     let visible = area.height.saturating_sub(2);
     state.content_height = content_h;
     state.visible_height = visible;
@@ -1209,27 +1266,21 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
     let lbl = |t: &str| Span::raw(format!(" {t}  "));
     let row1 = Line::from(vec![
         key("Enter"), lbl("send"),
-        key("Shift+Enter / Alt+Enter"), lbl("newline"),
-        key("PgUp/PgDn"), lbl("scroll"),
+        key("Shift/Alt+Enter"), lbl("newline"),
+        key("Ctrl+C"), lbl("quit"),
         key("Ctrl+S"), lbl("save"),
-        key("Esc / Ctrl+C"), lbl("quit"),
     ]);
     let row2 = Line::from(vec![
-        key("Ctrl+O"), lbl("toggle <think>…</think>"),
-        key("Ctrl+J/K"), lbl("scroll line"),
-        key("Ctrl+G / Ctrl+T"), lbl("jump bottom / top"),
-        key("←/→ Home/End"), lbl("cursor"),
+        key("↑/↓  PgUp/PgDn  mouse wheel"), lbl("scroll history"),
+        key("←/→ Home/End"), lbl("cursor in input"),
     ]);
     let row3 = Line::from(vec![
         key("/help"), lbl("commands"),
-        key("/clear"), lbl("wipe"),
-        key("/think"), lbl("toggle think"),
-        key("/search"), lbl("toggle web search"),
-        key("/model"), lbl("set model"),
-        key("/save FILE"), lbl("export"),
+        key("/quit  /exit"), lbl("leave"),
+        key("/think  /search  /clear  /save  /model"), lbl(""),
     ]);
     let p = Paragraph::new(vec![row1, row2, row3])
-        .block(Block::default().borders(Borders::ALL).title("keys — simple → advanced"));
+        .block(Block::default().borders(Borders::ALL).title("keys + commands"));
     f.render_widget(p, area);
 }
 

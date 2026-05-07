@@ -8,6 +8,7 @@ mod mcp_servers;
 mod md_stream;
 mod providers;
 mod repl;
+mod sandbox;
 mod theme;
 mod tui;
 
@@ -73,6 +74,33 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// List recent chat sessions (git snapshots).
+    Sessions,
+    /// Restore a session's git snapshot — undoes any changes since
+    /// that session started.
+    Undo {
+        /// Session id (from `lamu sessions`). Defaults to the most recent.
+        session_id: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Replay an agent's filesystem journal in reverse, restoring
+    /// each modified file to its pre-session bytes.
+    Rollback {
+        /// Session id (from `lamu sessions`).
+        session_id: String,
+    },
+    /// Run a command inside the lamu sandbox (bubblewrap/firejail).
+    /// Strict bind mounts, no network, no $HOME access.
+    Agent {
+        /// Allow outbound network access (default: no network).
+        #[arg(long)]
+        net: bool,
+        /// Command to run. Use `--` before flags meant for the command.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -112,7 +140,73 @@ async fn main() -> Result<()> {
         Some(Command::Pull { model, quant }) => cmd_pull(&model, &quant).await,
         Some(Command::Show { model }) => cmd_show(&model),
         Some(Command::Rm { model, yes }) => cmd_rm(&model, yes),
+        Some(Command::Sessions) => cmd_sessions(),
+        Some(Command::Undo { session_id, yes }) => cmd_undo(session_id, yes),
+        Some(Command::Rollback { session_id }) => cmd_rollback(&session_id),
+        Some(Command::Agent { net, cmd }) => cmd_agent(net, cmd),
     }
+}
+
+fn cmd_sessions() -> Result<()> {
+    let snaps = sandbox::snap::Snapshot::list()?;
+    if snaps.is_empty() {
+        println!("(no sessions yet — start a chat to capture one)");
+        return Ok(());
+    }
+    println!("Recent chat sessions ({} total):\n", snaps.len());
+    for s in snaps.iter().take(20) {
+        println!("  {}", s.pretty_summary());
+    }
+    Ok(())
+}
+
+fn cmd_undo(session_id: Option<String>, yes: bool) -> Result<()> {
+    let snap = match session_id {
+        Some(id) => sandbox::snap::Snapshot::load(&id)?,
+        None => {
+            let mut all = sandbox::snap::Snapshot::list()?;
+            all.into_iter().next()
+                .ok_or_else(|| anyhow::anyhow!("no sessions captured yet"))?
+        }
+    };
+    println!("About to restore session:\n  {}", snap.pretty_summary());
+    if snap.restored {
+        eprintln!("⚠️  this session was already restored once.");
+    }
+    if !yes {
+        eprint!("Proceed? [y/N] ");
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        if !buf.trim().to_lowercase().starts_with('y') {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+    snap.restore()?;
+    println!("✓ restored {}", snap.session_id);
+    Ok(())
+}
+
+fn cmd_rollback(session_id: &str) -> Result<()> {
+    let (restored, skipped) = sandbox::journal::rollback(session_id)?;
+    println!("Journal rollback complete: {} restored, {} skipped.", restored, skipped);
+    Ok(())
+}
+
+fn cmd_agent(allow_net: bool, cmd: Vec<String>) -> Result<()> {
+    if cmd.is_empty() {
+        anyhow::bail!("usage: lamu agent [--net] -- <command...>");
+    }
+    let cwd = std::env::current_dir()?;
+    let mut opts = sandbox::launcher::SandboxOpts::new(cwd);
+    if allow_net { opts = opts.with_net(); }
+    let status = sandbox::launcher::run(&opts, &cmd)?;
+    if !status.success() {
+        anyhow::bail!("sandboxed command exited {}", status);
+    }
+    Ok(())
 }
 
 async fn cmd_scan() -> Result<()> {
