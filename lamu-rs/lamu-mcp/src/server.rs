@@ -1395,11 +1395,19 @@ async fn handle_cloud_query(args: Value) -> String {
             }
         }
 
-        let resp = match client.post(&url)
+        let mut req = client.post(&url)
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&payload).send().await {
+            .header("content-type", "application/json");
+        // 1M ctx beta: opt-in via env var (matches the providers.rs path
+        // used by chat_tui). Models like claude-{sonnet,opus}-*-1m
+        // require it.
+        if let Ok(beta) = std::env::var("ANTHROPIC_BETA") {
+            if !beta.is_empty() {
+                req = req.header("anthropic-beta", beta);
+            }
+        }
+        let resp = match req.json(&payload).send().await {
             Ok(r) => r,
             Err(e) => return format!("error: post {url}: {e}"),
         };

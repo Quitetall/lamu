@@ -25,7 +25,7 @@ models:
     params_b: 2.0
     quant: Q4_K_M
     vram_mb: 1246
-    context_max: 131072
+    context_max: 1024
     capabilities:
     - chat
     - long_context
@@ -166,7 +166,7 @@ models:
     params_b: 4.6
     quant: Q4_K_M
     vram_mb: 2874
-    context_max: 131072
+    context_max: 32768
     capabilities:
     - chat
     - code

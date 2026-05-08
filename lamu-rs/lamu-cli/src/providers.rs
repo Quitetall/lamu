@@ -289,9 +289,18 @@ impl Provider for AnthropicProvider {
         req: reqwest::blocking::RequestBuilder,
         api_key: &str,
     ) -> reqwest::blocking::RequestBuilder {
-        req.header("x-api-key", api_key)
+        let mut req = req
+            .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        // Opt-in 1M-context beta. Set ANTHROPIC_BETA in env to engage:
+        //   ANTHROPIC_BETA=context-1m-2025-08-07
+        if let Ok(beta) = std::env::var("ANTHROPIC_BETA") {
+            if !beta.is_empty() {
+                req = req.header("anthropic-beta", beta);
+            }
+        }
+        req
     }
 
     fn build_payload(&self, model: &str, history: &[Message], search: bool) -> Value {

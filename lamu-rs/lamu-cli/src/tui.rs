@@ -1602,27 +1602,33 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .map(|r| match r {
             ModelRef::Local(i) => {
                 let e = &state.entries[*i];
-                let caps = e.capabilities.iter().map(|c| match c {
-                    lamu_core::types::Capability::Chat => "chat",
-                    lamu_core::types::Capability::Code => "code",
-                    lamu_core::types::Capability::Reasoning => "reason",
-                    lamu_core::types::Capability::Routing => "route",
-                    lamu_core::types::Capability::Vision => "vision",
-                    lamu_core::types::Capability::LongContext => "long",
-                }).collect::<Vec<_>>().join(",");
+                // Compact capability tags. Drop "chat" (universal),
+                // abbreviate the rest. Joined with single space inside
+                // brackets: e.g. [code think long].
+                let caps = e.capabilities.iter().filter_map(|c| match c {
+                    lamu_core::types::Capability::Chat => None,
+                    lamu_core::types::Capability::Code => Some("code"),
+                    lamu_core::types::Capability::Reasoning => Some("think"),
+                    lamu_core::types::Capability::Routing => Some("route"),
+                    lamu_core::types::Capability::Vision => Some("vis"),
+                    lamu_core::types::Capability::LongContext => Some("long"),
+                }).collect::<Vec<_>>().join(" ");
+                let caps_field = format!("[{}]", caps);
+                let notes_oneline = first_line(&e.notes);
                 let fav = state.favorites.has_model(&e.name);
                 let deployed = state.model_deployed(&e.name);
                 let glyph = if deployed { "●" } else if fav { "★" } else { " " };
                 let line = format!(
-                    "{} {:<7} {:<40}  {:>4}B  {:<6}  {:>5}  {:>9}  [{}]",
+                    "{} {:<7} {:<28}  {:>4}B  {:<6}  {:>5}  {:>9}  {:<18}  {}",
                     glyph,
                     "[LOCAL]",
-                    truncate(&e.name, 40),
+                    truncate(&e.name, 28),
                     format_params(e.params_b),
                     e.quant,
                     format_ctx(e.context_max),
                     e.vram_mb,
-                    caps,
+                    truncate(&caps_field, 18),
+                    notes_oneline,
                 );
                 let style = if deployed {
                     let s = Style::default().fg(Color::Green);
@@ -1645,16 +1651,20 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 // (clearer "this row has a problem" than `?` which
                 // reads as "unknown").
                 let glyph = if !key_ok { "!" } else if fav { "★" } else { " " };
+                // Cloud rows: blank tags column (no Capability vec) and
+                // notes flow to the right. Column widths match local
+                // rows so the LOCAL/CLOUD blocks line up cleanly.
                 let line = format!(
-                    "{} {:<7} {:<40}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
+                    "{} {:<7} {:<28}  {:>5}  {:<6}  {:>5}  {:>9}  {:<18}  {}",
                     glyph,
                     "[CLOUD]",
-                    truncate(&id, 40),
+                    truncate(&id, 28),
                     "—",
                     "—",
                     format_ctx(m.context_max),
                     "—",
-                    m.notes,
+                    "",
+                    first_line(&m.notes),
                 );
                 // Color rule for cloud rows:
                 //   key missing               → red (can't auth at all)
@@ -1988,11 +1998,18 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
     }
+}
+
+/// Pull the first line of a multi-line string, trimmed. Empty input → "".
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").trim().to_string()
 }
 
 fn format_params(p: f32) -> String {
