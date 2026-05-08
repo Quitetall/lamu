@@ -285,6 +285,8 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             reasoning_marker,
             speculative: None,
             pinned: false,
+            notes: String::new(),
+            status: String::new(),
         });
     }
 
@@ -316,6 +318,10 @@ struct ModelEntryYaml {
     speculative: Option<SpeculativeConfig>,
     #[serde(default, skip_serializing_if = "is_false")]
     pinned: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    notes: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    status: String,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
@@ -335,6 +341,8 @@ impl From<ModelEntry> for ModelEntryYaml {
             reasoning_marker: e.reasoning_marker,
             speculative: e.speculative,
             pinned: e.pinned,
+            notes: e.notes,
+            status: e.status,
         }
     }
 }
@@ -355,6 +363,8 @@ impl ModelEntryYaml {
             reasoning_marker: self.reasoning_marker,
             speculative: self.speculative,
             pinned: self.pinned,
+            notes: self.notes,
+            status: self.status,
         }
     }
 }

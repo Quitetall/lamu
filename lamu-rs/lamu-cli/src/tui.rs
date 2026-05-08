@@ -2451,6 +2451,8 @@ mod tests {
             reasoning_marker: None,
             speculative: None,
             pinned: false,
+            notes: String::new(),
+            status: String::new(),
         }
     }
 }

@@ -32,6 +32,8 @@ fn sample_entry(name: &str) -> ModelEntry {
         reasoning_marker: None,
         speculative: None,
         pinned: false,
+        notes: String::new(),
+        status: String::new(),
     }
 }
 

@@ -423,7 +423,14 @@ impl LamuMcpServer {
         for name in names {
             let entry = &st.entries[name];
             let loaded = st.scheduler.is_loaded(name);
-            let status = if loaded { "🟢 loaded" } else { "⚪ available" };
+            let status_glyph = if loaded { "🟢 loaded" } else { "⚪ available" };
+            // Operator-curated tag glyph + colour cue.
+            let tag = match entry.status.as_str() {
+                "recommended" => "★",
+                "utility"     => "⚙",
+                "deprecated"  => "⊘",
+                _ => " ",
+            };
             let caps: Vec<&str> = entry.capabilities.iter().map(|c| match c {
                 Capability::Chat => "chat",
                 Capability::Code => "code",
@@ -432,10 +439,14 @@ impl LamuMcpServer {
                 Capability::Vision => "vision",
                 Capability::LongContext => "long_context",
             }).collect();
-            lines.push(format!(
-                "{} {} ({}B {}, {}MB, [{}])",
-                status, name, entry.params_b, entry.quant, entry.vram_mb, caps.join(", ")
-            ));
+            let mut line = format!(
+                "{} {} {} ({}B {}, {}MB, [{}])",
+                status_glyph, tag, name, entry.params_b, entry.quant, entry.vram_mb, caps.join(", ")
+            );
+            if !entry.notes.is_empty() {
+                line.push_str(&format!("\n     — {}", entry.notes));
+            }
+            lines.push(line);
         }
         lines.join("\n")
     }

@@ -11,6 +11,12 @@ models:
     capabilities:
     - chat
     - long_context
+    status: utility
+    notes: |
+      Speculative decoding DRAFT for Qwen3.6-27B. Lucebox/dflash port.
+      Not standalone — pair with 27B target via DFlash + DDTree to hit
+      ~3.4× speedup (HumanEval 129 t/s vs 38 t/s baseline). Q4 quant of
+      the DFlash draft itself.
   gpt2-xl.q4_k_m:
     path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
     format: gguf
@@ -23,6 +29,11 @@ models:
     capabilities:
     - chat
     - long_context
+    status: deprecated
+    notes: |
+      Project origin (2021 InferKit / GPT-2 nostalgia). Kept for
+      historical reasons. Quality way below modern small models — use
+      qwen3.5-4b for any actual sub-3B task.
   qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
     path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
     format: gguf
@@ -35,6 +46,12 @@ models:
     capabilities:
     - chat
     - long_context
+    status: recommended
+    notes: |
+      Best speed × quality. MoE A3B = 3B active params per token, runs at
+      ~3B speeds with full 35B knowledge. Faster than 27B dense AND higher
+      quality. 22.2 GB tight on 24 GB GPU — use only when no other GPU
+      contention.
   dflash-3.6-q4km:
     path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
     format: gguf
@@ -49,6 +66,10 @@ models:
     - code
     - reasoning
     - long_context
+    status: utility
+    notes: |
+      Same as qwen3.6-27b-dflash-q4_k_m — DFlash speculator draft. Use
+      paired with the 27B target via Lucebox dflash; not standalone.
   qwen3.6-27b-q4_k_m:
     path: /home/brianklam/models/qwen3.6-official-gguf/Qwen3.6-27B-Q4_K_M.gguf
     format: gguf
@@ -67,6 +88,10 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    notes: |
+      Official Qwen3.6-27B Q4 (no heretic fine-tune). Use heretic-v2
+      variant instead for daily work — strictly better behavior. Keep
+      this one for alignment comparisons only.
   dflash-3.6-f16:
     path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
     format: gguf
@@ -81,6 +106,11 @@ models:
     - code
     - reasoning
     - long_context
+    status: utility
+    notes: |
+      Larger F16 DFlash draft variant. Higher draft accuracy → better
+      acceptance length, but uses more VRAM (3.6 GB). Try only if the
+      Q4 draft's acceptance rate is too low for the target's complexity.
   qwen3.5-27b-q4_k_m:
     path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
     format: gguf
@@ -99,6 +129,11 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    status: deprecated
+    notes: |
+      Superseded by qwen3.6-27b-uncensored-heretic-v2-q4_k_m. Same VRAM
+      footprint, slightly older base model. Keep only for ablation /
+      regression comparisons.
   qwen3.6-27b-uncensored-heretic-v2-q4_k_m:
     path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
     format: gguf
@@ -117,6 +152,12 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    status: recommended
+    notes: |
+      27B dense daily driver. Q4_K_M speed/quality sweet spot, ~70 t/s on
+      4090. Heretic v2 fine-tune drops alignment refusals without hurting
+      capability. Use when 35B-A3B is too tight on VRAM (this leaves 6+
+      GB headroom for other GPU work).
   qwen3.5-4b-q4_k_m:
     path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
     format: gguf
@@ -135,6 +176,11 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    status: utility
+    notes: |
+      Tiny tier (~3 GB VRAM). Useful for batch background tasks, format
+      conversion, or fast first-pass triage where 27B is overkill.
+      Quality limited compared to 27B+; not for hard reasoning.
   qwen3.6-27b-uncensored-heretic-v2-q5_k_s:
     path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q5_K_S.gguf
     format: gguf
@@ -153,3 +199,9 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    status: recommended
+    notes: |
+      Quality-first 27B variant. Same model as Q4 heretic-v2 but more bits
+      → ~1-2% lower perplexity for ~12% slower throughput (~60 t/s).
+      Pick when quality matters most: code generation, long reasoning
+      chains where small token errors compound.
