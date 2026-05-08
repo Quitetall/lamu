@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 pub struct LamuMcpServer {
     pub state: Arc<Mutex<ServerState>>,
@@ -180,6 +180,7 @@ impl LamuMcpServer {
             "review_diff" => handle_review_diff(args).await,
             "set_routing_mode" => self.handle_set_routing_mode(args).await,
             "routing_status" => self.handle_routing_status().await,
+            "parallel_query" => self.handle_parallel_query(args).await,
             other => format!("Unknown tool: {}", other),
         };
 
@@ -700,6 +701,121 @@ impl LamuMcpServer {
         )
     }
 
+    /// Fan out a batch of tasks. Each task gets routed via either
+    /// `handle_cloud_query` (if model name matches a cloud entry) or
+    /// `handle_query` (local). Concurrency is capped per-model — see
+    /// `provider_concurrency` for the per-provider table. Local
+    /// concurrency is always 1.
+    ///
+    /// Returns a JSON-shaped text body (parseable by the caller) plus
+    /// a human-readable summary header.
+    async fn handle_parallel_query(&self, args: Value) -> String {
+        let tasks_arr = match args["tasks"].as_array() {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => return "error: 'tasks' must be a non-empty array".into(),
+        };
+        let default_model = args["default_model"].as_str()
+            .unwrap_or("deepseek-v4-flash").to_string();
+        let default_system = args["default_system"].as_str().unwrap_or("").to_string();
+        let user_max = args["max_concurrency"].as_u64().map(|n| n as usize);
+
+        let cloud = load_cloud_models();
+
+        // Build per-(model) semaphores. Same-model tasks share one
+        // semaphore so the cap actually limits in-flight requests.
+        let mut sems: HashMap<String, Arc<Semaphore>> = HashMap::new();
+
+        let mut prepared = Vec::with_capacity(tasks_arr.len());
+        for (idx, t) in tasks_arr.iter().enumerate() {
+            let prompt = t["prompt"].as_str().unwrap_or("").to_string();
+            if prompt.is_empty() {
+                prepared.push(Err(format!("task[{}]: empty prompt", idx)));
+                continue;
+            }
+            let model = t["model"].as_str().unwrap_or(&default_model).to_string();
+            let task_id = t["id"].as_str().map(String::from)
+                .unwrap_or_else(|| format!("task{}", idx));
+            let system = t["system"].as_str().unwrap_or(&default_system).to_string();
+            let max_tokens = t["max_tokens"].as_u64().unwrap_or(8192);
+            let temperature = t["temperature"].as_f64().unwrap_or(0.3);
+            let include_reasoning = t["include_reasoning"].as_bool().unwrap_or(false);
+
+            let is_cloud = cloud.iter().any(|m| m.name == model);
+            let cap = if is_cloud {
+                let provider_cap = provider_concurrency(&model, &cloud);
+                user_max.map(|u| u.min(provider_cap)).unwrap_or(provider_cap)
+            } else {
+                1 // local: always sequential per project policy
+            };
+            let sem_key = if is_cloud { model.clone() } else { format!("local:{}", model) };
+            let sem = sems.entry(sem_key)
+                .or_insert_with(|| Arc::new(Semaphore::new(cap)))
+                .clone();
+
+            let inner_args = json!({
+                "model": model.clone(),
+                "prompt": prompt,
+                "system": system,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "include_reasoning": include_reasoning,
+            });
+
+            prepared.push(Ok((idx, task_id, model, is_cloud, sem, inner_args)));
+        }
+
+        // Spawn futures (all borrow self via &self lifetime; join_all
+        // holds them in a single scope so no 'static needed).
+        let t0 = std::time::Instant::now();
+        let futs = prepared.into_iter().map(|p| async move {
+            match p {
+                Err(msg) => (0usize, "error".to_string(), "(unknown)".to_string(), false, msg, 0.0),
+                Ok((idx, id, model, is_cloud, sem, args)) => {
+                    let t_start = std::time::Instant::now();
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(e) => return (idx, id, model, is_cloud,
+                                          format!("error: semaphore: {}", e), 0.0),
+                    };
+                    let result = if is_cloud {
+                        handle_cloud_query(args).await
+                    } else {
+                        self.handle_query(args).await
+                    };
+                    let elapsed = t_start.elapsed().as_secs_f32();
+                    (idx, id, model, is_cloud, result, elapsed)
+                }
+            }
+        });
+
+        let mut results: Vec<_> = futures_util::future::join_all(futs).await;
+        results.sort_by_key(|(idx, _, _, _, _, _)| *idx);
+        let total_wall = t0.elapsed().as_secs_f32();
+
+        // Build a JSON-shaped body so callers can machine-parse, plus
+        // a header readable by humans.
+        let json_results: Vec<Value> = results.iter().map(|(idx, id, model, is_cloud, text, elapsed)| {
+            json!({
+                "idx": idx,
+                "id": id,
+                "model": model,
+                "via": if *is_cloud { "cloud" } else { "local" },
+                "elapsed_s": elapsed,
+                "result": text,
+            })
+        }).collect();
+        let body = json!({
+            "total_tasks": results.len(),
+            "wall_time_s": total_wall,
+            "results": json_results,
+        });
+        let summary = format!(
+            "=== parallel_query: {} task(s) in {:.1}s wall ===",
+            results.len(), total_wall
+        );
+        format!("{}\n{}", summary, serde_json::to_string_pretty(&body).unwrap_or_default())
+    }
+
     fn handle_scan(&self) -> String {
         let mut st = self.state.lock();
         let entries = match scan_directory(&st.models_dir) {
@@ -876,6 +992,36 @@ fn tools_list_response(id: Option<Value>) -> Value {
             "description": "Report current routing mode + which backends are reachable.",
             "inputSchema": {"type": "object", "properties": {}}
         }),
+        json!({
+            "name": "parallel_query",
+            "description": "Fan out N prompts at once (agent swarm). Provider-aware concurrency: DeepSeek/OpenAI/Anthropic run in parallel up to per-provider caps, untested providers and ALL local models default to sequential (concurrency=1) until proven safe. Tasks are grouped by model so each model gets its own semaphore. Returns results in the original task order, with per-task elapsed time. Use this for batch reviews, parallel code generation, multi-perspective brainstorming.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": "Array of task objects. Each can override model/system/max_tokens/temperature/id; missing fields fall back to top-level defaults.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Optional caller-supplied id for matching results back."},
+                                "prompt": {"type": "string"},
+                                "model": {"type": "string"},
+                                "system": {"type": "string"},
+                                "max_tokens": {"type": "integer"},
+                                "temperature": {"type": "number"},
+                                "include_reasoning": {"type": "boolean"}
+                            },
+                            "required": ["prompt"]
+                        }
+                    },
+                    "default_model": {"type": "string", "default": "deepseek-v4-flash"},
+                    "default_system": {"type": "string", "default": ""},
+                    "max_concurrency": {"type": "integer", "description": "Optional cap that overrides per-provider defaults (downwards only — never raises an unproven provider above 1)."}
+                },
+                "required": ["tasks"]
+            }
+        }),
     ];
 
     json!({
@@ -1012,6 +1158,37 @@ fn load_cloud_models() -> Vec<CloudYamlEntry> {
     serde_yaml::from_str::<CloudYamlFile>(&body)
         .map(|f| f.models)
         .unwrap_or_default()
+}
+
+/// Per-provider concurrency cap. Conservative by default — only
+/// providers we've explicitly tested under parallel load get a cap >1.
+/// Unknown / lightly-tested providers are sequential until proven safe.
+///
+/// Override per-provider with env vars:
+///   LAMU_PARALLEL_DEEPSEEK / _ANTHROPIC / _OPENAI / etc.
+fn provider_concurrency(model_name: &str, cloud: &[CloudYamlEntry]) -> usize {
+    let provider = cloud.iter()
+        .find(|m| m.name == model_name)
+        .map(|m| m.provider.as_str())
+        .unwrap_or("");
+
+    // Env override takes precedence.
+    let env_var = format!("LAMU_PARALLEL_{}", provider.to_uppercase());
+    if let Ok(v) = std::env::var(&env_var) {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+
+    match provider {
+        // Tested under parallel load.
+        "deepseek" => 8,
+        "anthropic" => 4,
+        "openai" => 4,
+        // Less tested — start at 1 until proven. Bump via env var.
+        // Bumping here without a parallel-test run is the wrong default.
+        _ => 1,
+    }
 }
 
 fn handle_list_cloud_models() -> String {
@@ -1362,9 +1539,43 @@ mod tests {
             "unload_model", "vram_status", "scan_models", "queue_status",
             "cloud_query", "list_cloud_models",
             "review_commit", "review_diff", "set_routing_mode", "routing_status",
+            "parallel_query",
         ] {
             assert!(names.contains(&required), "missing tool: {}", required);
         }
+    }
+
+    #[test]
+    fn provider_concurrency_known_providers() {
+        let cloud = vec![
+            CloudYamlEntry { name: "ds".into(), provider: "deepseek".into(),
+                model_id: None, api_key_env: None, base_url: None,
+                notes: String::new(), context_max: 0 },
+            CloudYamlEntry { name: "claude".into(), provider: "anthropic".into(),
+                model_id: None, api_key_env: None, base_url: None,
+                notes: String::new(), context_max: 0 },
+            CloudYamlEntry { name: "gpt".into(), provider: "openai".into(),
+                model_id: None, api_key_env: None, base_url: None,
+                notes: String::new(), context_max: 0 },
+        ];
+        assert_eq!(provider_concurrency("ds", &cloud), 8);
+        assert_eq!(provider_concurrency("claude", &cloud), 4);
+        assert_eq!(provider_concurrency("gpt", &cloud), 4);
+    }
+
+    #[test]
+    fn provider_concurrency_unknown_defaults_to_1() {
+        let cloud = vec![
+            CloudYamlEntry { name: "kimi".into(), provider: "moonshot".into(),
+                model_id: None, api_key_env: None, base_url: None,
+                notes: String::new(), context_max: 0 },
+            CloudYamlEntry { name: "qwen".into(), provider: "alibaba".into(),
+                model_id: None, api_key_env: None, base_url: None,
+                notes: String::new(), context_max: 0 },
+        ];
+        assert_eq!(provider_concurrency("kimi", &cloud), 1);
+        assert_eq!(provider_concurrency("qwen", &cloud), 1);
+        assert_eq!(provider_concurrency("not-in-yaml", &cloud), 1);
     }
 
     #[test]
