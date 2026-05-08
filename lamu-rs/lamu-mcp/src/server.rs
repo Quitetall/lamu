@@ -813,10 +813,12 @@ impl LamuMcpServer {
             let max_tokens = t["max_tokens"].as_u64().unwrap_or(8192);
             let temperature = t["temperature"].as_f64().unwrap_or(0.3);
             let include_reasoning = t["include_reasoning"].as_bool().unwrap_or(false);
-            // thinking_enabled: pass through if the task supplies it,
-            // otherwise let handle_cloud_query apply its per-model
-            // default heuristic (Pro=on, Flash=off).
-            let thinking_enabled_arg = t.get("thinking_enabled").cloned();
+            // thinking_enabled: pass through ONLY if the task supplies
+            // an actual bool. Explicit null → fall back to per-model
+            // heuristic (treat null same as omitted).
+            let thinking_enabled_arg = t.get("thinking_enabled")
+                .and_then(|v| v.as_bool())
+                .map(Value::Bool);
 
             let is_cloud = cloud.iter().any(|m| m.name == model);
             let cap = if is_cloud {
@@ -1362,9 +1364,13 @@ async fn handle_cloud_query(args: Value) -> String {
         // disabled — Anthropic's default for non-reasoner models is
         // disabled anyway, but the explicit form is unambiguous.
         if thinking_enabled {
+            // Anthropic constraint: budget_tokens ≤ max_tokens. The
+            // .max(1024) floor must be clamped DOWN to max_tokens for
+            // small caps, otherwise the API rejects with 400.
+            let budget = (max_tokens / 2).max(1024).min(max_tokens.saturating_sub(1).max(1));
             payload["thinking"] = json!({
                 "type": "enabled",
-                "budget_tokens": (max_tokens / 2).max(1024),
+                "budget_tokens": budget,
             });
         }
 
