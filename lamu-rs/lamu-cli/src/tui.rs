@@ -29,6 +29,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::block::{Position, Title};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use std::io;
@@ -1638,7 +1639,10 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 let id = m.full_id();
                 let fav = state.favorites.has_model(&id);
                 let key_ok = m.key_present();
-                let glyph = if !key_ok { "🔒" } else if fav { "★" } else { " " };
+                // Single-column glyph so cloud rows stay column-aligned
+                // with local rows. 🔒 is 2-col which pushed every
+                // subsequent column right by one. `?` = key missing.
+                let glyph = if !key_ok { "?" } else if fav { "★" } else { " " };
                 let line = format!(
                     "{} {:<7} {:<40}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
                     glyph,
@@ -1674,17 +1678,16 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    let title = if state.model_filter.is_empty() {
+    let header = format!("Models  [{}]", state.model_view.len());
+    let footer = if state.model_filter.is_empty() {
         format!(
-            "Models  [{}]  source={}  sort={}  L/C/A switch  /filter  *favorite",
-            state.model_view.len(),
+            "source={}  sort={}  L/C/A switch  /filter  *favorite",
             state.source_filter.label(),
             state.model_sort.label()
         )
     } else {
         format!(
-            "Models  [{}]  source={}  filter='{}'  sort={}  Esc clears",
-            state.model_view.len(),
+            "source={}  filter='{}'  sort={}  Esc clears",
             state.source_filter.label(),
             state.model_filter,
             state.model_sort.label()
@@ -1692,7 +1695,12 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     };
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Title::from(header))
+                .title(Title::from(footer).position(Position::Bottom))
+        )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
         .highlight_symbol("→ ");
 
@@ -1906,22 +1914,20 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
         })
         .collect();
 
-    let title = if state.harness_filter.is_empty() {
-        format!(
-            "Harnesses  [{}]  sort={}  /filter  *favorite",
-            state.harness_view.len(),
-            state.harness_sort.label()
-        )
+    let header = format!("Harnesses  [{}]", state.harness_view.len());
+    let footer = if state.harness_filter.is_empty() {
+        format!("sort={}  /filter  *favorite", state.harness_sort.label())
     } else {
-        format!(
-            "Harnesses  [{}]  filter='{}'  Esc clears",
-            state.harness_view.len(),
-            state.harness_filter
-        )
+        format!("filter='{}'  Esc clears", state.harness_filter)
     };
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Title::from(header))
+                .title(Title::from(footer).position(Position::Bottom))
+        )
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
