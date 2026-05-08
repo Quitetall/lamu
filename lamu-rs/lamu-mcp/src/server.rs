@@ -424,12 +424,13 @@ impl LamuMcpServer {
             let entry = &st.entries[name];
             let loaded = st.scheduler.is_loaded(name);
             let status_glyph = if loaded { "🟢 loaded" } else { "⚪ available" };
-            // Operator-curated tag glyph + colour cue.
+            // Operator-curated tag glyph. Empty when status is unset
+            // so unflagged models don't print a stray double space.
             let tag = match entry.status.as_str() {
-                "recommended" => "★",
-                "utility"     => "⚙",
-                "deprecated"  => "⊘",
-                _ => " ",
+                "recommended" => "★ ",
+                "utility"     => "⚙ ",
+                "deprecated"  => "⊘ ",
+                _ => "",
             };
             let caps: Vec<&str> = entry.capabilities.iter().map(|c| match c {
                 Capability::Chat => "chat",
@@ -440,7 +441,7 @@ impl LamuMcpServer {
                 Capability::LongContext => "long_context",
             }).collect();
             let mut line = format!(
-                "{} {} {} ({}B {}, {}MB, [{}])",
+                "{} {}{} ({}B {}, {}MB, [{}])",
                 status_glyph, tag, name, entry.params_b, entry.quant, entry.vram_mb, caps.join(", ")
             );
             if !entry.notes.is_empty() {

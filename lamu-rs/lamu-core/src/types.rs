@@ -82,14 +82,14 @@ pub struct ModelEntry {
     pub speculative: Option<SpeculativeConfig>,
     #[serde(default)]
     pub pinned: bool,
-    /// Operator-curated tag. Drives the colored marker in `list_models`
-    /// and the TUI dashboard (★ recommended, ⚙ utility, ⊘ deprecated).
-    /// Free-form free-text for the human; lamu only displays it.
+    /// Free-text description shown in `mcp__local-llm__list_models`
+    /// output. Used by humans (and orchestrating agents) to pick the
+    /// right model for a task. (TUI dashboard rendering is a TODO —
+    /// currently MCP-only.)
     #[serde(default)]
     pub notes: String,
     /// One of: "recommended", "utility", "deprecated", or "" (default).
-    /// Shown as a glyph + color in the dashboard. Free-text in `notes`
-    /// describes WHY.
+    /// Renders as a glyph in `list_models`: ★ ⚙ ⊘ respectively.
     #[serde(default)]
     pub status: String,
 }
