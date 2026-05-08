@@ -1613,7 +1613,12 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                     lamu_core::types::Capability::Vision => Some("vis"),
                     lamu_core::types::Capability::LongContext => Some("long"),
                 }).collect::<Vec<_>>().join(" ");
-                let caps_field = format!("[{}]", caps);
+                // Empty caps (chat-only models) → blank, not a stray "[]"
+                let caps_field = if caps.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", caps)
+                };
                 let notes_oneline = first_line(&e.notes);
                 let fav = state.favorites.has_model(&e.name);
                 let deployed = state.model_deployed(&e.name);

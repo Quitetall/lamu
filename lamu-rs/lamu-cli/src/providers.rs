@@ -113,6 +113,26 @@ pub static PROVIDERS: &[&(dyn Provider + Sync)] = &[
 
 /// Pick the first provider whose `detect` returns true for `url`.
 /// Falls back to OpenAI compat (the last entry, which always matches).
+/// Parse + validate `ANTHROPIC_BETA` env var into a header-safe value.
+/// Returns None when the var is unset, empty after trimming, or
+/// contains bytes reqwest would reject as a header value (newlines,
+/// NULs, control chars). Shared between providers.rs and lamu-mcp's
+/// handle_cloud_query so the validation rule lives in one place.
+pub fn anthropic_beta_header() -> Option<reqwest::header::HeaderValue> {
+    let raw = std::env::var("ANTHROPIC_BETA").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match reqwest::header::HeaderValue::from_str(trimmed) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("ANTHROPIC_BETA rejected as header value: {} (ignoring)", e);
+            None
+        }
+    }
+}
+
 pub fn detect(url: &str) -> &'static (dyn Provider + Sync) {
     for p in PROVIDERS {
         if p.detect(url) {
@@ -295,10 +315,11 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json");
         // Opt-in 1M-context beta. Set ANTHROPIC_BETA in env to engage:
         //   ANTHROPIC_BETA=context-1m-2025-08-07
-        if let Ok(beta) = std::env::var("ANTHROPIC_BETA") {
-            if !beta.is_empty() {
-                req = req.header("anthropic-beta", beta);
-            }
+        // Validate before attaching: reqwest's `.header(..)` panics on
+        // invalid bytes (newlines, NULs, etc). Trim whitespace so a
+        // trailing newline in a `.env` file doesn't silently fail.
+        if let Some(val) = anthropic_beta_header() {
+            req = req.header("anthropic-beta", val);
         }
         req
     }
