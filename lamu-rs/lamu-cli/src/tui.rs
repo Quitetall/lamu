@@ -1641,8 +1641,10 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 let key_ok = m.key_present();
                 // Single-column glyph so cloud rows stay column-aligned
                 // with local rows. 🔒 is 2-col which pushed every
-                // subsequent column right by one. `?` = key missing.
-                let glyph = if !key_ok { "?" } else if fav { "★" } else { " " };
+                // subsequent column right by one. `!` = key missing
+                // (clearer "this row has a problem" than `?` which
+                // reads as "unknown").
+                let glyph = if !key_ok { "!" } else if fav { "★" } else { " " };
                 let line = format!(
                     "{} {:<7} {:<40}  {:>5}  {:<6}  {:>5}  {:>9}  {}",
                     glyph,
