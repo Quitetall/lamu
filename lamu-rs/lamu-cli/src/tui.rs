@@ -2143,7 +2143,17 @@ fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
             Some(0) | Some(1) => {} // killed, or nothing to kill — both fine
             Some(2) => anyhow::bail!("pkill syntax error — internal bug, please report"),
             Some(3) => anyhow::bail!("pkill fatal error (cannot read /proc?). Check permissions."),
-            other => eprintln!("  warning: pkill exited unexpectedly: {:?}", other),
+            // 127 (command not found), 126 (not executable), or any
+            // other non-zero/one — refuse to proceed since we have no
+            // confirmation the old server actually died. Spawning a new
+            // one would 404 on port-bind 60s later with a misleading
+            // error.
+            Some(code) => anyhow::bail!(
+                "pkill exited with unexpected code {} — refusing to spawn new backend. \
+                 Kill the existing llama-server manually, then retry.",
+                code
+            ),
+            None => anyhow::bail!("pkill terminated by signal — refusing to proceed"),
         },
         Err(e) => anyhow::bail!(
             "failed to spawn pkill ({}). Install procps or kill the existing llama-server manually before swapping.",

@@ -813,6 +813,10 @@ impl LamuMcpServer {
             let max_tokens = t["max_tokens"].as_u64().unwrap_or(8192);
             let temperature = t["temperature"].as_f64().unwrap_or(0.3);
             let include_reasoning = t["include_reasoning"].as_bool().unwrap_or(false);
+            // thinking_enabled: pass through if the task supplies it,
+            // otherwise let handle_cloud_query apply its per-model
+            // default heuristic (Pro=on, Flash=off).
+            let thinking_enabled_arg = t.get("thinking_enabled").cloned();
 
             let is_cloud = cloud.iter().any(|m| m.name == model);
             let cap = if is_cloud {
@@ -826,7 +830,7 @@ impl LamuMcpServer {
                 .or_insert_with(|| Arc::new(Semaphore::new(cap)))
                 .clone();
 
-            let inner_args = json!({
+            let mut inner_args = json!({
                 "model": model.clone(),
                 "prompt": prompt,
                 "system": system,
@@ -834,6 +838,9 @@ impl LamuMcpServer {
                 "temperature": temperature,
                 "include_reasoning": include_reasoning,
             });
+            if let Some(te) = thinking_enabled_arg {
+                inner_args["thinking_enabled"] = te;
+            }
 
             prepared.push(Ok((idx, task_id, model, is_cloud, sem, inner_args)));
         }
@@ -1015,7 +1022,8 @@ fn tools_list_response(id: Option<Value>) -> Value {
                     "system": {"type": "string", "description": "System prompt", "default": ""},
                     "max_tokens": {"type": "integer", "default": 8192},
                     "temperature": {"type": "number", "default": 0.3},
-                    "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."}
+                    "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."},
+                    "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."}
                 },
                 "required": ["prompt"]
             }
@@ -1293,6 +1301,14 @@ async fn handle_cloud_query(args: Value) -> String {
     let max_tokens = args["max_tokens"].as_u64().unwrap_or(8192) as u32;
     let temperature = args["temperature"].as_f64().unwrap_or(0.3) as f32;
     let include_reasoning = args["include_reasoning"].as_bool().unwrap_or(false);
+    // thinking_enabled: explicit override beats per-model default.
+    // Default rule: Pro models (and reasoner-named models) think;
+    // Flash and similarly-named "fast" tiers don't. Saves 50-80%
+    // wall time on simple tasks where reasoning isn't needed.
+    let thinking_enabled = args["thinking_enabled"].as_bool().unwrap_or_else(|| {
+        let n = model_name.to_lowercase();
+        n.contains("pro") || n.contains("reasoner") || n.contains("opus")
+    });
 
     let models = load_cloud_models();
     let entry = match models.iter().find(|m| m.name == model_name) {
@@ -1341,6 +1357,16 @@ async fn handle_cloud_query(args: Value) -> String {
             "stream": false,
         });
         if !system.is_empty() { payload["system"] = json!(system); }
+        // Anthropic native thinking: send `thinking: {type: "enabled",
+        // budget_tokens: N}` to engage extended thinking. Skip when
+        // disabled — Anthropic's default for non-reasoner models is
+        // disabled anyway, but the explicit form is unambiguous.
+        if thinking_enabled {
+            payload["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": (max_tokens / 2).max(1024),
+            });
+        }
 
         let resp = match client.post(&url)
             .header("x-api-key", &api_key)
@@ -1380,12 +1406,20 @@ async fn handle_cloud_query(args: Value) -> String {
             messages.push(json!({"role": "system", "content": system}));
         }
         messages.push(json!({"role": "user", "content": prompt}));
-        let payload = json!({
+        let mut payload = json!({
             "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": false,
+        });
+        // DeepSeek (and a growing list of OpenAI-compat providers) take
+        // a top-level `thinking` field. {type: "enabled"} engages the
+        // reasoning trace; {type: "disabled"} or absence skips it.
+        // For Flash by default we skip → ~50–80% wall-time savings on
+        // simple tasks. For Pro / reasoner / opus tiers we engage.
+        payload["thinking"] = json!({
+            "type": if thinking_enabled { "enabled" } else { "disabled" }
         });
         let resp = match client.post(&url)
             .bearer_auth(&api_key)
