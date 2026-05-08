@@ -1364,14 +1364,23 @@ async fn handle_cloud_query(args: Value) -> String {
         // disabled — Anthropic's default for non-reasoner models is
         // disabled anyway, but the explicit form is unambiguous.
         if thinking_enabled {
-            // Anthropic constraint: budget_tokens ≤ max_tokens. The
-            // .max(1024) floor must be clamped DOWN to max_tokens for
-            // small caps, otherwise the API rejects with 400.
-            let budget = (max_tokens / 2).max(1024).min(max_tokens.saturating_sub(1).max(1));
-            payload["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            });
+            // Anthropic constraints: budget_tokens MUST be ≥ 1024 AND
+            // ≤ max_tokens. If max_tokens ≤ 1024 there is no valid
+            // budget; silently skip the thinking block (the model will
+            // run without extended thinking — caller can retry with a
+            // larger max_tokens if they really wanted it).
+            if max_tokens > 1024 {
+                let budget = (max_tokens / 2).max(1024).min(max_tokens - 1);
+                payload["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            } else {
+                eprintln!(
+                    "cloud_query: thinking_enabled=true but max_tokens={} ≤ 1024 (Anthropic min budget); thinking block omitted",
+                    max_tokens
+                );
+            }
         }
 
         let resp = match client.post(&url)
