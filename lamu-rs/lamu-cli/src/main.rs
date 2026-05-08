@@ -101,6 +101,27 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// List active per-agent worktrees with last-checkpoint and stats.
+    Agents,
+    /// Squash an agent worktree's branch into a single commit on the
+    /// current branch — folds the agent's hard-earned work into main
+    /// without losing it.
+    Preserve {
+        /// Session id (from `lamu agents`).
+        session_id: String,
+    },
+    /// Selectively pull files matching a glob from an agent worktree
+    /// onto the current branch. Use to keep only the parts you want.
+    CherryPick {
+        session_id: String,
+        glob: String,
+    },
+    /// Drop an agent worktree + branch. Use after `preserve` (or when
+    /// the agent's work is unwanted). Main was never touched, so this
+    /// is non-destructive to the main branch.
+    DropAgent {
+        session_id: String,
+    },
 }
 
 #[tokio::main]
@@ -144,7 +165,58 @@ async fn main() -> Result<()> {
         Some(Command::Undo { session_id, yes }) => cmd_undo(session_id, yes),
         Some(Command::Rollback { session_id }) => cmd_rollback(&session_id),
         Some(Command::Agent { net, cmd }) => cmd_agent(net, cmd),
+        Some(Command::Agents) => cmd_agents(),
+        Some(Command::Preserve { session_id }) => cmd_preserve(&session_id),
+        Some(Command::CherryPick { session_id, glob }) => cmd_cherry_pick(&session_id, &glob),
+        Some(Command::DropAgent { session_id }) => cmd_drop_agent(&session_id),
     }
+}
+
+fn cmd_agents() -> Result<()> {
+    let trees = sandbox::preserve::list_agent_worktrees()?;
+    if trees.is_empty() {
+        println!("(no active agent worktrees — `lamu agent` to create one)");
+        return Ok(());
+    }
+    println!("Active agent worktrees ({}):\n", trees.len());
+    for w in &trees {
+        let last = w.last_checkpoint_secs.map(|s| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let age = now.saturating_sub(s);
+            if age < 60 { format!("{}s ago", age) }
+            else if age < 3600 { format!("{}m ago", age / 60) }
+            else { format!("{}h ago", age / 3600) }
+        }).unwrap_or_else(|| "(no checkpoint yet)".into());
+        println!(
+            "  {}\n    branch={}\n    path={}\n    last_checkpoint={}\n    files={}, loc_delta={:+}",
+            w.session_id, w.branch, w.path.display(), last, w.files_changed, w.loc_delta
+        );
+    }
+    Ok(())
+}
+
+fn cmd_preserve(session_id: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let sha = sandbox::preserve::preserve_session(session_id, &cwd)?;
+    println!("✓ preserved agent/{} → {}", session_id, sha);
+    println!("  Drop the worktree with `lamu drop-agent {}` once you're done.", session_id);
+    Ok(())
+}
+
+fn cmd_cherry_pick(session_id: &str, glob: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let summary = sandbox::preserve::cherry_pick_files(session_id, glob, &cwd)?;
+    println!("{}", summary);
+    Ok(())
+}
+
+fn cmd_drop_agent(session_id: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    sandbox::preserve::drop_session(session_id, &cwd)?;
+    println!("✓ dropped agent/{} (worktree + branch removed)", session_id);
+    Ok(())
 }
 
 fn cmd_sessions() -> Result<()> {

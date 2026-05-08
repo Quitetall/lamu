@@ -32,6 +32,7 @@ serde = { version = "1", features = ["derive"] }
 dirs = "5"
 termimad = "0.31"
 toml = "0.8"
+globset = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -16,6 +16,7 @@
 pub mod gate;
 pub mod journal;
 pub mod launcher;
+pub mod preserve;
 pub mod snap;
 
 use std::path::PathBuf;
