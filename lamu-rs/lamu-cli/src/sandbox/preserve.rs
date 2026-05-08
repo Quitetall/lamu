@@ -38,8 +38,83 @@ fn sandbox_worktrees_root() -> Result<PathBuf> {
     Ok(Path::new(&home).join(".local/share/lamu/sandbox/worktrees"))
 }
 
+/// session_id is used in: filesystem paths, branch names, and git
+/// arg vectors. Reject anything that could escape the sandbox or
+/// fool git's ref parser.
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty() {
+        anyhow::bail!("session_id is empty");
+    }
+    if session_id.len() > 100 {
+        anyhow::bail!("session_id too long (max 100 chars)");
+    }
+    let valid = session_id.chars().all(|c|
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+    );
+    if !valid {
+        anyhow::bail!(
+            "session_id '{}' rejected — only [a-zA-Z0-9_.-] allowed",
+            session_id
+        );
+    }
+    if session_id == "." || session_id == ".." || session_id.starts_with('.') {
+        anyhow::bail!("session_id may not start with '.' or be '.' / '..'");
+    }
+    Ok(())
+}
+
+/// Detect the repository's "default" branch — what to merge agent
+/// branches into. Tries (in order):
+///   1. origin/HEAD symbolic-ref (e.g. "main" or "master")
+///   2. current branch (HEAD), if it's not detached and not "agent/*"
+///   3. "main" as last resort
+fn detect_default_branch(repo_root: &Path) -> Result<String> {
+    // 1. origin/HEAD
+    if let Ok(out) = SyncCommand::new("git")
+        .arg("-C").arg(repo_root)
+        .arg("symbolic-ref").arg("refs/remotes/origin/HEAD")
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(name) = s.strip_prefix("refs/remotes/origin/") {
+                return Ok(name.to_string());
+            }
+        }
+    }
+    // 2. Current HEAD branch
+    if let Ok(out) = SyncCommand::new("git")
+        .arg("-C").arg(repo_root)
+        .arg("rev-parse").arg("--abbrev-ref").arg("HEAD")
+        .output()
+    {
+        if out.status.success() {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !name.is_empty() && name != "HEAD" && !name.starts_with("agent/") {
+                return Ok(name);
+            }
+        }
+    }
+    // 3. fallback
+    Ok("main".to_string())
+}
+
 fn worktree_path_for(session_id: &str) -> Result<PathBuf> {
-    Ok(sandbox_worktrees_root()?.join(session_id))
+    validate_session_id(session_id)?;
+    let path = sandbox_worktrees_root()?.join(session_id);
+    // Defense in depth: ensure the joined path is still under root.
+    let root = sandbox_worktrees_root()?;
+    let canonical_root = root.canonicalize().unwrap_or(root.clone());
+    // path may not exist yet; canonicalize ancestors.
+    let parent = path.parent().unwrap_or(&path);
+    if parent.exists() {
+        let canonical_parent = parent.canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if !canonical_parent.starts_with(&canonical_root) {
+            anyhow::bail!("worktree path escaped sandbox root");
+        }
+    }
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -216,33 +291,38 @@ fn get_worktree_stats(worktree_path: &Path) -> Result<(usize, i64)> {
 }
 
 fn parse_shortstat(stat: &str) -> Result<(usize, i64)> {
-    // Typical output: " 1 file changed, 5 insertions(+), 3 deletions(-)"
+    // " 1 file changed, 5 insertions(+), 3 deletions(-)"
+    // Words: "1", "file", "changed,", "5", "insertions(+),", "3", "deletions(-)"
+    // Each NUMBER is its own word — the keyword is the NEXT word.
     let stat = stat.trim();
     if stat.is_empty() {
         return Ok((0, 0));
     }
     let mut files = 0usize;
-    let mut loc_delta: i64 = 0;
-    // Split into words and look for patterns
+    let mut insertions: i64 = 0;
+    let mut deletions: i64 = 0;
     let parts: Vec<&str> = stat.split_whitespace().collect();
-    for (i, word) in parts.iter().enumerate() {
-        if *word == "file" || *word == "files" {
-            if let Some(prev) = parts.get(i.saturating_sub(1)) {
-                files = prev.parse().unwrap_or(0);
+    for (i, raw) in parts.iter().enumerate() {
+        let word = raw.trim_end_matches(',');
+        let prev_num = || -> Option<&str> {
+            if i == 0 { return None; }
+            Some(parts[i - 1].trim_end_matches(','))
+        };
+        if word == "file" || word == "files" {
+            if let Some(p) = prev_num() {
+                files = p.parse().unwrap_or(0);
+            }
+        } else if word == "insertions(+)" || word == "insertion(+)" {
+            if let Some(p) = prev_num() {
+                insertions = p.parse().unwrap_or(0);
+            }
+        } else if word == "deletions(-)" || word == "deletion(-)" {
+            if let Some(p) = prev_num() {
+                deletions = p.parse().unwrap_or(0);
             }
         }
-        if let Some(changes) = word.strip_suffix("insertions(+)")
-            .or_else(|| word.strip_suffix("insertion(+)"))
-        {
-            loc_delta += changes.parse::<i64>().unwrap_or(0);
-        }
-        if let Some(changes) = word.strip_suffix("deletions(-)")
-            .or_else(|| word.strip_suffix("deletion(-)"))
-        {
-            loc_delta -= changes.parse::<i64>().unwrap_or(0);
-        }
     }
-    Ok((files, loc_delta))
+    Ok((files, insertions - deletions))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,22 +337,31 @@ fn parse_shortstat(stat: &str) -> Result<(usize, i64)> {
 /// 3. `git commit -m "preserve: agent/<session_id>\n\n<auto-summary>"`
 /// 4. Return the new commit SHA via `git rev-parse HEAD`.
 pub fn preserve_session(session_id: &str, repo_root: &Path) -> Result<String> {
+    validate_session_id(session_id)?;
     let branch = format!("agent/{session_id}");
 
-    // Switch to main
+    // Detect the repository's default branch — main, master, trunk, etc.
+    // Prefer origin/HEAD; fall back to current HEAD's branch name; fail
+    // if neither resolves.
+    let default_branch = detect_default_branch(repo_root)?;
+
+    // Switch to default branch
     let output = SyncCommand::new("git")
         .arg("-C")
         .arg(repo_root)
         .arg("checkout")
-        .arg("main")
+        .arg(&default_branch)
         .output()
-        .context("Failed to checkout main")?;
+        .context("Failed to checkout default branch")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("git checkout main failed: {stderr}"));
+        return Err(anyhow!(
+            "git checkout {} failed: {stderr}",
+            default_branch
+        ));
     }
 
-    // Squash merge
+    // Squash merge — abort on conflict so the working tree is clean.
     let output = SyncCommand::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -282,8 +371,19 @@ pub fn preserve_session(session_id: &str, repo_root: &Path) -> Result<String> {
         .output()
         .context("Failed to run git merge --squash")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("git merge --squash failed: {stderr}"));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        // Best-effort cleanup so the user isn't left with a half-merged tree.
+        let _ = SyncCommand::new("git")
+            .arg("-C").arg(repo_root)
+            .arg("merge").arg("--abort")
+            .output();
+        let _ = SyncCommand::new("git")
+            .arg("-C").arg(repo_root)
+            .arg("reset").arg("--hard").arg("HEAD")
+            .output();
+        return Err(anyhow!(
+            "git merge --squash failed (working tree restored): {stderr}"
+        ));
     }
 
     // Generate auto-summary from staged changes
@@ -344,6 +444,7 @@ pub fn preserve_session(session_id: &str, repo_root: &Path) -> Result<String> {
 /// Lists files in `agent/<session_id>` matching the glob, checks them out,
 /// stages them, and returns the number of matched files.
 pub fn cherry_pick_files(session_id: &str, glob: &str, repo_root: &Path) -> Result<String> {
+    validate_session_id(session_id)?;
     let branch = format!("agent/{session_id}");
 
     // List all files in the agent branch
@@ -467,15 +568,19 @@ pub fn drop_session(session_id: &str, repo_root: &Path) -> Result<()> {
 ///
 /// Runs until the provided `shutdown` receiver resolves.
 pub async fn checkpoint_loop(
-    session_id: String,
+    _session_id: String,
     worktree: PathBuf,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    // tokio::time::interval fires its first tick immediately. Burn it
+    // so the first checkpoint happens at +60s, not at startup (where
+    // the index is still empty and we'd commit nothing useful or
+    // race the agent's first writes).
+    interval.tick().await;
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                // Perform a final checkpoint before exiting
                 checkpoint(&worktree).await;
                 break;
             }
@@ -622,6 +727,54 @@ mod tests {
         assert!(commit_out.status.success());
 
         dir
+    }
+
+    #[test]
+    fn validate_session_id_rejects_traversal_and_garbage() {
+        // valid
+        assert!(validate_session_id("abc").is_ok());
+        assert!(validate_session_id("session-2026-05-08").is_ok());
+        assert!(validate_session_id("a.b_c-d").is_ok());
+        // invalid
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("..").is_err());
+        assert!(validate_session_id(".").is_err());
+        assert!(validate_session_id("../etc").is_err());
+        assert!(validate_session_id(".hidden").is_err());
+        assert!(validate_session_id("name with space").is_err());
+        assert!(validate_session_id("name/with/slash").is_err());
+        assert!(validate_session_id("name;rm -rf").is_err());
+        assert!(validate_session_id(&"a".repeat(101)).is_err());
+        // bash special
+        assert!(validate_session_id("$(whoami)").is_err());
+        assert!(validate_session_id("`pwd`").is_err());
+    }
+
+    #[test]
+    fn parse_shortstat_handles_commas() {
+        // Real `git diff --shortstat` output
+        let s = " 1 file changed, 5 insertions(+), 3 deletions(-)";
+        let (files, delta) = parse_shortstat(s).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(delta, 2); // 5 - 3
+        // Multiple files
+        let s = " 7 files changed, 100 insertions(+), 50 deletions(-)";
+        let (files, delta) = parse_shortstat(s).unwrap();
+        assert_eq!(files, 7);
+        assert_eq!(delta, 50);
+        // Singular variants
+        let s = " 1 file changed, 1 insertion(+), 1 deletion(-)";
+        let (files, delta) = parse_shortstat(s).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(delta, 0);
+        // Insertions only
+        let s = " 1 file changed, 5 insertions(+)";
+        let (_files, delta) = parse_shortstat(s).unwrap();
+        assert_eq!(delta, 5);
+        // Empty
+        let (files, delta) = parse_shortstat("").unwrap();
+        assert_eq!(files, 0);
+        assert_eq!(delta, 0);
     }
 
     // Test (a): create_worktree_then_drop_session_roundtrip
