@@ -642,12 +642,25 @@ fn strip_html_tags(s: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
+/// Percent-encode a string for use in a URL query. Multi-byte UTF-8
+/// characters are encoded as their byte sequence ("é" → "%C3%A9"),
+/// not the Unicode codepoint ("%E9" — wrong; that's Latin-1, not what
+/// the receiving server expects).
 fn urlenccode(s: &str) -> String {
-    s.chars().map(|c| match c {
-        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-        ' ' => "+".to_string(),
-        _ => format!("%{:02X}", c as u32),
-    }).collect()
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", byte);
+            }
+        }
+    }
+    out
 }
 
 fn strip_think_blocks(text: &str) -> String {
@@ -870,12 +883,22 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
     if state.save_prompt {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // auto_save manages is_dirty itself — sets false ONLY
+                // on successful write. If save fails, is_dirty stays
+                // true and Drop's silent-save catches it. Don't exit
+                // on save failure — show the error and let the user
+                // try again or pick (n).
                 state.auto_save();
-                state.is_dirty = false;
                 state.save_prompt = false;
+                if state.is_dirty {
+                    // Save failed — keep the chat alive so the user
+                    // can retry or copy out manually.
+                    return Ok(false);
+                }
                 return Ok(true);
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
+                // Explicit discard — clear dirty so Drop doesn't save.
                 state.is_dirty = false;
                 state.save_prompt = false;
                 return Ok(true);

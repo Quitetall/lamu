@@ -2129,11 +2129,27 @@ fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
         return Ok(());
     }
 
-    // Kill existing llama-server on :8020.
+    // Kill existing llama-server on :8020. pkill exit codes:
+    //   0 — at least one process matched and was signaled
+    //   1 — no matching process (already dead — fine for our case)
+    //   2 — syntax error in the pattern (shouldn't happen)
+    //   3 — fatal error (e.g. /proc unreadable) — surface this
     println!("\n→ Swapping model → {} ({}B {}, ~{}MB VRAM)", entry.name, entry.params_b, entry.quant, entry.vram_mb);
-    let _ = std::process::Command::new("pkill")
+    match std::process::Command::new("pkill")
         .args(["-f", "llama-server.*--port 8020"])
-        .status();
+        .status()
+    {
+        Ok(status) => match status.code() {
+            Some(0) | Some(1) => {} // killed, or nothing to kill — both fine
+            Some(2) => anyhow::bail!("pkill syntax error — internal bug, please report"),
+            Some(3) => anyhow::bail!("pkill fatal error (cannot read /proc?). Check permissions."),
+            other => eprintln!("  warning: pkill exited unexpectedly: {:?}", other),
+        },
+        Err(e) => anyhow::bail!(
+            "failed to spawn pkill ({}). Install procps or kill the existing llama-server manually before swapping.",
+            e
+        ),
+    }
     // Give it a moment to release GPU mem.
     std::thread::sleep(std::time::Duration::from_secs(2));
 

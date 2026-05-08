@@ -12,7 +12,7 @@ mod sandbox;
 mod theme;
 mod tui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lamu_core::config::{models_dir, registry_path, PORT_MAIN, PORT_SIDECAR};
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
@@ -501,12 +501,34 @@ fn cmd_show(query: &str) -> Result<()> {
 fn cmd_rm(query: &str, yes: bool) -> Result<()> {
     let entry = resolve_entry(query)?;
     let path = &entry.path;
+
+    // Containment: the registry can be edited / corrupted, so we never
+    // trust ModelEntry.path blindly. Refuse to delete anything that
+    // doesn't canonicalize to a real path under the configured
+    // models_dir(). Defense against tampered registry pointing at
+    // /etc/passwd or ~/.ssh/id_rsa.
+    let dir = models_dir();
+    let dir_canonical = dir.canonicalize()
+        .with_context(|| format!("canonicalize models dir {}", dir.display()))?;
+    let path_canonical = match path.canonicalize() {
+        Ok(p) => Some(p),
+        Err(_) => None, // file may already be gone — that's fine
+    };
+    if let Some(p) = &path_canonical {
+        if !p.starts_with(&dir_canonical) {
+            anyhow::bail!(
+                "refusing to delete: registry path {} is outside models dir {}",
+                p.display(), dir_canonical.display()
+            );
+        }
+    }
+
     println!("Will remove from registry: {}", entry.name);
-    if path.exists() {
-        let size_mb = std::fs::metadata(path)
+    if let Some(p) = &path_canonical {
+        let size_mb = std::fs::metadata(p)
             .map(|m| m.len() / (1024 * 1024))
             .unwrap_or(0);
-        println!("Will delete file: {} ({} MB)", path.display(), size_mb);
+        println!("Will delete file: {} ({} MB)", p.display(), size_mb);
     } else {
         println!("(file already gone: {})", path.display());
     }
@@ -523,9 +545,16 @@ fn cmd_rm(query: &str, yes: bool) -> Result<()> {
         }
     }
 
-    if path.exists() {
-        std::fs::remove_file(path)?;
-        println!("  deleted file");
+    // Delete the canonicalized path — never the original (would be a
+    // TOCTOU race with symlink swap if we used `path` here).
+    if let Some(p) = path_canonical {
+        match std::fs::remove_file(&p) {
+            Ok(()) => println!("  deleted file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("  (already gone)");
+            }
+            Err(e) => return Err(e).with_context(|| format!("remove {}", p.display())),
+        }
     }
 
     // Re-scan to drop the entry from registry.

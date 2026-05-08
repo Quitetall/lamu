@@ -254,23 +254,38 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
         Ok(v)
     };
 
-    for chunk in bytes.chunks(4) {
+    let mut chunks = bytes.chunks(4).peekable();
+    while let Some(chunk) = chunks.next() {
         if chunk.len() < 2 {
             anyhow::bail!("base64 truncated: trailing chunk has {} bytes", chunk.len());
         }
         let v0 = valid_byte(chunk[0])? as u32;
         let v1 = valid_byte(chunk[1])? as u32;
-        let v2 = if chunk.len() > 2 && chunk[2] != b'=' {
+
+        // Padding rules: once we see '=' the rest of the chunk and
+        // everything after the chunk must also be '='. Reject `X==Y`
+        // (mid-chunk pad followed by data) and reject pad in non-final
+        // chunk.
+        let c2_pad = chunk.len() > 2 && chunk[2] == b'=';
+        let c3_pad = chunk.len() > 3 && chunk[3] == b'=';
+        if c2_pad && chunk.len() > 3 && !c3_pad {
+            anyhow::bail!("base64 invalid padding: '=' followed by non-pad in same chunk");
+        }
+        if (c2_pad || c3_pad) && chunks.peek().is_some() {
+            anyhow::bail!("base64 invalid padding: '=' before final chunk");
+        }
+
+        let v2 = if chunk.len() > 2 && !c2_pad {
             valid_byte(chunk[2])? as u32
         } else { 0 };
-        let v3 = if chunk.len() > 3 && chunk[3] != b'=' {
+        let v3 = if chunk.len() > 3 && !c3_pad {
             valid_byte(chunk[3])? as u32
         } else { 0 };
         out.push(((v0 << 2) | (v1 >> 4)) as u8);
-        if chunk.len() > 2 && chunk[2] != b'=' {
+        if chunk.len() > 2 && !c2_pad {
             out.push(((v1 << 4) | (v2 >> 2)) as u8);
         }
-        if chunk.len() > 3 && chunk[3] != b'=' {
+        if chunk.len() > 3 && !c3_pad {
             out.push(((v2 << 6) | v3) as u8);
         }
     }
@@ -281,6 +296,18 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn base64_rejects_invalid() {
+        // Garbage outside the alphabet
+        assert!(base64_decode("X#YZ").is_err());
+        // Padding in middle then data (X==Y)
+        assert!(base64_decode("X==Y").is_err());
+        // Truncated
+        assert!(base64_decode("X").is_err());
+        // Padding in non-final chunk
+        assert!(base64_decode("X===abcd").is_err());
+    }
 
     #[test]
     fn base64_roundtrip() {

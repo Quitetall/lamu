@@ -213,10 +213,13 @@ async fn chat_completions(
         // schemes, or credentialed URLs that could leak through.
         let parsed = match reqwest::Url::parse(&gw) {
             Ok(u) => u,
-            Err(e) => {
+            Err(_) => {
+                // Don't echo the bad URL back — could leak misconfigured
+                // hostnames or credentials embedded by mistake.
+                eprintln!("openai_compat: LAMU_GATEWAY_URL parse failed");
                 return (StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": {
-                        "message": format!("LAMU_GATEWAY_URL invalid: {}", e),
+                        "message": "LAMU_GATEWAY_URL is not a valid HTTP URL",
                         "type": "config"}}))).into_response();
             }
         };

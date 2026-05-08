@@ -170,7 +170,7 @@ impl LamuMcpServer {
             "plan_query" => self.handle_plan_query(args),
             "list_models" => self.handle_list_models(),
             "load_model" => self.handle_load_model(args).await,
-            "unload_model" => self.handle_unload_model(args),
+            "unload_model" => self.handle_unload_model(args).await,
             "vram_status" => self.handle_vram_status(),
             "scan_models" => self.handle_scan(),
             "queue_status" => self.handle_queue_status().await,
@@ -184,12 +184,20 @@ impl LamuMcpServer {
             other => format!("Unknown tool: {}", other),
         };
 
+        // Heuristic: handlers prefix error responses with "error:" or
+        // "Unknown tool:". Surface that as MCP `isError: true` so
+        // clients can branch on tool failure programmatically.
+        let lower = result.trim_start().to_lowercase();
+        let is_error = lower.starts_with("error:")
+            || lower.starts_with("unknown tool:")
+            || lower.starts_with("missing prompt");
+
         json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {
                 "content": [{ "type": "text", "text": result }],
-                "isError": false
+                "isError": is_error,
             }
         })
     }
@@ -435,43 +443,87 @@ impl LamuMcpServer {
     async fn handle_load_model(&self, args: Value) -> String {
         let name = match args.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.to_string(),
-            None => return "missing name".into(),
+            None => return "error: missing 'name' argument".into(),
         };
 
-        // Find entry + plan eviction
-        let (entry, to_evict) = {
-            let st = self.state.lock();
-            let entry: Option<ModelEntry> = st.entries.iter()
-                .find(|(n, _)| n.contains(&name) || name.contains(n.as_str()))
-                .map(|(_, e)| e.clone());
-            let Some(entry) = entry else {
-                return format!("Model '{}' not found in registry. Run scan_models.", name);
+        // Atomic plan-and-reserve: hold the state lock across (a) entry
+        // lookup, (b) plan_load, (c) mark_loading. Without this,
+        // concurrent load_model calls could both pass the is_loaded check
+        // and both spawn a backend on the same port.
+        // Also pick a name-resolution mode: exact match wins; otherwise
+        // require unique substring match. Ambiguous matches return an
+        // error rather than silently picking one.
+        let (entry, to_evict, evict_children) = {
+            let mut st = self.state.lock();
+
+            // 1. Resolve name: exact > unique-substring > error.
+            let entry: ModelEntry = if let Some(e) = st.entries.get(&name) {
+                e.clone()
+            } else {
+                let candidates: Vec<&ModelEntry> = st.entries.values()
+                    .filter(|e| e.name.contains(&name) || name.contains(e.name.as_str()))
+                    .collect();
+                match candidates.len() {
+                    0 => return format!(
+                        "error: model '{}' not found in registry. Run scan_models.",
+                        name
+                    ),
+                    1 => candidates[0].clone(),
+                    n => {
+                        let names: Vec<String> = candidates.iter().map(|e| e.name.clone()).collect();
+                        return format!(
+                            "error: model '{}' is ambiguous ({} matches: {}). Use the exact name.",
+                            name, n, names.join(", ")
+                        );
+                    }
+                }
             };
+
             if st.scheduler.is_loaded(&entry.name) {
                 return format!("Model '{}' already loaded.", entry.name);
             }
             let (can, evict) = st.scheduler.plan_load(&entry);
             if !can {
                 return format!(
-                    "Cannot fit '{}' ({}MB) in VRAM. Insufficient space.",
+                    "error: cannot fit '{}' ({}MB) in VRAM. Insufficient space.",
                     entry.name, entry.vram_mb
                 );
             }
-            (entry, evict)
-        };
 
-        // Evict — start_kill on the owned Child, then drop it. Health entry
-        // for the evicted backend is removed so its supervisor lifecycle ends.
-        if !to_evict.is_empty() {
-            let mut st = self.state.lock();
-            for evict_name in &to_evict {
-                if let Some(mut child) = st.loaded_procs.remove(evict_name) {
-                    let _ = child.start_kill();
+            // Mark loading INSIDE the lock so no concurrent caller picks
+            // up the same plan. evict_children carries owned Child handles
+            // we must wait() outside the lock.
+            let mut evict_children: Vec<(String, tokio::process::Child)> = Vec::new();
+            for evict_name in &evict {
+                if let Some(child) = st.loaded_procs.remove(evict_name) {
+                    evict_children.push((evict_name.clone(), child));
                 }
                 st.scheduler.mark_unloaded(evict_name);
                 st.health.drop(evict_name);
             }
+            st.scheduler.mark_loading(entry.clone());
+
+            (entry, evict, evict_children)
+        };
+
+        // Reap evicted children outside the lock — wait() with a timeout
+        // so a stuck backend can't hang the entire MCP server.
+        for (evict_name, mut child) in evict_children {
+            let _ = child.start_kill();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                child.wait()
+            ).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!(
+                    "load_model: wait({}) errored: {}", evict_name, e
+                ),
+                Err(_) => eprintln!(
+                    "load_model: wait({}) timed out — leaving zombie", evict_name
+                ),
+            }
         }
+        // Settle period for VRAM to actually drop after kill.
         if !to_evict.is_empty() {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
@@ -557,36 +609,58 @@ impl LamuMcpServer {
             }
         }
 
-        // Timeout — kill the stored Child and unregister scheduler/health.
-        let mut st = self.state.lock();
-        if let Some(mut child) = st.loaded_procs.remove(&entry.name) {
+        // Timeout — kill the stored Child and reap before returning.
+        let dead_child = {
+            let mut st = self.state.lock();
+            let dead = st.loaded_procs.remove(&entry.name);
+            st.scheduler.mark_unloaded(&entry.name);
+            st.health.drop(&entry.name);
+            dead
+        };
+        if let Some(mut child) = dead_child {
             let _ = child.start_kill();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                child.wait()
+            ).await;
         }
-        st.scheduler.mark_unloaded(&entry.name);
-        st.health.drop(&entry.name);
-        format!("Failed to load '{}' (timeout {}s)", entry.name, max_wait_secs)
+        format!("error: failed to load '{}' (timeout {}s)", entry.name, max_wait_secs)
     }
 
-    fn handle_unload_model(&self, args: Value) -> String {
+    async fn handle_unload_model(&self, args: Value) -> String {
         let name = match args.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.to_string(),
-            None => return "missing name".into(),
+            None => return "error: missing 'name' argument".into(),
         };
 
-        let mut st = self.state.lock();
-        let target: Option<String> = st.scheduler.loaded_models().iter()
-            .find(|m| m.entry.name.contains(&name) || name.contains(m.entry.name.as_str()))
-            .map(|m| m.entry.name.clone());
-
-        let Some(target) = target else {
-            return format!("Model '{}' not loaded.", name);
+        // Resolve under lock, take the Child handle out, release lock,
+        // THEN wait. Avoids holding the parking_lot lock across an
+        // await point.
+        let dead = {
+            let mut st = self.state.lock();
+            let target: Option<String> = st.scheduler.loaded_models().iter()
+                .find(|m| m.entry.name.contains(&name) || name.contains(m.entry.name.as_str()))
+                .map(|m| m.entry.name.clone());
+            let Some(target) = target else {
+                return format!("Model '{}' not loaded.", name);
+            };
+            let child = st.loaded_procs.remove(&target);
+            st.scheduler.mark_unloaded(&target);
+            st.health.drop(&target);
+            (target, child)
         };
-
-        if let Some(mut child) = st.loaded_procs.remove(&target) {
+        let (target, child) = dead;
+        if let Some(mut child) = child {
             let _ = child.start_kill();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                child.wait()
+            ).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("unload({}): wait errored: {}", target, e),
+                Err(_) => eprintln!("unload({}): timeout — leaving zombie", target),
+            }
         }
-        st.scheduler.mark_unloaded(&target);
-        st.health.drop(&target);
         format!("Unloaded '{}'. VRAM freed.", target)
     }
 
