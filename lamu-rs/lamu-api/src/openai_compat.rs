@@ -164,7 +164,12 @@ async fn chat_completions(
                     typ: "model_not_available",
                 },
             };
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::to_value(body).unwrap())).into_response();
+            let body_json = serde_json::to_value(&body)
+                .unwrap_or_else(|e| json!({"error": {
+                    "message": format!("internal serialization: {}", e),
+                    "type": "internal"
+                }}));
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body_json)).into_response();
         }
 
         let Some(loaded) = scheduler.get_loaded(&decision.model_name) else {
@@ -203,6 +208,33 @@ async fn chat_completions(
     // `model` field with whatever the user sent so client-side mappings
     // pass through unchanged.
     let backend_url = if let Ok(gw) = std::env::var("LAMU_GATEWAY_URL") {
+        // Validate the env var is a well-formed http(s) URL with no
+        // userinfo/fragment — refuses redirects to file://, weird
+        // schemes, or credentialed URLs that could leak through.
+        let parsed = match reqwest::Url::parse(&gw) {
+            Ok(u) => u,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": {
+                        "message": format!("LAMU_GATEWAY_URL invalid: {}", e),
+                        "type": "config"}}))).into_response();
+            }
+        };
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": {
+                        "message": format!("LAMU_GATEWAY_URL scheme '{}' not allowed", other),
+                        "type": "config"}}))).into_response();
+            }
+        }
+        if parsed.username() != "" || parsed.password().is_some() {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": {
+                    "message": "LAMU_GATEWAY_URL must not contain userinfo",
+                    "type": "config"}}))).into_response();
+        }
         let trimmed = gw.trim_end_matches('/');
         if let Some(model) = req.model.as_deref() {
             payload["model"] = json!(model);

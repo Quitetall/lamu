@@ -79,11 +79,29 @@ impl Backend for LlamaCppBackend {
 
         // Q8_0 KV is the speed/VRAM sweet spot; Q4_0 KV saved memory but
         // dequant added prompt-eval cost. Override with LAMU_KV.
-        let kv_type = std::env::var("LAMU_KV").unwrap_or_else(|_| "q8_0".into());
+        // Validate LAMU_KV against the set llama.cpp actually accepts. An
+        // unrecognized value here would either crash the server at startup
+        // or fall back to f16 silently — neither is what we want.
+        let kv_type = match std::env::var("LAMU_KV").as_deref() {
+            Ok("q8_0") | Ok("q4_0") | Ok("q4_1") | Ok("q5_0") | Ok("q5_1")
+                | Ok("f16") | Ok("bf16") | Ok("f32") => std::env::var("LAMU_KV").unwrap(),
+            Ok(other) => {
+                return Err(Error::Backend(format!(
+                    "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32",
+                    other
+                )));
+            }
+            Err(_) => "q8_0".to_string(),
+        };
+
+        // Bind to localhost by default. Remote exposure is opt-in via
+        // LAMU_BIND_HOST=0.0.0.0 — this avoids a default-config security
+        // hole on multi-host networks.
+        let host = std::env::var("LAMU_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
 
         let mut cmd = Command::new(&self.bin_path);
         cmd.arg("-m").arg(&entry.path)
-            .arg("--host").arg("0.0.0.0")
+            .arg("--host").arg(&host)
             .arg("--port").arg(port.to_string())
             .arg("--ctx-size").arg(ctx.to_string())
             .arg("-ngl").arg("99")

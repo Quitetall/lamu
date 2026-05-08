@@ -237,16 +237,35 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    let mut lookup = [0u8; 256];
+    // Build a lookup table where invalid byte = 0xFF sentinel. This
+    // lets us reject anything outside the alphabet — without it, a
+    // tampered or truncated journal silently restores garbage bytes.
+    let mut lookup = [0xFFu8; 256];
     for (i, b) in B64.iter().enumerate() { lookup[*b as usize] = i as u8; }
+
     let bytes: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+
+    let valid_byte = |b: u8| -> Result<u8> {
+        let v = lookup[b as usize];
+        if v == 0xFF {
+            anyhow::bail!("invalid base64 byte 0x{:02x}", b);
+        }
+        Ok(v)
+    };
+
     for chunk in bytes.chunks(4) {
-        if chunk.len() < 2 { break; }
-        let v0 = lookup[chunk[0] as usize] as u32;
-        let v1 = lookup[chunk[1] as usize] as u32;
-        let v2 = if chunk.len() > 2 && chunk[2] != b'=' { lookup[chunk[2] as usize] as u32 } else { 0 };
-        let v3 = if chunk.len() > 3 && chunk[3] != b'=' { lookup[chunk[3] as usize] as u32 } else { 0 };
+        if chunk.len() < 2 {
+            anyhow::bail!("base64 truncated: trailing chunk has {} bytes", chunk.len());
+        }
+        let v0 = valid_byte(chunk[0])? as u32;
+        let v1 = valid_byte(chunk[1])? as u32;
+        let v2 = if chunk.len() > 2 && chunk[2] != b'=' {
+            valid_byte(chunk[2])? as u32
+        } else { 0 };
+        let v3 = if chunk.len() > 3 && chunk[3] != b'=' {
+            valid_byte(chunk[3])? as u32
+        } else { 0 };
         out.push(((v0 << 2) | (v1 >> 4)) as u8);
         if chunk.len() > 2 && chunk[2] != b'=' {
             out.push(((v1 << 4) | (v2 >> 2)) as u8);

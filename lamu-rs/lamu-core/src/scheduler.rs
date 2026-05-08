@@ -42,7 +42,9 @@ impl VramScheduler {
         // (actual NVML-reported usage). Otherwise an orphan llama-server
         // that lamu didn't spawn would get reported as free VRAM, and
         // plan_load() would hand out a model that doesn't fit.
-        let registered: u32 = self.loaded.values().map(|m| m.vram_actual_mb).sum();
+        let registered: u32 = self.loaded.values()
+            .map(|m| m.vram_actual_mb)
+            .fold(0u32, |acc, v| acc.saturating_add(v));
         let (actual_used, _) = self.query_vram();
         let used = registered.max(actual_used);
         self.total_mb.saturating_sub(used).saturating_sub(self.reserved_mb)

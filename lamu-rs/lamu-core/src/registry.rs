@@ -73,12 +73,31 @@ fn parse_gguf_meta(path: &Path) -> Result<GgufMeta> {
         ..Default::default()
     };
 
+    // Per-string allocation cap. GGUF headers in practice contain
+    // strings of a few hundred bytes max (model names, arch tags). 4 MiB
+    // is far above realistic and well below DoS-via-OOM territory.
+    const MAX_STR_BYTES: u64 = 4 * 1024 * 1024;
+    // Sanity cap on integer offsets we hand to SeekFrom::Current. i64::MAX
+    // / 4 leaves headroom for `arr_len * 4` style multiplications below.
+    const MAX_SEEK: u64 = (i64::MAX as u64) / 4;
+
+    let read_capped_string = |r: &mut BufReader<File>, len: u64| -> Result<Vec<u8>> {
+        if len > MAX_STR_BYTES {
+            return Err(crate::Error::Backend(format!(
+                "GGUF string length {} exceeds {} byte cap",
+                len, MAX_STR_BYTES
+            )));
+        }
+        let mut buf = vec![0u8; len as usize];
+        r.read_exact(&mut buf)?;
+        Ok(buf)
+    };
+
     // Parse KV pairs (cap to 100 to avoid huge reads)
     let max_kv = std::cmp::min(n_kv, 100);
     for _ in 0..max_kv {
         let key_len = r.read_u64::<LittleEndian>()?;
-        let mut key_bytes = vec![0u8; key_len as usize];
-        r.read_exact(&mut key_bytes)?;
+        let key_bytes = read_capped_string(&mut r, key_len)?;
         let key = String::from_utf8_lossy(&key_bytes).into_owned();
 
         let val_type = r.read_u32::<LittleEndian>()?;
@@ -86,8 +105,7 @@ fn parse_gguf_meta(path: &Path) -> Result<GgufMeta> {
         match val_type {
             8 => {
                 let s_len = r.read_u64::<LittleEndian>()?;
-                let mut s_bytes = vec![0u8; s_len as usize];
-                r.read_exact(&mut s_bytes)?;
+                let s_bytes = read_capped_string(&mut r, s_len)?;
                 let val = String::from_utf8_lossy(&s_bytes).trim_end_matches('\0').to_string();
                 if key == "general.architecture" {
                     meta.arch = val.to_lowercase();
@@ -106,23 +124,43 @@ fn parse_gguf_meta(path: &Path) -> Result<GgufMeta> {
             9 => {
                 let arr_type = r.read_u32::<LittleEndian>()?;
                 let arr_len = r.read_u64::<LittleEndian>()?;
+                if arr_len > MAX_SEEK {
+                    return Err(crate::Error::Backend(format!(
+                        "GGUF array length {} exceeds seek cap", arr_len
+                    )));
+                }
                 match arr_type {
                     8 => {
                         let cap = std::cmp::min(arr_len, 5);
-                        let mut total_skip = 0u64;
                         for _ in 0..cap {
                             let sl = r.read_u64::<LittleEndian>()?;
+                            if sl > MAX_SEEK {
+                                return Err(crate::Error::Backend(format!(
+                                    "GGUF inner string {} exceeds seek cap", sl
+                                )));
+                            }
                             r.seek(SeekFrom::Current(sl as i64))?;
-                            total_skip += sl;
                         }
-                        let _ = total_skip;
-                        // skip remaining strings without reading lengths is hard — bail
                         if arr_len > cap {
                             break;
                         }
                     }
-                    4 | 5 => { r.seek(SeekFrom::Current((arr_len * 4) as i64))?; }
-                    6 => { r.seek(SeekFrom::Current((arr_len * 4) as i64))?; }
+                    4 | 5 => {
+                        let bytes = arr_len.checked_mul(4)
+                            .ok_or_else(|| crate::Error::Backend("array byte count overflow".into()))?;
+                        if bytes > MAX_SEEK {
+                            return Err(crate::Error::Backend("GGUF array seek overflow".into()));
+                        }
+                        r.seek(SeekFrom::Current(bytes as i64))?;
+                    }
+                    6 => {
+                        let bytes = arr_len.checked_mul(4)
+                            .ok_or_else(|| crate::Error::Backend("array byte count overflow".into()))?;
+                        if bytes > MAX_SEEK {
+                            return Err(crate::Error::Backend("GGUF array seek overflow".into()));
+                        }
+                        r.seek(SeekFrom::Current(bytes as i64))?;
+                    }
                     _ => break,
                 }
             }

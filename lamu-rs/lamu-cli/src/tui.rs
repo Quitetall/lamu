@@ -2151,7 +2151,7 @@ fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
 
     std::process::Command::new(&bin)
         .arg("-m").arg(&entry.path)
-        .arg("--host").arg("0.0.0.0")
+        .arg("--host").arg(std::env::var("LAMU_BIND_HOST").as_deref().unwrap_or("127.0.0.1"))
         .arg("--port").arg("8020")
         .arg("--ctx-size").arg(ctx.to_string())
         .arg("-ngl").arg("99")
