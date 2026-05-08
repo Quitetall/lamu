@@ -1366,9 +1366,9 @@ async fn handle_cloud_query(args: Value) -> String {
         if thinking_enabled {
             // Anthropic constraints: budget_tokens MUST be ≥ 1024 AND
             // ≤ max_tokens. If max_tokens ≤ 1024 there is no valid
-            // budget; silently skip the thinking block (the model will
-            // run without extended thinking — caller can retry with a
-            // larger max_tokens if they really wanted it).
+            // budget; skip the thinking block + log to stderr (the
+            // model will run without extended thinking — caller can
+            // retry with a larger max_tokens if they really wanted it).
             if max_tokens > 1024 {
                 let budget = (max_tokens / 2).max(1024).min(max_tokens - 1);
                 payload["thinking"] = json!({
