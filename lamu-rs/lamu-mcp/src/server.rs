@@ -150,7 +150,9 @@ impl LamuMcpServer {
         Ok(())
     }
 
-    async fn handle(&self, method: &str, params: Value, id: Option<Value>) -> Option<Value> {
+    /// Dispatch one JSON-RPC request. The stdio loop in `run()` calls
+    /// this; integration tests bypass stdio and call it directly.
+    pub async fn handle(&self, method: &str, params: Value, id: Option<Value>) -> Option<Value> {
         match method {
             "initialize" => Some(initialize_response(id)),
             "notifications/initialized" => None,
