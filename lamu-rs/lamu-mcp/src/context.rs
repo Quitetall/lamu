@@ -23,8 +23,15 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const CENTRAL_DEFAULT: &str = include_str!("../assets/central_review_policy.md");
+
+/// XDG override path: `~/.config/lamu/context/central.md`. When
+/// present + ≤ CENTRAL_MAX_OVERRIDE_BYTES, replaces the bundled
+/// default. Read once per process via OnceLock — leaked to keep
+/// `&'static str` identity for byte-prefix cache stability.
+const CENTRAL_MAX_OVERRIDE_BYTES: usize = 8 * 1024;
 
 /// Plan tier hard cap (~8K tokens). Truncate-from-front keeps the
 /// tail = newest plan content, since plan files grow downward.
@@ -71,9 +78,41 @@ pub struct ContextStats {
 }
 
 fn resolve_central() -> &'static str {
-    // Step 7 will add an XDG override here. For now the bundled
-    // default is the only source.
-    CENTRAL_DEFAULT
+    // Read the XDG override once per process and leak the String to a
+    // &'static so the prompt-cache prefix stays bit-identical across
+    // every call. If the override is missing / unreadable / oversized,
+    // fall through to the bundled default.
+    static OVERRIDE: OnceLock<Option<&'static str>> = OnceLock::new();
+    let override_text = OVERRIDE.get_or_init(|| {
+        let path = dirs::config_dir()?.join("lamu").join("context").join("central.md");
+        load_central_override_from(&path)
+    });
+    override_text.unwrap_or(CENTRAL_DEFAULT)
+}
+
+/// Read a candidate central-override file at `path`. Returns None when
+/// missing, unreadable, or oversized. Factored out of `resolve_central`
+/// so unit tests can exercise it without poisoning the OnceLock.
+fn load_central_override_from(path: &Path) -> Option<&'static str> {
+    let body = std::fs::read_to_string(path).ok()?;
+    if body.len() > CENTRAL_MAX_OVERRIDE_BYTES {
+        tracing::warn!(
+            "context: central override at {} is {} bytes (> {} limit); using bundled default",
+            path.display(),
+            body.len(),
+            CENTRAL_MAX_OVERRIDE_BYTES
+        );
+        return None;
+    }
+    tracing::debug!(
+        "context: loaded central override from {} ({} bytes)",
+        path.display(),
+        body.len()
+    );
+    // Leak so the &'static lifetime is honored. Read-once-per-process,
+    // so a single allocation persists for the lifetime of the binary —
+    // not a real leak, just a static-lifetime conversion.
+    Some(Box::leak(body.into_boxed_str()))
 }
 
 /// Resolve the plan tier source path in priority order:
@@ -372,6 +411,30 @@ mod tests {
             assert_eq!(stats.plan_source, PlanSource::None);
             assert_eq!(stats.plan_bytes, 0);
         });
+    }
+
+    #[test]
+    fn central_override_loads_when_present_and_within_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("central.md");
+        std::fs::write(&path, "OVERRIDE_BODY_MARK").unwrap();
+        let s = super::load_central_override_from(&path).expect("override should load");
+        assert_eq!(s, "OVERRIDE_BODY_MARK");
+    }
+
+    #[test]
+    fn central_override_skipped_when_missing() {
+        let path = std::path::PathBuf::from("/tmp/nonexistent-lamu-central-override.md");
+        assert!(super::load_central_override_from(&path).is_none());
+    }
+
+    #[test]
+    fn central_override_rejected_when_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.md");
+        let body: String = "X".repeat(CENTRAL_MAX_OVERRIDE_BYTES + 1);
+        std::fs::write(&path, &body).unwrap();
+        assert!(super::load_central_override_from(&path).is_none());
     }
 
     #[test]
