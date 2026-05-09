@@ -7,6 +7,7 @@
 //! Transport: JSON-RPC over stdio.
 
 pub mod cloud;
+pub mod context;
 pub mod handlers;
 pub mod server;
 pub mod tools;

@@ -368,10 +368,20 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     prompt.push_str(&diff_text);
     prompt.push_str("\n```\n");
 
+    let (system, _stats) = crate::context::prepend_to_system(
+        crate::context::ContextConfig {
+            central: true,
+            plan: None,        // Step 5 wires plan resolver
+            tactical: "",      // Step 6 wires tactical extension
+            repo: Some(std::path::Path::new(repo)),
+        },
+        REVIEW_SYSTEM_PROMPT,
+    );
+
     let review_args = json!({
         "model": "deepseek-v4-pro",
         "prompt": prompt,
-        "system": REVIEW_SYSTEM_PROMPT,
+        "system": system,
         "max_tokens": 8192,
         "temperature": 0.2,
         "include_reasoning": false,
@@ -402,10 +412,20 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
     prompt.push_str(&diff);
     prompt.push_str("\n```\n");
 
+    let (system, _stats) = crate::context::prepend_to_system(
+        crate::context::ContextConfig {
+            central: true,
+            plan: None,
+            tactical: "",
+            repo: None,        // review_diff doesn't carry a repo path
+        },
+        REVIEW_SYSTEM_PROMPT,
+    );
+
     let review_args = json!({
         "model": "deepseek-v4-pro",
         "prompt": prompt,
-        "system": REVIEW_SYSTEM_PROMPT,
+        "system": system,
         "max_tokens": 8192,
         "temperature": 0.2,
         "include_reasoning": false,
