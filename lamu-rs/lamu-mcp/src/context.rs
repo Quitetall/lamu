@@ -231,15 +231,19 @@ fn recent_activity_header(repo: &Path) -> String {
             return cached.clone();
         }
     }
+    // V6 M: cache-stable activity window. Skip the most recent 5
+    // commits (those land in the diff being reviewed anyway) so the
+    // header bytes don't rotate every commit. Cache prefix stays bit-
+    // identical across multiple commits being reviewed in a session.
     let out = std::process::Command::new("git")
         .current_dir(repo)
-        .args(["log", "--oneline", "-50"])
+        .args(["log", "--oneline", "-50", "--skip=5"])
         .output();
     let body = match out {
         Ok(o) if o.status.success() => {
             let log = String::from_utf8_lossy(&o.stdout);
             format!(
-                "## Recent activity (last 50 commits)\n\nUse this to ground the plan against what's already shipped — don't second-guess items that match a recent commit.\n\n```\n{}```",
+                "## Recent activity (commits 5–55 ago — cache-stable window)\n\nUse this to ground the plan against what's already shipped — don't second-guess items that match a recent commit. The most recent 5 commits are intentionally excluded; they land in the diff being reviewed itself.\n\n```\n{}```",
                 log
             )
         }

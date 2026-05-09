@@ -1,11 +1,11 @@
 # Graph Report - local-llm  (2026-05-09)
 
 ## Corpus Check
-- 176 files · ~120,447 words
+- 176 files · ~120,459 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2445 nodes · 6002 edges · 158 communities detected
+- 2445 nodes · 6002 edges · 157 communities detected
 - Extraction: 47% EXTRACTED · 53% INFERRED · 0% AMBIGUOUS · INFERRED: 3180 edges (avg confidence: 0.61)
 - Token cost: 0 input · 0 output
 
@@ -53,15 +53,15 @@
 - [[_COMMUNITY_Community 40|Community 40]]
 - [[_COMMUNITY_Community 41|Community 41]]
 - [[_COMMUNITY_Community 42|Community 42]]
-- [[_COMMUNITY_Community 43|Community 43]]
+- [[_COMMUNITY_Community 44|Community 44]]
 - [[_COMMUNITY_Community 45|Community 45]]
 - [[_COMMUNITY_Community 46|Community 46]]
 - [[_COMMUNITY_Community 47|Community 47]]
-- [[_COMMUNITY_Community 48|Community 48]]
+- [[_COMMUNITY_Community 49|Community 49]]
 - [[_COMMUNITY_Community 50|Community 50]]
 - [[_COMMUNITY_Community 51|Community 51]]
-- [[_COMMUNITY_Community 52|Community 52]]
-- [[_COMMUNITY_Community 55|Community 55]]
+- [[_COMMUNITY_Community 54|Community 54]]
+- [[_COMMUNITY_Community 77|Community 77]]
 - [[_COMMUNITY_Community 78|Community 78]]
 - [[_COMMUNITY_Community 79|Community 79]]
 - [[_COMMUNITY_Community 80|Community 80]]
@@ -167,7 +167,6 @@
 - [[_COMMUNITY_Community 180|Community 180]]
 - [[_COMMUNITY_Community 181|Community 181]]
 - [[_COMMUNITY_Community 182|Community 182]]
-- [[_COMMUNITY_Community 183|Community 183]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `ModelEntry` - 200 edges
@@ -197,83 +196,83 @@
 
 ### Community 0 - "Community 0"
 Cohesion: 0.03
-Nodes (262): LamuMetrics, Prometheus metrics for the OpenAI-compat layer.  All metrics live on a process-l, Pull instantaneous values into the gauges. Call from /metrics., Serialise to Prometheus text. Returns `(body, content_type)`., Bundle of collectors keyed to a single registry. The OpenAI compat     app holds, ChatRequest, create_app(), Message (+254 more)
+Nodes (263): LamuMetrics, Prometheus metrics for the OpenAI-compat layer.  All metrics live on a process-l, Pull instantaneous values into the gauges. Call from /metrics., Serialise to Prometheus text. Returns `(body, content_type)`., Bundle of collectors keyed to a single registry. The OpenAI compat     app holds, ChatRequest, create_app(), Message (+255 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.02
-Nodes (198): detect_ngram_support_blocking(), make_backend(), parse_inline(), render_markdown(), run(), test_write_then_load_roundtrip(), Corrupt YAML registry → load_registry raises (no silent fallback)., test_corrupt_yaml_raises() (+190 more)
+Nodes (196): detect_ngram_support_blocking(), make_backend(), parse_inline(), render_markdown(), run(), write_registry(), test_write_then_load_roundtrip(), Corrupt YAML registry → load_registry raises (no silent fallback). (+188 more)
 
 ### Community 2 - "Community 2"
 Cohesion: 0.02
-Nodes (122): get_config(), Return a LangChain RunnableConfig dict with active callbacks., compare(), load_swebench_tasks(), main(), Agentic benchmark runner — compare Opus solo vs swarm on coding tasks.  Three mo, Load SWE-bench Lite tasks. Requires swebench package., Run a task with just Opus (cloud-only, no local workers). (+114 more)
+Nodes (128): get_config(), Return a LangChain RunnableConfig dict with active callbacks., compare(), load_swebench_tasks(), main(), Agentic benchmark runner — compare Opus solo vs swarm on coding tasks.  Three mo, Load SWE-bench Lite tasks. Requires swebench package., Run a task with just Opus (cloud-only, no local workers). (+120 more)
 
 ### Community 3 - "Community 3"
-Cohesion: 0.04
-Nodes (99): Malformed GGUF — emitted via warnings.warn during scan., Think-block streaming buffer exceeded the configured cap (64 KB)., ReasoningOverflow, RegistryParseWarning, get_extractor(), NullReasoningExtractor, Reasoning extractor — per-model-family think-block detection and stripping., Handles think-block detection, stripping, and structured extraction.      Regist (+91 more)
+Cohesion: 0.03
+Nodes (86): alt_enter_inserts_newline(), brave_search(), chrono_or_timestamp(), ddg_search(), handle_key(), handle_mouse(), input_insert_advances_cursor_utf8(), plain_enter_does_not_newline() (+78 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.03
 Nodes (51): ABC, Backend, Backend, Backend protocol — interface that all model backends implement., Abstract base for model backends.      Each backend manages one model process (o, DflashBackend, build_llama_spawn(), build_llama_spawn_caps_ctx_via_env() (+43 more)
 
 ### Community 5 - "Community 5"
-Cohesion: 0.04
-Nodes (74): alt_enter_inserts_newline(), brave_search(), chrono_or_timestamp(), ddg_search(), handle_key(), handle_mouse(), input_insert_advances_cursor_utf8(), plain_enter_does_not_newline() (+66 more)
+Cohesion: 0.03
+Nodes (53): dedupe_tactical(), git_show_diff_or_empty(), handle_cloud_query(), handle_index_repo(), handle_recall_conversation(), handle_review_commit(), handle_review_diff(), handle_search_repo() (+45 more)
 
 ### Community 6 - "Community 6"
-Cohesion: 0.03
-Nodes (50): dedupe_tactical(), git_show_diff_or_empty(), handle_index_repo(), handle_recall_conversation(), handle_review_commit(), handle_search_repo(), hash_shingle(), is_safe_git_ref() (+42 more)
+Cohesion: 0.06
+Nodes (91): Malformed GGUF — emitted via warnings.warn during scan., Think-block streaming buffer exceeded the configured cap (64 KB)., ReasoningOverflow, RegistryParseWarning, get_extractor(), NullReasoningExtractor, Reasoning extractor — per-model-family think-block detection and stripping., Handles think-block detection, stripping, and structured extraction.      Regist (+83 more)
 
 ### Community 7 - "Community 7"
-Cohesion: 0.05
-Nodes (62): Tests for agents.trainer — pure helpers (collect/status/prepare)., Phase C: MissingDependency exists for ImportError propagation., test_collect_writes_json(), test_missing_dependency_class_exists(), collect(), export(), main(), prepare() (+54 more)
+Cohesion: 0.04
+Nodes (52): metrics(), sched(), test_health_state_gauge_uses_numeric_encoding(), test_queue_depth_gauge_per_model(), test_render_contains_lamu_metrics(), test_vram_total_gauge_reflects_scheduler(), test_dead_threshold_at_three(), test_first_error_promotes_to_degraded() (+44 more)
 
 ### Community 8 - "Community 8"
 Cohesion: 0.04
-Nodes (55): BaseModel, apply_chat_template(), aread_tokens(), chat_completions(), ChatRequest, get_tokenizer(), DFlash server for 24 GB GPUs (RTX 4090) with VRAM park/unpark dance.  The stock, Send command to daemon stdin. (+47 more)
+Nodes (53): test_handle_list_models_lists_all(), test_handle_load_model_already_loaded(), test_handle_load_model_unknown(), test_handle_plan_query_capability_invalid_raises(), test_handle_plan_query_serializes_decision(), test_handle_query_generates(), test_handle_query_no_model(), test_handle_query_not_loaded() (+45 more)
 
 ### Community 9 - "Community 9"
 Cohesion: 0.04
-Nodes (53): test_handle_list_models_lists_all(), test_handle_load_model_already_loaded(), test_handle_load_model_unknown(), test_handle_plan_query_capability_invalid_raises(), test_handle_plan_query_serializes_decision(), test_handle_query_generates(), test_handle_query_no_model(), test_handle_query_not_loaded() (+45 more)
-
-### Community 10 - "Community 10"
-Cohesion: 0.04
 Nodes (47): BaseDataLayer, BackendTimeout, ConfigError, DataLayerError, LamuError, Typed exception hierarchy for LAMU.  Every place the codebase used to write `exc, Root of every LAMU exception. Never raise directly — use a subclass., Invalid or missing configuration. (+39 more)
 
-### Community 11 - "Community 11"
+### Community 10 - "Community 10"
 Cohesion: 0.05
-Nodes (45): metrics(), sched(), test_health_state_gauge_uses_numeric_encoding(), test_queue_depth_gauge_per_model(), test_render_contains_lamu_metrics(), test_vram_total_gauge_reflects_scheduler(), test_dead_threshold_at_three(), test_first_error_promotes_to_degraded() (+37 more)
+Nodes (56): Tests for agents.trainer — pure helpers (collect/status/prepare)., Phase C: MissingDependency exists for ImportError propagation., test_collect_writes_json(), test_missing_dependency_class_exists(), collect(), export(), main(), prepare() (+48 more)
 
-### Community 12 - "Community 12"
+### Community 11 - "Community 11"
 Cohesion: 0.04
 Nodes (41): sched(), test_available_mb_subtracts_reserved_and_loaded(), test_budget_snapshot_shape(), test_can_fit_false_when_full(), test_can_fit_true_when_room(), test_is_loaded_only_when_state_is_loaded(), test_loaded_models_listing(), test_mark_loading_then_confirm() (+33 more)
 
-### Community 13 - "Community 13"
+### Community 12 - "Community 12"
 Cohesion: 0.05
 Nodes (46): Tests for lamu.core.config — path constants + ports., test_ports_distinct_and_in_range(), test_null_extractor_passthrough(), test_stream_filter_no_reasoning_block(), test_scan_directory_finds_gguf(), chat(), get_default(), LocalLLM (+38 more)
 
-### Community 14 - "Community 14"
+### Community 13 - "Community 13"
 Cohesion: 0.04
 Nodes (47): corpus(), _load_corpus(), normalise(), python_mcp_cmd(), Shared scaffolding for cross-language MCP contract tests.  Spawn either Python o, Strip fields that legitimately differ between implementations.      - `id`: drop, How to launch the Python MCP server.      Uses the project venv's interpreter; s, How to launch the Rust MCP server.      Looks for the release binary; skips when (+39 more)
 
+### Community 14 - "Community 14"
+Cohesion: 0.05
+Nodes (43): BaseModel, AnthropicMessage, AnthropicMessagesRequest, build_app(), ChatMessage, ChatRequest, main(), _parse_tool_calls() (+35 more)
+
 ### Community 15 - "Community 15"
 Cohesion: 0.05
-Nodes (46): Command, filter_think(), handle_command(), http_get_json(), iter_sse_deltas(), main(), Message, parse_command() (+38 more)
+Nodes (44): Command, filter_think(), handle_command(), http_get_json(), iter_sse_deltas(), main(), Message, parse_command() (+36 more)
 
 ### Community 16 - "Community 16"
-Cohesion: 0.07
-Nodes (28): emit(), new_trace_id(), Single funnel for structured events. Stderr by default; optional file sink.  Eve, Emit a structured event.      Stderr always gets a single JSON line. If LAMU_EVE, Generate a 16-hex-char trace id. Compatible with W3C TraceContext     middle 16, Tests for lamu.core.observability — structured event sink., A broken file sink must not block the stderr emit., test_emit_appends_to_file_sink() (+20 more)
+Cohesion: 0.06
+Nodes (29): emit(), new_trace_id(), Single funnel for structured events. Stderr by default; optional file sink.  Eve, Emit a structured event.      Stderr always gets a single JSON line. If LAMU_EVE, Generate a 16-hex-char trace id. Compatible with W3C TraceContext     middle 16, Tests for lamu.core.observability — structured event sink., A broken file sink must not block the stderr emit., test_emit_appends_to_file_sink() (+21 more)
 
 ### Community 17 - "Community 17"
-Cohesion: 0.09
-Nodes (15): anthropic_beta_header(), trims_trailing_newline(), anthropic_payload_promotes_system(), anthropic_payload_skips_empty_text_block(), anthropic_payload_text_then_tool_block(), anthropic_payload_tool_blocks(), anthropic_payload_uses_input_schema(), build_anthropic_payload() (+7 more)
+Cohesion: 0.08
+Nodes (16): call_tool(), _chat(), _discover_models(), MCP server — exposes all local LLMs as tools for Claude Code (or any MCP client), Probe all known endpoints and return available models., Probe all known endpoints and return available models., Send a chat completion to Bifrost (routes to the right backend)., Send a chat completion to Bifrost (routes to the right backend). (+8 more)
 
 ### Community 18 - "Community 18"
 Cohesion: 0.08
 Nodes (24): ModuleType, _ensure_real_class(), fake_completed_process(), _install_stub(), _is_marked(), make_gguf_bytes(), mock_nvidia_smi(), no_real_subprocess() (+16 more)
 
 ### Community 19 - "Community 19"
-Cohesion: 0.08
-Nodes (16): call_tool(), _chat(), _discover_models(), MCP server — exposes all local LLMs as tools for Claude Code (or any MCP client), Probe all known endpoints and return available models., Probe all known endpoints and return available models., Send a chat completion to Bifrost (routes to the right backend)., Send a chat completion to Bifrost (routes to the right backend). (+8 more)
+Cohesion: 0.14
+Nodes (22): blob_to_vec(), chunk_text(), chunk_text_preserves_full_body(), chunk_text_respects_max(), cosine(), cosine_identical_is_one(), embed_batch(), embed_one() (+14 more)
 
 ### Community 20 - "Community 20"
 Cohesion: 0.1
@@ -332,88 +331,88 @@ Cohesion: 0.17
 Nodes (5): Tests for lamu.daemon — CLI dispatch., All probe ports refused — current bare-except prints '⚪ :port'.     Phase C will, Phase C: cmd_status uses typed catches. RuntimeError is NOT in the     expected, test_cmd_status_no_running_servers(), test_cmd_status_typed_errors()
 
 ### Community 34 - "Community 34"
-Cohesion: 0.44
-Nodes (7): health_state_gauge_uses_numeric_encoding(), health_to_numeric(), LamuMetrics, quarantine_force_updates_health_struct(), queue_depth_gauge_per_model(), render_contains_lamu_series(), request_counter_increments()
-
-### Community 35 - "Community 35"
 Cohesion: 0.29
 Nodes (5): Tests for agents.base — env loading + langfuse handler., Smoke: agents.base loads even when langfuse keys absent., Phase C: agents.base exposes a public `tracing_enabled` bool., test_module_imports(), test_tracing_disabled_flag_when_init_fails()
 
-### Community 36 - "Community 36"
+### Community 35 - "Community 35"
 Cohesion: 0.33
 Nodes (5): backend_error_response(), no_backend_response(), HTTP error helpers for the OpenAI-compat layer.  Every routing/backend failure f, Build a 503 the client can act on.      Args:         reason: human-readable exp, Backend reachable but request failed — 502 Bad Gateway by default.
 
-### Community 37 - "Community 37"
+### Community 36 - "Community 36"
 Cohesion: 0.33
 Nodes (1): Tests for agents.bench — task harness + compare.
 
-### Community 38 - "Community 38"
+### Community 37 - "Community 37"
 Cohesion: 0.33
 Nodes (3): Tests for server.poincare — knowledge-graph viz (smoke only)., Currently raises FileNotFoundError or similar — pin behavior., test_load_graphify_json_missing()
 
-### Community 39 - "Community 39"
+### Community 38 - "Community 38"
 Cohesion: 0.4
 Nodes (5): loader(), GPU-bound server modules — smoke import only.  Marked `gpu`. CI skips by default, Return a function that loads server/<name>.py under sys.modules['<name>']., Smoke: module loads under stub'd heavy imports., test_module_imports()
 
-### Community 40 - "Community 40"
+### Community 39 - "Community 39"
 Cohesion: 0.5
 Nodes (3): scripts/ — smoke import test only (GPU-bound).  These scripts use torch/transfor, Verify the file at least parses — guards against syntax-error regressions., test_script_compiles()
 
-### Community 41 - "Community 41"
+### Community 40 - "Community 40"
 Cohesion: 0.5
 Nodes (3): _mark_slow(), Integration-test fixtures (slow, end-to-end-ish)., All tests under tests/integration/ get the `slow` marker implicitly.
 
-### Community 42 - "Community 42"
+### Community 41 - "Community 41"
 Cohesion: 1.0
 Nodes (1): SGLang launcher with qwen35 GGUF patch. Applies the monkey-patch then starts SGL
 
-### Community 43 - "Community 43"
+### Community 42 - "Community 42"
 Cohesion: 1.0
 Nodes (1): Monkey-patch transformers to support qwen35 GGUF architecture.  Qwen3.5/3.6 uses
 
-### Community 45 - "Community 45"
+### Community 44 - "Community 44"
 Cohesion: 1.0
 Nodes (1): Runs inside the container — quantizes the heretic model to W4A16 compressed-tens
 
-### Community 46 - "Community 46"
+### Community 45 - "Community 45"
 Cohesion: 1.0
 Nodes (1): Generate EAGLE training data from the model's own code completions.  No external
 
-### Community 47 - "Community 47"
+### Community 46 - "Community 46"
 Cohesion: 1.0
 Nodes (1): Allow `python -m lamu` invocation.
 
-### Community 48 - "Community 48"
+### Community 47 - "Community 47"
 Cohesion: 1.0
 Nodes (1): Configuration constants and paths.
 
-### Community 50 - "Community 50"
+### Community 49 - "Community 49"
 Cohesion: 1.0
 Nodes (1): Predict next n_draft tokens from a single hidden state vector.
 
-### Community 51 - "Community 51"
+### Community 50 - "Community 50"
 Cohesion: 1.0
 Nodes (1): Generate tokens with speculative decoding.
 
-### Community 52 - "Community 52"
+### Community 51 - "Community 51"
 Cohesion: 1.0
 Nodes (1): Generate n_draft tokens autoregressively.
 
-### Community 55 - "Community 55"
+### Community 54 - "Community 54"
 Cohesion: 1.0
 Nodes (1): True only if state is HEALTHY or DEGRADED.          DEGRADED still routes — give
 
-### Community 78 - "Community 78"
+### Community 77 - "Community 77"
 Cohesion: 1.0
 Nodes (1): Currently swallows everything to []. Phase C will narrow to URLError.
 
-### Community 79 - "Community 79"
+### Community 78 - "Community 78"
 Cohesion: 1.0
 Nodes (1): Pinned: function should print without crashing even if every endpoint fails.
 
-### Community 80 - "Community 80"
+### Community 79 - "Community 79"
 Cohesion: 1.0
 Nodes (1): Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a
+
+### Community 80 - "Community 80"
+Cohesion: 1.0
+Nodes (1): # TODO: backend pool (lazy init on first load)
 
 ### Community 81 - "Community 81"
 Cohesion: 1.0
@@ -421,67 +420,67 @@ Nodes (1): # TODO: backend pool (lazy init on first load)
 
 ### Community 82 - "Community 82"
 Cohesion: 1.0
-Nodes (1): # TODO: backend pool (lazy init on first load)
+Nodes (1): REPL state. Mutable container — NOT frozen.
 
 ### Community 83 - "Community 83"
 Cohesion: 1.0
-Nodes (1): REPL state. Mutable container — NOT frozen.
+Nodes (1): Parse '/cmd args...' into (Command, rest). None if not a command.
 
 ### Community 84 - "Community 84"
 Cohesion: 1.0
-Nodes (1): Parse '/cmd args...' into (Command, rest). None if not a command.
+Nodes (1): Send chat completion request, stream response, return assistant message.      Re
 
 ### Community 85 - "Community 85"
 Cohesion: 1.0
-Nodes (1): Send chat completion request, stream response, return assistant message.      Re
+Nodes (1): Yield delta content strings from an OpenAI SSE stream.
 
 ### Community 86 - "Community 86"
 Cohesion: 1.0
-Nodes (1): Yield delta content strings from an OpenAI SSE stream.
+Nodes (1): Strip <think>...</think> from a chunk if not show_thinking.      `in_think_ref`
 
 ### Community 87 - "Community 87"
 Cohesion: 1.0
-Nodes (1): Strip <think>...</think> from a chunk if not show_thinking.      `in_think_ref`
+Nodes (1): Remove all <think>...</think> blocks from text.
 
 ### Community 88 - "Community 88"
 Cohesion: 1.0
-Nodes (1): Remove all <think>...</think> blocks from text.
+Nodes (1): Run slash command. Return False if REPL should exit.
 
 ### Community 89 - "Community 89"
 Cohesion: 1.0
-Nodes (1): Run slash command. Return False if REPL should exit.
+Nodes (1): # TODO: backend pool (lazy init on first load)
 
 ### Community 90 - "Community 90"
 Cohesion: 1.0
-Nodes (1): # TODO: backend pool (lazy init on first load)
+Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
 
 ### Community 91 - "Community 91"
 Cohesion: 1.0
-Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
+Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
 
 ### Community 92 - "Community 92"
 Cohesion: 1.0
-Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
+Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
 
 ### Community 93 - "Community 93"
 Cohesion: 1.0
-Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
+Nodes (1): Path that points to a not-yet-existing registry YAML.
 
 ### Community 94 - "Community 94"
 Cohesion: 1.0
-Nodes (1): Path that points to a not-yet-existing registry YAML.
+Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
 
 ### Community 95 - "Community 95"
 Cohesion: 1.0
-Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
+Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
 
 ### Community 96 - "Community 96"
 Cohesion: 1.0
-Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
+Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
 
 ### Community 97 - "Community 97"
 Cohesion: 1.0
-Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
+Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
 
 ### Community 98 - "Community 98"
 Cohesion: 1.0
@@ -489,341 +488,337 @@ Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
 
 ### Community 99 - "Community 99"
 Cohesion: 1.0
-Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
+Nodes (1): Real ModuleType so Python's import machinery accepts __spec__/__path__.
 
 ### Community 100 - "Community 100"
 Cohesion: 1.0
-Nodes (1): Real ModuleType so Python's import machinery accepts __spec__/__path__.
+Nodes (1): Install a permissive stub module so `from x.y import Z` works.
 
 ### Community 101 - "Community 101"
 Cohesion: 1.0
-Nodes (1): Install a permissive stub module so `from x.y import Z` works.
+Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
 
 ### Community 102 - "Community 102"
 Cohesion: 1.0
-Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
+Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
 
 ### Community 103 - "Community 103"
 Cohesion: 1.0
-Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
+Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
 
 ### Community 104 - "Community 104"
 Cohesion: 1.0
-Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
+Nodes (1): Path that points to a not-yet-existing registry YAML.
 
 ### Community 105 - "Community 105"
 Cohesion: 1.0
-Nodes (1): Path that points to a not-yet-existing registry YAML.
+Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
 
 ### Community 106 - "Community 106"
 Cohesion: 1.0
-Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
+Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
 
 ### Community 107 - "Community 107"
 Cohesion: 1.0
-Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
+Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
 
 ### Community 108 - "Community 108"
 Cohesion: 1.0
-Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
+Nodes (1): In-memory sqlite3 connection.
 
 ### Community 109 - "Community 109"
 Cohesion: 1.0
-Nodes (1): In-memory sqlite3 connection.
+Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
 
 ### Community 110 - "Community 110"
 Cohesion: 1.0
-Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
+Nodes (1): Real ModuleType so Python's import machinery accepts __spec__/__path__.
 
 ### Community 111 - "Community 111"
 Cohesion: 1.0
-Nodes (1): Real ModuleType so Python's import machinery accepts __spec__/__path__.
+Nodes (1): Install a permissive stub module so `from x.y import Z` works.
 
 ### Community 112 - "Community 112"
 Cohesion: 1.0
-Nodes (1): Install a permissive stub module so `from x.y import Z` works.
+Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
 
 ### Community 113 - "Community 113"
 Cohesion: 1.0
-Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
+Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
 
 ### Community 114 - "Community 114"
 Cohesion: 1.0
-Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
+Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
 
 ### Community 115 - "Community 115"
 Cohesion: 1.0
-Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
+Nodes (1): Path that points to a not-yet-existing registry YAML.
 
 ### Community 116 - "Community 116"
 Cohesion: 1.0
-Nodes (1): Path that points to a not-yet-existing registry YAML.
+Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
 
 ### Community 117 - "Community 117"
 Cohesion: 1.0
-Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
+Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
 
 ### Community 118 - "Community 118"
 Cohesion: 1.0
-Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
+Nodes (1): In-memory sqlite3 connection.
 
 ### Community 119 - "Community 119"
 Cohesion: 1.0
-Nodes (1): In-memory sqlite3 connection.
+Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
 
 ### Community 120 - "Community 120"
 Cohesion: 1.0
-Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
+Nodes (1): Real ModuleType so Python's import machinery accepts __spec__/__path__.
 
 ### Community 121 - "Community 121"
 Cohesion: 1.0
-Nodes (1): Real ModuleType so Python's import machinery accepts __spec__/__path__.
+Nodes (1): Install a permissive stub module so `from x.y import Z` works.
 
 ### Community 122 - "Community 122"
 Cohesion: 1.0
-Nodes (1): Install a permissive stub module so `from x.y import Z` works.
+Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
 
 ### Community 123 - "Community 123"
 Cohesion: 1.0
-Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
+Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
 
 ### Community 124 - "Community 124"
 Cohesion: 1.0
-Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
+Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
 
 ### Community 125 - "Community 125"
 Cohesion: 1.0
-Nodes (1): Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.
+Nodes (1): Path that points to a not-yet-existing registry YAML.
 
 ### Community 126 - "Community 126"
 Cohesion: 1.0
-Nodes (1): Path that points to a not-yet-existing registry YAML.
+Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
 
 ### Community 127 - "Community 127"
 Cohesion: 1.0
-Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
+Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
 
 ### Community 128 - "Community 128"
 Cohesion: 1.0
-Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
+Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
 
 ### Community 129 - "Community 129"
 Cohesion: 1.0
-Nodes (1): Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th
+Nodes (1): In-memory sqlite3 connection.
 
 ### Community 130 - "Community 130"
 Cohesion: 1.0
-Nodes (1): In-memory sqlite3 connection.
+Nodes (1): Load cli/chat_repl.py as a regular module (no package init present).
 
 ### Community 131 - "Community 131"
 Cohesion: 1.0
-Nodes (1): Load cli/chat_repl.py as a regular module (no package init present).
+Nodes (1): Currently swallows everything to []. Phase C will narrow to URLError.
 
 ### Community 132 - "Community 132"
 Cohesion: 1.0
-Nodes (1): Currently swallows everything to []. Phase C will narrow to URLError.
+Nodes (1): Pinned: function should print without crashing even if every endpoint fails.
 
 ### Community 133 - "Community 133"
 Cohesion: 1.0
-Nodes (1): Pinned: function should print without crashing even if every endpoint fails.
+Nodes (1): Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a
 
 ### Community 134 - "Community 134"
 Cohesion: 1.0
-Nodes (1): Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a
+Nodes (1): Import web/app.py — it does `from data_layer import ...` so the web/     directo
 
 ### Community 135 - "Community 135"
 Cohesion: 1.0
-Nodes (1): Import web/app.py — it does `from data_layer import ...` so the web/     directo
+Nodes (1): python_repl is decorated with @tool → StructuredTool. Unwrap to .func.
 
 ### Community 136 - "Community 136"
 Cohesion: 1.0
-Nodes (1): python_repl is decorated with @tool → StructuredTool. Unwrap to .func.
+Nodes (1): Phase C: error message includes exception class name so the model     can act on
 
 ### Community 137 - "Community 137"
 Cohesion: 1.0
-Nodes (1): Phase C: error message includes exception class name so the model     can act on
+Nodes (1): python_repl is a model-facing tool — syntax errors come back as text     so the
 
 ### Community 138 - "Community 138"
 Cohesion: 1.0
-Nodes (1): python_repl is a model-facing tool — syntax errors come back as text     so the
+Nodes (1): Extract hidden state at position `pos` using llama_get_embeddings_ith.     Does
 
 ### Community 139 - "Community 139"
 Cohesion: 1.0
-Nodes (1): Extract hidden state at position `pos` using llama_get_embeddings_ith.     Does
+Nodes (1): Minimal client for the local LLM stack. Zero dependencies beyond stdlib.
 
 ### Community 140 - "Community 140"
 Cohesion: 1.0
-Nodes (1): Minimal client for the local LLM stack. Zero dependencies beyond stdlib.
+Nodes (1): List available model IDs by probing all known local endpoints.
 
 ### Community 141 - "Community 141"
 Cohesion: 1.0
-Nodes (1): List available model IDs by probing all known local endpoints.
+Nodes (1): Send a chat completion. Returns the response text.          Args:             pr
 
 ### Community 142 - "Community 142"
 Cohesion: 1.0
-Nodes (1): Send a chat completion. Returns the response text.          Args:             pr
+Nodes (1): Send a multi-turn conversation. Returns the response text.
 
 ### Community 143 - "Community 143"
 Cohesion: 1.0
-Nodes (1): Send a multi-turn conversation. Returns the response text.
+Nodes (1): Stream tokens from a chat completion.
 
 ### Community 144 - "Community 144"
 Cohesion: 1.0
-Nodes (1): Stream tokens from a chat completion.
+Nodes (1): Check if the LLM backend is reachable.
 
 ### Community 145 - "Community 145"
 Cohesion: 1.0
-Nodes (1): Check if the LLM backend is reachable.
+Nodes (1): Get detailed health status of all known endpoints.
 
 ### Community 146 - "Community 146"
 Cohesion: 1.0
-Nodes (1): Get detailed health status of all known endpoints.
+Nodes (1): Quick one-liner: `from server.client import chat; print(chat("hi"))`
 
 ### Community 147 - "Community 147"
 Cohesion: 1.0
-Nodes (1): Quick one-liner: `from server.client import chat; print(chat("hi"))`
+Nodes (1): Probe all endpoints, return {endpoint_name: [model_ids]}.
 
 ### Community 148 - "Community 148"
 Cohesion: 1.0
-Nodes (1): Probe all endpoints, return {endpoint_name: [model_ids]}.
+Nodes (1): Return flat list of available model names from all endpoints.
 
 ### Community 149 - "Community 149"
 Cohesion: 1.0
-Nodes (1): Return flat list of available model names from all endpoints.
+Nodes (1): Start the LLM stack if nothing is running.
 
 ### Community 150 - "Community 150"
 Cohesion: 1.0
-Nodes (1): Start the LLM stack if nothing is running.
+Nodes (1): Stream from backend, buffer silently. Returns (reply, think).
 
 ### Community 151 - "Community 151"
 Cohesion: 1.0
-Nodes (1): Stream from backend, buffer silently. Returns (reply, think).
+Nodes (1): List available models.
 
 ### Community 152 - "Community 152"
 Cohesion: 1.0
-Nodes (1): List available models.
+Nodes (1): Return a LangChain RunnableConfig dict with active callbacks.
 
 ### Community 153 - "Community 153"
 Cohesion: 1.0
-Nodes (1): Return a LangChain RunnableConfig dict with active callbacks.
+Nodes (1): Merge LoRA + export to GGUF (for DFlash) or HF format (for vLLM).
 
 ### Community 154 - "Community 154"
 Cohesion: 1.0
-Nodes (1): Merge LoRA + export to GGUF (for DFlash) or HF format (for vLLM).
+Nodes (1): Cloud model reviews passing implementation.
 
 ### Community 155 - "Community 155"
 Cohesion: 1.0
-Nodes (1): Cloud model reviews passing implementation.
+Nodes (1): Final step — save training data for future fine-tuning.
 
 ### Community 156 - "Community 156"
 Cohesion: 1.0
-Nodes (1): Final step — save training data for future fine-tuning.
+Nodes (1): Terminal — swarm exhausted retries.
 
 ### Community 157 - "Community 157"
 Cohesion: 1.0
-Nodes (1): Terminal — swarm exhausted retries.
+Nodes (1): Persist successful (task → implementation) pair for fine-tuning.
 
 ### Community 158 - "Community 158"
 Cohesion: 1.0
-Nodes (1): Persist successful (task → implementation) pair for fine-tuning.
+Nodes (1): Run the full swarm on a task. Returns final state.
 
 ### Community 159 - "Community 159"
 Cohesion: 1.0
-Nodes (1): Run the full swarm on a task. Returns final state.
+Nodes (1): Compare two benchmark runs side by side.
 
 ### Community 160 - "Community 160"
 Cohesion: 1.0
-Nodes (1): Compare two benchmark runs side by side.
+Nodes (1): # TODO: backend pool (lazy init on first load)
 
 ### Community 161 - "Community 161"
 Cohesion: 1.0
-Nodes (1): # TODO: backend pool (lazy init on first load)
+Nodes (1): Install a permissive MagicMock module under the given name.
 
 ### Community 162 - "Community 162"
 Cohesion: 1.0
-Nodes (1): Install a permissive MagicMock module under the given name.
+Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
 
 ### Community 163 - "Community 163"
 Cohesion: 1.0
-Nodes (1): Build a minimal but parseable GGUF blob.      truncate: if set, return only firs
+Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
 
 ### Community 164 - "Community 164"
 Cohesion: 1.0
-Nodes (1): Return the make_gguf_bytes helper for tests that want custom GGUFs.
+Nodes (1): Path that points to a not-yet-existing registry YAML.
 
 ### Community 165 - "Community 165"
 Cohesion: 1.0
-Nodes (1): Path that points to a not-yet-existing registry YAML.
+Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
 
 ### Community 166 - "Community 166"
 Cohesion: 1.0
-Nodes (1): Build a fake subprocess.CompletedProcess with given stdout.
+Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
 
 ### Community 167 - "Community 167"
 Cohesion: 1.0
-Nodes (1): Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.
+Nodes (1): In-memory sqlite3 connection.
 
 ### Community 168 - "Community 168"
 Cohesion: 1.0
-Nodes (1): In-memory sqlite3 connection.
+Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
 
 ### Community 169 - "Community 169"
 Cohesion: 1.0
-Nodes (1): Auto-skip GPU tests when CUDA toolkit absent.
+Nodes (1): Phase C target: cmd_status must NOT swallow arbitrary exceptions.     Picking a
 
 ### Community 170 - "Community 170"
 Cohesion: 1.0
-Nodes (1): Phase C target: cmd_status must NOT swallow arbitrary exceptions.     Picking a
+Nodes (1): Phase C target: agents.base must expose a public `tracing_enabled` boolean.
 
 ### Community 171 - "Community 171"
 Cohesion: 1.0
-Nodes (1): Phase C target: agents.base must expose a public `tracing_enabled` boolean.
+Nodes (1): Phase C: test_runner_node must raise SwarmStepError if pytest itself errors.
 
 ### Community 172 - "Community 172"
 Cohesion: 1.0
-Nodes (1): Phase C: test_runner_node must raise SwarmStepError if pytest itself errors.
+Nodes (1): Phase C: probe_endpoint should not catch arbitrary RuntimeError.
 
 ### Community 173 - "Community 173"
 Cohesion: 1.0
-Nodes (1): Phase C: probe_endpoint should not catch arbitrary RuntimeError.
+Nodes (1): update_thread should persist a row that subsequent calls can read.
 
 ### Community 174 - "Community 174"
 Cohesion: 1.0
-Nodes (1): update_thread should persist a row that subsequent calls can read.
+Nodes (1): All tests under tests/integration/ get the `slow` marker implicitly.
 
 ### Community 175 - "Community 175"
 Cohesion: 1.0
-Nodes (1): All tests under tests/integration/ get the `slow` marker implicitly.
+Nodes (1): # TODO: backend pool (lazy init on first load)
 
 ### Community 176 - "Community 176"
 Cohesion: 1.0
-Nodes (1): # TODO: backend pool (lazy init on first load)
+Nodes (1): Snapshot of VRAM allocation.
 
 ### Community 177 - "Community 177"
 Cohesion: 1.0
-Nodes (1): Snapshot of VRAM allocation.
+Nodes (1): List available models.
 
 ### Community 178 - "Community 178"
 Cohesion: 1.0
-Nodes (1): List available models.
+Nodes (1): Probe all endpoints, return {endpoint_name: [model_ids]}.
 
 ### Community 179 - "Community 179"
 Cohesion: 1.0
-Nodes (1): Probe all endpoints, return {endpoint_name: [model_ids]}.
+Nodes (1): Return flat list of Bifrost-routable model names.
 
 ### Community 180 - "Community 180"
 Cohesion: 1.0
-Nodes (1): Return flat list of Bifrost-routable model names.
+Nodes (1): Start the LLM stack if nothing is running.
 
 ### Community 181 - "Community 181"
 Cohesion: 1.0
-Nodes (1): Start the LLM stack if nothing is running.
-
-### Community 182 - "Community 182"
-Cohesion: 1.0
 Nodes (1): Stream from backend, buffer silently. Returns (reply, think).
 
-### Community 183 - "Community 183"
+### Community 182 - "Community 182"
 Cohesion: 1.0
 Nodes (1): List available models.
 
@@ -832,249 +827,249 @@ Nodes (1): List available models.
   These have ≤1 connection - possible missing edges or undocumented components.
 - **Thin community `Community 28`** (16 nodes): `state.rs`, `AppState`, `.model_deployed()`, `.move_cursor()`, `.move_launcher()`, `.move_mcp()`, `.move_settings()`, `.recompute_views()`, `.selected_cloud()`, `.selected_entry()`, `.selected_harness()`, `.selected_harness_orig_idx()`, `.selected_mcp_idx()`, `.selected_name()`, `.selected_ref()`, `.settings_items()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 37`** (6 nodes): `Tests for agents.bench — task harness + compare.`, `test_builtin_tasks_have_required_keys()`, `test_compare_handles_missing_dir()`, `test_compare_with_two_runs()`, `test_module_imports()`, `test_bench.py`
+- **Thin community `Community 36`** (6 nodes): `Tests for agents.bench — task harness + compare.`, `test_builtin_tasks_have_required_keys()`, `test_compare_handles_missing_dir()`, `test_compare_with_two_runs()`, `test_module_imports()`, `test_bench.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 42`** (2 nodes): `sglang_launcher.py`, `SGLang launcher with qwen35 GGUF patch. Applies the monkey-patch then starts SGL`
+- **Thin community `Community 41`** (2 nodes): `sglang_launcher.py`, `SGLang launcher with qwen35 GGUF patch. Applies the monkey-patch then starts SGL`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 43`** (2 nodes): `patch_gguf_qwen35.py`, `Monkey-patch transformers to support qwen35 GGUF architecture.  Qwen3.5/3.6 uses`
+- **Thin community `Community 42`** (2 nodes): `patch_gguf_qwen35.py`, `Monkey-patch transformers to support qwen35 GGUF architecture.  Qwen3.5/3.6 uses`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 45`** (2 nodes): `quantize_inner.py`, `Runs inside the container — quantizes the heretic model to W4A16 compressed-tens`
+- **Thin community `Community 44`** (2 nodes): `quantize_inner.py`, `Runs inside the container — quantizes the heretic model to W4A16 compressed-tens`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 46`** (2 nodes): `gen_eagle_data.py`, `Generate EAGLE training data from the model's own code completions.  No external`
+- **Thin community `Community 45`** (2 nodes): `gen_eagle_data.py`, `Generate EAGLE training data from the model's own code completions.  No external`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 47`** (2 nodes): `__main__.py`, `Allow `python -m lamu` invocation.`
+- **Thin community `Community 46`** (2 nodes): `__main__.py`, `Allow `python -m lamu` invocation.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 48`** (2 nodes): `Configuration constants and paths.`, `config.py`
+- **Thin community `Community 47`** (2 nodes): `Configuration constants and paths.`, `config.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 50`** (1 nodes): `Predict next n_draft tokens from a single hidden state vector.`
+- **Thin community `Community 49`** (1 nodes): `Predict next n_draft tokens from a single hidden state vector.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 51`** (1 nodes): `Generate tokens with speculative decoding.`
+- **Thin community `Community 50`** (1 nodes): `Generate tokens with speculative decoding.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 52`** (1 nodes): `Generate n_draft tokens autoregressively.`
+- **Thin community `Community 51`** (1 nodes): `Generate n_draft tokens autoregressively.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 55`** (1 nodes): `True only if state is HEALTHY or DEGRADED.          DEGRADED still routes — give`
+- **Thin community `Community 54`** (1 nodes): `True only if state is HEALTHY or DEGRADED.          DEGRADED still routes — give`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 78`** (1 nodes): `Currently swallows everything to []. Phase C will narrow to URLError.`
+- **Thin community `Community 77`** (1 nodes): `Currently swallows everything to []. Phase C will narrow to URLError.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 79`** (1 nodes): `Pinned: function should print without crashing even if every endpoint fails.`
+- **Thin community `Community 78`** (1 nodes): `Pinned: function should print without crashing even if every endpoint fails.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 80`** (1 nodes): `Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a`
+- **Thin community `Community 79`** (1 nodes): `Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 80`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 81`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 82`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
+- **Thin community `Community 82`** (1 nodes): `REPL state. Mutable container — NOT frozen.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 83`** (1 nodes): `REPL state. Mutable container — NOT frozen.`
+- **Thin community `Community 83`** (1 nodes): `Parse '/cmd args...' into (Command, rest). None if not a command.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 84`** (1 nodes): `Parse '/cmd args...' into (Command, rest). None if not a command.`
+- **Thin community `Community 84`** (1 nodes): `Send chat completion request, stream response, return assistant message.      Re`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 85`** (1 nodes): `Send chat completion request, stream response, return assistant message.      Re`
+- **Thin community `Community 85`** (1 nodes): `Yield delta content strings from an OpenAI SSE stream.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 86`** (1 nodes): `Yield delta content strings from an OpenAI SSE stream.`
+- **Thin community `Community 86`** (1 nodes): `Strip <think>...</think> from a chunk if not show_thinking.      `in_think_ref``
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 87`** (1 nodes): `Strip <think>...</think> from a chunk if not show_thinking.      `in_think_ref``
+- **Thin community `Community 87`** (1 nodes): `Remove all <think>...</think> blocks from text.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 88`** (1 nodes): `Remove all <think>...</think> blocks from text.`
+- **Thin community `Community 88`** (1 nodes): `Run slash command. Return False if REPL should exit.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 89`** (1 nodes): `Run slash command. Return False if REPL should exit.`
+- **Thin community `Community 89`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 90`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
+- **Thin community `Community 90`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 91`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
+- **Thin community `Community 91`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 92`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
+- **Thin community `Community 92`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 93`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
+- **Thin community `Community 93`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 94`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
+- **Thin community `Community 94`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 95`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
+- **Thin community `Community 95`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 96`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
+- **Thin community `Community 96`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 97`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
+- **Thin community `Community 97`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 98`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 99`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
+- **Thin community `Community 99`** (1 nodes): `Real ModuleType so Python's import machinery accepts __spec__/__path__.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 100`** (1 nodes): `Real ModuleType so Python's import machinery accepts __spec__/__path__.`
+- **Thin community `Community 100`** (1 nodes): `Install a permissive stub module so `from x.y import Z` works.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 101`** (1 nodes): `Install a permissive stub module so `from x.y import Z` works.`
+- **Thin community `Community 101`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 102`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
+- **Thin community `Community 102`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 103`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
+- **Thin community `Community 103`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 104`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
+- **Thin community `Community 104`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 105`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
+- **Thin community `Community 105`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 106`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
+- **Thin community `Community 106`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 107`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
+- **Thin community `Community 107`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 108`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
+- **Thin community `Community 108`** (1 nodes): `In-memory sqlite3 connection.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 109`** (1 nodes): `In-memory sqlite3 connection.`
+- **Thin community `Community 109`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 110`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
+- **Thin community `Community 110`** (1 nodes): `Real ModuleType so Python's import machinery accepts __spec__/__path__.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 111`** (1 nodes): `Real ModuleType so Python's import machinery accepts __spec__/__path__.`
+- **Thin community `Community 111`** (1 nodes): `Install a permissive stub module so `from x.y import Z` works.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 112`** (1 nodes): `Install a permissive stub module so `from x.y import Z` works.`
+- **Thin community `Community 112`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 113`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
+- **Thin community `Community 113`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 114`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
+- **Thin community `Community 114`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 115`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
+- **Thin community `Community 115`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 116`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
+- **Thin community `Community 116`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 117`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
+- **Thin community `Community 117`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 118`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
+- **Thin community `Community 118`** (1 nodes): `In-memory sqlite3 connection.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 119`** (1 nodes): `In-memory sqlite3 connection.`
+- **Thin community `Community 119`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 120`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
+- **Thin community `Community 120`** (1 nodes): `Real ModuleType so Python's import machinery accepts __spec__/__path__.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 121`** (1 nodes): `Real ModuleType so Python's import machinery accepts __spec__/__path__.`
+- **Thin community `Community 121`** (1 nodes): `Install a permissive stub module so `from x.y import Z` works.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 122`** (1 nodes): `Install a permissive stub module so `from x.y import Z` works.`
+- **Thin community `Community 122`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 123`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
+- **Thin community `Community 123`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 124`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
+- **Thin community `Community 124`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 125`** (1 nodes): `Tmp dir with two synthetic GGUF files: qwen35 27B + gpt2 0.5B.`
+- **Thin community `Community 125`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 126`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
+- **Thin community `Community 126`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 127`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
+- **Thin community `Community 127`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 128`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
+- **Thin community `Community 128`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 129`** (1 nodes): `Autouse-style guard: assert no un-mocked Popen escapes test scope.      Tests th`
+- **Thin community `Community 129`** (1 nodes): `In-memory sqlite3 connection.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 130`** (1 nodes): `In-memory sqlite3 connection.`
+- **Thin community `Community 130`** (1 nodes): `Load cli/chat_repl.py as a regular module (no package init present).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 131`** (1 nodes): `Load cli/chat_repl.py as a regular module (no package init present).`
+- **Thin community `Community 131`** (1 nodes): `Currently swallows everything to []. Phase C will narrow to URLError.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 132`** (1 nodes): `Currently swallows everything to []. Phase C will narrow to URLError.`
+- **Thin community `Community 132`** (1 nodes): `Pinned: function should print without crashing even if every endpoint fails.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 133`** (1 nodes): `Pinned: function should print without crashing even if every endpoint fails.`
+- **Thin community `Community 133`** (1 nodes): `Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 134`** (1 nodes): `Phase C: probe_endpoint catches only expected I/O errors. RuntimeError     is a`
+- **Thin community `Community 134`** (1 nodes): `Import web/app.py — it does `from data_layer import ...` so the web/     directo`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 135`** (1 nodes): `Import web/app.py — it does `from data_layer import ...` so the web/     directo`
+- **Thin community `Community 135`** (1 nodes): `python_repl is decorated with @tool → StructuredTool. Unwrap to .func.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 136`** (1 nodes): `python_repl is decorated with @tool → StructuredTool. Unwrap to .func.`
+- **Thin community `Community 136`** (1 nodes): `Phase C: error message includes exception class name so the model     can act on`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 137`** (1 nodes): `Phase C: error message includes exception class name so the model     can act on`
+- **Thin community `Community 137`** (1 nodes): `python_repl is a model-facing tool — syntax errors come back as text     so the`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 138`** (1 nodes): `python_repl is a model-facing tool — syntax errors come back as text     so the`
+- **Thin community `Community 138`** (1 nodes): `Extract hidden state at position `pos` using llama_get_embeddings_ith.     Does`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 139`** (1 nodes): `Extract hidden state at position `pos` using llama_get_embeddings_ith.     Does`
+- **Thin community `Community 139`** (1 nodes): `Minimal client for the local LLM stack. Zero dependencies beyond stdlib.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 140`** (1 nodes): `Minimal client for the local LLM stack. Zero dependencies beyond stdlib.`
+- **Thin community `Community 140`** (1 nodes): `List available model IDs by probing all known local endpoints.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 141`** (1 nodes): `List available model IDs by probing all known local endpoints.`
+- **Thin community `Community 141`** (1 nodes): `Send a chat completion. Returns the response text.          Args:             pr`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 142`** (1 nodes): `Send a chat completion. Returns the response text.          Args:             pr`
+- **Thin community `Community 142`** (1 nodes): `Send a multi-turn conversation. Returns the response text.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 143`** (1 nodes): `Send a multi-turn conversation. Returns the response text.`
+- **Thin community `Community 143`** (1 nodes): `Stream tokens from a chat completion.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 144`** (1 nodes): `Stream tokens from a chat completion.`
+- **Thin community `Community 144`** (1 nodes): `Check if the LLM backend is reachable.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 145`** (1 nodes): `Check if the LLM backend is reachable.`
+- **Thin community `Community 145`** (1 nodes): `Get detailed health status of all known endpoints.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 146`** (1 nodes): `Get detailed health status of all known endpoints.`
+- **Thin community `Community 146`** (1 nodes): `Quick one-liner: `from server.client import chat; print(chat("hi"))``
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 147`** (1 nodes): `Quick one-liner: `from server.client import chat; print(chat("hi"))``
+- **Thin community `Community 147`** (1 nodes): `Probe all endpoints, return {endpoint_name: [model_ids]}.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 148`** (1 nodes): `Probe all endpoints, return {endpoint_name: [model_ids]}.`
+- **Thin community `Community 148`** (1 nodes): `Return flat list of available model names from all endpoints.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 149`** (1 nodes): `Return flat list of available model names from all endpoints.`
+- **Thin community `Community 149`** (1 nodes): `Start the LLM stack if nothing is running.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 150`** (1 nodes): `Start the LLM stack if nothing is running.`
+- **Thin community `Community 150`** (1 nodes): `Stream from backend, buffer silently. Returns (reply, think).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 151`** (1 nodes): `Stream from backend, buffer silently. Returns (reply, think).`
+- **Thin community `Community 151`** (1 nodes): `List available models.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 152`** (1 nodes): `List available models.`
+- **Thin community `Community 152`** (1 nodes): `Return a LangChain RunnableConfig dict with active callbacks.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 153`** (1 nodes): `Return a LangChain RunnableConfig dict with active callbacks.`
+- **Thin community `Community 153`** (1 nodes): `Merge LoRA + export to GGUF (for DFlash) or HF format (for vLLM).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 154`** (1 nodes): `Merge LoRA + export to GGUF (for DFlash) or HF format (for vLLM).`
+- **Thin community `Community 154`** (1 nodes): `Cloud model reviews passing implementation.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 155`** (1 nodes): `Cloud model reviews passing implementation.`
+- **Thin community `Community 155`** (1 nodes): `Final step — save training data for future fine-tuning.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 156`** (1 nodes): `Final step — save training data for future fine-tuning.`
+- **Thin community `Community 156`** (1 nodes): `Terminal — swarm exhausted retries.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 157`** (1 nodes): `Terminal — swarm exhausted retries.`
+- **Thin community `Community 157`** (1 nodes): `Persist successful (task → implementation) pair for fine-tuning.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 158`** (1 nodes): `Persist successful (task → implementation) pair for fine-tuning.`
+- **Thin community `Community 158`** (1 nodes): `Run the full swarm on a task. Returns final state.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 159`** (1 nodes): `Run the full swarm on a task. Returns final state.`
+- **Thin community `Community 159`** (1 nodes): `Compare two benchmark runs side by side.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 160`** (1 nodes): `Compare two benchmark runs side by side.`
+- **Thin community `Community 160`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 161`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
+- **Thin community `Community 161`** (1 nodes): `Install a permissive MagicMock module under the given name.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 162`** (1 nodes): `Install a permissive MagicMock module under the given name.`
+- **Thin community `Community 162`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 163`** (1 nodes): `Build a minimal but parseable GGUF blob.      truncate: if set, return only firs`
+- **Thin community `Community 163`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 164`** (1 nodes): `Return the make_gguf_bytes helper for tests that want custom GGUFs.`
+- **Thin community `Community 164`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 165`** (1 nodes): `Path that points to a not-yet-existing registry YAML.`
+- **Thin community `Community 165`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 166`** (1 nodes): `Build a fake subprocess.CompletedProcess with given stdout.`
+- **Thin community `Community 166`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 167`** (1 nodes): `Replace subprocess.run for nvidia-smi calls. Default: 4090 / 24 GB.`
+- **Thin community `Community 167`** (1 nodes): `In-memory sqlite3 connection.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 168`** (1 nodes): `In-memory sqlite3 connection.`
+- **Thin community `Community 168`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 169`** (1 nodes): `Auto-skip GPU tests when CUDA toolkit absent.`
+- **Thin community `Community 169`** (1 nodes): `Phase C target: cmd_status must NOT swallow arbitrary exceptions.     Picking a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 170`** (1 nodes): `Phase C target: cmd_status must NOT swallow arbitrary exceptions.     Picking a`
+- **Thin community `Community 170`** (1 nodes): `Phase C target: agents.base must expose a public `tracing_enabled` boolean.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 171`** (1 nodes): `Phase C target: agents.base must expose a public `tracing_enabled` boolean.`
+- **Thin community `Community 171`** (1 nodes): `Phase C: test_runner_node must raise SwarmStepError if pytest itself errors.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 172`** (1 nodes): `Phase C: test_runner_node must raise SwarmStepError if pytest itself errors.`
+- **Thin community `Community 172`** (1 nodes): `Phase C: probe_endpoint should not catch arbitrary RuntimeError.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 173`** (1 nodes): `Phase C: probe_endpoint should not catch arbitrary RuntimeError.`
+- **Thin community `Community 173`** (1 nodes): `update_thread should persist a row that subsequent calls can read.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 174`** (1 nodes): `update_thread should persist a row that subsequent calls can read.`
+- **Thin community `Community 174`** (1 nodes): `All tests under tests/integration/ get the `slow` marker implicitly.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 175`** (1 nodes): `All tests under tests/integration/ get the `slow` marker implicitly.`
+- **Thin community `Community 175`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 176`** (1 nodes): `# TODO: backend pool (lazy init on first load)`
+- **Thin community `Community 176`** (1 nodes): `Snapshot of VRAM allocation.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 177`** (1 nodes): `Snapshot of VRAM allocation.`
+- **Thin community `Community 177`** (1 nodes): `List available models.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 178`** (1 nodes): `List available models.`
+- **Thin community `Community 178`** (1 nodes): `Probe all endpoints, return {endpoint_name: [model_ids]}.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 179`** (1 nodes): `Probe all endpoints, return {endpoint_name: [model_ids]}.`
+- **Thin community `Community 179`** (1 nodes): `Return flat list of Bifrost-routable model names.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 180`** (1 nodes): `Return flat list of Bifrost-routable model names.`
+- **Thin community `Community 180`** (1 nodes): `Start the LLM stack if nothing is running.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 181`** (1 nodes): `Start the LLM stack if nothing is running.`
+- **Thin community `Community 181`** (1 nodes): `Stream from backend, buffer silently. Returns (reply, think).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 182`** (1 nodes): `Stream from backend, buffer silently. Returns (reply, think).`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 183`** (1 nodes): `List available models.`
+- **Thin community `Community 182`** (1 nodes): `List available models.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `VramScheduler` connect `Community 0` to `Community 2`, `Community 12`, `Community 15`?**
+- **Why does `VramScheduler` connect `Community 0` to `Community 2`, `Community 11`, `Community 15`?**
   _High betweenness centrality (0.074) - this node is a cross-community bridge._
-- **Why does `ModelEntry` connect `Community 0` to `Community 3`, `Community 4`?**
+- **Why does `ModelEntry` connect `Community 0` to `Community 4`, `Community 6`?**
   _High betweenness centrality (0.069) - this node is a cross-community bridge._
-- **Why does `BackendError` connect `Community 0` to `Community 4`, `Community 10`, `Community 13`, `Community 16`, `Community 19`?**
+- **Why does `BackendError` connect `Community 0` to `Community 4`, `Community 9`, `Community 12`, `Community 16`, `Community 17`?**
   _High betweenness centrality (0.054) - this node is a cross-community bridge._
 - **Are the 198 inferred relationships involving `ModelEntry` (e.g. with `Router` and `Request router — capability-based model selection with dry-run support.`) actually correct?**
   _`ModelEntry` has 198 INFERRED edges - model-reasoned connections that need verification._
