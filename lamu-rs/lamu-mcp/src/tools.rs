@@ -1,2 +1,403 @@
-//! Tool dispatch lives inline in `server.rs` for now.
-//! Future: extract per-tool handlers here for testability.
+//! Single source of truth for the MCP tool catalog.
+//!
+//! Phase 2.1 design: every tool has one entry in `TOOLS` carrying its
+//! name, description, JSON schema, and a dispatch function. The
+//! dispatcher in `server::tools_call` looks the entry up by name and
+//! invokes the handler; `server::tools_list_response` iterates the
+//! same table to build the catalog. The "every tool listed" test
+//! guard is now a no-op by construction.
+//!
+//! Phase 2.2 (deferred): split per-tool dispatch wrappers into one
+//! file each under `src/tools/<name>.rs`.
+
+use crate::server::LamuMcpServer;
+use serde_json::{json, Value};
+use std::future::Future;
+use std::pin::Pin;
+
+/// Dispatch handler kind. Distinguishes stateful (needs `&LamuMcpServer`)
+/// from free (no state). Sync handlers wrap their result in a ready
+/// future so the dispatcher only has two arms instead of four.
+pub enum HandlerKind {
+    /// Async handler taking `&LamuMcpServer` (or sync-wrapped-as-async).
+    Stateful(for<'a> fn(&'a LamuMcpServer, Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>),
+    /// Async handler with no state (or sync-wrapped-as-async).
+    Free(fn(Value) -> Pin<Box<dyn Future<Output = String> + Send>>),
+}
+
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Schema is computed lazily so the const table holds plain fn ptrs.
+    pub schema_fn: fn() -> Value,
+    pub handler: HandlerKind,
+}
+
+impl ToolDef {
+    /// Build the JSON object MCP `tools/list` wants for this tool.
+    pub fn to_list_entry(&self) -> Value {
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": (self.schema_fn)(),
+        })
+    }
+}
+
+// ── Schema constructors ─────────────────────────────────────────────
+// One per tool. Each returns the inputSchema JSON object. Kept as
+// functions (not consts) because serde_json::Value isn't const-evaluable.
+
+fn schema_query() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "model": {"type": "string"},
+            "capabilities": {"type": "array", "items": {"type": "string"}},
+            "system": {"type": "string", "default": ""},
+            "max_tokens": {"type": "integer", "default": 16384},
+            "temperature": {"type": "number", "default": 0.7},
+            "include_reasoning": {"type": "boolean", "default": false},
+            "priority": {"type": "integer", "default": 0, "description": "Higher served first (priority strategy only)"},
+            "origin": {"type": "string", "default": "anonymous", "description": "Agent identifier for queue observability"},
+        },
+        "required": ["prompt"]
+    })
+}
+
+fn schema_plan_query() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "model": {"type": "string"},
+            "capabilities": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["prompt"]
+    })
+}
+
+fn schema_empty_object() -> Value {
+    json!({"type": "object", "properties": {}})
+}
+
+fn schema_named_only() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+    })
+}
+
+fn schema_cloud_query() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "User prompt"},
+            "model": {"type": "string", "description": "Cloud model name from cloud-models.yaml (e.g. 'deepseek-v4-flash', 'claude-haiku-4-5'). Defaults to 'deepseek-v4-flash'.", "default": "deepseek-v4-flash"},
+            "system": {"type": "string", "description": "System prompt", "default": ""},
+            "max_tokens": {"type": "integer", "default": 8192},
+            "temperature": {"type": "number", "default": 0.3},
+            "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."},
+            "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."}
+        },
+        "required": ["prompt"]
+    })
+}
+
+fn schema_review_commit() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "commit": {"type": "string", "description": "Commit SHA or ref (e.g. 'HEAD', 'HEAD~1', 'abc123'). Defaults to HEAD.", "default": "HEAD"},
+            "repo": {"type": "string", "description": "Path to the git repo. Defaults to current working directory.", "default": "."},
+            "focus": {"type": "string", "description": "Optional review focus (e.g. 'security', 'performance', 'API design'). Defaults to all-around.", "default": ""}
+        }
+    })
+}
+
+fn schema_review_diff() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "diff": {"type": "string", "description": "Unified diff text or a code chunk to review."},
+            "context": {"type": "string", "description": "Optional surrounding context (e.g. file paths, what changed and why).", "default": ""},
+            "focus": {"type": "string", "default": ""}
+        },
+        "required": ["diff"]
+    })
+}
+
+fn schema_set_routing_mode() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["auto", "local-only", "cloud-only"]}
+        },
+        "required": ["mode"]
+    })
+}
+
+fn schema_write_file() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path under cwd. Relative components only — '..' is refused."},
+            "content": {"type": "string", "description": "UTF-8 file contents."},
+            "session_id": {"type": "string", "description": "Session identifier for rollback. Allowed chars: [A-Za-z0-9_-.]"}
+        },
+        "required": ["path", "content", "session_id"]
+    })
+}
+
+fn schema_parallel_query() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "Array of task objects. Each can override model/system/max_tokens/temperature/id; missing fields fall back to top-level defaults.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Optional caller-supplied id for matching results back."},
+                        "prompt": {"type": "string"},
+                        "model": {"type": "string"},
+                        "system": {"type": "string"},
+                        "max_tokens": {"type": "integer"},
+                        "temperature": {"type": "number"},
+                        "include_reasoning": {"type": "boolean"}
+                    },
+                    "required": ["prompt"]
+                }
+            },
+            "default_model": {"type": "string", "default": "deepseek-v4-flash"},
+            "default_system": {"type": "string", "default": ""},
+            "max_concurrency": {"type": "integer", "description": "Optional cap that overrides per-provider defaults (downwards only — never raises an unproven provider above 1)."}
+        },
+        "required": ["tasks"]
+    })
+}
+
+// ── Dispatch wrappers ───────────────────────────────────────────────
+// One per tool. Async handlers Box::pin their future; sync handlers
+// run synchronously and wrap the result in a ready future.
+
+fn dispatch_query<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_query(args))
+}
+
+fn dispatch_plan_query<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    let r = s.handle_plan_query(args);
+    Box::pin(async move { r })
+}
+
+fn dispatch_list_models<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    let r = s.handle_list_models();
+    Box::pin(async move { r })
+}
+
+fn dispatch_load_model<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_load_model(args))
+}
+
+fn dispatch_unload_model<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_unload_model(args))
+}
+
+fn dispatch_vram_status<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    let r = s.handle_vram_status();
+    Box::pin(async move { r })
+}
+
+fn dispatch_scan<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    let r = s.handle_scan();
+    Box::pin(async move { r })
+}
+
+fn dispatch_queue_status<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_queue_status())
+}
+
+fn dispatch_set_routing_mode<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_set_routing_mode(args))
+}
+
+fn dispatch_routing_status<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_routing_status())
+}
+
+fn dispatch_parallel_query<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_parallel_query(args))
+}
+
+fn dispatch_cloud_query(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::server::handle_cloud_query(args))
+}
+
+fn dispatch_list_cloud_models(_args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    let r = crate::server::handle_list_cloud_models();
+    Box::pin(async move { r })
+}
+
+fn dispatch_review_commit(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::server::handle_review_commit(args))
+}
+
+fn dispatch_review_diff(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::server::handle_review_diff(args))
+}
+
+fn dispatch_write_file(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::server::handle_write_file(args))
+}
+
+// ── The catalog ─────────────────────────────────────────────────────
+// New tool? One entry here. tools_list_response + dispatcher both
+// pick it up automatically.
+
+pub static TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "query",
+        description: "Send prompt to local LLM. Routes by capabilities or explicit model. Queued per-model (FIFO default) so concurrent agents don't collide. Fast, free, uncensored.",
+        schema_fn: schema_query,
+        handler: HandlerKind::Stateful(dispatch_query),
+    },
+    ToolDef {
+        name: "plan_query",
+        description: "Dry-run: see which model WOULD handle a request without generating.",
+        schema_fn: schema_plan_query,
+        handler: HandlerKind::Stateful(dispatch_plan_query),
+    },
+    ToolDef {
+        name: "list_models",
+        description: "List all known models with load status and capabilities.",
+        schema_fn: schema_empty_object,
+        handler: HandlerKind::Stateful(dispatch_list_models),
+    },
+    ToolDef {
+        name: "load_model",
+        description: "Explicitly load a model onto GPU.",
+        schema_fn: schema_named_only,
+        handler: HandlerKind::Stateful(dispatch_load_model),
+    },
+    ToolDef {
+        name: "unload_model",
+        description: "Unload a model from GPU.",
+        schema_fn: schema_named_only,
+        handler: HandlerKind::Stateful(dispatch_unload_model),
+    },
+    ToolDef {
+        name: "vram_status",
+        description: "Show current VRAM allocation.",
+        schema_fn: schema_empty_object,
+        handler: HandlerKind::Stateful(dispatch_vram_status),
+    },
+    ToolDef {
+        name: "scan_models",
+        description: "Re-scan disk for new models.",
+        schema_fn: schema_empty_object,
+        handler: HandlerKind::Stateful(dispatch_scan),
+    },
+    ToolDef {
+        name: "queue_status",
+        description: "Show per-model queue depth and scheduling strategy.",
+        schema_fn: schema_empty_object,
+        handler: HandlerKind::Stateful(dispatch_queue_status),
+    },
+    ToolDef {
+        name: "cloud_query",
+        description: "Send prompt to a cloud model (DeepSeek V4, Claude, GLM, Kimi, Qwen-Max, etc.). Use this for tasks that need stronger reasoning than local, OR cheaper inference than the calling agent (e.g. Claude Code → DeepSeek V4 Flash for code generation at ~$0.07/M input, currently 75% off). Auto-routes via OpenAI/Anthropic format detection.",
+        schema_fn: schema_cloud_query,
+        handler: HandlerKind::Free(dispatch_cloud_query),
+    },
+    ToolDef {
+        name: "list_cloud_models",
+        description: "List configured cloud models from ~/.config/lamu/cloud-models.yaml. Returns name, provider, context window, and whether the API key env var is set.",
+        schema_fn: schema_empty_object,
+        handler: HandlerKind::Free(dispatch_list_cloud_models),
+    },
+    ToolDef {
+        name: "review_commit",
+        description: "PRIMARY REVIEW TOOL — auto-routes to DeepSeek V4 Pro (the project policy reviewer). Takes a commit SHA (or 'HEAD' for the most recent), runs `git show` to get the full diff + commit message, and returns a deep code review covering security, correctness, edge cases, idiom, and architectural fit. NO CODE SHOULD BE CONSIDERED DONE WITHOUT GOING THROUGH THIS TOOL. Use it after every commit you make.\n\nMANDATORY: Before applying ANY fix from a review, verify each finding is real, not a hallucination. V4 Pro has ~30% false-positive rate. Open the cited file:line, read the code, confirm the bug exists. Common hallucinations: serde_json indexing claimed to panic (returns Null instead), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (actually 32-bit per spec), env-var race across cargo test binaries (env is process-local). Skip findings that don't reproduce. Note skipped false positives in the follow-up commit message.",
+        schema_fn: schema_review_commit,
+        handler: HandlerKind::Free(dispatch_review_commit),
+    },
+    ToolDef {
+        name: "review_diff",
+        description: "Review an arbitrary diff via DeepSeek V4 Pro. Same reviewer policy as review_commit but accepts the diff text directly — useful when reviewing uncommitted changes or a chunk of pasted code.\n\nMANDATORY: Before applying ANY fix, verify each finding is real (~30% false-positive rate). Open the cited code, confirm the bug exists. Skip findings that don't reproduce. Common hallucinations: serde_json indexing claimed to panic (returns Null in reality), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (32-bit per spec), env-var race across cargo test binaries (env is process-local).",
+        schema_fn: schema_review_diff,
+        handler: HandlerKind::Free(dispatch_review_diff),
+    },
+    ToolDef {
+        name: "set_routing_mode",
+        description: "Control which backends are usable. Modes: 'auto' (default — use local for matching capabilities, cloud for the rest), 'local-only' (refuse cloud requests), 'cloud-only' (kill local llama-server and free VRAM, route everything to cloud). Useful when you want to free GPU for other work but keep DeepSeek/Claude on tap.",
+        schema_fn: schema_set_routing_mode,
+        handler: HandlerKind::Stateful(dispatch_set_routing_mode),
+    },
+    ToolDef {
+        name: "routing_status",
+        description: "Report current routing mode + which backends are reachable.",
+        schema_fn: schema_empty_object,
+        handler: HandlerKind::Stateful(dispatch_routing_status),
+    },
+    ToolDef {
+        name: "write_file",
+        description: "Write a file with rollback journaling (Phase 6.1). Records the file's pre-state under session_id; `lamu rollback <session>` restores. Path is required relative to lamu-mcp's cwd; absolute paths and '..' segments are refused so the call cannot escape the working directory. session_id must match [A-Za-z0-9_-.]+ — anything else is rejected up front.",
+        schema_fn: schema_write_file,
+        handler: HandlerKind::Free(dispatch_write_file),
+    },
+    ToolDef {
+        name: "parallel_query",
+        description: "Fan out N prompts at once (agent swarm). Provider-aware concurrency: DeepSeek/OpenAI/Anthropic run in parallel up to per-provider caps, untested providers and ALL local models default to sequential (concurrency=1) until proven safe. Tasks are grouped by model so each model gets its own semaphore. Returns results in the original task order, with per-task elapsed time. Use this for batch reviews, parallel code generation, multi-perspective brainstorming.",
+        schema_fn: schema_parallel_query,
+        handler: HandlerKind::Stateful(dispatch_parallel_query),
+    },
+];
+
+pub fn find(name: &str) -> Option<&'static ToolDef> {
+    TOOLS.iter().find(|t| t.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_duplicate_tool_names() {
+        let mut seen = std::collections::HashSet::new();
+        for t in TOOLS {
+            assert!(seen.insert(t.name), "duplicate tool name: {}", t.name);
+        }
+    }
+
+    #[test]
+    fn every_tool_has_nonempty_description() {
+        for t in TOOLS {
+            assert!(!t.description.is_empty(), "{} has empty description", t.name);
+        }
+    }
+
+    #[test]
+    fn every_tool_schema_is_object() {
+        for t in TOOLS {
+            let s = (t.schema_fn)();
+            assert_eq!(s["type"], "object", "{} schema missing type=object", t.name);
+        }
+    }
+
+    #[test]
+    fn find_resolves_known_tools() {
+        assert!(find("query").is_some());
+        assert!(find("write_file").is_some());
+        assert!(find("nonexistent_tool_xyz").is_none());
+    }
+
+    #[test]
+    fn catalog_size_locked() {
+        // Adding a tool? Bump this and add coverage to the
+        // server-level integration tests.
+        assert_eq!(TOOLS.len(), 16);
+    }
+}

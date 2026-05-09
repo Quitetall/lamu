@@ -169,24 +169,15 @@ impl LamuMcpServer {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
 
-        let result = match tool_name {
-            "query" => self.handle_query(args).await,
-            "plan_query" => self.handle_plan_query(args),
-            "list_models" => self.handle_list_models(),
-            "load_model" => self.handle_load_model(args).await,
-            "unload_model" => self.handle_unload_model(args).await,
-            "vram_status" => self.handle_vram_status(),
-            "scan_models" => self.handle_scan(),
-            "queue_status" => self.handle_queue_status().await,
-            "cloud_query" => handle_cloud_query(args).await,
-            "list_cloud_models" => handle_list_cloud_models(),
-            "review_commit" => handle_review_commit(args).await,
-            "review_diff" => handle_review_diff(args).await,
-            "set_routing_mode" => self.handle_set_routing_mode(args).await,
-            "routing_status" => self.handle_routing_status().await,
-            "parallel_query" => self.handle_parallel_query(args).await,
-            "write_file" => handle_write_file(args).await,
-            other => format!("Unknown tool: {}", other),
+        // Phase 2.1: dispatcher reads from `tools::TOOLS`. Adding a new
+        // tool means one entry in tools.rs; the dispatcher and the
+        // tools/list response both pick it up automatically.
+        let result = match crate::tools::find(tool_name) {
+            Some(t) => match &t.handler {
+                crate::tools::HandlerKind::Stateful(f) => f(self, args).await,
+                crate::tools::HandlerKind::Free(f) => f(args).await,
+            },
+            None => format!("Unknown tool: {}", tool_name),
         };
 
         // Heuristic: handlers prefix error responses with "error:" or
@@ -217,7 +208,7 @@ impl LamuMcpServer {
         q
     }
 
-    async fn handle_query(&self, args: Value) -> String {
+    pub(crate) async fn handle_query(&self, args: Value) -> String {
         let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         if prompt.is_empty() {
             return "missing prompt".into();
@@ -399,7 +390,7 @@ impl LamuMcpServer {
         }
     }
 
-    fn handle_plan_query(&self, args: Value) -> String {
+    pub(crate) fn handle_plan_query(&self, args: Value) -> String {
         let model = args.get("model").and_then(|v| v.as_str());
         let caps_raw = args.get("capabilities").and_then(|v| v.as_array());
         let caps: Vec<Capability> = caps_raw
@@ -420,7 +411,7 @@ impl LamuMcpServer {
         })).unwrap_or_else(|e| format!("serialize error: {}", e))
     }
 
-    fn handle_list_models(&self) -> String {
+    pub(crate) fn handle_list_models(&self) -> String {
         let st = self.state.lock();
         let mut lines = Vec::new();
         let mut names: Vec<&String> = st.entries.keys().collect();
@@ -452,7 +443,7 @@ impl LamuMcpServer {
         lines.join("\n")
     }
 
-    async fn handle_load_model(&self, args: Value) -> String {
+    pub(crate) async fn handle_load_model(&self, args: Value) -> String {
         let name = match args.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.to_string(),
             None => return "error: missing 'name' argument".into(),
@@ -639,7 +630,7 @@ impl LamuMcpServer {
         format!("error: failed to load '{}' (timeout {}s)", entry.name, max_wait_secs)
     }
 
-    async fn handle_unload_model(&self, args: Value) -> String {
+    pub(crate) async fn handle_unload_model(&self, args: Value) -> String {
         let name = match args.get("name").and_then(|v| v.as_str()) {
             Some(n) => n.to_string(),
             None => return "error: missing 'name' argument".into(),
@@ -676,7 +667,7 @@ impl LamuMcpServer {
         format!("Unloaded '{}'. VRAM freed.", target)
     }
 
-    fn handle_vram_status(&self) -> String {
+    pub(crate) fn handle_vram_status(&self) -> String {
         let st = self.state.lock();
         let budget = st.scheduler.budget();
         let mut lines = vec![
@@ -694,7 +685,7 @@ impl LamuMcpServer {
         lines.join("\n")
     }
 
-    async fn handle_queue_status(&self) -> String {
+    pub(crate) async fn handle_queue_status(&self) -> String {
         let strategy = match self.queue_strategy {
             QueueStrategy::Fifo => "fifo",
             QueueStrategy::Lifo => "lifo",
@@ -716,7 +707,7 @@ impl LamuMcpServer {
         lines.join("\n")
     }
 
-    async fn handle_set_routing_mode(&self, args: Value) -> String {
+    pub(crate) async fn handle_set_routing_mode(&self, args: Value) -> String {
         let mode = args["mode"].as_str().unwrap_or("auto").to_string();
         if !matches!(mode.as_str(), "auto" | "local-only" | "cloud-only") {
             return format!("error: mode must be 'auto', 'local-only', or 'cloud-only' (got '{}')", mode);
@@ -770,7 +761,7 @@ impl LamuMcpServer {
         msg
     }
 
-    async fn handle_routing_status(&self) -> String {
+    pub(crate) async fn handle_routing_status(&self) -> String {
         let mode = self.routing_mode.lock().await.clone();
         let st = self.state.lock();
         let (used, total) = st.scheduler.query_vram();
@@ -795,7 +786,7 @@ impl LamuMcpServer {
     ///
     /// Returns a JSON-shaped text body (parseable by the caller) plus
     /// a human-readable summary header.
-    async fn handle_parallel_query(&self, args: Value) -> String {
+    pub(crate) async fn handle_parallel_query(&self, args: Value) -> String {
         let tasks_arr = match args["tasks"].as_array() {
             Some(a) if !a.is_empty() => a.clone(),
             _ => return "error: 'tasks' must be a non-empty array".into(),
@@ -911,7 +902,7 @@ impl LamuMcpServer {
         format!("{}\n{}", summary, serde_json::to_string_pretty(&body).unwrap_or_default())
     }
 
-    fn handle_scan(&self) -> String {
+    pub(crate) fn handle_scan(&self) -> String {
         let mut st = self.state.lock();
         let entries = match scan_directory(&st.models_dir) {
             Ok(e) => e,
@@ -953,185 +944,13 @@ fn initialize_response(id: Option<Value>) -> Value {
     })
 }
 
+
 fn tools_list_response(id: Option<Value>) -> Value {
-    let tools = vec![
-        json!({
-            "name": "query",
-            "description": "Send prompt to local LLM. Routes by capabilities or explicit model. Queued per-model (FIFO default) so concurrent agents don't collide. Fast, free, uncensored.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "model": {"type": "string"},
-                    "capabilities": {"type": "array", "items": {"type": "string"}},
-                    "system": {"type": "string", "default": ""},
-                    "max_tokens": {"type": "integer", "default": 16384},
-                    "temperature": {"type": "number", "default": 0.7},
-                    "include_reasoning": {"type": "boolean", "default": false},
-                    "priority": {"type": "integer", "default": 0, "description": "Higher served first (priority strategy only)"},
-                    "origin": {"type": "string", "default": "anonymous", "description": "Agent identifier for queue observability"},
-                },
-                "required": ["prompt"]
-            }
-        }),
-        json!({
-            "name": "plan_query",
-            "description": "Dry-run: see which model WOULD handle a request without generating.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "model": {"type": "string"},
-                    "capabilities": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["prompt"]
-            }
-        }),
-        json!({
-            "name": "list_models",
-            "description": "List all known models with load status and capabilities.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "load_model",
-            "description": "Explicitly load a model onto GPU.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"]
-            }
-        }),
-        json!({
-            "name": "unload_model",
-            "description": "Unload a model from GPU.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"]
-            }
-        }),
-        json!({
-            "name": "vram_status",
-            "description": "Show current VRAM allocation.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "scan_models",
-            "description": "Re-scan disk for new models.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "queue_status",
-            "description": "Show per-model queue depth and scheduling strategy.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "cloud_query",
-            "description": "Send prompt to a cloud model (DeepSeek V4, Claude, GLM, Kimi, Qwen-Max, etc.). Use this for tasks that need stronger reasoning than local, OR cheaper inference than the calling agent (e.g. Claude Code → DeepSeek V4 Flash for code generation at ~$0.07/M input, currently 75% off). Auto-routes via OpenAI/Anthropic format detection.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string", "description": "User prompt"},
-                    "model": {"type": "string", "description": "Cloud model name from cloud-models.yaml (e.g. 'deepseek-v4-flash', 'claude-haiku-4-5'). Defaults to 'deepseek-v4-flash'.", "default": "deepseek-v4-flash"},
-                    "system": {"type": "string", "description": "System prompt", "default": ""},
-                    "max_tokens": {"type": "integer", "default": 8192},
-                    "temperature": {"type": "number", "default": 0.3},
-                    "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."},
-                    "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."}
-                },
-                "required": ["prompt"]
-            }
-        }),
-        json!({
-            "name": "list_cloud_models",
-            "description": "List configured cloud models from ~/.config/lamu/cloud-models.yaml. Returns name, provider, context window, and whether the API key env var is set.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "review_commit",
-            "description": "PRIMARY REVIEW TOOL — auto-routes to DeepSeek V4 Pro (the project policy reviewer). Takes a commit SHA (or 'HEAD' for the most recent), runs `git show` to get the full diff + commit message, and returns a deep code review covering security, correctness, edge cases, idiom, and architectural fit. NO CODE SHOULD BE CONSIDERED DONE WITHOUT GOING THROUGH THIS TOOL. Use it after every commit you make.\n\nMANDATORY: Before applying ANY fix from a review, verify each finding is real, not a hallucination. V4 Pro has ~30% false-positive rate. Open the cited file:line, read the code, confirm the bug exists. Common hallucinations: serde_json indexing claimed to panic (returns Null instead), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (actually 32-bit per spec), env-var race across cargo test binaries (env is process-local). Skip findings that don't reproduce. Note skipped false positives in the follow-up commit message.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "commit": {"type": "string", "description": "Commit SHA or ref (e.g. 'HEAD', 'HEAD~1', 'abc123'). Defaults to HEAD.", "default": "HEAD"},
-                    "repo": {"type": "string", "description": "Path to the git repo. Defaults to current working directory.", "default": "."},
-                    "focus": {"type": "string", "description": "Optional review focus (e.g. 'security', 'performance', 'API design'). Defaults to all-around.", "default": ""}
-                }
-            }
-        }),
-        json!({
-            "name": "review_diff",
-            "description": "Review an arbitrary diff via DeepSeek V4 Pro. Same reviewer policy as review_commit but accepts the diff text directly — useful when reviewing uncommitted changes or a chunk of pasted code.\n\nMANDATORY: Before applying ANY fix, verify each finding is real (~30% false-positive rate). Open the cited code, confirm the bug exists. Skip findings that don't reproduce. Common hallucinations: serde_json indexing claimed to panic (returns Null in reality), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (32-bit per spec), env-var race across cargo test binaries (env is process-local).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "diff": {"type": "string", "description": "Unified diff text or a code chunk to review."},
-                    "context": {"type": "string", "description": "Optional surrounding context (e.g. file paths, what changed and why).", "default": ""},
-                    "focus": {"type": "string", "default": ""}
-                },
-                "required": ["diff"]
-            }
-        }),
-        json!({
-            "name": "set_routing_mode",
-            "description": "Control which backends are usable. Modes: 'auto' (default — use local for matching capabilities, cloud for the rest), 'local-only' (refuse cloud requests), 'cloud-only' (kill local llama-server and free VRAM, route everything to cloud). Useful when you want to free GPU for other work but keep DeepSeek/Claude on tap.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mode": {"type": "string", "enum": ["auto", "local-only", "cloud-only"]}
-                },
-                "required": ["mode"]
-            }
-        }),
-        json!({
-            "name": "routing_status",
-            "description": "Report current routing mode + which backends are reachable.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "write_file",
-            "description": "Write a file with rollback journaling (Phase 6.1). Records the file's pre-state under session_id; `lamu rollback <session>` restores. Path is required relative to lamu-mcp's cwd; absolute paths and '..' segments are refused so the call cannot escape the working directory. session_id must match [A-Za-z0-9_-.]+ — anything else is rejected up front.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path under cwd. Relative components only — '..' is refused."},
-                    "content": {"type": "string", "description": "UTF-8 file contents."},
-                    "session_id": {"type": "string", "description": "Session identifier for rollback. Allowed chars: [A-Za-z0-9_-.]"}
-                },
-                "required": ["path", "content", "session_id"]
-            }
-        }),
-        json!({
-            "name": "parallel_query",
-            "description": "Fan out N prompts at once (agent swarm). Provider-aware concurrency: DeepSeek/OpenAI/Anthropic run in parallel up to per-provider caps, untested providers and ALL local models default to sequential (concurrency=1) until proven safe. Tasks are grouped by model so each model gets its own semaphore. Returns results in the original task order, with per-task elapsed time. Use this for batch reviews, parallel code generation, multi-perspective brainstorming.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "description": "Array of task objects. Each can override model/system/max_tokens/temperature/id; missing fields fall back to top-level defaults.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string", "description": "Optional caller-supplied id for matching results back."},
-                                "prompt": {"type": "string"},
-                                "model": {"type": "string"},
-                                "system": {"type": "string"},
-                                "max_tokens": {"type": "integer"},
-                                "temperature": {"type": "number"},
-                                "include_reasoning": {"type": "boolean"}
-                            },
-                            "required": ["prompt"]
-                        }
-                    },
-                    "default_model": {"type": "string", "default": "deepseek-v4-flash"},
-                    "default_system": {"type": "string", "default": ""},
-                    "max_concurrency": {"type": "integer", "description": "Optional cap that overrides per-provider defaults (downwards only — never raises an unproven provider above 1)."}
-                },
-                "required": ["tasks"]
-            }
-        }),
-    ];
+    // Phase 2.1: iterate the single-source tool catalog. Adding a
+    // new tool to crate::tools::TOOLS shows up here automatically.
+    let tools: Vec<Value> = crate::tools::TOOLS.iter()
+        .map(|t| t.to_list_entry())
+        .collect();
 
     json!({
         "jsonrpc": "2.0",
@@ -1267,7 +1086,7 @@ fn provider_concurrency(model_name: &str, cloud: &[CloudModel]) -> usize {
     }
 }
 
-fn handle_list_cloud_models() -> String {
+pub(crate) fn handle_list_cloud_models() -> String {
     let models = load_cloud_models();
     if models.is_empty() {
         return "(no cloud models — edit ~/.config/lamu/cloud-models.yaml or run `lamu` and press 'n' to add)".into();
@@ -1287,7 +1106,7 @@ fn handle_list_cloud_models() -> String {
     out
 }
 
-async fn handle_cloud_query(args: Value) -> String {
+pub(crate) async fn handle_cloud_query(args: Value) -> String {
     let prompt = args["prompt"].as_str().unwrap_or("");
     if prompt.is_empty() { return "error: prompt is required".into(); }
     let model_name = args["model"].as_str().unwrap_or("deepseek-v4-flash");
@@ -1528,7 +1347,7 @@ fn truncate_with_marker(text: &str, limit: usize) -> String {
     out
 }
 
-async fn handle_review_commit(args: Value) -> String {
+pub(crate) async fn handle_review_commit(args: Value) -> String {
     let commit = args["commit"].as_str().unwrap_or("HEAD");
     let repo = args["repo"].as_str().unwrap_or(".");
     let focus = args["focus"].as_str().unwrap_or("");
@@ -1581,7 +1400,7 @@ async fn handle_review_commit(args: Value) -> String {
     format!("=== Review of {} (DeepSeek V4 Pro) ===\n\n{}", commit, review)
 }
 
-async fn handle_review_diff(args: Value) -> String {
+pub(crate) async fn handle_review_diff(args: Value) -> String {
     let diff = args["diff"].as_str().unwrap_or("");
     if diff.is_empty() {
         return "error: 'diff' is required".into();
@@ -1626,7 +1445,7 @@ async fn handle_review_diff(args: Value) -> String {
 // controlling the MCP arguments can't write outside cwd or escape the
 // journal directory.
 
-async fn handle_write_file(args: Value) -> String {
+pub(crate) async fn handle_write_file(args: Value) -> String {
     let path_str = args["path"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
     let session_id = args["session_id"].as_str().unwrap_or("");
