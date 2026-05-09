@@ -185,6 +185,7 @@ impl LamuMcpServer {
             "set_routing_mode" => self.handle_set_routing_mode(args).await,
             "routing_status" => self.handle_routing_status().await,
             "parallel_query" => self.handle_parallel_query(args).await,
+            "write_file" => handle_write_file(args).await,
             other => format!("Unknown tool: {}", other),
         };
 
@@ -1088,6 +1089,19 @@ fn tools_list_response(id: Option<Value>) -> Value {
             "inputSchema": {"type": "object", "properties": {}}
         }),
         json!({
+            "name": "write_file",
+            "description": "Write a file with rollback journaling (Phase 6.1). Records the file's pre-state under session_id; `lamu rollback <session>` restores. Path is required relative to lamu-mcp's cwd; absolute paths and '..' segments are refused so the call cannot escape the working directory. session_id must match [A-Za-z0-9_-.]+ — anything else is rejected up front.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path under cwd. Relative components only — '..' is refused."},
+                    "content": {"type": "string", "description": "UTF-8 file contents."},
+                    "session_id": {"type": "string", "description": "Session identifier for rollback. Allowed chars: [A-Za-z0-9_-.]"}
+                },
+                "required": ["path", "content", "session_id"]
+            }
+        }),
+        json!({
             "name": "parallel_query",
             "description": "Fan out N prompts at once (agent swarm). Provider-aware concurrency: DeepSeek/OpenAI/Anthropic run in parallel up to per-provider caps, untested providers and ALL local models default to sequential (concurrency=1) until proven safe. Tasks are grouped by model so each model gets its own semaphore. Returns results in the original task order, with per-task elapsed time. Use this for batch reviews, parallel code generation, multi-perspective brainstorming.",
             "inputSchema": {
@@ -1601,6 +1615,62 @@ async fn handle_review_diff(args: Value) -> String {
     format!("=== Diff review (DeepSeek V4 Pro) ===\n\n{}", review)
 }
 
+// ── Sandboxed file write (Phase 6.1) ────────────────────────────────
+// Wraps lamu_core::sandbox::journal::safe_write so any agent
+// modification gets recorded for `lamu rollback <session>`.
+//
+// Path scoping: caller passes a relative path; it's resolved against
+// the lamu-mcp process cwd. Absolute paths and any '..' segments are
+// refused so the call cannot escape cwd. Combined with the
+// validate_session_id allowlist on the journal side, an attacker
+// controlling the MCP arguments can't write outside cwd or escape the
+// journal directory.
+
+async fn handle_write_file(args: Value) -> String {
+    let path_str = args["path"].as_str().unwrap_or("");
+    let content = args["content"].as_str().unwrap_or("");
+    let session_id = args["session_id"].as_str().unwrap_or("");
+
+    if path_str.is_empty() {
+        return "error: path is required".into();
+    }
+    if session_id.is_empty() {
+        return "error: session_id is required".into();
+    }
+
+    let rel = std::path::PathBuf::from(path_str);
+    if rel.is_absolute() {
+        return format!(
+            "error: absolute paths refused — pass a path relative to lamu-mcp's cwd: {}",
+            path_str
+        );
+    }
+    if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return format!("error: '..' refused in path: {}", path_str);
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => return format!("error: getcwd: {}", e),
+    };
+    let abs = cwd.join(&rel);
+
+    let journal = match lamu_core::sandbox::journal::Journal::open(session_id) {
+        Ok(j) => j,
+        Err(e) => return format!("error: open journal: {}", e),
+    };
+
+    if let Err(e) = lamu_core::sandbox::journal::safe_write(&journal, &abs, content.as_bytes()) {
+        return format!("error: write_file: {}", e);
+    }
+
+    format!(
+        "wrote {} bytes to {} (journaled to session {})",
+        content.len(),
+        rel.display(),
+        session_id
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1723,7 +1793,7 @@ mod tests {
             "unload_model", "vram_status", "scan_models", "queue_status",
             "cloud_query", "list_cloud_models",
             "review_commit", "review_diff", "set_routing_mode", "routing_status",
-            "parallel_query",
+            "parallel_query", "write_file",
         ] {
             assert!(names.contains(&required), "missing tool: {}", required);
         }
@@ -1842,5 +1912,60 @@ mod tests {
             .iter().find(|t| t["name"] == "query").unwrap();
         let required = query["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "prompt"));
+    }
+
+    // Phase 6.1 — write_file MCP tool. The journal scoping + path
+    // validation are covered in lamu-core; these tests pin the tool's
+    // input-shape rejections (which run before the journal sees
+    // anything).
+
+    #[tokio::test]
+    async fn write_file_rejects_absolute_path() {
+        let r = handle_write_file(json!({
+            "path": "/etc/passwd",
+            "content": "x",
+            "session_id": "test",
+        })).await;
+        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.contains("absolute"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_parent_dir_segment() {
+        let r = handle_write_file(json!({
+            "path": "subdir/../../escape.txt",
+            "content": "x",
+            "session_id": "test",
+        })).await;
+        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.contains(".."), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_missing_path_or_session() {
+        let no_path = handle_write_file(json!({
+            "content": "x",
+            "session_id": "test",
+        })).await;
+        assert!(no_path.starts_with("error: path"), "got: {no_path}");
+
+        let no_session = handle_write_file(json!({
+            "path": "ok.txt",
+            "content": "x",
+        })).await;
+        assert!(no_session.starts_with("error: session_id"), "got: {no_session}");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_bad_session_id() {
+        let r = handle_write_file(json!({
+            "path": "ok.txt",
+            "content": "x",
+            "session_id": "../escape",
+        })).await;
+        // The journal validator's error string starts with "session id …"
+        // and bubbles up through the "error: open journal: …" wrapper.
+        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.contains("session id"), "got: {r}");
     }
 }
