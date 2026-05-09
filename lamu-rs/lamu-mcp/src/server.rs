@@ -585,9 +585,15 @@ impl LamuMcpServer {
         };
         {
             let mut st = self.state.lock();
+            // Insert into the backends map BEFORE confirm_loaded.
+            // Once Backend::generate is wired in (next step), a query
+            // arriving between confirm_loaded and backends.insert would
+            // see the scheduler say "loaded" but find no backend in the
+            // map. Doing both inside one lock acquisition with the
+            // insert first removes the race entirely.
+            st.backends.insert(entry.name.clone(), Arc::new(AsyncMutex::new(backend)));
             let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
             st.health.get_or_create(&entry.name).record_success();
-            st.backends.insert(entry.name.clone(), Arc::new(AsyncMutex::new(backend)));
         }
         let evict_msg = if to_evict.is_empty() {
             String::new()
