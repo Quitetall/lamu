@@ -773,15 +773,32 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         REVIEW_SYSTEM_PROMPT,
     );
 
-    let review_args = json!({
-        "model": "deepseek-v4-pro",
-        "prompt": prompt,
-        "system": system,
-        "max_tokens": 8192,
-        "temperature": 0.2,
-        "include_reasoning": false,
-    });
-    let review = handle_cloud_query(review_args).await;
+    // V6 L: two-stage review when auto_context engages and the
+    // env knob doesn't disable. Stage 1 = Flash candidate scan,
+    // Stage 2 = Pro verify. Cheaper than V5's single-shot Pro on
+    // the same input.
+    // V6 L is OPT-IN via LAMU_TWO_STAGE_REVIEW=1. Bench showed it's
+    // a regression in our setup: full prefix replays in both Flash
+    // stage 1 and Pro stage 2, paying ~2× the prefix cost. Kept
+    // available for callers who want Flash's tighter candidate
+    // shortlist as a focusing aid (e.g. when Pro is the bottleneck
+    // not the prefix), but default off.
+    let review = if auto && std::env::var("LAMU_TWO_STAGE_REVIEW")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        two_stage_review(&prompt, &system).await
+    } else {
+        let review_args = json!({
+            "model": "deepseek-v4-pro",
+            "prompt": prompt,
+            "system": system,
+            "max_tokens": 8192,
+            "temperature": 0.2,
+            "include_reasoning": false,
+        });
+        handle_cloud_query(review_args).await
+    };
 
     // V4 Batch 2 + V5 D: two-direction self-reflection.
     //   - When draft has findings, run verify_findings_via_flash to
@@ -822,6 +839,58 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
 ///
 /// Best-effort: any failure path returns the original draft so the
 /// reviewer's signal is never lost — only filtered.
+/// V6 L: two-stage review. Stage 1 (Flash) scans the diff and emits
+/// a candidate-issue shortlist. Stage 2 (Pro) reads the same prompt
+/// + Flash's shortlist and produces the final review with verdict.
+/// Pro's reasoning gets directed at evaluating candidates instead of
+/// re-discovering everything from scratch — typically ~40% fewer
+/// reasoning tokens.
+async fn two_stage_review(prompt: &str, system: &str) -> String {
+    // Stage 1: Flash candidate scan. Same system prompt, but the
+    // user prompt asks for a shortlist not a verdict.
+    let stage1_prompt = format!(
+        "{}\n\n---\n\nFor STAGE 1: list candidate issues you'd flag — one bullet each, severity tag + file:line + 1-line description. NO verdict line. NO recommend. Just candidates. If you don't see anything substantive, return: NO_CANDIDATES",
+        prompt
+    );
+    let stage1_args = json!({
+        "model": "deepseek-v4-flash",
+        "prompt": stage1_prompt,
+        "system": system,
+        "max_tokens": 1024,
+        "temperature": 0.1,
+        "include_reasoning": false,
+    });
+    let candidates = handle_cloud_query(stage1_args).await;
+    let candidates_trim = candidates.trim();
+    let candidates_short = candidates_trim.starts_with("NO_CANDIDATES")
+        || candidates_trim.starts_with("error:")
+        || candidates_trim.is_empty();
+
+    // Stage 2: Pro verifies. If Flash had no candidates, ask Pro to
+    // confirm; else ask Pro to grade Flash's shortlist + add anything
+    // Flash missed.
+    let stage2_prompt = if candidates_short {
+        format!(
+            "{}\n\n---\n\nA fast first-pass scan found NO candidate issues. Verify this is correct. If you agree, return PASS + a one-line justification. If you disagree, list the missed findings.",
+            prompt
+        )
+    } else {
+        format!(
+            "{}\n\n---\n\nA fast first-pass scan flagged these candidates:\n\n{}\n\n---\n\nAct as the verifier: for each candidate, KEEP if real (severity, file:line, fix), DROP if FP (cite the FP pattern from the policy). Add any genuine findings the first pass missed. End with the verdict line + recommend.",
+            prompt, candidates
+        )
+    };
+    let stage2_args = json!({
+        "model": "deepseek-v4-pro",
+        "prompt": stage2_prompt,
+        "system": system,
+        "max_tokens": 8192,
+        "temperature": 0.2,
+        "include_reasoning": false,
+    });
+    handle_cloud_query(stage2_args).await
+}
+
 /// V5 D: when V4 Pro returns PASS, run a quick Flash pass that
 /// re-reads the diff with the central FP-list as system prompt and
 /// asks "did the reviewer miss anything obvious?". Returns the
