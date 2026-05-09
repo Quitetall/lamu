@@ -88,10 +88,66 @@ pub struct ModelEntry {
     /// currently MCP-only.)
     #[serde(default)]
     pub notes: String,
-    /// One of: "recommended", "utility", "deprecated", or "" (default).
-    /// Renders as a glyph in `list_models`: ★ ⚙ ⊘ respectively.
-    #[serde(default)]
-    pub status: String,
+    /// Operator-curated tag. Renders as a glyph in `list_models`:
+    /// ★ for Recommended, ⚙ for Utility, ⊘ for Deprecated; nothing
+    /// when Unspecified.
+    #[serde(default, deserialize_with = "ModelStatus::deserialize_lenient")]
+    pub status: ModelStatus,
+}
+
+/// Operator-curated status tag for a model. Stored in the YAML registry
+/// as a lowercase string — `recommended` / `utility` / `deprecated` —
+/// or omitted entirely when unspecified. The custom deserializer also
+/// accepts an empty string as `Unspecified` for backward compat with
+/// pre-Phase-5.2 YAMLs that wrote `status: ""`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelStatus {
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
+    Recommended,
+    Utility,
+    Deprecated,
+}
+
+impl ModelStatus {
+    pub fn is_unspecified(&self) -> bool {
+        matches!(self, ModelStatus::Unspecified)
+    }
+
+    /// Glyph for the dashboard column. Empty string when unspecified
+    /// so unflagged models don't print a stray double space.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            ModelStatus::Recommended => "★ ",
+            ModelStatus::Utility => "⚙ ",
+            ModelStatus::Deprecated => "⊘ ",
+            ModelStatus::Unspecified => "",
+        }
+    }
+
+    /// Lenient deserializer: accepts the canonical lowercase strings
+    /// ("recommended", "utility", "deprecated"), the empty string, or
+    /// a missing field. Unknown values produce a clear error so typos
+    /// like "recomended" surface visibly instead of silently mapping
+    /// to Unspecified.
+    pub fn deserialize_lenient<'de, D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw: Option<String> = Option::deserialize(d)?;
+        match raw.as_deref() {
+            None | Some("") => Ok(ModelStatus::Unspecified),
+            Some("recommended") => Ok(ModelStatus::Recommended),
+            Some("utility") => Ok(ModelStatus::Utility),
+            Some("deprecated") => Ok(ModelStatus::Deprecated),
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "invalid status '{}' — expected one of: recommended, utility, deprecated (or omit the field)",
+                other
+            ))),
+        }
+    }
 }
 
 /// Runtime state for a currently loaded model.
@@ -213,5 +269,53 @@ method: dflash
         let j = serde_json::to_value(&d).unwrap();
         assert_eq!(j["loaded"], true);
         assert_eq!(j["would_evict"][0], "a");
+    }
+
+    // Anchor: status field deserialization. The lenient deserializer
+    // must accept missing field, empty string, and the three canonical
+    // values, and reject typos visibly.
+    #[derive(Debug, serde::Deserialize)]
+    struct StatusOnly {
+        #[serde(default, deserialize_with = "ModelStatus::deserialize_lenient")]
+        status: ModelStatus,
+    }
+
+    #[test]
+    fn status_missing_field_is_unspecified() {
+        let s: StatusOnly = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(s.status, ModelStatus::Unspecified);
+    }
+
+    #[test]
+    fn status_empty_string_is_unspecified() {
+        let s: StatusOnly = serde_yaml::from_str("status: ''").unwrap();
+        assert_eq!(s.status, ModelStatus::Unspecified);
+    }
+
+    #[test]
+    fn status_canonical_variants_parse() {
+        let r: StatusOnly = serde_yaml::from_str("status: recommended").unwrap();
+        assert_eq!(r.status, ModelStatus::Recommended);
+        let u: StatusOnly = serde_yaml::from_str("status: utility").unwrap();
+        assert_eq!(u.status, ModelStatus::Utility);
+        let d: StatusOnly = serde_yaml::from_str("status: deprecated").unwrap();
+        assert_eq!(d.status, ModelStatus::Deprecated);
+    }
+
+    #[test]
+    fn status_typo_rejected_visibly() {
+        let r = serde_yaml::from_str::<StatusOnly>("status: recomended");
+        assert!(r.is_err(), "typo should fail to parse");
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("invalid status"), "got: {msg}");
+        assert!(msg.contains("recomended"), "got: {msg}");
+    }
+
+    #[test]
+    fn status_glyph_table() {
+        assert_eq!(ModelStatus::Recommended.glyph(), "★ ");
+        assert_eq!(ModelStatus::Utility.glyph(), "⚙ ");
+        assert_eq!(ModelStatus::Deprecated.glyph(), "⊘ ");
+        assert_eq!(ModelStatus::Unspecified.glyph(), "");
     }
 }

@@ -2472,7 +2472,7 @@ mod tests {
             speculative: None,
             pinned: false,
             notes: String::new(),
-            status: String::new(),
+            status: lamu_core::types::ModelStatus::default(),
         }
     }
 }

@@ -428,14 +428,9 @@ impl LamuMcpServer {
             let entry = &st.entries[name];
             let loaded = st.scheduler.is_loaded(name);
             let status_glyph = if loaded { "🟢 loaded" } else { "⚪ available" };
-            // Operator-curated tag glyph. Empty when status is unset
-            // so unflagged models don't print a stray double space.
-            let tag = match entry.status.as_str() {
-                "recommended" => "★ ",
-                "utility"     => "⚙ ",
-                "deprecated"  => "⊘ ",
-                _ => "",
-            };
+            // Operator-curated tag glyph (defined on ModelStatus so the
+            // match can never drift from the enum's variants).
+            let tag = entry.status.glyph();
             let caps: Vec<&str> = entry.capabilities.iter().map(|c| match c {
                 Capability::Chat => "chat",
                 Capability::Code => "code",
@@ -1654,7 +1649,7 @@ mod tests {
             speculative: None,
             pinned: false,
             notes: String::new(),
-            status: String::new(),
+            status: lamu_core::types::ModelStatus::default(),
         };
 
         let (cmd, _, _, _) = build_spawn_cmd(&entry, 18888).await

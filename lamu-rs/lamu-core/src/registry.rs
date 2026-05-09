@@ -286,7 +286,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             speculative: None,
             pinned: false,
             notes: String::new(),
-            status: String::new(),
+            status: crate::types::ModelStatus::default(),
         });
     }
 
@@ -320,8 +320,9 @@ struct ModelEntryYaml {
     pinned: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     notes: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    status: String,
+    #[serde(default, deserialize_with = "crate::types::ModelStatus::deserialize_lenient",
+            skip_serializing_if = "crate::types::ModelStatus::is_unspecified")]
+    status: crate::types::ModelStatus,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
