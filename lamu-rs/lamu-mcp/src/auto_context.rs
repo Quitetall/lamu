@@ -162,26 +162,34 @@ fn git_show_file(commit: &str, path: &str, repo: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Smart-truncate a long file body. Files > THRESHOLD_LINES get
-/// "first 60 + last 30" — preserves imports/headers + the file's
-/// trailing context (often where the changes landed) while dropping
-/// the middle. Below the threshold pass through unchanged.
+/// Smart-truncate a long file body. V5 E: when the file is `.rs`,
+/// use tree-sitter to chunk by item boundaries — keep top-level
+/// items intact instead of byte-cutting mid-fn. Falls back to the
+/// V4 line-based "first 60 + last 30" when tree-sitter parse fails
+/// or the file is short enough.
 fn smart_truncate_file_body(body: &str) -> String {
     const THRESHOLD_LINES: usize = 200;
-    const HEAD: usize = 60;
-    const TAIL: usize = 30;
     let lines: Vec<&str> = body.lines().collect();
     if lines.len() <= THRESHOLD_LINES {
         return body.to_string();
     }
-    let mut out = String::with_capacity(body.len() / 2);
+    if let Some(s) = symbol_aware_truncate_rust(body) {
+        return s;
+    }
+    line_based_truncate(&lines)
+}
+
+fn line_based_truncate(lines: &[&str]) -> String {
+    const HEAD: usize = 60;
+    const TAIL: usize = 30;
+    let mut out = String::with_capacity(lines.iter().map(|l| l.len()).sum::<usize>() / 2);
     for l in lines.iter().take(HEAD) {
         out.push_str(l);
         out.push('\n');
     }
     out.push_str(&format!(
         "\n[...{} lines elided ({} total)...]\n\n",
-        lines.len() - HEAD - TAIL,
+        lines.len().saturating_sub(HEAD + TAIL),
         lines.len()
     ));
     for l in lines.iter().skip(lines.len() - TAIL) {
@@ -189,6 +197,87 @@ fn smart_truncate_file_body(body: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// V5 E: symbol-aware Rust file truncation. Walks tree-sitter top-level
+/// items, keeps `pub` items + items whose start byte is in the first
+/// or last quarter of the file. Drops private helpers in the middle.
+/// Returns Some on success, None on parse failure (caller falls back).
+fn symbol_aware_truncate_rust(body: &str) -> Option<String> {
+    let language = tree_sitter_rust::language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(body.as_bytes(), None)?;
+    let root = tree.root_node();
+    if root.has_error() && body.len() > 100_000 {
+        // Big files with parse errors — bail; fallback handles them.
+        return None;
+    }
+    let total_bytes = body.len();
+    let head_zone = total_bytes / 4;
+    let tail_zone_start = total_bytes.saturating_sub(total_bytes / 4);
+
+    let mut keep_ranges: Vec<(usize, usize)> = Vec::new();
+    for i in 0..root.child_count() {
+        let Some(child) = root.child(i) else { continue };
+        let start = child.start_byte();
+        let end = child.end_byte();
+        let kind = child.kind();
+        // Always keep use, mod, attribute, line_comment, block_comment.
+        let always_keep = matches!(
+            kind,
+            "use_declaration" | "mod_item" | "attribute_item"
+            | "line_comment" | "block_comment" | "inner_attribute_item"
+        );
+        // Public items keep regardless of zone.
+        let is_pub = body[start..end].trim_start().starts_with("pub ")
+            || body[start..end].trim_start().starts_with("pub(");
+        // Head/tail zone: keep regardless of visibility.
+        let in_zone = end <= head_zone || start >= tail_zone_start;
+        if always_keep || is_pub || in_zone {
+            keep_ranges.push((start, end));
+        }
+    }
+
+    if keep_ranges.is_empty() {
+        return None;
+    }
+
+    // Merge overlapping/adjacent ranges, render with "[...elided...]"
+    // gaps between non-adjacent kept blocks.
+    keep_ranges.sort_by_key(|r| r.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(keep_ranges.len());
+    for (s, e) in keep_ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 + 80 {
+                // Merge if gap < 80 bytes — too short to be worth eliding.
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+
+    let mut out = String::with_capacity(total_bytes / 2);
+    let mut cursor = 0usize;
+    for (s, e) in &merged {
+        if *s > cursor {
+            let elided = *s - cursor;
+            if elided > 0 {
+                out.push_str(&format!("\n// […{} bytes of private items elided…]\n", elided));
+            }
+        }
+        out.push_str(&body[*s..*e]);
+        out.push('\n');
+        cursor = *e;
+    }
+    if cursor < total_bytes {
+        let trailing = total_bytes - cursor;
+        if trailing > 0 {
+            out.push_str(&format!("\n// […{} trailing bytes elided…]\n", trailing));
+        }
+    }
+    Some(out)
 }
 
 /// Test-noise filter on ripgrep caller hits. Drops `tests/` /
@@ -428,6 +517,26 @@ diff --git a/src/x.rs b/src/x.rs
         let symbols = extract_added_symbols(diff);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0], "kept");
+    }
+
+    #[test]
+    fn symbol_aware_truncate_keeps_pub_items() {
+        let mut src = String::new();
+        src.push_str("use std::path::Path;\n\n");
+        // Add 250 lines of dummy content so we hit the threshold.
+        for i in 0..50 {
+            src.push_str(&format!("fn private_{i}() {{\n    // body\n    // body\n    // body\n}}\n"));
+        }
+        src.push_str("\npub fn keep_me() {\n    let x = 1;\n}\n");
+        let out = smart_truncate_file_body(&src);
+        assert!(out.contains("pub fn keep_me"), "out: {out}");
+        // At least some private items should be elided.
+        assert!(
+            out.contains("elided") || out.len() < src.len(),
+            "no truncation happened: {} -> {}",
+            src.len(),
+            out.len()
+        );
     }
 
     #[test]
