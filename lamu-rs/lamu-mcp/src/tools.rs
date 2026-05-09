@@ -104,7 +104,9 @@ fn schema_cloud_query() -> Value {
             "max_tokens": {"type": "integer", "default": 8192},
             "temperature": {"type": "number", "default": 0.3},
             "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."},
-            "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."}
+            "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."},
+            "plan_file": {"type": "string", "description": "Optional path to a plan/spec markdown file to inject as Plan-tier context before the system prompt. Overrides $LAMU_PLAN env and any auto-detected ~/.claude/plans/active.md."},
+            "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, recent commits, etc.) injected before the system prompt and after Plan tier. Truncated at 200 KiB."}
         },
         "required": ["prompt"]
     })
@@ -116,7 +118,9 @@ fn schema_review_commit() -> Value {
         "properties": {
             "commit": {"type": "string", "description": "Commit SHA or ref (e.g. 'HEAD', 'HEAD~1', 'abc123'). Defaults to HEAD.", "default": "HEAD"},
             "repo": {"type": "string", "description": "Path to the git repo. Defaults to current working directory.", "default": "."},
-            "focus": {"type": "string", "description": "Optional review focus (e.g. 'security', 'performance', 'API design'). Defaults to all-around.", "default": ""}
+            "focus": {"type": "string", "description": "Optional review focus (e.g. 'security', 'performance', 'API design'). Defaults to all-around.", "default": ""},
+            "plan_file": {"type": "string", "description": "Optional path to a plan/spec markdown file to inject as Plan-tier context. Overrides $LAMU_PLAN and any auto-detected ~/.claude/plans/active.md."},
+            "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, related commits, etc.) injected before the reviewer system prompt. Truncated at 200 KiB."}
         }
     })
 }
@@ -126,8 +130,9 @@ fn schema_review_diff() -> Value {
         "type": "object",
         "properties": {
             "diff": {"type": "string", "description": "Unified diff text or a code chunk to review."},
-            "context": {"type": "string", "description": "Optional surrounding context (e.g. file paths, what changed and why).", "default": ""},
-            "focus": {"type": "string", "default": ""}
+            "context": {"type": "string", "description": "Optional Tactical-tier context (file paths, related commits, what changed and why). Truncated at 200 KiB.", "default": ""},
+            "focus": {"type": "string", "default": ""},
+            "plan_file": {"type": "string", "description": "Optional path to a plan/spec markdown file to inject as Plan-tier context. Overrides $LAMU_PLAN and any auto-detected ~/.claude/plans/active.md."}
         },
         "required": ["diff"]
     })

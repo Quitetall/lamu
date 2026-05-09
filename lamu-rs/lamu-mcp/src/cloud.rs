@@ -312,7 +312,7 @@ fn parse_rev_suffix(mut s: &str) -> bool {
 /// nearest UTF-8 char boundary so we never split a multi-byte
 /// codepoint mid-stream. Appends a marker describing how much was
 /// dropped so the reviewer LLM knows it didn't see the full diff.
-fn truncate_with_marker(text: &str, limit: usize) -> String {
+pub(crate) fn truncate_with_marker(text: &str, limit: usize) -> String {
     if text.len() <= limit { return text.to_string(); }
     // Walk back to the last char boundary at or before `limit`.
     let mut cut = limit;
@@ -368,10 +368,11 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     prompt.push_str(&diff_text);
     prompt.push_str("\n```\n");
 
+    let plan_arg = args["plan_file"].as_str();
     let (system, _stats) = crate::context::prepend_to_system(
         crate::context::ContextConfig {
             central: true,
-            plan: None,        // Step 5 wires plan resolver
+            plan: plan_arg,
             tactical: "",      // Step 6 wires tactical extension
             repo: Some(std::path::Path::new(repo)),
         },
@@ -412,11 +413,12 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
     prompt.push_str(&diff);
     prompt.push_str("\n```\n");
 
+    let plan_arg = args["plan_file"].as_str();
     let (system, _stats) = crate::context::prepend_to_system(
         crate::context::ContextConfig {
             central: true,
-            plan: None,
-            tactical: "",
+            plan: plan_arg,
+            tactical: "",      // Step 6 wires tactical extension
             repo: None,        // review_diff doesn't carry a repo path
         },
         REVIEW_SYSTEM_PROMPT,

@@ -22,9 +22,13 @@
 //! <original system prompt>
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const CENTRAL_DEFAULT: &str = include_str!("../assets/central_review_policy.md");
+
+/// Plan tier hard cap (~8K tokens). Truncate-from-front keeps the
+/// tail = newest plan content, since plan files grow downward.
+pub(crate) const PLAN_MAX_BYTES: usize = 32 * 1024;
 
 /// Separator between context tiers / role prompt. Plain `---` is
 /// unambiguous across markdown + diffs and stays bit-stable so cache
@@ -72,6 +76,62 @@ fn resolve_central() -> &'static str {
     CENTRAL_DEFAULT
 }
 
+/// Resolve the plan tier source path in priority order:
+/// 1. Caller-supplied `cfg.plan` arg.
+/// 2. `LAMU_PLAN` env var.
+/// 3. Repo-local `<repo>/.claude/plans/active.md`.
+/// 4. Home `~/.claude/plans/active.md`.
+///
+/// Returns (path, source) when something resolved, None otherwise.
+fn resolve_plan_path(arg: Option<&str>, repo: Option<&Path>) -> Option<(PathBuf, PlanSource)> {
+    if let Some(p) = arg {
+        if !p.is_empty() {
+            return Some((PathBuf::from(p), PlanSource::Arg));
+        }
+    }
+    if let Ok(p) = std::env::var("LAMU_PLAN") {
+        if !p.is_empty() {
+            return Some((PathBuf::from(p), PlanSource::EnvVar));
+        }
+    }
+    if let Some(r) = repo {
+        let candidate = r.join(".claude").join("plans").join("active.md");
+        if candidate.is_file() {
+            return Some((candidate, PlanSource::RepoLocal));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join(".claude").join("plans").join("active.md");
+        if candidate.is_file() {
+            return Some((candidate, PlanSource::HomeDir));
+        }
+    }
+    None
+}
+
+/// Read the plan file with a max-size guard. Truncates from the front
+/// (drops oldest content) so the tail — typically the active sprint
+/// section — stays in the prompt.
+fn load_plan(path: &Path) -> Option<(String, bool)> {
+    let body = std::fs::read_to_string(path).ok()?;
+    if body.len() <= PLAN_MAX_BYTES {
+        return Some((body, false));
+    }
+    // Truncate-from-front: keep the last PLAN_MAX_BYTES, snap back to
+    // a UTF-8 char boundary so we never split a multi-byte codepoint.
+    let mut start = body.len() - PLAN_MAX_BYTES;
+    while start < body.len() && !body.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut out = String::with_capacity(PLAN_MAX_BYTES + 64);
+    out.push_str(&format!(
+        "[…truncated — plan exceeded {} bytes; showing tail]\n\n",
+        PLAN_MAX_BYTES
+    ));
+    out.push_str(&body[start..]);
+    Some((out, true))
+}
+
 /// Resolve all enabled tiers and concatenate them into a single prefix
 /// suitable for prepending to a model's system prompt.
 ///
@@ -88,14 +148,26 @@ pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
         stats.central_bytes = central.len();
     }
 
-    // Plan tier (step 5) — placeholder for now; resolves to empty
-    // until step 5 lands its source resolution.
-    let plan_text: String = String::new();
-    let _ = cfg.plan;
-    let _ = cfg.repo;
+    let plan_text = if let Some((path, source)) = resolve_plan_path(cfg.plan, cfg.repo) {
+        match load_plan(&path) {
+            Some((body, truncated)) => {
+                stats.plan_source = source;
+                stats.plan_truncated = truncated;
+                body
+            }
+            None => {
+                // File didn't read — silently skip rather than fail
+                // the whole assemble. Logged at debug for diagnosis.
+                tracing::debug!("context: plan file at {} unreadable", path.display());
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
     if !plan_text.is_empty() {
-        parts.push(&plan_text);
         stats.plan_bytes = plan_text.len();
+        parts.push(plan_text.as_str());
     }
 
     if !cfg.tactical.is_empty() {
@@ -103,7 +175,10 @@ pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
         stats.tactical_bytes = cfg.tactical.len();
     }
 
+    // Need to outlive `parts` references — keep plan_text alive until
+    // the join completes.
     let prefix = parts.join(TIER_SEP);
+    drop(plan_text);
     (prefix, stats)
 }
 
@@ -193,5 +268,124 @@ mod tests {
         // Separator must appear exactly between central and the role
         // prompt — count occurrences to confirm.
         assert_eq!(s.matches(TIER_SEP).count(), 1);
+    }
+
+    // Plan tier tests. Env reads/writes serialized via PLAN_ENV_LOCK
+    // since LAMU_PLAN is process-global; tempfiles+tempdirs scope each
+    // test's filesystem state.
+    use std::sync::Mutex;
+    static PLAN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_clean_plan_env<F: FnOnce() -> R, R>(f: F) -> R {
+        let _g = PLAN_ENV_LOCK.lock().unwrap();
+        // SAFETY: PLAN_ENV_LOCK serializes test access. No other thread
+        // reads LAMU_PLAN within the lamu-mcp test binary.
+        unsafe {
+            std::env::remove_var("LAMU_PLAN");
+        }
+        f()
+    }
+
+    #[test]
+    fn plan_arg_overrides_env() {
+        with_clean_plan_env(|| {
+            let arg_dir = tempfile::tempdir().unwrap();
+            let arg_path = arg_dir.path().join("arg.md");
+            std::fs::write(&arg_path, "ARG_PLAN_BODY").unwrap();
+
+            let env_dir = tempfile::tempdir().unwrap();
+            let env_path = env_dir.path().join("env.md");
+            std::fs::write(&env_path, "ENV_PLAN_BODY").unwrap();
+            unsafe {
+                std::env::set_var("LAMU_PLAN", env_path.to_str().unwrap());
+            }
+
+            let (s, stats) = assemble(ContextConfig {
+                central: false, // isolate plan tier
+                plan: arg_path.to_str(),
+                ..Default::default()
+            });
+            unsafe { std::env::remove_var("LAMU_PLAN"); }
+            assert_eq!(stats.plan_source, PlanSource::Arg);
+            assert!(s.contains("ARG_PLAN_BODY"));
+            assert!(!s.contains("ENV_PLAN_BODY"));
+        });
+    }
+
+    #[test]
+    fn plan_env_used_when_no_arg() {
+        with_clean_plan_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("env.md");
+            std::fs::write(&path, "ENV_ONLY_PLAN").unwrap();
+            unsafe {
+                std::env::set_var("LAMU_PLAN", path.to_str().unwrap());
+            }
+
+            let (s, stats) = assemble(ContextConfig {
+                central: false,
+                ..Default::default()
+            });
+            unsafe { std::env::remove_var("LAMU_PLAN"); }
+            assert_eq!(stats.plan_source, PlanSource::EnvVar);
+            assert!(s.contains("ENV_ONLY_PLAN"));
+        });
+    }
+
+    #[test]
+    fn plan_repo_local_beats_home() {
+        with_clean_plan_env(|| {
+            let repo = tempfile::tempdir().unwrap();
+            let plans_dir = repo.path().join(".claude").join("plans");
+            std::fs::create_dir_all(&plans_dir).unwrap();
+            std::fs::write(plans_dir.join("active.md"), "REPO_LOCAL_PLAN").unwrap();
+
+            let (s, stats) = assemble(ContextConfig {
+                central: false,
+                repo: Some(repo.path()),
+                ..Default::default()
+            });
+            assert_eq!(stats.plan_source, PlanSource::RepoLocal);
+            assert!(s.contains("REPO_LOCAL_PLAN"));
+        });
+    }
+
+    #[test]
+    fn plan_missing_returns_empty() {
+        with_clean_plan_env(|| {
+            // No arg, no env, no repo path → no plan tier engages.
+            let (s, stats) = assemble(ContextConfig {
+                central: false,
+                ..Default::default()
+            });
+            assert!(s.is_empty());
+            assert_eq!(stats.plan_source, PlanSource::None);
+            assert_eq!(stats.plan_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn plan_truncated_when_oversized() {
+        with_clean_plan_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("big.md");
+            // 50 KiB > PLAN_MAX_BYTES (32 KiB).
+            let body: String = "X".repeat(50 * 1024) + "TAIL_MARKER_FOR_TEST";
+            std::fs::write(&path, &body).unwrap();
+            unsafe {
+                std::env::set_var("LAMU_PLAN", path.to_str().unwrap());
+            }
+
+            let (s, stats) = assemble(ContextConfig {
+                central: false,
+                ..Default::default()
+            });
+            unsafe { std::env::remove_var("LAMU_PLAN"); }
+            assert!(stats.plan_truncated);
+            // Truncate-from-front keeps the tail.
+            assert!(s.contains("TAIL_MARKER_FOR_TEST"));
+            assert!(s.contains("truncated"));
+            assert!(stats.plan_bytes <= PLAN_MAX_BYTES + 256);
+        });
     }
 }
