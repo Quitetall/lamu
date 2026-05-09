@@ -53,9 +53,10 @@ pub fn build_llama_spawn(
         .unwrap_or(u32::MAX);
     let ctx = entry.context_max.min(ctx_cap);
 
-    let kv_type = match std::env::var("LAMU_KV").as_deref() {
+    let kv_raw = std::env::var("LAMU_KV");
+    let kv_type = match kv_raw.as_deref() {
         Ok("q8_0") | Ok("q4_0") | Ok("q4_1") | Ok("q5_0") | Ok("q5_1")
-            | Ok("f16") | Ok("bf16") | Ok("f32") => std::env::var("LAMU_KV").unwrap(),
+            | Ok("f16") | Ok("bf16") | Ok("f32") => kv_raw.unwrap(),
         Ok(other) => {
             return Err(Error::Backend(format!(
                 "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32",
