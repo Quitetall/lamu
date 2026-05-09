@@ -1554,6 +1554,12 @@ mod tests {
     }
 
     #[test]
+    fn truncate_zero_max_returns_empty() {
+        assert_eq!(truncate("anything", 0), "");
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
     fn format_params_under_10_one_decimal() {
         assert_eq!(format_params(0.8), "0.8");
         assert_eq!(format_params(2.7), "2.7");

@@ -704,6 +704,13 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
 }
 
 pub(super) fn truncate(s: &str, max: usize) -> String {
+    // Guard against max == 0: subtracting from zero would underflow
+    // and silently return a value longer than the input. No current
+    // caller passes 0, but a future caller with a dynamic width
+    // calculation might.
+    if max == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max {
         s.to_string()
     } else {
