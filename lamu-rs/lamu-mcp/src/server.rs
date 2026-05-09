@@ -22,6 +22,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tracing::warn;
 
 pub struct LamuMcpServer {
     pub state: Arc<Mutex<ServerState>>,
@@ -103,6 +104,9 @@ impl LamuMcpServer {
         let mut reader = BufReader::new(stdin).lines();
         let mut writer = stdout;
 
+        // Startup banner stays as explicit eprintln (not tracing) so it's
+        // visible regardless of RUST_LOG. Some callers wait for this string
+        // before sending requests.
         eprintln!("LAMU MCP server ready (rust)");
 
         loop {
@@ -110,7 +114,7 @@ impl LamuMcpServer {
                 Ok(Some(l)) => l,
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("read error: {}", e);
+                    tracing::error!("read error: {}", e);
                     break;
                 }
             };
@@ -121,7 +125,7 @@ impl LamuMcpServer {
             let request: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("bad json: {}", e);
+                    warn!("bad json: {}", e);
                     continue;
                 }
             };
@@ -527,10 +531,10 @@ impl LamuMcpServer {
                 child.wait()
             ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!(
+                Ok(Err(e)) => warn!(
                     "load_model: wait({}) errored: {}", evict_name, e
                 ),
-                Err(_) => eprintln!(
+                Err(_) => warn!(
                     "load_model: wait({}) timed out — leaving zombie", evict_name
                 ),
             }
@@ -669,8 +673,8 @@ impl LamuMcpServer {
                 child.wait()
             ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!("unload({}): wait errored: {}", target, e),
-                Err(_) => eprintln!("unload({}): timeout — leaving zombie", target),
+                Ok(Err(e)) => warn!("unload({}): wait errored: {}", target, e),
+                Err(_) => warn!("unload({}): timeout — leaving zombie", target),
             }
         }
         format!("Unloaded '{}'. VRAM freed.", target)
@@ -758,8 +762,8 @@ impl LamuMcpServer {
             // rather than hang the entire MCP server.
             match tokio::time::timeout(std::time::Duration::from_secs(30), p.wait()).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!("set_routing_mode: wait({}) errored: {}", name, e),
-                Err(_) => eprintln!("set_routing_mode: wait({}) timed out after 30s — leaving zombie", name),
+                Ok(Err(e)) => warn!("set_routing_mode: wait({}) errored: {}", name, e),
+                Err(_) => warn!("set_routing_mode: wait({}) timed out after 30s — leaving zombie", name),
             }
         }
 
@@ -1429,7 +1433,7 @@ async fn handle_cloud_query(args: Value) -> String {
                     "budget_tokens": budget,
                 });
             } else {
-                eprintln!(
+                warn!(
                     "cloud_query: thinking_enabled=true but max_tokens={} ≤ 1024 (Anthropic min budget); thinking block omitted",
                     max_tokens
                 );

@@ -126,8 +126,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default to `warn` when RUST_LOG is unset so operationally-relevant
+    // warnings (zombie children, dropped thinking blocks, etc.) are
+    // visible without the user having to opt in. RUST_LOG=info or debug
+    // for higher verbosity; RUST_LOG=error to silence warns.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 
