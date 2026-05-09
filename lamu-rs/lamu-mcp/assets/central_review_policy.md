@@ -24,6 +24,8 @@ Reviewers that touch this codebase have a documented ~30% false-positive rate. T
 
 If the finding doesn't survive a 30-second check against the cited file, skip it. Note skipped FPs in the review so the audit trail is preserved.
 
+**Cite or drop.** Every BUG / SECURITY finding must cite `file:line` from the supplied diff or an auto-context body. If you cannot point at the exact line, drop the finding — it's likely speculative. STYLE / QUESTION findings can reference a region without exact line, but should still name the file.
+
 **Cross-reference recent activity.** When the prompt includes a "Recent activity" header (last 50 commits), check it BEFORE flagging plan items as TODO or open issues. A plan that says "Phase 6.3 will wire Backend trait" is stale if the activity log shows "Phase 6.3: route load/unload through Backend trait" already shipped. Don't re-raise issues already fixed by a recent commit — name the commit instead and treat the plan note as historical.
 
 ## Project facts the reviewer should know
