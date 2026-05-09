@@ -715,13 +715,22 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     });
     let review = handle_cloud_query(review_args).await;
 
-    // V4 Batch 2: self-reflection pass when full-stack mode (auto)
-    // is engaged. Feed the draft + central FP-list to a Flash call
-    // and ask it to drop findings that match a known-FP pattern.
-    // Cheap (~$0.0002 per review) but cuts the residual FP rate
-    // beyond what the central tier alone achieves.
+    // V4 Batch 2 + V5 D: two-direction self-reflection.
+    //   - When draft has findings, run verify_findings_via_flash to
+    //     drop those matching a known-FP pattern. Cuts residual FPs.
+    //   - When draft says PASS, run pass_double_check_via_flash to
+    //     scan the diff a second time for issues V4 Pro might have
+    //     skipped. Cuts false negatives (silent merge of broken code).
     let review = if auto && !review.starts_with("error:") {
-        verify_findings_via_flash(&review).await
+        if review.contains("\nPASS\n") || review.contains("\nPASS.")
+            || review.starts_with("PASS\n") || review.starts_with("PASS.") {
+            // PASS path — scan for false negatives
+            let diff = git_show_diff_or_empty(commit, std::path::Path::new(repo));
+            pass_double_check_via_flash(&review, &diff).await
+        } else {
+            // Has findings — drop FPs
+            verify_findings_via_flash(&review).await
+        }
     } else {
         review
     };
@@ -737,6 +746,56 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
 ///
 /// Best-effort: any failure path returns the original draft so the
 /// reviewer's signal is never lost — only filtered.
+/// V5 D: when V4 Pro returns PASS, run a quick Flash pass that
+/// re-reads the diff with the central FP-list as system prompt and
+/// asks "did the reviewer miss anything obvious?". Returns the
+/// original PASS draft unchanged if Flash also says PASS; otherwise
+/// upgrades to PASS WITH NITS / NEEDS CHANGES with Flash's findings
+/// appended. Cost: ~$0.0002 per review.
+async fn pass_double_check_via_flash(draft: &str, diff: &str) -> String {
+    if diff.is_empty() {
+        return draft.to_string();
+    }
+    let central = include_str!("../assets/central_review_policy.md");
+    let system = format!(
+        "You are a second-pass reviewer. The first pass returned PASS. Your job is to scan the diff for issues the first pass might have missed — security, correctness, edge cases, race conditions, missing error handling. Apply the same FP rules below. If you genuinely find no issues, return ONLY the single line: SECOND_PASS_OK\n\n{}",
+        central
+    );
+    let prompt = format!(
+        "Diff:\n\n```\n{}\n```\n\nFirst-pass verdict: PASS. Did the first pass miss anything? If yes, list the missed findings (severity tag, file:line, problem, fix). If no genuine missed findings, return SECOND_PASS_OK on a single line.",
+        diff
+    );
+    let args = json!({
+        "model": "deepseek-v4-flash",
+        "prompt": prompt,
+        "system": system,
+        "max_tokens": 2048,
+        "temperature": 0.1,
+        "include_reasoning": false,
+    });
+    let second = handle_cloud_query(args).await;
+    let second_trim = second.trim();
+    if second.starts_with("error:") || second_trim.is_empty() || second_trim.starts_with("SECOND_PASS_OK") {
+        return draft.to_string();
+    }
+    // Flash found something — append to draft, upgrade verdict.
+    format!(
+        "{}\n\n---\n\n## Second-pass findings (V5 D — Flash, after V4 Pro PASS)\n\n{}",
+        draft, second
+    )
+}
+
+fn git_show_diff_or_empty(commit: &str, repo: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["show", "--patch", "--no-color", commit])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => String::new(),
+    }
+}
+
 async fn verify_findings_via_flash(draft: &str) -> String {
     // Skip if draft says PASS — nothing to filter.
     if draft.contains("PASS\n") || draft.starts_with("PASS\n") || draft.contains("PASS\nNo ") {
