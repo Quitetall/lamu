@@ -495,8 +495,32 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     prompt.push_str("\n```\n");
 
     let plan_arg = args["plan_file"].as_str();
-    let raw_tactical = args["context"].as_str().unwrap_or("");
-    let tactical = truncate_with_marker(raw_tactical, MAX_TACTICAL_CONTEXT_BYTES);
+    let raw_tactical_arg = args["context"].as_str().unwrap_or("");
+    let auto = args["auto_context"].as_bool().unwrap_or(false);
+
+    // When auto_context=true, run the diff-derived context assembler
+    // (changed-files + tree-sitter symbols + ripgrep callers) and
+    // prepend it to the caller-supplied tactical blob. Caller-supplied
+    // sits at the end so it stays closer to the role prompt.
+    let auto_blob = if auto {
+        match crate::auto_context::assemble_auto_context(commit, std::path::Path::new(repo)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("auto_context: assemble failed: {}", e);
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+    let raw_tactical = if auto_blob.is_empty() {
+        raw_tactical_arg.to_string()
+    } else if raw_tactical_arg.is_empty() {
+        auto_blob
+    } else {
+        format!("{}\n\n---\n\n{}", auto_blob, raw_tactical_arg)
+    };
+    let tactical = truncate_with_marker(&raw_tactical, MAX_TACTICAL_CONTEXT_BYTES);
     let (system, _stats) = crate::context::prepend_to_system(
         crate::context::ContextConfig {
             central: true,

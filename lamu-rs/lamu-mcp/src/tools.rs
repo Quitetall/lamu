@@ -121,7 +121,8 @@ fn schema_review_commit() -> Value {
             "repo": {"type": "string", "description": "Path to the git repo. Defaults to current working directory.", "default": "."},
             "focus": {"type": "string", "description": "Optional review focus (e.g. 'security', 'performance', 'API design'). Defaults to all-around.", "default": ""},
             "plan_file": {"type": "string", "description": "Optional path to a plan/spec markdown file to inject as Plan-tier context. Overrides $LAMU_PLAN and any auto-detected ~/.claude/plans/active.md."},
-            "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, related commits, etc.) injected before the reviewer system prompt. Truncated at 200 KiB."}
+            "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, related commits, etc.) injected before the reviewer system prompt. Truncated at 200 KiB."},
+            "auto_context": {"type": "boolean", "default": false, "description": "When true, lamu-mcp builds Tactical-tier context automatically: changed files at HEAD, tree-sitter-extracted added/modified Rust symbols, and ripgrep caller locations across the repo. Concatenated with any caller-supplied `context` arg. Bounded at 200 KiB total. Cost: ~1 git show + 1 ripgrep per added symbol."}
         }
     })
 }

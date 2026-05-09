@@ -6,6 +6,7 @@
 //!
 //! Transport: JSON-RPC over stdio.
 
+pub mod auto_context;
 pub mod cloud;
 pub mod context;
 pub mod handlers;
