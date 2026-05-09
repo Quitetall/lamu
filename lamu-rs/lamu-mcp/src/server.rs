@@ -1049,7 +1049,7 @@ fn tools_list_response(id: Option<Value>) -> Value {
         }),
         json!({
             "name": "review_commit",
-            "description": "PRIMARY REVIEW TOOL — auto-routes to DeepSeek V4 Pro (the project policy reviewer). Takes a commit SHA (or 'HEAD' for the most recent), runs `git show` to get the full diff + commit message, and returns a deep code review covering security, correctness, edge cases, idiom, and architectural fit. NO CODE SHOULD BE CONSIDERED DONE WITHOUT GOING THROUGH THIS TOOL. Use it after every commit you make.",
+            "description": "PRIMARY REVIEW TOOL — auto-routes to DeepSeek V4 Pro (the project policy reviewer). Takes a commit SHA (or 'HEAD' for the most recent), runs `git show` to get the full diff + commit message, and returns a deep code review covering security, correctness, edge cases, idiom, and architectural fit. NO CODE SHOULD BE CONSIDERED DONE WITHOUT GOING THROUGH THIS TOOL. Use it after every commit you make.\n\nMANDATORY: Before applying ANY fix from a review, verify each finding is real, not a hallucination. V4 Pro has ~30% false-positive rate. Open the cited file:line, read the code, confirm the bug exists. Common hallucinations: serde_json indexing claimed to panic (returns Null instead), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (actually 32-bit per spec), env-var race across cargo test binaries (env is process-local). Skip findings that don't reproduce. Note skipped false positives in the follow-up commit message.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1061,7 +1061,7 @@ fn tools_list_response(id: Option<Value>) -> Value {
         }),
         json!({
             "name": "review_diff",
-            "description": "Review an arbitrary diff via DeepSeek V4 Pro. Same reviewer policy as review_commit but accepts the diff text directly — useful when reviewing uncommitted changes or a chunk of pasted code.",
+            "description": "Review an arbitrary diff via DeepSeek V4 Pro. Same reviewer policy as review_commit but accepts the diff text directly — useful when reviewing uncommitted changes or a chunk of pasted code.\n\nMANDATORY: Before applying ANY fix, verify each finding is real (~30% false-positive rate). Open the cited code, confirm the bug exists. Skip findings that don't reproduce. See review_commit description for known hallucination patterns.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
