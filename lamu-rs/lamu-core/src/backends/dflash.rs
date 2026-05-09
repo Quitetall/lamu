@@ -106,7 +106,7 @@ impl Backend for DflashBackend {
 
     async fn unload(&mut self) -> Result<()> {
         if let Some(mut p) = self.proc.take() {
-            let _ = p.kill().await;
+            crate::backends::graceful_kill(&mut p).await;
         }
         self.model_name.clear();
         Ok(())

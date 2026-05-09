@@ -58,3 +58,37 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
+
+/// Graceful child shutdown: SIGTERM, wait up to 10s for the child to
+/// exit cleanly, fall back to SIGKILL if it ignores TERM. Used by every
+/// `Backend::unload` impl so server-side flushes (KV cache, log files,
+/// etc.) get a chance to run before we tear the process down.
+///
+/// Why 10s: llama-server typically exits in <1s; megakernel/dflash
+/// Python servers can take 2-5s to flush. 10s leaves margin without
+/// hanging the MCP server when a child genuinely refuses to die.
+#[cfg(unix)]
+pub async fn graceful_kill(child: &mut tokio::process::Child) {
+    use std::time::Duration;
+    if let Some(pid) = child.id() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(_) => {
+            tracing::debug!("graceful_kill: child exited cleanly after SIGTERM");
+        }
+        Err(_) => {
+            tracing::warn!("graceful_kill: 10s SIGTERM timeout, escalating to SIGKILL");
+            let _ = child.kill().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn graceful_kill(child: &mut tokio::process::Child) {
+    // No SIGTERM on non-Unix; just kill.
+    let _ = child.kill().await;
+}
