@@ -1,7 +1,11 @@
-//! Pure provider wire-format adapters.
+//! Provider wire-format adapters.
 //!
-//! This crate is intentionally minimal: shared types + payload
-//! builders + header helpers. No HTTP client, no tokio, no blocking.
+//! Shared types + payload builders + a single env-driven header
+//! helper. No HTTP client, no tokio, no blocking transport. The
+//! payload builders are pure (input → JSON); `headers::anthropic_beta_header`
+//! is the one exception that touches IO, by reading the
+//! `ANTHROPIC_BETA` environment variable.
+//!
 //! The `Provider` trait (sync transport) lives in `lamu-cli`; the
 //! async transport for MCP lives in `lamu-mcp`. Both consume from
 //! here so the wire format stays in lock-step.
