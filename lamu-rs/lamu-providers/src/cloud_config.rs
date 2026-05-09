@@ -30,6 +30,10 @@ pub struct CloudModel {
     /// Display name used in the TUI (e.g. "claude-opus-4-7").
     pub name: String,
     /// Provider key Bifrost knows about ("anthropic", "openai", ...).
+    /// Defaults to empty string for forward-compat with older YAMLs
+    /// where the field could be omitted; the loader treats an empty
+    /// provider as "use Bifrost / catch-all routing".
+    #[serde(default)]
     pub provider: String,
     /// Bifrost-shaped id for the OpenAI request body. Defaults to
     /// `<provider>/<name>` if unset.
@@ -111,18 +115,37 @@ pub fn config_path() -> PathBuf {
     PathBuf::from("./cloud-models.yaml")
 }
 
-/// Best-effort load: missing file → empty Vec, parse error → empty Vec.
+/// Best-effort load: missing file → empty Vec, parse error → empty Vec
+/// + a stderr warning so a broken YAML isn't invisible.
+///
 /// Use this from MCP / non-interactive paths where seeding to disk on
-/// missing-file would be surprising. The lamu-cli TUI uses its own
-/// load() that seeds the file when missing.
+/// missing-file would be surprising. The lamu-cli TUI uses `load()` (in
+/// lamu-cli) which seeds the file when missing.
 pub fn load_or_empty() -> Vec<CloudModel> {
     let path = config_path();
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "lamu: cloud-models.yaml read failed at {} ({}); using empty list.",
+                path.display(),
+                e
+            );
+            return Vec::new();
+        }
     };
-    serde_yaml::from_str::<CloudModelList>(&body)
-        .map(|l| l.models)
-        .unwrap_or_default()
+    match serde_yaml::from_str::<CloudModelList>(&body) {
+        Ok(l) => l.models,
+        Err(e) => {
+            eprintln!(
+                "lamu: cloud-models.yaml is corrupt at {} ({}); using empty list.",
+                path.display(),
+                e
+            );
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -269,7 +269,9 @@ pub fn save(models: &[CloudModel]) -> std::io::Result<()> {
 }
 
 /// Load cloud models. Missing file → seed list written to disk for
-/// users to edit. Bad YAML → empty list + a stderr warning.
+/// users to edit, then returned. Existing file → consume via the
+/// shared lamu_providers::load_or_empty so the parser logic lives in
+/// one place.
 pub fn load() -> Vec<CloudModel> {
     let path = config_path();
     if !path.exists() {
@@ -283,21 +285,7 @@ pub fn load() -> Vec<CloudModel> {
         }
         return seed;
     }
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    match serde_yaml::from_slice::<CloudModelList>(&bytes) {
-        Ok(list) => list.models,
-        Err(e) => {
-            eprintln!(
-                "lamu: cloud-models.yaml is corrupt at {} ({}); using empty list.",
-                path.display(),
-                e
-            );
-            Vec::new()
-        }
-    }
+    lamu_providers::load_or_empty()
 }
 
 #[cfg(test)]
