@@ -16,10 +16,12 @@
 //! to the on-disk registry when not.
 
 mod render;
+mod settings;
 mod state;
 mod swap;
 
 pub use state::AppState;
+use settings::{first_run_checks, pick_editor, run_blocking, save_api_key, settings_file_path, spawn_detached};
 use swap::swap_to_model_if_needed;
 
 #[cfg(test)]
@@ -894,128 +896,6 @@ pub(super) fn which_exists(bin: &str) -> bool {
 }
 
 /// Resolve the on-disk path for a Settings "Edit ..." item.
-fn settings_file_path(which: SettingFile) -> std::path::PathBuf {
-    match which {
-        SettingFile::LamuConfig => LamuConfig::path(),
-        SettingFile::CloudModels => cloud_models::config_path(),
-        SettingFile::LocalModels => lamu_core::config::registry_path(),
-        SettingFile::McpServers => mcp_servers::config_path(),
-        SettingFile::Favorites => Favorites::path(),
-        SettingFile::ThemesDir => {
-            Theme::user_themes_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.config/lamu/themes"))
-        }
-    }
-}
-
-fn pick_editor() -> String {
-    let cfg = LamuConfig::load();
-    if !cfg.editor.is_empty() {
-        return cfg.editor;
-    }
-    std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".into())
-}
-
-fn save_api_key(var_name: &str, key_val: &str) -> std::io::Result<std::path::PathBuf> {
-    let dir = dirs::config_dir()
-        .map(|d| d.join("lamu"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("api-keys.env");
-    // Read existing, replace or append.
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let prefix = format!("export {}=", var_name);
-    let new_line = format!("export {}={}", var_name, key_val);
-    let updated: String = if existing.lines().any(|l| l.starts_with(&prefix)) {
-        existing
-            .lines()
-            .map(|l| if l.starts_with(&prefix) { new_line.as_str() } else { l })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
-    } else {
-        format!("{}{}\n", existing, new_line)
-    };
-    std::fs::write(&path, updated)?;
-    Ok(path)
-}
-
-fn spawn_detached(argv: &[&str]) {
-    use std::process::{Command, Stdio};
-    if argv.is_empty() {
-        return;
-    }
-    let _ = Command::new(argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
-/// Pre-TUI bootstrap. Runs while the terminal is still in cooked mode so
-/// the user sees plain `[Y/n]` prompts instead of a half-initialised
-/// dashboard. Skips silently when stdin is not a TTY (CI / piped runs).
-fn first_run_checks() {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return;
-    }
-
-    // 1. Empty registry → offer to download Qwen3.6-27B + run scan.
-    let entries = load_registry(&registry_path()).unwrap_or_default();
-    if entries.is_empty() {
-        eprintln!("\nLAMU first-run: no models found in registry.");
-        eprintln!("  Suggested: download Qwen3.6-27B-uncensored-heretic-v2 (~16 GB).");
-        if prompt_yes("Run `just setup-qwen36` now?", true) {
-            run_blocking(&["just", "setup-qwen36"]);
-            run_blocking(&["lamu", "scan"]);
-        } else {
-            eprintln!("  Skipped. You can run it later via `just setup-qwen36`.");
-        }
-    }
-
-    // 2. LAMU_GATEWAY_URL set but Bifrost down → offer to start it.
-    if let Ok(gw) = std::env::var("LAMU_GATEWAY_URL") {
-        if gw.contains(":8080") && !probe_port(8080) {
-            eprintln!("\nLAMU_GATEWAY_URL points at :8080 but Bifrost is not running.");
-            if prompt_yes("Start Bifrost (just serve-bifrost)?", true) {
-                run_blocking(&["just", "serve-bifrost"]);
-            }
-        }
-    }
-}
-
-fn prompt_yes(question: &str, default_yes: bool) -> bool {
-    use std::io::{self, Write};
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    eprint!("  {} {} ", question, suffix);
-    let _ = io::stderr().flush();
-    let mut buf = String::new();
-    if io::stdin().read_line(&mut buf).is_err() {
-        return default_yes;
-    }
-    let answer = buf.trim().to_lowercase();
-    if answer.is_empty() {
-        default_yes
-    } else {
-        answer.starts_with('y')
-    }
-}
-
-fn run_blocking(argv: &[&str]) {
-    use std::process::Command;
-    if argv.is_empty() {
-        return;
-    }
-    let status = Command::new(argv[0]).args(&argv[1..]).status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("  command exited with {}", s),
-        Err(e) => eprintln!("  failed to run {:?}: {}", argv, e),
-    }
-}
 
 /// Check which model is loaded on :8020 and swap if it doesn't match
 /// `entry`. Kills the existing llama-server, spawns a new one with the
