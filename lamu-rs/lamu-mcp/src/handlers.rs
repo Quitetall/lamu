@@ -152,6 +152,24 @@ impl LamuMcpServer {
         // queue gating limits concurrent same-model requests already.
         let raw = {
             let backend = backend_arc.lock().await;
+            // Pre-check: if the backend has died (process exited, port
+            // unbound, etc.) surface a clear error before .generate()
+            // returns an opaque empty/timeout. Each Backend impl knows
+            // how to probe its own health endpoint.
+            if !backend.is_healthy().await {
+                emit(
+                    "mcp_query_failed",
+                    Some(&trace_id),
+                    json!({
+                        "model": model_name,
+                        "error_type": "backend_unhealthy",
+                    }),
+                );
+                return format!(
+                    "error: backend '{}' is not healthy — try `unload_model` then `load_model` to restart",
+                    model_name
+                );
+            }
             match backend.generate(chat_messages, max_tokens, temperature).await {
                 Ok(s) => s,
                 Err(e) => {
