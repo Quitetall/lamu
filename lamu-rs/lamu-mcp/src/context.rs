@@ -191,6 +191,91 @@ fn recent_activity_header(repo: &Path) -> String {
     body
 }
 
+/// V5 improvement B: strip plan headings whose `Phase X.Y` /
+/// `Step N` / `Improvement Z` token also appears in the recent
+/// activity log. The reviewer keeps the plan's strategic context
+/// without the per-phase TODO list re-raising items already shipped.
+///
+/// Conservative: only strips when a heading contains a phase token
+/// AND the same token appears in the activity. Keeps headings that
+/// don't carry recognized tokens. False-positive on this stripper
+/// just means the plan stays intact (no harm); false-negative means
+/// stale items survive (no worse than V4).
+fn strip_shipped_phases(plan_body: &str, activity: &str) -> String {
+    if activity.is_empty() {
+        return plan_body.to_string();
+    }
+    use std::collections::HashSet;
+    let phase_re_chars: &[char] = &['.', ':'];
+
+    // Tokens we recognize in activity log: "Phase X.Y", "Step N",
+    // "Improvement Z". Walk activity once, build a set.
+    let mut shipped: HashSet<String> = HashSet::new();
+    for line in activity.lines() {
+        for word in line.split_whitespace() {
+            let word = word.trim_matches(phase_re_chars);
+            if let Some(rest) = word.strip_prefix("Phase") {
+                if !rest.is_empty() && rest.chars().next().map_or(false, |c| c.is_ascii_digit() || c.is_whitespace()) {
+                    // Multi-token form: "Phase 6.3" — peek next word in activity
+                    // is too involved; skip. Catch single-token "Phase6.3" if
+                    // ever used. For multi-token we look for "Phase" anchor +
+                    // next word, handled below.
+                }
+            }
+        }
+        // Multi-token capture: walk word pairs, find "Phase X.Y" /
+        // "Step N" / "Improvement Z".
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for i in 0..words.len().saturating_sub(1) {
+            let anchor = words[i];
+            let next = words[i + 1].trim_matches(phase_re_chars).trim_end_matches(',');
+            if (anchor == "Phase" || anchor == "Step" || anchor == "Improvement")
+                && !next.is_empty()
+            {
+                shipped.insert(format!("{} {}", anchor, next));
+            }
+        }
+    }
+
+    if shipped.is_empty() {
+        return plan_body.to_string();
+    }
+
+    // Walk plan body line-by-line. When a heading line ("##" / "###")
+    // contains a shipped token, mark a "strip until next heading at
+    // <= same depth" window. Append a one-line "(shipped: …)" stub
+    // so reviewer sees the heading was elided + which commit context.
+    let mut out = String::with_capacity(plan_body.len());
+    let mut strip_depth: Option<usize> = None;
+    for line in plan_body.lines() {
+        let depth = line.chars().take_while(|c| *c == '#').count();
+        let is_heading = depth > 0 && line.chars().nth(depth).map_or(false, |c| c == ' ');
+        if is_heading {
+            if let Some(d) = strip_depth {
+                if depth <= d {
+                    strip_depth = None;
+                }
+            }
+            if strip_depth.is_none() {
+                let shipped_match = shipped.iter().find(|tok| line.contains(tok.as_str()));
+                if let Some(tok) = shipped_match {
+                    out.push_str(&format!(
+                        "{} _(shipped — {} appears in recent activity; details elided)_\n",
+                        line, tok
+                    ));
+                    strip_depth = Some(depth);
+                    continue;
+                }
+            }
+        }
+        if strip_depth.is_none() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Read the plan file with a max-size guard. Truncates from the front
 /// (drops oldest content) so the tail — typically the active sprint
 /// section — stays in the prompt.
@@ -243,7 +328,8 @@ pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
                 if let Some(repo) = cfg.repo {
                     let header = recent_activity_header(repo);
                     if !header.is_empty() {
-                        format!("{}\n\n---\n\n{}", header, body)
+                        let stripped = strip_shipped_phases(&body, &header);
+                        format!("{}\n\n---\n\n{}", header, stripped)
                     } else {
                         body
                     }
@@ -466,6 +552,34 @@ mod tests {
             assert_eq!(stats.plan_source, PlanSource::None);
             assert_eq!(stats.plan_bytes, 0);
         });
+    }
+
+    #[test]
+    fn strip_shipped_phases_drops_matching_heading_block() {
+        let plan = "## Plan\n\n### Phase 1: setup\nSetup details.\n\n### Phase 2.3: feature X\nDetails about phase 2.3.\n\n### Phase 9: future\nNot yet shipped.\n";
+        let activity = "abc1234 Phase 2.3: shipped feature X\ndef5678 unrelated work\n";
+        let out = strip_shipped_phases(plan, activity);
+        assert!(out.contains("Phase 1: setup"));
+        assert!(out.contains("Phase 9: future"));
+        assert!(out.contains("shipped"));
+        assert!(out.contains("Phase 2.3"));
+        assert!(!out.contains("Details about phase 2.3"));
+    }
+
+    #[test]
+    fn strip_shipped_phases_unchanged_when_activity_empty() {
+        let plan = "## Phase 1\nbody\n";
+        assert_eq!(strip_shipped_phases(plan, ""), plan);
+    }
+
+    #[test]
+    fn strip_shipped_phases_preserves_non_phase_headings() {
+        let plan = "## Architecture\n\nbody about arch.\n\n## Phase 7\nshipped body.\n";
+        let activity = "abc Phase 7: done\n";
+        let out = strip_shipped_phases(plan, activity);
+        assert!(out.contains("Architecture"));
+        assert!(out.contains("body about arch"));
+        assert!(!out.contains("shipped body"));
     }
 
     #[test]
