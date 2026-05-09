@@ -354,6 +354,29 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     result
 }
 
+/// V5 improvement I: per-process timestamp for the last `review_commit`
+/// invocation. When the next call comes in after IDLE_THRESHOLD, we
+/// implicitly run a warmup pass first so DeepSeek's prompt-cache TTL
+/// (server-side, ~1 hour) has been refreshed. No explicit `warmup`
+/// tool call needed.
+fn last_review_call_ts() -> &'static parking_lot::Mutex<std::time::Instant> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<std::time::Instant>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(3600 * 2)))
+}
+
+/// Returns true when the previous review was > IDLE_THRESHOLD ago AND
+/// updates the timestamp. Caller can use the boolean to decide
+/// whether to fire an implicit warmup before the real review.
+fn should_implicit_warmup() -> bool {
+    const IDLE_THRESHOLD_SECS: u64 = 30 * 60; // 30 min — DeepSeek cache TTL is ~1h
+    let mut ts = last_review_call_ts().lock();
+    let now = std::time::Instant::now();
+    let elapsed = now.duration_since(*ts).as_secs();
+    *ts = now;
+    elapsed > IDLE_THRESHOLD_SECS
+}
+
 /// V5 improvement F: heuristic for skipping auto_context. Counts
 /// added lines (`^+`) and changed files via `git show --shortstat`.
 /// Returns true when both counts are below thresholds — the diff is
@@ -624,6 +647,19 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     let plan_arg = args["plan_file"].as_str();
     let raw_tactical_arg = args["context"].as_str().unwrap_or("");
     let auto = args["auto_context"].as_bool().unwrap_or(false);
+
+    // V5 improvement I: implicit warmup when this MCP server hasn't
+    // seen a review_commit call in > 30 min. Server-side prompt cache
+    // (DeepSeek) likely expired. Fire a 1-token warmup call against
+    // the same central+plan prefix so the real call hits cache.
+    if should_implicit_warmup() {
+        tracing::info!(target: "lamu_bench", "auto-warmup triggered (idle > 30 min)");
+        let warmup_args = json!({
+            "plan_file": plan_arg.unwrap_or(""),
+            "repo": repo,
+        });
+        let _ = handle_warmup(warmup_args).await;
+    }
 
     // When auto_context=true, run the diff-derived context assembler
     // (changed-files + tree-sitter symbols + ripgrep callers) and
