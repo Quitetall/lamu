@@ -100,15 +100,19 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         ),
     };
 
-    let api_key = match entry.api_key_env.as_deref() {
+    // None means gateway-routed (Bifrost or similar handles auth). Skip
+    // the auth header entirely in that case — sending a bogus
+    // `Bearer no-key-needed` works against permissive gateways but
+    // signals a misconfiguration and breaks any gateway that validates.
+    let api_key: Option<String> = match entry.api_key_env.as_deref() {
         Some(env) => match std::env::var(env) {
-            Ok(k) => k,
+            Ok(k) => Some(k),
             Err(_) => return format!(
                 "error: ${} is not set. Add it via `lamu` (press 'a' on the model row) or export it manually.",
                 env
             ),
         },
-        None => "no-key-needed".to_string(),
+        None => None,
     };
 
     let base = match entry.base_url.as_deref() {
@@ -119,7 +123,11 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         ),
     };
     let model_id = entry.model_id.clone().unwrap_or_else(|| entry.name.clone());
-    let is_anthropic = entry.provider == "anthropic" || base.contains("anthropic");
+    // Use the explicit provider field. Substring-matching the base URL
+    // would misroute a non-Anthropic provider whose host happens to
+    // contain "anthropic" (e.g. a proxy domain) — every cloud-models.yaml
+    // entry already declares its provider, so trust that.
+    let is_anthropic = entry.provider == "anthropic";
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -163,9 +171,11 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         }
 
         let mut req = client.post(&url)
-            .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
+        if let Some(k) = &api_key {
+            req = req.header("x-api-key", k);
+        }
         // 1M ctx beta: validated via the shared helper so the trim +
         // reject-bad-value rule lives in lamu-providers only.
         if let Some(val) = lamu_providers::anthropic_beta_header() {
@@ -220,9 +230,11 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         payload["thinking"] = json!({
             "type": if thinking_enabled { "enabled" } else { "disabled" }
         });
-        let resp = match client.post(&url)
-            .bearer_auth(&api_key)
-            .json(&payload).send().await {
+        let mut req = client.post(&url);
+        if let Some(k) = &api_key {
+            req = req.bearer_auth(k);
+        }
+        let resp = match req.json(&payload).send().await {
             Ok(r) => r,
             Err(e) => return format!("error: post {url}: {e}"),
         };
