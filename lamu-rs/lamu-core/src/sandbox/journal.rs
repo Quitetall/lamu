@@ -147,22 +147,10 @@ pub fn safe_write(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<()> {
     }
     // Refuse to follow symlinks at the leaf. symlink_metadata does NOT
     // dereference; it tells us whether the path itself is a symlink.
-    // Without this check, std::fs::write would follow the link and
-    // write to whatever the symlink targets — including paths outside
-    // any sandbox the caller scoped above.
-    //
-    // KNOWN TOCTOU GAP: a process with write access to the parent dir
-    // could swap a regular file for a symlink between this check and
-    // the write below. Closing that race needs O_NOFOLLOW on the open
-    // syscall, which requires platform-specific OpenOptionsExt; tracked
-    // separately. For a single-tenant local sandbox this trade-off is
-    // acceptable; multi-tenant deployments must layer additional
-    // isolation (bubblewrap, mount namespaces).
-    // symlink_metadata error is intentionally swallowed: a NotFound
-    // means the leaf doesn't exist yet (the common create case) and a
-    // permissions error would also cause std::fs::write below to fail,
-    // so the net effect is the same — we never silently succeed at a
-    // bypass.
+    // The metadata error is intentionally swallowed: NotFound means
+    // the leaf doesn't exist yet (the common create case); a perm
+    // error cascades into the open below failing anyway, so the net
+    // effect is the same — we never silently succeed at a bypass.
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             anyhow::bail!(
@@ -180,8 +168,43 @@ pub fn safe_write(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, bytes)?;
+    write_no_follow(path, bytes)?;
     Ok(())
+}
+
+/// Write `bytes` to `path` with O_NOFOLLOW on Unix so an attacker who
+/// races between symlink_metadata and the open call can't swap in a
+/// symlink and have us write through it. `OpenOptions::truncate(true)`
+/// keeps the existing file behavior (overwrite-not-append) consistent
+/// with `std::fs::write`. On non-Unix platforms we fall back to
+/// `std::fs::write`; the symlink_metadata pre-check above is the only
+/// guard there.
+#[cfg(unix)]
+fn write_no_follow(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW on Linux = 0x20000, macOS = 0x100, FreeBSD = 0x100.
+    // libc isn't a direct dep here, so go through cfg-specific values.
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW: i32 = 0x20000;
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "ios"))]
+    const O_NOFOLLOW: i32 = 0x100;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "ios")))]
+    const O_NOFOLLOW: i32 = 0; // unknown unix — soft fallback (no-op flag)
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_no_follow(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).map_err(Into::into)
 }
 
 pub fn safe_delete(journal: &Journal, path: &Path) -> Result<()> {
@@ -509,5 +532,34 @@ mod tests {
         };
         let r = super::rollback_one(&entry);
         assert!(r.is_err(), "malformed b64 should surface as rollback error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_write_o_nofollow_blocks_swap_race() {
+        // Simulate the TOCTOU race: pre-create the leaf as a symlink
+        // pointing outside (the prior symlink_metadata check would
+        // catch this on the first call, but we want to prove
+        // O_NOFOLLOW also fails to follow when the open is reached).
+        let tmp = tempdir().unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"original").unwrap();
+        let inside = tmp.path().join("inside.txt");
+        std::os::unix::fs::symlink(&outside, &inside).unwrap();
+        let r = write_no_follow(&inside, b"clobber");
+        assert!(r.is_err(), "O_NOFOLLOW should refuse to open symlink");
+        // outside.txt is unchanged.
+        assert_eq!(std::fs::read(&outside).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_write_o_nofollow_creates_new_file() {
+        // Sanity: O_NOFOLLOW does NOT block creating a new regular
+        // file at a path that doesn't exist yet (the common case).
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("fresh.txt");
+        write_no_follow(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
 }
