@@ -270,8 +270,15 @@ pub fn save(models: &[CloudModel]) -> std::io::Result<()> {
 
 /// Load cloud models. Missing file → seed list written to disk for
 /// users to edit, then returned. Existing file → consume via the
-/// shared lamu_providers::load_or_empty so the parser logic lives in
-/// one place.
+/// shared `lamu_providers::load_or_empty` parser, then top up with
+/// any seed entries the user is missing.
+///
+/// Phase 5.3 — the seed list is the canonical Rust-side definition.
+/// When a new model lands in `default_seed()` (e.g. a new release),
+/// existing users get the entry added on next launch. User
+/// customizations (notes, quota, model_id overrides) are preserved
+/// because we never overwrite an entry whose `name` already lives in
+/// the YAML — we only append the seed entries that are absent.
 pub fn load() -> Vec<CloudModel> {
     let path = config_path();
     if !path.exists() {
@@ -285,7 +292,29 @@ pub fn load() -> Vec<CloudModel> {
         }
         return seed;
     }
-    lamu_providers::load_or_empty()
+    let mut existing = lamu_providers::load_or_empty();
+    let merged = merge_seed_into(&mut existing, default_seed());
+    if merged {
+        // Persist the topped-up list so subsequent reads (TUI + MCP)
+        // see the same entries. A failure here just means the seed
+        // re-applies on the next launch, which is harmless.
+        let _ = save(&existing);
+    }
+    existing
+}
+
+/// Append seed entries whose `name` is missing from `existing`.
+/// Returns true when at least one entry was appended (so the caller
+/// can persist).
+fn merge_seed_into(existing: &mut Vec<CloudModel>, seed: Vec<CloudModel>) -> bool {
+    let mut changed = false;
+    for s in seed {
+        if !existing.iter().any(|e| e.name == s.name) {
+            existing.push(s);
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -348,5 +377,67 @@ mod tests {
     #[test]
     fn provider_template_unknown_returns_none() {
         assert!(provider_template("definitely-fake-provider").is_none());
+    }
+
+    fn dummy(name: &str) -> CloudModel {
+        CloudModel {
+            name: name.into(),
+            provider: "anthropic".into(),
+            model_id: None,
+            context_max: 200_000,
+            notes: String::new(),
+            quota: QuotaState::Available,
+            api_key_env: None,
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn merge_seed_appends_missing_entries() {
+        let mut existing = vec![dummy("kept-1"), dummy("kept-2")];
+        let seed = vec![dummy("kept-1"), dummy("new-1"), dummy("new-2")];
+        let changed = merge_seed_into(&mut existing, seed);
+        assert!(changed);
+        let names: Vec<&str> = existing.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["kept-1", "kept-2", "new-1", "new-2"]);
+    }
+
+    #[test]
+    fn merge_seed_preserves_user_customizations() {
+        // User's existing entry has custom notes + quota; seed has the
+        // same name with the default values. The merge must NOT clobber.
+        let mut existing = vec![CloudModel {
+            name: "claude-opus-4-7".into(),
+            provider: "anthropic".into(),
+            model_id: None,
+            context_max: 200_000,
+            notes: "user-edited note".into(),
+            quota: QuotaState::Low,
+            api_key_env: Some("MY_OWN_KEY_VAR".into()),
+            base_url: None,
+        }];
+        let seed = default_seed();
+        let _ = merge_seed_into(&mut existing, seed);
+        let opus = existing.iter().find(|m| m.name == "claude-opus-4-7").unwrap();
+        assert_eq!(opus.notes, "user-edited note");
+        assert_eq!(opus.quota, QuotaState::Low);
+        assert_eq!(opus.api_key_env.as_deref(), Some("MY_OWN_KEY_VAR"));
+    }
+
+    #[test]
+    fn merge_seed_no_change_returns_false() {
+        let mut existing = default_seed();
+        let changed = merge_seed_into(&mut existing, default_seed());
+        assert!(!changed, "merging seed into seed shouldn't add entries");
+    }
+
+    #[test]
+    fn merge_seed_keeps_user_only_entries() {
+        let mut existing = vec![dummy("user-only")];
+        let seed = vec![dummy("seed-1")];
+        let _ = merge_seed_into(&mut existing, seed);
+        let names: Vec<&str> = existing.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"user-only"));
+        assert!(names.contains(&"seed-1"));
     }
 }
