@@ -345,6 +345,51 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     result
 }
 
+// ── Repo retrieval (RAG) ────────────────────────────────────────────
+
+pub(crate) async fn handle_search_repo(args: Value) -> String {
+    let query = args["query"].as_str().unwrap_or("");
+    if query.is_empty() {
+        return "error: query is required".into();
+    }
+    let mode = crate::rag::SearchMode::parse(args["mode"].as_str().unwrap_or("auto"));
+    let k = args["k"].as_u64().unwrap_or(8) as usize;
+    let repo_str = args["repo"].as_str().unwrap_or(".");
+    let repo = std::path::Path::new(repo_str);
+
+    match crate::rag::search(query, mode, k, repo).await {
+        Ok(hits) if hits.is_empty() => format!("(no matches for '{}')", query),
+        Ok(hits) => {
+            let mut out = format!("=== {} hits for '{}' ===\n\n", hits.len(), query);
+            for h in &hits {
+                let line_part = h.line.map(|l| format!(":{}", l)).unwrap_or_default();
+                let score_part = h
+                    .score
+                    .map(|s| format!(" (score {:.3})", s))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "**{}{}** [{}]{}\n{}\n\n",
+                    h.path, line_part, h.source, score_part, h.snippet
+                ));
+            }
+            out
+        }
+        Err(e) => format!("error: search failed: {}", e),
+    }
+}
+
+pub(crate) async fn handle_index_repo(args: Value) -> String {
+    let repo_str = args["repo"].as_str().unwrap_or(".");
+    let repo = std::path::Path::new(repo_str);
+    let force = args["force"].as_bool().unwrap_or(false);
+
+    match crate::rag::index_repo(repo, force).await {
+        Ok(0) => "(no chunks indexed — repo unchanged or all files already up to date)".into(),
+        Ok(n) => format!("indexed {} chunks into ~/.local/share/lamu/embeddings.db", n),
+        Err(e) => format!("error: index_repo failed: {}", e),
+    }
+}
+
 // ── Conversation recall (memory tier) ───────────────────────────────
 
 pub(crate) fn handle_recall_conversation(args: Value) -> String {

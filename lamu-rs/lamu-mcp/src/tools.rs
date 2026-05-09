@@ -150,6 +150,29 @@ fn schema_set_routing_mode() -> Value {
     })
 }
 
+fn schema_search_repo() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search term or regex (ripgrep) / natural-language phrase (semantic)."},
+            "mode": {"type": "string", "enum": ["auto", "ripgrep", "semantic"], "default": "auto", "description": "auto = ripgrep first, semantic fallback (requires OPENAI_API_KEY). ripgrep = grep only. semantic = embeddings only."},
+            "k": {"type": "integer", "default": 8, "description": "Max hits to return."},
+            "repo": {"type": "string", "default": ".", "description": "Path to git repo. Defaults to cwd."}
+        },
+        "required": ["query"]
+    })
+}
+
+fn schema_index_repo() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "default": ".", "description": "Path to git repo to index."},
+            "force": {"type": "boolean", "default": false, "description": "Re-embed all files even if mtime is unchanged."}
+        }
+    })
+}
+
 fn schema_recall_conversation() -> Value {
     json!({
         "type": "object",
@@ -271,6 +294,14 @@ fn dispatch_review_diff(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_review_diff(args))
 }
 
+fn dispatch_search_repo(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::cloud::handle_search_repo(args))
+}
+
+fn dispatch_index_repo(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::cloud::handle_index_repo(args))
+}
+
 fn dispatch_recall_conversation(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     let r = crate::cloud::handle_recall_conversation(args);
     Box::pin(async move { r })
@@ -370,6 +401,18 @@ pub static TOOLS: &[ToolDef] = &[
         handler: HandlerKind::Stateful(dispatch_routing_status),
     },
     ToolDef {
+        name: "search_repo",
+        description: "Find code in the repository. Modes: 'auto' (ripgrep first, semantic fallback when OPENAI_API_KEY is set), 'ripgrep' (instant grep), 'semantic' (cosine-sim against the embedding index — `index_repo` builds it). Returns up to k hits with file:line + snippet. Useful for the orchestrator to populate the Tactical-tier `context` arg of cloud_query / review_commit.",
+        schema_fn: schema_search_repo,
+        handler: HandlerKind::Free(dispatch_search_repo),
+    },
+    ToolDef {
+        name: "index_repo",
+        description: "Build / refresh the semantic-search index at ~/.local/share/lamu/embeddings.db. Walks `git ls-files`, chunks each text file at ~1KB boundaries, embeds via OpenAI text-embedding-3-small (~$0.02/M tokens). Skips files whose mtime is unchanged from the previous index unless `force: true`.",
+        schema_fn: schema_index_repo,
+        handler: HandlerKind::Free(dispatch_index_repo),
+    },
+    ToolDef {
         name: "recall_conversation",
         description: "Read recorded turns from a conversation logged via cloud_query's `conversation_id` arg. Returns oldest-first, optionally capped at `limit` most-recent turns. Storage: ~/.local/share/lamu/conversations.db (SQLite). Use this to inspect what was said in a prior session, or to replay a conversation thread into a fresh cloud_query via the `context` arg.",
         schema_fn: schema_recall_conversation,
@@ -433,7 +476,7 @@ mod tests {
         // letting new tools land without a forced test bump. The
         // critical-tools test below pins the named entries that
         // external callers (Claude Code, ultrareview, etc.) depend on.
-        assert!(TOOLS.len() >= 17, "catalog shrunk below 17: {}", TOOLS.len());
+        assert!(TOOLS.len() >= 19, "catalog shrunk below 19: {}", TOOLS.len());
     }
 
     #[test]
@@ -445,6 +488,7 @@ mod tests {
             "query", "cloud_query", "review_commit", "review_diff",
             "list_models", "list_cloud_models", "write_file",
             "parallel_query", "set_routing_mode", "recall_conversation",
+            "search_repo", "index_repo",
         ] {
             assert!(find(name).is_some(), "missing critical tool: {name}");
         }

@@ -11,5 +11,6 @@ pub mod cloud;
 pub mod context;
 pub mod handlers;
 pub mod memory;
+pub mod rag;
 pub mod server;
 pub mod tools;
