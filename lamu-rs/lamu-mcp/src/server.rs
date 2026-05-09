@@ -348,6 +348,19 @@ impl LamuMcpServer {
             }
         };
 
+        // Empty Ok("") from a backend means the response parsed but
+        // had no content — surface as an error instead of returning
+        // a silent blank string. Backend impls returning Err already
+        // path through the match arm above.
+        if raw.is_empty() {
+            emit(
+                "mcp_query_failed",
+                Some(&trace_id),
+                json!({"model": model_name, "error_type": "backend_empty_response"}),
+            );
+            return "error: backend returned empty response".into();
+        }
+
         // LlamaCppBackend / Megakernel / Dflash all return either
         // "content" or "<think>{reasoning}</think>\n{content}".
         // The reasoning extractor handles both shapes.
