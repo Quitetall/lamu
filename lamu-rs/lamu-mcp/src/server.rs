@@ -1654,6 +1654,31 @@ async fn handle_write_file(args: Value) -> String {
     };
     let abs = cwd.join(&rel);
 
+    // Symlink-escape guard: canonicalize the *parent* (which must exist)
+    // and require it to live under the canonicalized cwd. This catches
+    // a relative path like `link/file` where `link` is a symlink
+    // pointing outside cwd — the `..` block above doesn't see those.
+    // The leaf filename itself can be new (doesn't need to exist).
+    let cwd_canon = match cwd.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return format!("error: canonicalize cwd: {}", e),
+    };
+    let parent_to_check = abs.parent().unwrap_or(&abs);
+    if let Err(e) = std::fs::create_dir_all(parent_to_check) {
+        return format!("error: prepare parent dir: {}", e);
+    }
+    let parent_canon = match parent_to_check.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return format!("error: canonicalize parent: {}", e),
+    };
+    if !parent_canon.starts_with(&cwd_canon) {
+        return format!(
+            "error: resolved path escapes cwd via symlink: parent {} not under {}",
+            parent_canon.display(),
+            cwd_canon.display()
+        );
+    }
+
     let journal = match lamu_core::sandbox::journal::Journal::open(session_id) {
         Ok(j) => j,
         Err(e) => return format!("error: open journal: {}", e),
@@ -1965,7 +1990,39 @@ mod tests {
         })).await;
         // The journal validator's error string starts with "session id …"
         // and bubbles up through the "error: open journal: …" wrapper.
-        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.starts_with("error: open journal:"), "got: {r}");
         assert!(r.contains("session id"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_symlink_escape() {
+        // Build a tempdir with a symlink subdir pointing OUTSIDE the
+        // dir, then chdir into the dir, then ask write_file to write
+        // through the symlink. Should be refused before journaling.
+        // SAFETY: env::set_current_dir is process-global; serialize
+        // via the existing test mutex pattern. The other write_file
+        // tests don't depend on cwd, so a temporary cwd swap inside
+        // this one test is fine.
+        let outside = tempfile::tempdir().unwrap();
+        let inside = tempfile::tempdir().unwrap();
+        // Create symlink `inside/escape -> outside/`.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), inside.path().join("escape")).unwrap();
+        #[cfg(not(unix))]
+        return; // No symlink primitive on this platform — skip.
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(inside.path()).unwrap();
+        let r = handle_write_file(json!({
+            "path": "escape/pwned.txt",
+            "content": "owned",
+            "session_id": "test-symlink-escape",
+        })).await;
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.contains("escapes cwd via symlink"), "got: {r}");
+        // Confirm no file was actually written outside.
+        assert!(!outside.path().join("pwned.txt").exists(), "symlink escape wrote anyway");
     }
 }
