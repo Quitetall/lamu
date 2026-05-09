@@ -91,11 +91,45 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     // context layer engages with the corresponding tiers. Otherwise the
     // pre-step-6 wire format is preserved exactly.
     let plan_arg = args["plan_file"].as_str();
-    let raw_tactical = args["context"].as_str().unwrap_or("");
+    let conv_id = args["conversation_id"].as_str().unwrap_or("");
+
+    // When conversation_id is set, prepend the rendered prior turns to
+    // the Tactical tier. The recall is bounded (last 20 turns) so a
+    // long conversation doesn't blow the context window.
+    let conv_recall = if !conv_id.is_empty() {
+        match crate::memory::shared() {
+            Ok(mem) => match mem.recall(conv_id, 20) {
+                Ok(turns) if !turns.is_empty() => crate::memory::render_for_context(&turns),
+                Ok(_) => String::new(),
+                Err(e) => {
+                    tracing::warn!("memory recall({}) failed: {}", conv_id, e);
+                    String::new()
+                }
+            },
+            Err(e) => {
+                tracing::warn!("memory init failed: {}", e);
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let raw_tactical_arg = args["context"].as_str().unwrap_or("");
+    // Compose tactical = prior-conversation + caller-supplied. Conv
+    // first so the most recent turns sit at the back (closer to the
+    // user prompt). Both fit under one cap.
+    let raw_tactical = if conv_recall.is_empty() {
+        raw_tactical_arg.to_string()
+    } else if raw_tactical_arg.is_empty() {
+        conv_recall
+    } else {
+        format!("{}\n\n---\n\n{}", conv_recall, raw_tactical_arg)
+    };
     let tactical = if raw_tactical.is_empty() {
         String::new()
     } else {
-        truncate_with_marker(raw_tactical, MAX_TACTICAL_CONTEXT_BYTES)
+        truncate_with_marker(&raw_tactical, MAX_TACTICAL_CONTEXT_BYTES)
     };
     let want_layer = plan_arg.is_some() || !tactical.is_empty();
     let system = if want_layer {
@@ -170,7 +204,7 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         Err(e) => return format!("error: client init: {e}"),
     };
 
-    if is_anthropic {
+    let result: String = if is_anthropic {
         let url = format!("{}/v1/messages", base);
         let mut payload = json!({
             "model": model_id,
@@ -239,9 +273,10 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             }
         }
         if include_reasoning && !thinking.is_empty() {
-            return format!("<think>\n{}\n</think>\n{}", thinking, out);
+            format!("<think>\n{}\n</think>\n{}", thinking, out)
+        } else {
+            out
         }
-        out
     } else {
         let url = format!("{}/chat/completions", base);
         let mut messages: Vec<Value> = Vec::new();
@@ -287,7 +322,59 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         } else {
             content.to_string()
         }
+    };
+
+    // Persist to conversation memory if conversation_id was set.
+    // Best-effort: a memory failure must not fail the query — the
+    // model already produced a reply, the user wants it.
+    if !conv_id.is_empty() {
+        if let Ok(mem) = crate::memory::shared() {
+            let meta = format!("model={}", model_name);
+            if let Err(e) = mem.append_turns(
+                conv_id,
+                &[
+                    ("user", prompt, None),
+                    ("assistant", &result, Some(&meta)),
+                ],
+            ) {
+                tracing::warn!("memory append({}) failed: {}", conv_id, e);
+            }
+        }
     }
+
+    result
+}
+
+// ── Conversation recall (memory tier) ───────────────────────────────
+
+pub(crate) fn handle_recall_conversation(args: Value) -> String {
+    let conv_id = args["conversation_id"].as_str().unwrap_or("");
+    if conv_id.is_empty() {
+        return "error: conversation_id is required".into();
+    }
+    let limit = args["limit"].as_u64().unwrap_or(0) as usize;
+
+    let mem = match crate::memory::shared() {
+        Ok(m) => m,
+        Err(e) => return format!("error: memory init: {}", e),
+    };
+    let turns = match mem.recall(conv_id, limit) {
+        Ok(t) => t,
+        Err(e) => return format!("error: recall {}: {}", conv_id, e),
+    };
+    if turns.is_empty() {
+        return format!("(no turns recorded for conversation_id='{}')", conv_id);
+    }
+    let mut out = format!("=== Conversation '{}' — {} turns ===\n\n", conv_id, turns.len());
+    for t in &turns {
+        let meta = t
+            .metadata
+            .as_deref()
+            .map(|m| format!(" [{}]", m))
+            .unwrap_or_default();
+        out.push_str(&format!("**{}**{} (idx {}, ts {})\n{}\n\n", t.role, meta, t.idx, t.ts, t.content));
+    }
+    out
 }
 
 // ── DeepSeek V4 Pro reviewer (project policy) ───────────────────────

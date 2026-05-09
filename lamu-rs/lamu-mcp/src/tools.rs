@@ -106,7 +106,8 @@ fn schema_cloud_query() -> Value {
             "include_reasoning": {"type": "boolean", "default": false, "description": "When true, include the model's <think> reasoning_content in the output. Default false (just the answer)."},
             "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."},
             "plan_file": {"type": "string", "description": "Optional path to a plan/spec markdown file to inject as Plan-tier context before the system prompt. Overrides $LAMU_PLAN env and any auto-detected ~/.claude/plans/active.md."},
-            "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, recent commits, etc.) injected before the system prompt and after Plan tier. Truncated at 200 KiB."}
+            "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, recent commits, etc.) injected before the system prompt and after Plan tier. Truncated at 200 KiB."},
+            "conversation_id": {"type": "string", "description": "Optional conversation identifier. When set, the last 20 turns under this id are prepended to the Tactical tier as prior context, and this turn (user prompt + assistant reply) is appended to the conversation log at ~/.local/share/lamu/conversations.db. Allowed chars: [A-Za-z0-9_-.]"}
         },
         "required": ["prompt"]
     })
@@ -145,6 +146,17 @@ fn schema_set_routing_mode() -> Value {
             "mode": {"type": "string", "enum": ["auto", "local-only", "cloud-only"]}
         },
         "required": ["mode"]
+    })
+}
+
+fn schema_recall_conversation() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Identifier for the conversation. Allowed chars: [A-Za-z0-9_-.]"},
+            "limit": {"type": "integer", "default": 0, "description": "Max number of most-recent turns to return (oldest-first). 0 = no cap (full transcript)."}
+        },
+        "required": ["conversation_id"]
     })
 }
 
@@ -258,6 +270,11 @@ fn dispatch_review_diff(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_review_diff(args))
 }
 
+fn dispatch_recall_conversation(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    let r = crate::cloud::handle_recall_conversation(args);
+    Box::pin(async move { r })
+}
+
 fn dispatch_write_file(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::server::handle_write_file(args))
 }
@@ -352,6 +369,12 @@ pub static TOOLS: &[ToolDef] = &[
         handler: HandlerKind::Stateful(dispatch_routing_status),
     },
     ToolDef {
+        name: "recall_conversation",
+        description: "Read recorded turns from a conversation logged via cloud_query's `conversation_id` arg. Returns oldest-first, optionally capped at `limit` most-recent turns. Storage: ~/.local/share/lamu/conversations.db (SQLite). Use this to inspect what was said in a prior session, or to replay a conversation thread into a fresh cloud_query via the `context` arg.",
+        schema_fn: schema_recall_conversation,
+        handler: HandlerKind::Free(dispatch_recall_conversation),
+    },
+    ToolDef {
         name: "write_file",
         description: "Write a file with rollback journaling (Phase 6.1). Records the file's pre-state under session_id; `lamu rollback <session>` restores. Path is required relative to lamu-mcp's cwd; absolute paths and '..' segments are refused so the call cannot escape the working directory. session_id must match [A-Za-z0-9_-.]+ — anything else is rejected up front.",
         schema_fn: schema_write_file,
@@ -409,7 +432,7 @@ mod tests {
         // letting new tools land without a forced test bump. The
         // critical-tools test below pins the named entries that
         // external callers (Claude Code, ultrareview, etc.) depend on.
-        assert!(TOOLS.len() >= 16, "catalog shrunk below 16: {}", TOOLS.len());
+        assert!(TOOLS.len() >= 17, "catalog shrunk below 17: {}", TOOLS.len());
     }
 
     #[test]
@@ -420,7 +443,7 @@ mod tests {
         for name in [
             "query", "cloud_query", "review_commit", "review_diff",
             "list_models", "list_cloud_models", "write_file",
-            "parallel_query", "set_routing_mode",
+            "parallel_query", "set_routing_mode", "recall_conversation",
         ] {
             assert!(find(name).is_some(), "missing critical tool: {name}");
         }
