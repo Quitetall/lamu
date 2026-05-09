@@ -10,10 +10,12 @@
 //! async transport for MCP lives in `lamu-mcp`. Both consume from
 //! here so the wire format stays in lock-step.
 
+pub mod cloud_config;
 pub mod headers;
 pub mod payload;
 pub mod types;
 
+pub use cloud_config::{config_path, load_or_empty, CloudModel, CloudModelList, QuotaState};
 pub use headers::anthropic_beta_header;
 pub use payload::{build_anthropic_payload, build_openai_payload};
 pub use types::{Message, Role, StreamEvent, ToolCallRef};

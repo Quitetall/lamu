@@ -1218,36 +1218,13 @@ async fn build_spawn_cmd(
 // base_url (Anthropic → /v1/messages + x-api-key; everything else →
 // OpenAI compat /chat/completions + Bearer).
 
-#[derive(serde::Deserialize, Debug, Clone)]
-struct CloudYamlEntry {
-    name: String,
-    #[serde(default)]
-    provider: String,
-    #[serde(default)]
-    model_id: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    notes: String,
-    #[serde(default)]
-    context_max: u32,
-}
+// Cloud model schema lives in lamu_providers::cloud_config — unified
+// with the lamu-cli loader so the two crates can never disagree on
+// field names or defaults.
+use lamu_providers::CloudModel;
 
-#[derive(serde::Deserialize, Debug)]
-struct CloudYamlFile {
-    #[serde(default)]
-    models: Vec<CloudYamlEntry>,
-}
-
-fn load_cloud_models() -> Vec<CloudYamlEntry> {
-    let Some(dir) = dirs::config_dir() else { return Vec::new(); };
-    let path = dir.join("lamu").join("cloud-models.yaml");
-    let Ok(body) = std::fs::read_to_string(&path) else { return Vec::new(); };
-    serde_yaml::from_str::<CloudYamlFile>(&body)
-        .map(|f| f.models)
-        .unwrap_or_default()
+fn load_cloud_models() -> Vec<CloudModel> {
+    lamu_providers::load_or_empty()
 }
 
 /// Per-provider concurrency cap. Conservative by default — only
@@ -1256,7 +1233,7 @@ fn load_cloud_models() -> Vec<CloudYamlEntry> {
 ///
 /// Override per-provider with env vars:
 ///   LAMU_PARALLEL_DEEPSEEK / _ANTHROPIC / _OPENAI / etc.
-fn provider_concurrency(model_name: &str, cloud: &[CloudYamlEntry]) -> usize {
+fn provider_concurrency(model_name: &str, cloud: &[CloudModel]) -> usize {
     let provider = cloud.iter()
         .find(|m| m.name == model_name)
         .map(|m| m.provider.as_str())
@@ -1757,18 +1734,25 @@ mod tests {
         }
     }
 
+    fn dummy_cloud(name: &str, provider: &str) -> CloudModel {
+        CloudModel {
+            name: name.into(),
+            provider: provider.into(),
+            model_id: None,
+            context_max: 0,
+            notes: String::new(),
+            quota: lamu_providers::QuotaState::Available,
+            api_key_env: None,
+            base_url: None,
+        }
+    }
+
     #[test]
     fn provider_concurrency_known_providers() {
         let cloud = vec![
-            CloudYamlEntry { name: "ds".into(), provider: "deepseek".into(),
-                model_id: None, api_key_env: None, base_url: None,
-                notes: String::new(), context_max: 0 },
-            CloudYamlEntry { name: "claude".into(), provider: "anthropic".into(),
-                model_id: None, api_key_env: None, base_url: None,
-                notes: String::new(), context_max: 0 },
-            CloudYamlEntry { name: "gpt".into(), provider: "openai".into(),
-                model_id: None, api_key_env: None, base_url: None,
-                notes: String::new(), context_max: 0 },
+            dummy_cloud("ds", "deepseek"),
+            dummy_cloud("claude", "anthropic"),
+            dummy_cloud("gpt", "openai"),
         ];
         assert_eq!(provider_concurrency("ds", &cloud), 8);
         assert_eq!(provider_concurrency("claude", &cloud), 4);
@@ -1778,12 +1762,8 @@ mod tests {
     #[test]
     fn provider_concurrency_unknown_defaults_to_1() {
         let cloud = vec![
-            CloudYamlEntry { name: "kimi".into(), provider: "moonshot".into(),
-                model_id: None, api_key_env: None, base_url: None,
-                notes: String::new(), context_max: 0 },
-            CloudYamlEntry { name: "qwen".into(), provider: "alibaba".into(),
-                model_id: None, api_key_env: None, base_url: None,
-                notes: String::new(), context_max: 0 },
+            dummy_cloud("kimi", "moonshot"),
+            dummy_cloud("qwen", "alibaba"),
         ];
         assert_eq!(provider_concurrency("kimi", &cloud), 1);
         assert_eq!(provider_concurrency("qwen", &cloud), 1);

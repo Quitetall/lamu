@@ -1313,9 +1313,11 @@ dependencies = [
 name = "lamu-providers"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

@@ -11,5 +11,7 @@ description = "Pure provider wire-format adapters (OpenAI / Anthropic). Sync, IO
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+dirs = "5"
 # Just the header types — no client, no tokio, no blocking I/O.
 reqwest = { version = "0.12", default-features = false }
