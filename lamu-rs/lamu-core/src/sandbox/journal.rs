@@ -60,8 +60,11 @@ impl EncodedBlob {
             b64: base64_encode(bytes),
         }
     }
-    pub fn to_bytes(&self) -> Vec<u8> {
-        base64_decode(&self.b64).unwrap_or_default()
+    /// Decode the journaled bytes. Returns an error when the blob
+    /// payload is malformed — callers can decide to skip the rollback
+    /// step rather than silently restoring a file to empty bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        base64_decode(&self.b64)
     }
 }
 
@@ -71,8 +74,34 @@ pub struct Journal {
     pub path: PathBuf,
 }
 
+/// Validate a session id before joining it into a filesystem path.
+/// Allows ASCII letters, digits, underscore, dash, and dot, and
+/// rejects empty, leading-dot, or `..`-containing values to block
+/// path traversal. The on-disk format `<session_id>.jsonl` means a
+/// session id with `/` could escape the journal directory entirely;
+/// MCP and CLI both pass user-controllable strings here so the
+/// allowlist must be narrow.
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty() {
+        anyhow::bail!("session id is empty");
+    }
+    if session_id.starts_with('.') {
+        anyhow::bail!("session id cannot start with '.': {session_id}");
+    }
+    if session_id.contains("..") {
+        anyhow::bail!("session id contains '..': {session_id}");
+    }
+    if !session_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        anyhow::bail!(
+            "session id contains forbidden character — allowed: [A-Za-z0-9_-.]: {session_id}"
+        );
+    }
+    Ok(())
+}
+
 impl Journal {
     pub fn open(session_id: &str) -> Result<Self> {
+        validate_session_id(session_id)?;
         let dir = sandbox_root().join("journal");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.jsonl", session_id));
@@ -107,6 +136,15 @@ impl Journal {
 // ── safe_* mutation helpers ──────────────────────────────────────────
 
 pub fn safe_write(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<()> {
+    // Refuse to journal-then-write over a directory: std::fs::write
+    // would fail and leave the journal claiming a write that never
+    // happened. Catch it before recording.
+    if path.is_dir() {
+        anyhow::bail!(
+            "safe_write target is a directory, not a file: {}",
+            path.display()
+        );
+    }
     let before = read_blob(path);
     journal.append(&JournalEntry::Write {
         path: path.to_path_buf(),
@@ -169,8 +207,10 @@ pub fn rollback_one(entry: &JournalEntry) -> Result<()> {
     match entry {
         JournalEntry::Write { path, before, .. } => match before {
             Some(blob) => {
+                let bytes = blob.to_bytes()
+                    .with_context(|| format!("decode journaled blob for {}", path.display()))?;
                 if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-                std::fs::write(path, blob.to_bytes())?;
+                std::fs::write(path, bytes)?;
             }
             None => {
                 // Path didn't exist before — delete it now if it does.
@@ -181,8 +221,10 @@ pub fn rollback_one(entry: &JournalEntry) -> Result<()> {
         },
         JournalEntry::Delete { path, before, .. } => {
             if let Some(blob) = before {
+                let bytes = blob.to_bytes()
+                    .with_context(|| format!("decode journaled blob for {}", path.display()))?;
                 if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-                std::fs::write(path, blob.to_bytes())?;
+                std::fs::write(path, bytes)?;
             }
         }
         JournalEntry::Mkdir { path, existed, .. } => {
@@ -394,5 +436,52 @@ mod tests {
         // Dir should still exist because it's not empty — refusing to
         // clobber files the user added.
         assert!(new_dir.exists());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_path_traversal() {
+        // Direct slash escape.
+        assert!(validate_session_id("../etc/passwd").is_err());
+        // Double-dot fragment anywhere.
+        assert!(validate_session_id("a..b").is_err());
+        // Leading dot — could shadow `.something.jsonl`.
+        assert!(validate_session_id(".hidden").is_err());
+        // Backslashes still rejected (Windows path-traversal style).
+        assert!(validate_session_id("a\\b").is_err());
+        // Empty.
+        assert!(validate_session_id("").is_err());
+        // Canonical accepted shapes.
+        assert!(validate_session_id("20260509-035410-12345").is_ok());
+        assert!(validate_session_id("test-rollback").is_ok());
+        assert!(validate_session_id("agent_42").is_ok());
+    }
+
+    #[test]
+    fn safe_write_rejects_directory_target() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("a_dir");
+        std::fs::create_dir(&dir).unwrap();
+        let j = Journal {
+            session_id: "test-dir-target".into(),
+            path: tmp.path().join("journal.jsonl"),
+        };
+        let r = safe_write(&j, &dir, b"hello");
+        assert!(r.is_err(), "should reject dir target before journaling");
+        // Journal must NOT have appended a phantom Write entry.
+        assert!(!j.path.exists(), "journal should not exist when safe_write refuses up front");
+    }
+
+    #[test]
+    fn rollback_surfaces_decode_error_instead_of_silent_truncate() {
+        let entry = JournalEntry::Write {
+            path: PathBuf::from("/tmp/lamu-test-rollback-decode"),
+            before: Some(EncodedBlob {
+                size: 3,
+                b64: "@@@".into(),
+            }),
+            ts: 0,
+        };
+        let r = super::rollback_one(&entry);
+        assert!(r.is_err(), "malformed b64 should surface as rollback error");
     }
 }
