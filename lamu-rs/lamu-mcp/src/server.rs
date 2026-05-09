@@ -1944,9 +1944,17 @@ mod tests {
     // input-shape rejections (which run before the journal sees
     // anything). Tests that mutate cwd serialize via WRITE_FILE_CWD_LOCK
     // since std::env::set_current_dir is process-global.
+    //
+    // Use tokio::sync::Mutex (not std::sync::Mutex) so the guard can be
+    // safely held across the .await on handle_write_file without the
+    // sync-mutex-across-await footgun.
 
-    use std::sync::Mutex;
-    static WRITE_FILE_CWD_LOCK: Mutex<()> = Mutex::new(());
+    use tokio::sync::Mutex as TokioMutex;
+    use std::sync::OnceLock;
+    static WRITE_FILE_CWD_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+    fn cwd_lock() -> &'static TokioMutex<()> {
+        WRITE_FILE_CWD_LOCK.get_or_init(|| TokioMutex::new(()))
+    }
 
     #[tokio::test]
     async fn write_file_rejects_absolute_path() {
@@ -2003,7 +2011,7 @@ mod tests {
     async fn write_file_rejects_directory_symlink_escape() {
         // Symlinked subdir attack: cwd/escape -> outside_dir/.
         // write_file("escape/pwned.txt", ...) must refuse.
-        let _g = WRITE_FILE_CWD_LOCK.lock().unwrap();
+        let _g = cwd_lock().lock().await;
         let outside = tempfile::tempdir().unwrap();
         let inside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), inside.path().join("escape")).unwrap();
@@ -2030,7 +2038,7 @@ mod tests {
         // but std::fs::write would follow the leaf symlink. Defense
         // lives in lamu_core::sandbox::journal::safe_write, which
         // refuses to follow a leaf symlink before writing.
-        let _g = WRITE_FILE_CWD_LOCK.lock().unwrap();
+        let _g = cwd_lock().lock().await;
         let outside = tempfile::tempdir().unwrap();
         let outside_target = outside.path().join("target.txt");
         std::fs::write(&outside_target, b"original").unwrap();

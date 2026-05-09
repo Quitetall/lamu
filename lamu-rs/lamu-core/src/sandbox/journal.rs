@@ -158,6 +158,11 @@ pub fn safe_write(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<()> {
     // separately. For a single-tenant local sandbox this trade-off is
     // acceptable; multi-tenant deployments must layer additional
     // isolation (bubblewrap, mount namespaces).
+    // symlink_metadata error is intentionally swallowed: a NotFound
+    // means the leaf doesn't exist yet (the common create case) and a
+    // permissions error would also cause std::fs::write below to fail,
+    // so the net effect is the same — we never silently succeed at a
+    // bypass.
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             anyhow::bail!(
