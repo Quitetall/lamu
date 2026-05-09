@@ -95,6 +95,16 @@ fn resolve_central() -> &'static str {
 /// so unit tests can exercise it without poisoning the OnceLock.
 fn load_central_override_from(path: &Path) -> Option<&'static str> {
     let body = std::fs::read_to_string(path).ok()?;
+    // Empty / whitespace-only override → fall through to bundled
+    // default. A user who `touch`-es the file shouldn't accidentally
+    // suppress the entire central tier.
+    if body.trim().is_empty() {
+        tracing::debug!(
+            "context: central override at {} is empty; using bundled default",
+            path.display()
+        );
+        return None;
+    }
     if body.len() > CENTRAL_MAX_OVERRIDE_BYTES {
         tracing::warn!(
             "context: central override at {} is {} bytes (> {} limit); using bundled default",
@@ -424,8 +434,21 @@ mod tests {
 
     #[test]
     fn central_override_skipped_when_missing() {
-        let path = std::path::PathBuf::from("/tmp/nonexistent-lamu-central-override.md");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("definitely-not-here.md");
         assert!(super::load_central_override_from(&path).is_none());
+    }
+
+    #[test]
+    fn central_override_skipped_when_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.md");
+        std::fs::write(&empty, "").unwrap();
+        assert!(super::load_central_override_from(&empty).is_none());
+
+        let ws = dir.path().join("whitespace.md");
+        std::fs::write(&ws, "   \n\t  \n").unwrap();
+        assert!(super::load_central_override_from(&ws).is_none());
     }
 
     #[test]
