@@ -26,6 +26,65 @@ pub(crate) const MAX_AUTO_BYTES: usize = 200 * 1024;
 /// per symbol to keep noise down.
 const CALLERS_PER_SYMBOL_MAX: usize = 10;
 
+/// V6 P: cargo test pre-flight. Runs `cargo test --workspace --quiet
+/// --no-fail-fast` against the commit's tip, captures any failure
+/// summary, and prepends it to the auto-context payload. Real test
+/// signal beats static analysis.
+///
+/// Bounded: 60s timeout. If tests pass / cargo absent / timeout, no
+/// section is appended (empty string returned).
+pub fn run_test_preflight(repo: &Path) -> String {
+    use std::process::Stdio;
+    use std::time::Duration;
+    let out = std::process::Command::new("cargo")
+        .current_dir(repo)
+        .args(["test", "--workspace", "--quiet", "--no-fail-fast"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match out {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    // Use std::sync wait with manual timeout; cargo test in a small
+    // workspace usually finishes in <30s. We bound at 60s.
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
+    while child.try_wait().ok().flatten().is_none() {
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let status = child.try_wait().ok().flatten();
+    let stdout = match child.wait_with_output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return String::new(),
+    };
+    if matches!(status, Some(s) if s.success()) {
+        return String::new(); // tests passed → no signal
+    }
+    // Failures present — extract concise summary lines.
+    let summary: Vec<&str> = stdout
+        .lines()
+        .filter(|l| {
+            l.contains("FAILED")
+                || l.contains("test result: FAILED")
+                || l.contains("panicked at")
+                || l.starts_with("---- ")
+        })
+        .take(50)
+        .collect();
+    if summary.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Test pre-flight (cargo test --workspace) — FAILURES PRESENT\n\nReal test failures observed at this commit's tip. Review with these in mind.\n\n```\n{}\n```\n\n",
+        summary.join("\n")
+    )
+}
+
 /// Assemble the full auto-context payload for one commit.
 ///
 /// Best-effort: each step (git show, tree-sitter parse, ripgrep)
@@ -37,6 +96,19 @@ pub fn assemble_auto_context(commit: &str, repo: &Path) -> Result<String> {
     out.push_str("# Auto-context for commit ");
     out.push_str(commit);
     out.push_str("\n\n");
+
+    // V6 P: test pre-flight — opt-in via LAMU_TEST_PREFLIGHT=1.
+    // Slow (up to 60s), so default-off; turn on for review-on-merge
+    // flows where the wall-time cost is acceptable.
+    if std::env::var("LAMU_TEST_PREFLIGHT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let pre = run_test_preflight(repo);
+        if !pre.is_empty() {
+            out.push_str(&pre);
+        }
+    }
 
     // Stage 1: list changed files
     match git_changed_files(commit, repo) {
