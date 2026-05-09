@@ -219,7 +219,19 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             "temperature": temperature,
             "stream": false,
         });
-        if !system.is_empty() { payload["system"] = json!(system); }
+        // V5 J: Anthropic doesn't auto-cache by byte-prefix; it uses
+        // explicit `cache_control: {type: "ephemeral"}` on a system-
+        // prompt block. Wrap the system prompt in the array form with
+        // a cache_control marker on the central+plan portion (the
+        // stable prefix). DeepSeek uses byte-prefix auto-cache so this
+        // path only kicks in for anthropic.
+        if !system.is_empty() {
+            payload["system"] = json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" }
+            }]);
+        }
         // Anthropic native thinking: send `thinking: {type: "enabled",
         // budget_tokens: N}` to engage extended thinking. Skip when
         // disabled — Anthropic's default for non-reasoner models is
