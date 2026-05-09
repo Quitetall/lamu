@@ -162,19 +162,24 @@ fn git_show_file(commit: &str, path: &str, repo: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Smart-truncate a long file body. V5 E: when the file is `.rs`,
-/// use tree-sitter to chunk by item boundaries — keep top-level
-/// items intact instead of byte-cutting mid-fn. Falls back to the
-/// V4 line-based "first 60 + last 30" when tree-sitter parse fails
-/// or the file is short enough.
+/// Smart-truncate a long file body.
+///
+/// V6 K — lazy symbol-aware: only invoke tree-sitter when the file
+/// is genuinely large (> SYMBOL_AWARE_THRESHOLD lines). Medium files
+/// (200-400 lines) use line-based truncate — cheaper prompt, still
+/// preserves head/tail context. Symbol-aware kicks in only when
+/// per-item granularity is worth the prompt-size premium.
 fn smart_truncate_file_body(body: &str) -> String {
-    const THRESHOLD_LINES: usize = 200;
+    const LINE_TRUNCATE_THRESHOLD: usize = 200;
+    const SYMBOL_AWARE_THRESHOLD: usize = 400;
     let lines: Vec<&str> = body.lines().collect();
-    if lines.len() <= THRESHOLD_LINES {
+    if lines.len() <= LINE_TRUNCATE_THRESHOLD {
         return body.to_string();
     }
-    if let Some(s) = symbol_aware_truncate_rust(body) {
-        return s;
+    if lines.len() > SYMBOL_AWARE_THRESHOLD {
+        if let Some(s) = symbol_aware_truncate_rust(body) {
+            return s;
+        }
     }
     line_based_truncate(&lines)
 }
