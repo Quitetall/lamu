@@ -1253,6 +1253,7 @@ dependencies = [
  "lamu-api",
  "lamu-core",
  "lamu-mcp",
+ "lamu-providers",
  "ratatui",
  "reqwest",
  "rustyline",
