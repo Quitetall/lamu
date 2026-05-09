@@ -789,8 +789,16 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     //   - When draft says PASS, run pass_double_check_via_flash to
     //     scan the diff a second time for issues V4 Pro might have
     //     skipped. Cuts false negatives (silent merge of broken code).
+    // V6 N: skip Flash 2nd-pass on trivial diffs. The double-check
+    // primarily catches issues in substantive changes; small commits
+    // are too small to hide much. Threshold matches F's auto_context
+    // skip — same shape, same call.
     let review = if auto && !review.starts_with("error:") {
-        if review.contains("\nPASS\n") || review.contains("\nPASS.")
+        let trivial = is_trivial_diff(commit, std::path::Path::new(repo));
+        if trivial {
+            tracing::debug!("v6 N: skipping Flash 2nd-pass on trivial diff");
+            review
+        } else if review.contains("\nPASS\n") || review.contains("\nPASS.")
             || review.starts_with("PASS\n") || review.starts_with("PASS.") {
             // PASS path — scan for false negatives
             let diff = git_show_diff_or_empty(commit, std::path::Path::new(repo));

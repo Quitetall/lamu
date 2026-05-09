@@ -1,7 +1,7 @@
 # Graph Report - local-llm  (2026-05-09)
 
 ## Corpus Check
-- 176 files · ~120,459 words
+- 176 files · ~120,523 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -196,95 +196,95 @@
 
 ### Community 0 - "Community 0"
 Cohesion: 0.03
-Nodes (263): LamuMetrics, Prometheus metrics for the OpenAI-compat layer.  All metrics live on a process-l, Pull instantaneous values into the gauges. Call from /metrics., Serialise to Prometheus text. Returns `(body, content_type)`., Bundle of collectors keyed to a single registry. The OpenAI compat     app holds, ChatRequest, create_app(), Message (+255 more)
+Nodes (262): LamuMetrics, Prometheus metrics for the OpenAI-compat layer.  All metrics live on a process-l, Pull instantaneous values into the gauges. Call from /metrics., Serialise to Prometheus text. Returns `(body, content_type)`., Bundle of collectors keyed to a single registry. The OpenAI compat     app holds, ChatRequest, create_app(), Message (+254 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.02
-Nodes (196): detect_ngram_support_blocking(), make_backend(), parse_inline(), render_markdown(), run(), write_registry(), test_write_then_load_roundtrip(), Corrupt YAML registry → load_registry raises (no silent fallback). (+188 more)
+Nodes (212): detect_ngram_support_blocking(), make_backend(), parse_inline(), render_markdown(), run(), test_write_then_load_roundtrip(), Corrupt YAML registry → load_registry raises (no silent fallback)., test_corrupt_yaml_raises() (+204 more)
 
 ### Community 2 - "Community 2"
 Cohesion: 0.02
-Nodes (128): get_config(), Return a LangChain RunnableConfig dict with active callbacks., compare(), load_swebench_tasks(), main(), Agentic benchmark runner — compare Opus solo vs swarm on coding tasks.  Three mo, Load SWE-bench Lite tasks. Requires swebench package., Run a task with just Opus (cloud-only, no local workers). (+120 more)
+Nodes (122): get_config(), Return a LangChain RunnableConfig dict with active callbacks., compare(), load_swebench_tasks(), main(), Agentic benchmark runner — compare Opus solo vs swarm on coding tasks.  Three mo, Load SWE-bench Lite tasks. Requires swebench package., Run a task with just Opus (cloud-only, no local workers). (+114 more)
 
 ### Community 3 - "Community 3"
-Cohesion: 0.03
-Nodes (86): alt_enter_inserts_newline(), brave_search(), chrono_or_timestamp(), ddg_search(), handle_key(), handle_mouse(), input_insert_advances_cursor_utf8(), plain_enter_does_not_newline() (+78 more)
+Cohesion: 0.04
+Nodes (99): Malformed GGUF — emitted via warnings.warn during scan., Think-block streaming buffer exceeded the configured cap (64 KB)., ReasoningOverflow, RegistryParseWarning, get_extractor(), NullReasoningExtractor, Reasoning extractor — per-model-family think-block detection and stripping., Handles think-block detection, stripping, and structured extraction.      Regist (+91 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.03
 Nodes (51): ABC, Backend, Backend, Backend protocol — interface that all model backends implement., Abstract base for model backends.      Each backend manages one model process (o, DflashBackend, build_llama_spawn(), build_llama_spawn_caps_ctx_via_env() (+43 more)
 
 ### Community 5 - "Community 5"
-Cohesion: 0.03
-Nodes (53): dedupe_tactical(), git_show_diff_or_empty(), handle_cloud_query(), handle_index_repo(), handle_recall_conversation(), handle_review_commit(), handle_review_diff(), handle_search_repo() (+45 more)
+Cohesion: 0.04
+Nodes (73): alt_enter_inserts_newline(), brave_search(), chrono_or_timestamp(), ddg_search(), handle_key(), handle_mouse(), input_insert_advances_cursor_utf8(), plain_enter_does_not_newline() (+65 more)
 
 ### Community 6 - "Community 6"
-Cohesion: 0.06
-Nodes (91): Malformed GGUF — emitted via warnings.warn during scan., Think-block streaming buffer exceeded the configured cap (64 KB)., ReasoningOverflow, RegistryParseWarning, get_extractor(), NullReasoningExtractor, Reasoning extractor — per-model-family think-block detection and stripping., Handles think-block detection, stripping, and structured extraction.      Regist (+83 more)
-
-### Community 7 - "Community 7"
 Cohesion: 0.04
 Nodes (52): metrics(), sched(), test_health_state_gauge_uses_numeric_encoding(), test_queue_depth_gauge_per_model(), test_render_contains_lamu_metrics(), test_vram_total_gauge_reflects_scheduler(), test_dead_threshold_at_three(), test_first_error_promotes_to_degraded() (+44 more)
 
+### Community 7 - "Community 7"
+Cohesion: 0.05
+Nodes (62): Tests for agents.trainer — pure helpers (collect/status/prepare)., Phase C: MissingDependency exists for ImportError propagation., test_collect_writes_json(), test_missing_dependency_class_exists(), collect(), export(), main(), prepare() (+54 more)
+
 ### Community 8 - "Community 8"
 Cohesion: 0.04
-Nodes (53): test_handle_list_models_lists_all(), test_handle_load_model_already_loaded(), test_handle_load_model_unknown(), test_handle_plan_query_capability_invalid_raises(), test_handle_plan_query_serializes_decision(), test_handle_query_generates(), test_handle_query_no_model(), test_handle_query_not_loaded() (+45 more)
+Nodes (55): BaseModel, apply_chat_template(), aread_tokens(), chat_completions(), ChatRequest, get_tokenizer(), DFlash server for 24 GB GPUs (RTX 4090) with VRAM park/unpark dance.  The stock, Send command to daemon stdin. (+47 more)
 
 ### Community 9 - "Community 9"
 Cohesion: 0.04
-Nodes (47): BaseDataLayer, BackendTimeout, ConfigError, DataLayerError, LamuError, Typed exception hierarchy for LAMU.  Every place the codebase used to write `exc, Root of every LAMU exception. Never raise directly — use a subclass., Invalid or missing configuration. (+39 more)
+Nodes (53): test_handle_list_models_lists_all(), test_handle_load_model_already_loaded(), test_handle_load_model_unknown(), test_handle_plan_query_capability_invalid_raises(), test_handle_plan_query_serializes_decision(), test_handle_query_generates(), test_handle_query_no_model(), test_handle_query_not_loaded() (+45 more)
 
 ### Community 10 - "Community 10"
-Cohesion: 0.05
-Nodes (56): Tests for agents.trainer — pure helpers (collect/status/prepare)., Phase C: MissingDependency exists for ImportError propagation., test_collect_writes_json(), test_missing_dependency_class_exists(), collect(), export(), main(), prepare() (+48 more)
+Cohesion: 0.04
+Nodes (47): BaseDataLayer, BackendTimeout, ConfigError, DataLayerError, LamuError, Typed exception hierarchy for LAMU.  Every place the codebase used to write `exc, Root of every LAMU exception. Never raise directly — use a subclass., Invalid or missing configuration. (+39 more)
 
 ### Community 11 - "Community 11"
 Cohesion: 0.04
 Nodes (41): sched(), test_available_mb_subtracts_reserved_and_loaded(), test_budget_snapshot_shape(), test_can_fit_false_when_full(), test_can_fit_true_when_room(), test_is_loaded_only_when_state_is_loaded(), test_loaded_models_listing(), test_mark_loading_then_confirm() (+33 more)
 
 ### Community 12 - "Community 12"
+Cohesion: 0.04
+Nodes (32): handle_index_repo(), handle_recall_conversation(), blob_to_vec(), chunk_text(), chunk_text_preserves_full_body(), chunk_text_respects_max(), cosine(), cosine_identical_is_one() (+24 more)
+
+### Community 13 - "Community 13"
 Cohesion: 0.05
 Nodes (46): Tests for lamu.core.config — path constants + ports., test_ports_distinct_and_in_range(), test_null_extractor_passthrough(), test_stream_filter_no_reasoning_block(), test_scan_directory_finds_gguf(), chat(), get_default(), LocalLLM (+38 more)
 
-### Community 13 - "Community 13"
-Cohesion: 0.04
-Nodes (47): corpus(), _load_corpus(), normalise(), python_mcp_cmd(), Shared scaffolding for cross-language MCP contract tests.  Spawn either Python o, Strip fields that legitimately differ between implementations.      - `id`: drop, How to launch the Python MCP server.      Uses the project venv's interpreter; s, How to launch the Rust MCP server.      Looks for the release binary; skips when (+39 more)
-
 ### Community 14 - "Community 14"
 Cohesion: 0.05
-Nodes (43): BaseModel, AnthropicMessage, AnthropicMessagesRequest, build_app(), ChatMessage, ChatRequest, main(), _parse_tool_calls() (+35 more)
+Nodes (43): corpus(), _load_corpus(), normalise(), python_mcp_cmd(), Shared scaffolding for cross-language MCP contract tests.  Spawn either Python o, Strip fields that legitimately differ between implementations.      - `id`: drop, How to launch the Python MCP server.      Uses the project venv's interpreter; s, How to launch the Rust MCP server.      Looks for the release binary; skips when (+35 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.05
-Nodes (44): Command, filter_think(), handle_command(), http_get_json(), iter_sse_deltas(), main(), Message, parse_command() (+36 more)
+Cohesion: 0.07
+Nodes (43): Command, filter_think(), handle_command(), http_get_json(), iter_sse_deltas(), main(), Message, parse_command() (+35 more)
 
 ### Community 16 - "Community 16"
-Cohesion: 0.06
-Nodes (29): emit(), new_trace_id(), Single funnel for structured events. Stderr by default; optional file sink.  Eve, Emit a structured event.      Stderr always gets a single JSON line. If LAMU_EVE, Generate a 16-hex-char trace id. Compatible with W3C TraceContext     middle 16, Tests for lamu.core.observability — structured event sink., A broken file sink must not block the stderr emit., test_emit_appends_to_file_sink() (+21 more)
+Cohesion: 0.07
+Nodes (28): emit(), new_trace_id(), Single funnel for structured events. Stderr by default; optional file sink.  Eve, Emit a structured event.      Stderr always gets a single JSON line. If LAMU_EVE, Generate a 16-hex-char trace id. Compatible with W3C TraceContext     middle 16, Tests for lamu.core.observability — structured event sink., A broken file sink must not block the stderr emit., test_emit_appends_to_file_sink() (+20 more)
 
 ### Community 17 - "Community 17"
-Cohesion: 0.08
-Nodes (16): call_tool(), _chat(), _discover_models(), MCP server — exposes all local LLMs as tools for Claude Code (or any MCP client), Probe all known endpoints and return available models., Probe all known endpoints and return available models., Send a chat completion to Bifrost (routes to the right backend)., Send a chat completion to Bifrost (routes to the right backend). (+8 more)
+Cohesion: 0.07
+Nodes (25): handle_search_repo(), AppState, auto_register(), chat_completions(), ChatRequest, ErrorBody, ErrorResponse, Message (+17 more)
 
 ### Community 18 - "Community 18"
 Cohesion: 0.08
-Nodes (24): ModuleType, _ensure_real_class(), fake_completed_process(), _install_stub(), _is_marked(), make_gguf_bytes(), mock_nvidia_smi(), no_real_subprocess() (+16 more)
+Nodes (16): stream_worker(), anthropic_beta_header(), trims_trailing_newline(), anthropic_payload_promotes_system(), anthropic_payload_skips_empty_text_block(), anthropic_payload_text_then_tool_block(), anthropic_payload_tool_blocks(), anthropic_payload_uses_input_schema() (+8 more)
 
 ### Community 19 - "Community 19"
-Cohesion: 0.14
-Nodes (22): blob_to_vec(), chunk_text(), chunk_text_preserves_full_body(), chunk_text_respects_max(), cosine(), cosine_identical_is_one(), embed_batch(), embed_one() (+14 more)
+Cohesion: 0.08
+Nodes (24): ModuleType, _ensure_real_class(), fake_completed_process(), _install_stub(), _is_marked(), make_gguf_bytes(), mock_nvidia_smi(), no_real_subprocess() (+16 more)
 
 ### Community 20 - "Community 20"
+Cohesion: 0.08
+Nodes (16): call_tool(), _chat(), _discover_models(), MCP server — exposes all local LLMs as tools for Claude Code (or any MCP client), Probe all known endpoints and return available models., Probe all known endpoints and return available models., Send a chat completion to Bifrost (routes to the right backend)., Send a chat completion to Bifrost (routes to the right backend). (+8 more)
+
+### Community 21 - "Community 21"
 Cohesion: 0.1
 Nodes (11): Dataset, DS, EagleV2, EAGLE v2 training — standalone script, no datasets library., draft_multi(), EagleV3, HiddenStateDataset, main() (+3 more)
 
-### Community 21 - "Community 21"
+### Community 22 - "Community 22"
 Cohesion: 0.14
 Nodes (20): assemble_auto_context(), extract_added_symbols(), extract_symbols_finds_struct_and_impl(), extract_symbols_from_simple_added_fn(), extract_symbols_skips_minus_lines(), extract_symbols_skips_non_rust_files(), git_changed_files(), git_show_diff() (+12 more)
-
-### Community 22 - "Community 22"
-Cohesion: 0.15
-Nodes (14): filter_think(), filter_think_carries_state_across_chunks(), filter_think_pass_through_when_show_enabled(), filter_think_within_single_chunk(), handle_command(), http_get_json(), Message, parse_command() (+6 more)
 
 ### Community 23 - "Community 23"
 Cohesion: 0.16
@@ -1067,9 +1067,9 @@ _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `VramScheduler` connect `Community 0` to `Community 2`, `Community 11`, `Community 15`?**
   _High betweenness centrality (0.074) - this node is a cross-community bridge._
-- **Why does `ModelEntry` connect `Community 0` to `Community 4`, `Community 6`?**
+- **Why does `ModelEntry` connect `Community 0` to `Community 3`, `Community 4`?**
   _High betweenness centrality (0.069) - this node is a cross-community bridge._
-- **Why does `BackendError` connect `Community 0` to `Community 4`, `Community 9`, `Community 12`, `Community 16`, `Community 17`?**
+- **Why does `BackendError` connect `Community 0` to `Community 4`, `Community 10`, `Community 13`, `Community 16`, `Community 20`?**
   _High betweenness centrality (0.054) - this node is a cross-community bridge._
 - **Are the 198 inferred relationships involving `ModelEntry` (e.g. with `Router` and `Request router — capability-based model selection with dry-run support.`) actually correct?**
   _`ModelEntry` has 198 INFERRED edges - model-reasoned connections that need verification._
