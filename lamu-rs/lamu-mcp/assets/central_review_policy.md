@@ -24,6 +24,8 @@ Reviewers that touch this codebase have a documented ~30% false-positive rate. T
 
 If the finding doesn't survive a 30-second check against the cited file, skip it. Note skipped FPs in the review so the audit trail is preserved.
 
+**Cross-reference recent activity.** When the prompt includes a "Recent activity" header (last 50 commits), check it BEFORE flagging plan items as TODO or open issues. A plan that says "Phase 6.3 will wire Backend trait" is stale if the activity log shows "Phase 6.3: route load/unload through Backend trait" already shipped. Don't re-raise issues already fixed by a recent commit — name the commit instead and treat the plan note as historical.
+
 ## Project facts the reviewer should know
 
 - Workspace crates: `lamu-core` (types/registry/scheduler/backends/sandbox), `lamu-providers` (pure wire-format adapters, IO-free except `anthropic_beta_header` env read), `lamu-mcp` (JSON-RPC server, dispatch table in `tools.rs::TOOLS`), `lamu-cli` (TUI + chat_tui), `lamu-api` (HTTP).
