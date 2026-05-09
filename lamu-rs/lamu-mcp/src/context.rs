@@ -243,7 +243,7 @@ fn recent_activity_header(repo: &Path) -> String {
         Ok(o) if o.status.success() => {
             let log = String::from_utf8_lossy(&o.stdout);
             format!(
-                "## Recent activity (commits 5–55 ago — cache-stable window)\n\nUse this to ground the plan against what's already shipped — don't second-guess items that match a recent commit. The most recent 5 commits are intentionally excluded; they land in the diff being reviewed itself.\n\n```\n{}```",
+                "<RECENT_ACTIVITY cache_stable=\"true\">\n## Recent activity (commits 5–55 ago)\n\n**MUST consult before flagging.** If a finding matches an entry in this log, name the commit (e.g. `b27ebec`) and treat the issue as historical, not current. Don't re-raise issues already shipped.\n\nThe most recent 5 commits are excluded so this window stays cache-stable; they land in the diff being reviewed itself.\n\n```\n{}```\n</RECENT_ACTIVITY>",
                 log
             )
         }
