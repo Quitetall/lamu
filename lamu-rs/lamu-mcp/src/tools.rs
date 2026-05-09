@@ -18,6 +18,10 @@ use std::pin::Pin;
 /// Dispatch handler kind. Distinguishes stateful (needs `&LamuMcpServer`)
 /// from free (no state). Sync handlers wrap their result in a ready
 /// future so the dispatcher only has two arms instead of four.
+///
+/// Sealed by design — no `#[non_exhaustive]`. Adding a third variant
+/// here forces the dispatcher in `server::tools_call` to recompile
+/// with a missing arm, which is the correctness property we want.
 pub enum HandlerKind {
     /// Async handler taking `&LamuMcpServer` (or sync-wrapped-as-async).
     Stateful(for<'a> fn(&'a LamuMcpServer, Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>),
@@ -395,9 +399,25 @@ mod tests {
     }
 
     #[test]
-    fn catalog_size_locked() {
-        // Adding a tool? Bump this and add coverage to the
-        // server-level integration tests.
-        assert_eq!(TOOLS.len(), 16);
+    fn catalog_size_floor() {
+        // Lower bound, not exact: catches accidental deletions while
+        // letting new tools land without a forced test bump. The
+        // critical-tools test below pins the named entries that
+        // external callers (Claude Code, ultrareview, etc.) depend on.
+        assert!(TOOLS.len() >= 16, "catalog shrunk below 16: {}", TOOLS.len());
+    }
+
+    #[test]
+    fn critical_tools_present() {
+        // Tools that external callers rely on by name. Removing one
+        // is a load-bearing breakage; this guard surfaces the change
+        // before the live MCP integration discovers it.
+        for name in [
+            "query", "cloud_query", "review_commit", "review_diff",
+            "list_models", "list_cloud_models", "write_file",
+            "parallel_query", "set_routing_mode",
+        ] {
+            assert!(find(name).is_some(), "missing critical tool: {name}");
+        }
     }
 }
