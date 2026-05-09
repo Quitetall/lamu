@@ -354,6 +354,58 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     result
 }
 
+/// V5 improvement H: dedupe overlapping content between auto_context
+/// and caller-supplied tactical. Walks both as 6-line shingles, hashes
+/// each shingle, drops shingles from the caller-supplied side that
+/// already appear in auto_context. Conservative: only drops on exact
+/// shingle match — partial overlap stays.
+fn dedupe_tactical(auto_blob: &str, manual: &str) -> String {
+    use std::collections::HashSet;
+    const SHINGLE: usize = 6;
+    let auto_lines: Vec<&str> = auto_blob.lines().collect();
+    let mut auto_shingles: HashSet<u64> = HashSet::new();
+    for w in auto_lines.windows(SHINGLE) {
+        auto_shingles.insert(hash_shingle(w));
+    }
+    if auto_shingles.is_empty() {
+        return format!("{}\n\n---\n\n{}", auto_blob, manual);
+    }
+    let manual_lines: Vec<&str> = manual.lines().collect();
+    let mut keep: Vec<&str> = Vec::with_capacity(manual_lines.len());
+    let mut skip_until = 0usize;
+    for i in 0..manual_lines.len() {
+        if i < skip_until {
+            continue;
+        }
+        if i + SHINGLE <= manual_lines.len() {
+            let h = hash_shingle(&manual_lines[i..i + SHINGLE]);
+            if auto_shingles.contains(&h) {
+                // Found an overlap — skip this shingle's worth of
+                // lines. Subsequent lines may still uniquely contribute.
+                skip_until = i + SHINGLE;
+                continue;
+            }
+        }
+        keep.push(manual_lines[i]);
+    }
+    let pruned = keep.join("\n");
+    if pruned.trim().is_empty() {
+        // Whole manual blob was redundant.
+        auto_blob.to_string()
+    } else {
+        format!("{}\n\n---\n\n{}", auto_blob, pruned)
+    }
+}
+
+fn hash_shingle(lines: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for l in lines {
+        l.trim().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// V5 improvement I: per-process timestamp for the last `review_commit`
 /// invocation. When the next call comes in after IDLE_THRESHOLD, we
 /// implicitly run a warmup pass first so DeepSeek's prompt-cache TTL
@@ -692,7 +744,11 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     } else if raw_tactical_arg.is_empty() {
         auto_blob
     } else {
-        format!("{}\n\n---\n\n{}", auto_blob, raw_tactical_arg)
+        // V5 H: dedupe overlapping content. When auto_context's
+        // changed-files section already includes the same lines that
+        // appear in caller-supplied `context`, drop the duplicate
+        // chunk to keep the prefix lean. Hash by 6-line shingle.
+        dedupe_tactical(&auto_blob, raw_tactical_arg)
     };
     let tactical = truncate_with_marker(&raw_tactical, MAX_TACTICAL_CONTEXT_BYTES);
     let (system, _stats) = crate::context::prepend_to_system(
