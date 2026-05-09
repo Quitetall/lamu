@@ -1,0 +1,15 @@
+[package]
+name = "lamu-providers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure provider wire-format adapters (OpenAI / Anthropic). Sync, IO-free. Shared between lamu-cli (sync transport) and lamu-mcp (async transport)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Just the header types — no client, no tokio, no blocking I/O.
+reqwest = { version = "0.12", default-features = false }

@@ -5,6 +5,7 @@ members = [
     "lamu-mcp",
     "lamu-api",
     "lamu-cli",
+    "lamu-providers",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ walkdir = "2"
 
 # Internal crates
 lamu-core = { path = "lamu-core" }
+lamu-providers = { path = "lamu-providers" }
 
 [profile.release]
 lto = "thin"
