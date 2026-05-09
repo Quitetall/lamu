@@ -354,6 +354,43 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     result
 }
 
+/// V5 improvement F: heuristic for skipping auto_context. Counts
+/// added lines (`^+`) and changed files via `git show --shortstat`.
+/// Returns true when both counts are below thresholds — the diff is
+/// small enough to live entirely in the user prompt, no need to
+/// expand to full file bodies + caller scans.
+fn is_trivial_diff(commit: &str, repo: &std::path::Path) -> bool {
+    const MAX_LINES: usize = 50;
+    const MAX_FILES: usize = 3;
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["show", "--shortstat", "--format=", commit])
+        .output();
+    let Ok(out) = out else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    // Output line: " 3 files changed, 12 insertions(+), 4 deletions(-)"
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().last().unwrap_or("").trim();
+    let mut files = 0usize;
+    let mut insertions = 0usize;
+    for token_pair in line.split(',') {
+        let tp = token_pair.trim();
+        let mut parts = tp.splitn(2, ' ');
+        if let (Some(num), Some(rest)) = (parts.next(), parts.next()) {
+            if let Ok(n) = num.parse::<usize>() {
+                if rest.starts_with("file") {
+                    files = n;
+                } else if rest.starts_with("insertion") {
+                    insertions = n;
+                }
+            }
+        }
+    }
+    insertions <= MAX_LINES && files <= MAX_FILES
+}
+
 // ── Cache warmup ────────────────────────────────────────────────────
 
 /// Prime DeepSeek's prompt cache with the central + plan tier of a
@@ -592,12 +629,23 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     // (changed-files + tree-sitter symbols + ripgrep callers) and
     // prepend it to the caller-supplied tactical blob. Caller-supplied
     // sits at the end so it stays closer to the role prompt.
+    //
+    // V5 improvement F: skip auto_context for trivial commits — small
+    // diffs already fit in the diff prompt itself, expanding to full
+    // file bodies is pure overhead. Threshold: < 50 added lines + < 3
+    // changed files. Above either threshold we engage as normal.
     let auto_blob = if auto {
-        match crate::auto_context::assemble_auto_context(commit, std::path::Path::new(repo)) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("auto_context: assemble failed: {}", e);
-                String::new()
+        let trivial = is_trivial_diff(commit, std::path::Path::new(repo));
+        if trivial {
+            tracing::debug!("auto_context: skipped (trivial diff under threshold)");
+            String::new()
+        } else {
+            match crate::auto_context::assemble_auto_context(commit, std::path::Path::new(repo)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("auto_context: assemble failed: {}", e);
+                    String::new()
+                }
             }
         }
     } else {
