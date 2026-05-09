@@ -82,12 +82,70 @@ fn resolve_central() -> &'static str {
     // &'static so the prompt-cache prefix stays bit-identical across
     // every call. If the override is missing / unreadable / oversized,
     // fall through to the bundled default.
+    //
+    // V5 G: append a per-repo FP-feedback footer mined from prior
+    // commit messages. Reviewer's documented FPs grow organically
+    // across sessions without manual asset edits.
     static OVERRIDE: OnceLock<Option<&'static str>> = OnceLock::new();
     let override_text = OVERRIDE.get_or_init(|| {
         let path = dirs::config_dir()?.join("lamu").join("context").join("central.md");
         load_central_override_from(&path)
     });
     override_text.unwrap_or(CENTRAL_DEFAULT)
+}
+
+/// V5 G: per-repo FP feedback footer. Mines `FP: …` notes from prior
+/// commit messages (the audit trail the project already keeps when
+/// skipping V4 Pro false positives), formats as a "documented FP
+/// patterns from this repo's history" list. Cached per-process per-
+/// repo so the cache prefix stays stable.
+pub(crate) fn fp_feedback_footer(repo: &Path) -> String {
+    use std::collections::HashMap;
+    static CACHE: OnceLock<parking_lot::Mutex<HashMap<String, String>>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let key = repo.to_string_lossy().to_string();
+    {
+        let m = map.lock();
+        if let Some(v) = m.get(&key) {
+            return v.clone();
+        }
+    }
+    let body = match std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["log", "--pretty=format:%B", "-200", "--all"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let log = String::from_utf8_lossy(&o.stdout);
+            let mut fps: Vec<String> = Vec::new();
+            for line in log.lines() {
+                let trimmed = line.trim();
+                // Match: "FP: …" or "FALSE POSITIVE: …" prefixes.
+                let prefix = ["FP:", "FALSE POSITIVE:", "fp:"];
+                for p in prefix {
+                    if let Some(rest) = trimmed.strip_prefix(p) {
+                        let clean = rest.trim();
+                        if !clean.is_empty() && !fps.iter().any(|x| x == clean) {
+                            fps.push(clean.to_string());
+                        }
+                    }
+                }
+            }
+            if fps.is_empty() {
+                String::new()
+            } else {
+                let mut s = String::from("## Project-mined FP patterns (from recent commit audit trail)\n\n");
+                s.push_str("These false-positives have been verified-and-skipped on prior reviews. Apply the same skepticism:\n\n");
+                for fp in fps.iter().take(20) {
+                    s.push_str(&format!("- {}\n", fp));
+                }
+                s
+            }
+        }
+        _ => String::new(),
+    };
+    map.lock().insert(key, body.clone());
+    body
 }
 
 /// Read a candidate central-override file at `path`. Returns None when
@@ -313,6 +371,22 @@ pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
     if !central.is_empty() {
         parts.push(central);
         stats.central_bytes = central.len();
+    }
+
+    // V5 G: append FP-feedback footer from this repo's commit history.
+    // Empty when the repo has no FP/FALSE POSITIVE notes yet.
+    let fp_footer = if cfg.central {
+        if let Some(repo) = cfg.repo {
+            fp_feedback_footer(repo)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    if !fp_footer.is_empty() {
+        parts.push(fp_footer.as_str());
+        stats.central_bytes += fp_footer.len();
     }
 
     let plan_text = if let Some((path, source)) = resolve_plan_path(cfg.plan, cfg.repo) {
