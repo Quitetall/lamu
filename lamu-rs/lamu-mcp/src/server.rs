@@ -1146,16 +1146,57 @@ async fn build_spawn_cmd(
                 Ok(o) => String::from_utf8_lossy(&o.stdout).contains("--spec-ngram-mod-n-match"),
                 Err(_) => false,
             };
+
+            // Flag set MUST mirror lamu-core::backends::llamacpp::LlamaCppBackend::load
+            // to avoid drift. Phase 4 of the refactor consolidates this into
+            // a single shared `build_command`; until then the values are
+            // deliberately copied verbatim.
+
+            // Default: model's full advertised context. LAMU_DEFAULT_CTX caps
+            // the per-spawn ctx for tight-VRAM cases.
+            let ctx_cap: u32 = std::env::var("LAMU_DEFAULT_CTX")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
+            let ctx = entry.context_max.min(ctx_cap);
+
+            // Validate LAMU_KV against the set llama.cpp accepts. Garbage
+            // values either crash the server at startup or silently fall
+            // back to f16 — neither is what we want.
+            let kv_type = match std::env::var("LAMU_KV").as_deref() {
+                Ok("q8_0") | Ok("q4_0") | Ok("q4_1") | Ok("q5_0") | Ok("q5_1")
+                    | Ok("f16") | Ok("bf16") | Ok("f32") => std::env::var("LAMU_KV").unwrap(),
+                Ok(other) => return Err(format!(
+                    "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32",
+                    other
+                )),
+                Err(_) => "q8_0".to_string(),
+            };
+
+            // Bind to localhost by default. Remote exposure is opt-in via
+            // LAMU_BIND_HOST=0.0.0.0 — avoids a default-config security
+            // hole on multi-host networks. The earlier hardening (commit
+            // a91153f) only patched lamu-core and lamu-cli; this third
+            // path was missed until the post-audit verify-finding pass.
+            let host = std::env::var("LAMU_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+
             let mut cmd = Command::new(&bin);
             cmd.arg("-m").arg(&entry.path)
-                .arg("--host").arg("0.0.0.0")
+                .arg("--host").arg(&host)
                 .arg("--port").arg(port.to_string())
-                .arg("--ctx-size").arg(std::cmp::min(entry.context_max, 32768).to_string())
+                .arg("--ctx-size").arg(ctx.to_string())
                 .arg("-ngl").arg("99")
                 .arg("--flash-attn").arg("on")
-                .arg("--cache-type-k").arg("q4_0")
-                .arg("--cache-type-v").arg("q4_0")
-                .arg("--parallel").arg("1");
+                .arg("--cache-type-k").arg(&kv_type)
+                .arg("--cache-type-v").arg(&kv_type)
+                .arg("--parallel").arg("1")
+                // Larger prompt-eval batches = fewer kernel launches per
+                // turn. 4096/512 keeps VRAM stable on a 24GB card.
+                .arg("--batch-size").arg("4096")
+                .arg("--ubatch-size").arg("512")
+                // Reuse shared prefixes across multi-turn chat — the next
+                // turn's KV starts where the last one ended, so re-eval
+                // skips the system prompt + history.
+                .arg("--cache-reuse").arg("256")
+                .env("CUDA_VISIBLE_DEVICES", "0");
             if supports_ngram && (entry.arch == "qwen35" || entry.arch == "qwen3") {
                 cmd.args([
                     "--spec-type", "ngram-mod",
@@ -1657,6 +1698,84 @@ async fn handle_review_diff(args: Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Phase 0 regression: build_spawn_cmd LlamaCpp arm must bind to
+    /// 127.0.0.1 by default, NEVER 0.0.0.0. The earlier hardening
+    /// (a91153f) only patched lamu-core and lamu-cli; this third spawn
+    /// path was missed. Lock the security default in.
+    ///
+    /// Skipped when llama-server isn't installed (CI without the
+    /// binary) — local dev with the bin available exercises the real
+    /// argv assertion. Phase 4 extracts the flag construction into a
+    /// pure free function which makes this testable everywhere.
+    #[tokio::test]
+    async fn build_spawn_cmd_llamacpp_binds_localhost_by_default() {
+        use std::path::PathBuf;
+        use lamu_core::types::{BackendType, Capability, ModelFormat, ModelEntry};
+
+        if !lamu_core::config::llama_bin().exists() {
+            eprintln!("skipping: llama-server bin not installed");
+            return;
+        }
+
+        // Belt-and-braces: clear any leaked env from another test.
+        // SAFETY: tokio::test runs on a runtime; env reads/writes here
+        // happen before any other thread reads them in this test.
+        unsafe {
+            std::env::remove_var("LAMU_BIND_HOST");
+            std::env::remove_var("LAMU_KV");
+            std::env::remove_var("LAMU_DEFAULT_CTX");
+        }
+
+        let entry = ModelEntry {
+            name: "test-bind".into(),
+            path: PathBuf::from("/tmp/nonexistent.gguf"), // not spawned
+            format: ModelFormat::Gguf,
+            backend: BackendType::LlamaCpp,
+            arch: "qwen35".into(),
+            params_b: 1.0,
+            quant: "Q4_K_M".into(),
+            vram_mb: 1000,
+            context_max: 8192,
+            capabilities: vec![Capability::Chat],
+            reasoning_marker: None,
+            speculative: None,
+            pinned: false,
+            notes: String::new(),
+            status: String::new(),
+        };
+
+        let (cmd, _, _, _) = build_spawn_cmd(&entry, 18888).await
+            .expect("build_spawn_cmd should succeed when bin exists");
+
+        let args: Vec<String> = cmd.as_std().get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+
+        // Find --host position, then check the next arg.
+        let host_idx = args.iter().position(|a| a == "--host")
+            .expect("--host flag missing entirely");
+        let host_val = args.get(host_idx + 1)
+            .expect("--host has no value");
+        assert_eq!(host_val, "127.0.0.1",
+            "build_spawn_cmd must bind 127.0.0.1 by default; got --host {}", host_val);
+        assert!(args.iter().all(|a| a != "0.0.0.0"),
+            "0.0.0.0 must not appear anywhere in the argv");
+
+        // Phase 0 also restored the rest of the flag set. Check the
+        // ones that protect us against silent perf regressions.
+        assert!(args.iter().any(|a| a == "--cache-reuse"),
+            "--cache-reuse missing");
+        assert!(args.iter().any(|a| a == "--batch-size"),
+            "--batch-size missing");
+        assert!(args.iter().any(|a| a == "--ubatch-size"),
+            "--ubatch-size missing");
+        // KV default is q8_0; ensure we didn't regress to q4_0.
+        let kv_idx = args.iter().position(|a| a == "--cache-type-k")
+            .expect("--cache-type-k missing");
+        assert_eq!(args[kv_idx + 1], "q8_0",
+            "default KV must be q8_0 (got {})", args[kv_idx + 1]);
+    }
 
     #[test]
     fn parse_capability_known() {
