@@ -1288,24 +1288,6 @@ struct CloudYamlFile {
     models: Vec<CloudYamlEntry>,
 }
 
-/// Parse + validate `ANTHROPIC_BETA` env var. Mirrors the helper in
-/// lamu-cli/src/providers.rs — kept in sync because lamu-mcp doesn't
-/// depend on lamu-cli.
-fn parse_anthropic_beta() -> Option<reqwest::header::HeaderValue> {
-    let raw = std::env::var("ANTHROPIC_BETA").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match reqwest::header::HeaderValue::from_str(trimmed) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("ANTHROPIC_BETA rejected as header value: {} (ignoring)", e);
-            None
-        }
-    }
-}
-
 fn load_cloud_models() -> Vec<CloudYamlEntry> {
     let Some(dir) = dirs::config_dir() else { return Vec::new(); };
     let path = dir.join("lamu").join("cloud-models.yaml");
@@ -1458,9 +1440,9 @@ async fn handle_cloud_query(args: Value) -> String {
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
-        // 1M ctx beta: validated via the same helper that providers.rs
-        // uses, so the trim + reject-bad-value rule is in one place.
-        if let Some(val) = parse_anthropic_beta() {
+        // 1M ctx beta: validated via the shared helper so the trim +
+        // reject-bad-value rule lives in lamu-providers only.
+        if let Some(val) = lamu_providers::anthropic_beta_header() {
             req = req.header("anthropic-beta", val);
         }
         let resp = match req.json(&payload).send().await {

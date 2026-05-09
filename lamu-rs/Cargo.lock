@@ -1298,6 +1298,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "lamu-core",
+ "lamu-providers",
  "parking_lot",
  "reqwest",
  "serde",
