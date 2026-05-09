@@ -317,7 +317,7 @@ impl LamuMcpServer {
             // Mark loading INSIDE the lock so no concurrent caller picks
             // up the same plan. evict_backends carries Arc<Mutex<Box<dyn
             // Backend>>> handles we'll unload outside the state lock.
-            let mut evict_backends: Vec<(String, Arc<AsyncMutex<Box<dyn Backend>>>)> = Vec::new();
+            let mut evict_backends: Vec<(String, crate::server::BackendHandle)> = Vec::new();
             for evict_name in &evict {
                 if let Some(b) = st.backends.remove(evict_name) {
                     evict_backends.push((evict_name.clone(), b));
@@ -513,7 +513,7 @@ impl LamuMcpServer {
         // state lock, THEN unload outside the lock so the per-backend
         // unload doesn't hold the state lock for 30s.
         let mut freed = Vec::new();
-        let mut to_unload: Vec<(String, Arc<AsyncMutex<Box<dyn Backend>>>)> = Vec::new();
+        let mut to_unload: Vec<(String, crate::server::BackendHandle)> = Vec::new();
         if mode == "cloud-only" {
             let mut st = self.state.lock();
             let names: Vec<String> = st.scheduler.loaded_models()

@@ -35,6 +35,12 @@ pub struct LamuMcpServer {
     pub routing_mode: Arc<AsyncMutex<String>>,
 }
 
+/// Shared handle to a loaded Backend. Wrapped in `Arc<TokioMutex<…>>`
+/// so a query can clone the Arc out of the state lock and serialize
+/// per-backend access without re-locking the whole ServerState across
+/// an `.await`.
+pub type BackendHandle = Arc<AsyncMutex<Box<dyn Backend>>>;
+
 pub struct ServerState {
     pub models_dir: PathBuf,
     pub registry_path: PathBuf,
@@ -48,11 +54,8 @@ pub struct ServerState {
     pub health: HealthRegistry,
     /// Loaded backends keyed by model name. Each Backend impl owns its
     /// own Child + transport details; lamu-mcp only orchestrates
-    /// load/unload + routes to .generate(). Wrapped in
-    /// Arc<TokioMutex<…>> so handle_query can clone the Arc out of the
-    /// state lock and serialize per-backend access without re-locking
-    /// the whole ServerState across an await.
-    pub backends: HashMap<String, Arc<AsyncMutex<Box<dyn Backend>>>>,
+    /// load/unload + routes to .generate().
+    pub backends: HashMap<String, BackendHandle>,
 }
 
 impl LamuMcpServer {
