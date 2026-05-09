@@ -828,6 +828,21 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         review
     };
 
+    // V6 Q: critic pass — second-order regression hunting. Opt-in.
+    let review = if auto && std::env::var("LAMU_CRITIC_PASS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let extra = critic_pass(&prompt, &system).await;
+        if extra.is_empty() {
+            review
+        } else {
+            format!("{}{}", review, extra)
+        }
+    } else {
+        review
+    };
+
     format!("=== Review of {} (DeepSeek V4 Pro) ===\n\n{}", commit, review)
 }
 
@@ -839,6 +854,42 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
 ///
 /// Best-effort: any failure path returns the original draft so the
 /// reviewer's signal is never lost — only filtered.
+/// V6 Q: critic role parallel pass. Same diff fed to a "Critic" Flash
+/// call asking "what could this BREAK? what regressions might land?"
+/// The reviewer's normal pass finds bugs in the diff itself; the
+/// critic looks for second-order effects on callers / contracts /
+/// future use. Findings are appended to the main review, marked as
+/// CRITIC-source so the reader can weigh them differently.
+///
+/// Opt-in via LAMU_CRITIC_PASS=1. Cost: ~$0.0003 per review.
+async fn critic_pass(prompt: &str, system: &str) -> String {
+    let critic_system = format!(
+        "You are a CRITIC reviewing code changes for second-order effects. Focus on: regressions to existing callers, contract changes that downstream code may not expect, performance cliffs, edge cases the author probably didn't consider. Don't repeat findings about the diff itself — assume the primary reviewer covered those. Format: numbered list of CONCERN findings, severity tag, file:line, problem, mitigation. If you genuinely see no second-order risk, return ONLY: NO_CRITIC_FINDINGS\n\n{}",
+        system
+    );
+    let critic_prompt = format!(
+        "{}\n\n---\n\nWhat could this BREAK?",
+        prompt
+    );
+    let args = json!({
+        "model": "deepseek-v4-flash",
+        "prompt": critic_prompt,
+        "system": critic_system,
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "include_reasoning": false,
+    });
+    let resp = handle_cloud_query(args).await;
+    let trim = resp.trim();
+    if resp.starts_with("error:") || trim.is_empty() || trim.starts_with("NO_CRITIC_FINDINGS") {
+        return String::new();
+    }
+    format!(
+        "\n\n---\n\n## Critic-pass findings (V6 Q — what could this break?)\n\n{}",
+        resp
+    )
+}
+
 /// V6 L: two-stage review. Stage 1 (Flash) scans the diff and emits
 /// a candidate-issue shortlist. Stage 2 (Pro) reads the same prompt
 /// + Flash's shortlist and produces the final review with verdict.
