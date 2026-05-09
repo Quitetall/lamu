@@ -1942,7 +1942,11 @@ mod tests {
     // Phase 6.1 — write_file MCP tool. The journal scoping + path
     // validation are covered in lamu-core; these tests pin the tool's
     // input-shape rejections (which run before the journal sees
-    // anything).
+    // anything). Tests that mutate cwd serialize via WRITE_FILE_CWD_LOCK
+    // since std::env::set_current_dir is process-global.
+
+    use std::sync::Mutex;
+    static WRITE_FILE_CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn write_file_rejects_absolute_path() {
@@ -1994,22 +1998,15 @@ mod tests {
         assert!(r.contains("session id"), "got: {r}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn write_file_rejects_symlink_escape() {
-        // Build a tempdir with a symlink subdir pointing OUTSIDE the
-        // dir, then chdir into the dir, then ask write_file to write
-        // through the symlink. Should be refused before journaling.
-        // SAFETY: env::set_current_dir is process-global; serialize
-        // via the existing test mutex pattern. The other write_file
-        // tests don't depend on cwd, so a temporary cwd swap inside
-        // this one test is fine.
+    async fn write_file_rejects_directory_symlink_escape() {
+        // Symlinked subdir attack: cwd/escape -> outside_dir/.
+        // write_file("escape/pwned.txt", ...) must refuse.
+        let _g = WRITE_FILE_CWD_LOCK.lock().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let inside = tempfile::tempdir().unwrap();
-        // Create symlink `inside/escape -> outside/`.
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), inside.path().join("escape")).unwrap();
-        #[cfg(not(unix))]
-        return; // No symlink primitive on this platform — skip.
 
         let prev_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(inside.path()).unwrap();
@@ -2022,7 +2019,36 @@ mod tests {
 
         assert!(r.starts_with("error:"), "got: {r}");
         assert!(r.contains("escapes cwd via symlink"), "got: {r}");
-        // Confirm no file was actually written outside.
         assert!(!outside.path().join("pwned.txt").exists(), "symlink escape wrote anyway");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_rejects_leaf_symlink_escape() {
+        // Symlinked leaf attack: cwd/sneaky -> /tmp/outside/target.
+        // The parent canonicalizes to cwd (passes the parent check),
+        // but std::fs::write would follow the leaf symlink. Defense
+        // lives in lamu_core::sandbox::journal::safe_write, which
+        // refuses to follow a leaf symlink before writing.
+        let _g = WRITE_FILE_CWD_LOCK.lock().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_target = outside.path().join("target.txt");
+        std::fs::write(&outside_target, b"original").unwrap();
+        let inside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&outside_target, inside.path().join("sneaky")).unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(inside.path()).unwrap();
+        let r = handle_write_file(json!({
+            "path": "sneaky",
+            "content": "pwned",
+            "session_id": "test-leaf-symlink",
+        })).await;
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.contains("symlink"), "got: {r}");
+        // Confirm the symlink target is unchanged.
+        assert_eq!(std::fs::read(&outside_target).unwrap(), b"original");
     }
 }

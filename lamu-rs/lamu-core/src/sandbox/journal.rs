@@ -145,6 +145,27 @@ pub fn safe_write(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<()> {
             path.display()
         );
     }
+    // Refuse to follow symlinks at the leaf. symlink_metadata does NOT
+    // dereference; it tells us whether the path itself is a symlink.
+    // Without this check, std::fs::write would follow the link and
+    // write to whatever the symlink targets — including paths outside
+    // any sandbox the caller scoped above.
+    //
+    // KNOWN TOCTOU GAP: a process with write access to the parent dir
+    // could swap a regular file for a symlink between this check and
+    // the write below. Closing that race needs O_NOFOLLOW on the open
+    // syscall, which requires platform-specific OpenOptionsExt; tracked
+    // separately. For a single-tenant local sandbox this trade-off is
+    // acceptable; multi-tenant deployments must layer additional
+    // isolation (bubblewrap, mount namespaces).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "safe_write refuses to follow leaf symlink: {}",
+                path.display()
+            );
+        }
+    }
     let before = read_blob(path);
     journal.append(&JournalEntry::Write {
         path: path.to_path_buf(),
