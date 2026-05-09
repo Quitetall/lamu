@@ -12,6 +12,7 @@ description = "Core types, registry, scheduler, router, reasoning extraction"
 serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
 tokio.workspace = true
@@ -26,6 +27,6 @@ async-stream = "0.3"
 serde_json.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 futures-util = "0.3"
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

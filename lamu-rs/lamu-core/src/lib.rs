@@ -14,6 +14,7 @@ pub mod health;
 pub mod backends;
 pub mod observability;
 pub mod queue;
+pub mod sandbox;
 pub mod supervisor;
 
 pub use error::{Error, Result};
