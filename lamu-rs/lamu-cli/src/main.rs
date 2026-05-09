@@ -130,8 +130,19 @@ async fn main() -> Result<()> {
     // warnings (zombie children, dropped thinking blocks, etc.) are
     // visible without the user having to opt in. RUST_LOG=info or debug
     // for higher verbosity; RUST_LOG=error to silence warns.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let env_filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(e) => {
+            // Distinguish "RUST_LOG unset" (silent fallback to warn) from
+            // "RUST_LOG set but malformed" (eprintln so the user notices
+            // the typo). Subscriber isn't initialized yet — eprintln is
+            // the only available output.
+            if std::env::var_os("RUST_LOG").is_some() {
+                eprintln!("RUST_LOG ignored ({}); defaulting to 'warn'", e);
+            }
+            tracing_subscriber::EnvFilter::new("warn")
+        }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
