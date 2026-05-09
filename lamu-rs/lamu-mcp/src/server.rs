@@ -264,8 +264,10 @@ impl LamuMcpServer {
             .unwrap_or_default();
         let caps_opt = if caps.is_empty() { None } else { Some(caps.as_slice()) };
 
-        // Route + collect target info under lock
-        let (port, model_name, marker, client) = {
+        // Route + collect target info under lock. Backend Arc is
+        // cloned out of the map so .generate() can run without holding
+        // the state lock across .await.
+        let (model_name, marker, backend_arc) = {
             let st = self.state.lock();
             let decision = st.router.route(&st.scheduler, model, caps_opt, Some(st.health.all()));
 
@@ -280,14 +282,18 @@ impl LamuMcpServer {
                 );
             }
 
-            let Some(loaded) = st.scheduler.get_loaded(&decision.model_name) else {
+            let Some(_loaded) = st.scheduler.get_loaded(&decision.model_name) else {
                 return "internal: lost loaded model".into();
             };
-            let port = loaded.port;
             let entry = st.entries.get(&decision.model_name).cloned();
             let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
-            let client = st.client.clone();
-            (port, decision.model_name, marker, client)
+            let Some(backend_arc) = st.backends.get(&decision.model_name).cloned() else {
+                return format!(
+                    "internal: model '{}' marked loaded but missing from backends map",
+                    decision.model_name
+                );
+            };
+            (decision.model_name, marker, backend_arc)
         };
 
         // Mark used (separate lock acquisition)
@@ -296,20 +302,18 @@ impl LamuMcpServer {
             st.scheduler.mark_used(&model_name);
         }
 
-        // Build messages
-        let mut messages = Vec::new();
+        // Build chat history in the unified Backend format.
+        let mut chat_messages: Vec<lamu_core::backends::ChatMessage> = Vec::new();
         if !system.is_empty() {
-            messages.push(json!({"role":"system","content":system}));
+            chat_messages.push(lamu_core::backends::ChatMessage {
+                role: "system".into(),
+                content: system.to_string(),
+            });
         }
-        messages.push(json!({"role":"user","content":prompt}));
-
-        let payload = json!({
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": false,
+        chat_messages.push(lamu_core::backends::ChatMessage {
+            role: "user".into(),
+            content: prompt.to_string(),
         });
-        let url = format!("http://localhost:{}/v1/chat/completions", port);
 
         // Acquire queue slot before hitting backend
         let queue = self.get_or_create_queue(&model_name).await;
@@ -320,57 +324,35 @@ impl LamuMcpServer {
             origin,
         }).await;
 
-        let resp = match client.post(&url).json(&payload).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                emit(
-                    "mcp_query_failed",
-                    Some(&trace_id),
-                    json!({
-                        "model": model_name,
-                        "error_type": "request_send",
-                        "error": format!("{e}"),
-                    }),
-                );
-                return format!("Generation error: {}", e);
-            }
-        };
-        let data: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                emit(
-                    "mcp_query_failed",
-                    Some(&trace_id),
-                    json!({
-                        "model": model_name,
-                        "error_type": "json_decode",
-                        "error": format!("{e}"),
-                    }),
-                );
-                return format!("JSON decode error: {}", e);
+        // Phase 6.3b: dispatch through Backend::generate. Each impl
+        // (LlamaCpp / Megakernel / Dflash) parses its own response
+        // shape, so the OpenAI-only inline parser this used to be is
+        // gone. The backend mutex is held only across .generate() —
+        // queue gating limits concurrent same-model requests already.
+        let raw = {
+            let backend = backend_arc.lock().await;
+            match backend.generate(chat_messages, max_tokens, temperature).await {
+                Ok(s) => s,
+                Err(e) => {
+                    emit(
+                        "mcp_query_failed",
+                        Some(&trace_id),
+                        json!({
+                            "model": model_name,
+                            "error_type": "backend_generate",
+                            "error": format!("{e}"),
+                        }),
+                    );
+                    return format!("Generation error: {}", e);
+                }
             }
         };
 
-        let msg = match data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")) {
-            Some(m) => m,
-            None => {
-                emit(
-                    "mcp_query_failed",
-                    Some(&trace_id),
-                    json!({"model": model_name, "error_type": "no_message"}),
-                );
-                return "no message in response".into();
-            }
-        };
-        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let reasoning_content = msg.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
-
+        // LlamaCppBackend / Megakernel / Dflash all return either
+        // "content" or "<think>{reasoning}</think>\n{content}".
+        // The reasoning extractor handles both shapes.
         let extractor = get_extractor(marker);
-        let (reasoning, content_clean) = if !reasoning_content.is_empty() {
-            (reasoning_content.to_string(), content.to_string())
-        } else {
-            extractor.split(content)
-        };
+        let (reasoning, content_clean) = extractor.split(&raw);
 
         let text = if include_reasoning && !reasoning.is_empty() {
             format!("**Reasoning:**\n{}\n\n**Answer:**\n{}", reasoning, content_clean)
