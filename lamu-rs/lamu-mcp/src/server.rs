@@ -1146,68 +1146,17 @@ async fn build_spawn_cmd(
             if !bin.exists() {
                 return Err(format!("llama-server not found at {}", bin.display()));
             }
-            let supports_ngram = match Command::new(&bin).arg("--help").output().await {
-                Ok(o) => String::from_utf8_lossy(&o.stdout).contains("--spec-ngram-mod-n-match"),
-                Err(_) => false,
-            };
-
-            // Flag set MUST mirror lamu-core::backends::llamacpp::LlamaCppBackend::load
-            // to avoid drift. Phase 4 of the refactor consolidates this into
-            // a single shared `build_command`; until then the values are
-            // deliberately copied verbatim.
-
-            // Default: model's full advertised context. LAMU_DEFAULT_CTX caps
-            // the per-spawn ctx for tight-VRAM cases.
-            let ctx_cap: u32 = std::env::var("LAMU_DEFAULT_CTX")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
-            let ctx = entry.context_max.min(ctx_cap);
-
-            // Validate LAMU_KV against the set llama.cpp accepts. Garbage
-            // values either crash the server at startup or silently fall
-            // back to f16 — neither is what we want.
-            let kv_type = match std::env::var("LAMU_KV").as_deref() {
-                Ok("q8_0") | Ok("q4_0") | Ok("q4_1") | Ok("q5_0") | Ok("q5_1")
-                    | Ok("f16") | Ok("bf16") | Ok("f32") => std::env::var("LAMU_KV").unwrap(),
-                Ok(other) => return Err(format!(
-                    "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32",
-                    other
-                )),
-                Err(_) => "q8_0".to_string(),
-            };
-
-            // Bind to localhost by default. Remote exposure is opt-in via
-            // LAMU_BIND_HOST=0.0.0.0 — avoids a default-config security
-            // hole on multi-host networks. The earlier hardening (commit
-            // a91153f) only patched lamu-core and lamu-cli; this third
-            // path was missed until the post-audit verify-finding pass.
-            let host = std::env::var("LAMU_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-
+            // Phase 4: flag construction lives in lamu-core::backends::llamacpp.
+            // All three spawn paths (this one, the core Backend::load impl, and
+            // the TUI swap_to_model_if_needed) consume the same `build_llama_spawn`
+            // so they cannot drift again.
+            let supports_ngram = lamu_core::backends::llamacpp::detect_ngram_support(&bin).await;
+            let spawn = lamu_core::backends::llamacpp::build_llama_spawn(entry, port, supports_ngram)
+                .map_err(|e| e.to_string())?;
             let mut cmd = Command::new(&bin);
-            cmd.arg("-m").arg(&entry.path)
-                .arg("--host").arg(&host)
-                .arg("--port").arg(port.to_string())
-                .arg("--ctx-size").arg(ctx.to_string())
-                .arg("-ngl").arg("99")
-                .arg("--flash-attn").arg("on")
-                .arg("--cache-type-k").arg(&kv_type)
-                .arg("--cache-type-v").arg(&kv_type)
-                .arg("--parallel").arg("1")
-                // Larger prompt-eval batches = fewer kernel launches per
-                // turn. 4096/512 keeps VRAM stable on a 24GB card.
-                .arg("--batch-size").arg("4096")
-                .arg("--ubatch-size").arg("512")
-                // Reuse shared prefixes across multi-turn chat — the next
-                // turn's KV starts where the last one ended, so re-eval
-                // skips the system prompt + history.
-                .arg("--cache-reuse").arg("256")
-                .env("CUDA_VISIBLE_DEVICES", "0");
-            if supports_ngram && (entry.arch == "qwen35" || entry.arch == "qwen3") {
-                cmd.args([
-                    "--spec-type", "ngram-mod",
-                    "--spec-ngram-mod-n-match", "24",
-                    "--spec-ngram-mod-n-min", "12",
-                    "--spec-ngram-mod-n-max", "48",
-                ]);
+            cmd.args(&spawn.args);
+            for (k, v) in &spawn.envs {
+                cmd.env(k, v);
             }
             Ok((cmd, "/health", true, 45))
         }

@@ -2198,28 +2198,18 @@ fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
         anyhow::bail!("llama-server not found at {}", bin.display());
     }
 
-    // Use the model's full advertised context by default. Set
-    // LAMU_DEFAULT_CTX to cap manually if VRAM is tight.
-    let ctx_cap: u32 = std::env::var("LAMU_DEFAULT_CTX")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
-    let ctx = entry.context_max.min(ctx_cap);
-    let kv = std::env::var("LAMU_KV").unwrap_or_else(|_| "q8_0".into());
+    // Phase 4: flag construction shared with lamu-core's Backend::load and
+    // lamu-mcp's build_spawn_cmd. Picking up validated LAMU_KV + ngram-mod
+    // detection that the local copy here was missing.
+    let supports_ngram = lamu_core::backends::llamacpp::detect_ngram_support_blocking(&bin);
+    let spawn = lamu_core::backends::llamacpp::build_llama_spawn(entry, 8020, supports_ngram)?;
 
-    std::process::Command::new(&bin)
-        .arg("-m").arg(&entry.path)
-        .arg("--host").arg(std::env::var("LAMU_BIND_HOST").as_deref().unwrap_or("127.0.0.1"))
-        .arg("--port").arg("8020")
-        .arg("--ctx-size").arg(ctx.to_string())
-        .arg("-ngl").arg("99")
-        .arg("--flash-attn").arg("on")
-        .arg("--cache-type-k").arg(&kv)
-        .arg("--cache-type-v").arg(&kv)
-        .arg("--parallel").arg("1")
-        .arg("--batch-size").arg("4096")
-        .arg("--ubatch-size").arg("512")
-        .arg("--cache-reuse").arg("256")
-        .env("CUDA_VISIBLE_DEVICES", "0")
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(&spawn.args);
+    for (k, v) in &spawn.envs {
+        cmd.env(k, v);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
