@@ -217,57 +217,67 @@ mod tests {
 
     #[test]
     fn assemble_central_only() {
-        let (s, stats) = assemble(ContextConfig {
-            central: true,
-            ..Default::default()
+        with_clean_plan_env(|| {
+            let (s, stats) = assemble(ContextConfig {
+                central: true,
+                ..Default::default()
+            });
+            assert_eq!(stats.central_bytes, CENTRAL_DEFAULT.len());
+            assert_eq!(stats.plan_bytes, 0);
+            assert_eq!(stats.tactical_bytes, 0);
+            assert!(s.starts_with(CENTRAL_DEFAULT));
         });
-        assert_eq!(stats.central_bytes, CENTRAL_DEFAULT.len());
-        assert_eq!(stats.plan_bytes, 0);
-        assert_eq!(stats.tactical_bytes, 0);
-        assert!(s.starts_with(CENTRAL_DEFAULT));
     }
 
     #[test]
     fn assemble_central_off_returns_empty() {
-        let (s, stats) = assemble(ContextConfig::default());
-        assert!(s.is_empty());
-        assert_eq!(stats.central_bytes, 0);
+        with_clean_plan_env(|| {
+            let (s, stats) = assemble(ContextConfig::default());
+            assert!(s.is_empty());
+            assert_eq!(stats.central_bytes, 0);
+        });
     }
 
     #[test]
     fn assemble_central_plus_tactical() {
-        let (s, stats) = assemble(ContextConfig {
-            central: true,
-            tactical: "TACTICAL_PROBE_BLOB",
-            ..Default::default()
+        with_clean_plan_env(|| {
+            let (s, stats) = assemble(ContextConfig {
+                central: true,
+                tactical: "TACTICAL_PROBE_BLOB",
+                ..Default::default()
+            });
+            assert_eq!(stats.tactical_bytes, "TACTICAL_PROBE_BLOB".len());
+            // Order: central, then separator, then tactical.
+            assert!(s.contains(CENTRAL_DEFAULT));
+            assert!(s.contains(TIER_SEP));
+            assert!(s.ends_with("TACTICAL_PROBE_BLOB"));
         });
-        assert_eq!(stats.tactical_bytes, "TACTICAL_PROBE_BLOB".len());
-        // Order: central, then separator, then tactical.
-        assert!(s.contains(CENTRAL_DEFAULT));
-        assert!(s.contains(TIER_SEP));
-        assert!(s.ends_with("TACTICAL_PROBE_BLOB"));
     }
 
     #[test]
     fn prepend_to_system_skips_when_empty() {
-        let (s, _) = prepend_to_system(ContextConfig::default(), "ROLE_PROMPT");
-        assert_eq!(s, "ROLE_PROMPT");
+        with_clean_plan_env(|| {
+            let (s, _) = prepend_to_system(ContextConfig::default(), "ROLE_PROMPT");
+            assert_eq!(s, "ROLE_PROMPT");
+        });
     }
 
     #[test]
     fn prepend_to_system_appends_role_after_separator() {
-        let (s, _) = prepend_to_system(
-            ContextConfig {
-                central: true,
-                ..Default::default()
-            },
-            "ROLE_PROMPT",
-        );
-        assert!(s.starts_with(CENTRAL_DEFAULT));
-        assert!(s.ends_with("ROLE_PROMPT"));
-        // Separator must appear exactly between central and the role
-        // prompt — count occurrences to confirm.
-        assert_eq!(s.matches(TIER_SEP).count(), 1);
+        with_clean_plan_env(|| {
+            let (s, _) = prepend_to_system(
+                ContextConfig {
+                    central: true,
+                    ..Default::default()
+                },
+                "ROLE_PROMPT",
+            );
+            assert!(s.starts_with(CENTRAL_DEFAULT));
+            assert!(s.ends_with("ROLE_PROMPT"));
+            // Separator must appear exactly between central and the role
+            // prompt — count occurrences to confirm.
+            assert_eq!(s.matches(TIER_SEP).count(), 1);
+        });
     }
 
     // Plan tier tests. Env reads/writes serialized via PLAN_ENV_LOCK

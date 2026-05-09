@@ -78,7 +78,41 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     let prompt = args["prompt"].as_str().unwrap_or("");
     if prompt.is_empty() { return "error: prompt is required".into(); }
     let model_name = args["model"].as_str().unwrap_or("deepseek-v4-flash");
-    let system = args["system"].as_str().unwrap_or("");
+    let raw_system = args["system"].as_str().unwrap_or("");
+
+    // Phase 6 step 6: context layer for cloud_query. Defaults match
+    // backward-compat behavior — when no plan/context args are passed,
+    // prefix is empty and `system` stays bit-identical to the caller's
+    // raw `system` string. Central is *off* by default for cloud_query
+    // because it's reviewer-shaped today; reviewers should opt in via
+    // `system="<role>"` then explicitly request central.
+    //
+    // Rule: if any of plan_file/context/_with_central is present, the
+    // context layer engages with the corresponding tiers. Otherwise the
+    // pre-step-6 wire format is preserved exactly.
+    let plan_arg = args["plan_file"].as_str();
+    let raw_tactical = args["context"].as_str().unwrap_or("");
+    let tactical = if raw_tactical.is_empty() {
+        String::new()
+    } else {
+        truncate_with_marker(raw_tactical, MAX_TACTICAL_CONTEXT_BYTES)
+    };
+    let want_layer = plan_arg.is_some() || !tactical.is_empty();
+    let system = if want_layer {
+        let (s, _stats) = crate::context::prepend_to_system(
+            crate::context::ContextConfig {
+                central: false, // cloud_query is generic; reviewer paths add central themselves
+                plan: plan_arg,
+                tactical: &tactical,
+                repo: None,
+            },
+            raw_system,
+        );
+        s
+    } else {
+        raw_system.to_string()
+    };
+    let system = system.as_str();
     let max_tokens = args["max_tokens"].as_u64().unwrap_or(8192) as u32;
     let temperature = args["temperature"].as_f64().unwrap_or(0.3) as f32;
     let include_reasoning = args["include_reasoning"].as_bool().unwrap_or(false);
@@ -271,6 +305,11 @@ const REVIEW_SYSTEM_PROMPT: &str = "You are a senior staff engineer doing a code
 /// with a marker so the model knows it's not seeing the whole change.
 const MAX_REVIEW_DIFF_BYTES: usize = 200 * 1024;
 
+/// Cap on the Tactical-tier `context` arg that callers can pass to
+/// review_commit / review_diff / cloud_query. Same shape as the diff
+/// cap above.
+pub(crate) const MAX_TACTICAL_CONTEXT_BYTES: usize = 200 * 1024;
+
 /// Validate a git ref / commit. Accepts: hex SHA (7-40 chars), HEAD
 /// followed by any sequence of `~N` / `^[N]` suffixes (HEAD^^,
 /// HEAD~1^2, HEAD^^^, etc. — all valid git refs), or a plain refname
@@ -369,11 +408,13 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     prompt.push_str("\n```\n");
 
     let plan_arg = args["plan_file"].as_str();
+    let raw_tactical = args["context"].as_str().unwrap_or("");
+    let tactical = truncate_with_marker(raw_tactical, MAX_TACTICAL_CONTEXT_BYTES);
     let (system, _stats) = crate::context::prepend_to_system(
         crate::context::ContextConfig {
             central: true,
             plan: plan_arg,
-            tactical: "",      // Step 6 wires tactical extension
+            tactical: &tactical,
             repo: Some(std::path::Path::new(repo)),
         },
         REVIEW_SYSTEM_PROMPT,
@@ -397,17 +438,16 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
         return "error: 'diff' is required".into();
     }
     let diff = truncate_with_marker(diff, MAX_REVIEW_DIFF_BYTES);
-    let context = args["context"].as_str().unwrap_or("");
+    let raw_tactical = args["context"].as_str().unwrap_or("");
+    let tactical = truncate_with_marker(raw_tactical, MAX_TACTICAL_CONTEXT_BYTES);
     let focus = args["focus"].as_str().unwrap_or("");
 
+    // Step 6: `context` moves from in-prompt body to Tactical-tier
+    // prefix on the system prompt. Cache-friendlier (DeepSeek caches
+    // the system prefix), and consistent with review_commit + cloud_query.
     let mut prompt = String::new();
     if !focus.is_empty() {
         prompt.push_str(&format!("Focus the review on: {}\n\n", focus));
-    }
-    if !context.is_empty() {
-        prompt.push_str("Context:\n");
-        prompt.push_str(context);
-        prompt.push_str("\n\n");
     }
     prompt.push_str("Diff to review:\n\n```\n");
     prompt.push_str(&diff);
@@ -418,7 +458,7 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
         crate::context::ContextConfig {
             central: true,
             plan: plan_arg,
-            tactical: "",      // Step 6 wires tactical extension
+            tactical: &tactical,
             repo: None,        // review_diff doesn't carry a repo path
         },
         REVIEW_SYSTEM_PROMPT,

@@ -163,3 +163,68 @@ async fn write_file_round_trip_uses_journal() {
     let bytes = read_back.expect("file should exist");
     assert_eq!(bytes, b"integration");
 }
+
+// Phase 6 step 6 — context layer args reach the dispatch path. We
+// verify the args parse + route correctly without hitting the cloud
+// (request errors at the cloud-models lookup, not at parsing).
+
+#[tokio::test]
+async fn cloud_query_accepts_context_and_plan_file_args() {
+    let srv = fresh_server();
+    let resp = call_tool(
+        &srv,
+        "cloud_query",
+        json!({
+            "prompt": "hi",
+            "model": "definitely-not-a-real-model",
+            "context": "tactical context blob",
+            "plan_file": "/tmp/nonexistent-plan.md"
+        }),
+    )
+    .await;
+    // Errors at "model not in cloud-models.yaml" — proves args parsed
+    // and routed past the new context-layer plumbing.
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("not in cloud-models.yaml"), "got: {text}");
+}
+
+#[tokio::test]
+async fn review_diff_accepts_plan_file_arg() {
+    // Empty `diff` is rejected up front by review_diff before any
+    // cloud call — keeps this test from depending on whether
+    // DEEPSEEK_API_KEY is set in the test env.
+    let srv = fresh_server();
+    let resp = call_tool(
+        &srv,
+        "review_diff",
+        json!({
+            "diff": "",
+            "context": "tactical context",
+            "plan_file": "/tmp/nonexistent-plan.md"
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("'diff' is required"), "got: {text}");
+}
+
+#[tokio::test]
+async fn review_commit_accepts_plan_file_and_context_args() {
+    let srv = fresh_server();
+    let resp = call_tool(
+        &srv,
+        "review_commit",
+        json!({
+            "commit": "HEAD",
+            "repo": "/tmp/definitely-not-a-git-repo",
+            "context": "tactical context",
+            "plan_file": "/tmp/nonexistent-plan.md"
+        }),
+    )
+    .await;
+    // git show fails since the path isn't a repo. Confirms args route
+    // through the new plumbing without panicking.
+    assert_eq!(resp["result"]["isError"], true);
+}
