@@ -429,6 +429,7 @@ mod tests {
             quota: QuotaState::Available,
             api_key_env: None,
             base_url: None,
+            chat_path: None,
         }
     }
 

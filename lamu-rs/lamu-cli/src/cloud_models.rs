@@ -25,6 +25,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
             base_url: Some("https://api.anthropic.com".into()),
+            chat_path: None,
         },
         CloudModel {
             name: "claude-sonnet-4-6".into(),
@@ -35,6 +36,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
             base_url: Some("https://api.anthropic.com".into()),
+            chat_path: None,
         },
         CloudModel {
             name: "claude-haiku-4-5".into(),
@@ -45,6 +47,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
             base_url: Some("https://api.anthropic.com".into()),
+            chat_path: None,
         },
         // GLM 5.1 (Zhipu / Z.AI)
         CloudModel {
@@ -56,6 +59,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("ZHIPU_API_KEY".into()),
             base_url: None,
+            chat_path: None,
         },
         // Kimi K2.6 (Moonshot)
         CloudModel {
@@ -67,6 +71,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("MOONSHOT_API_KEY".into()),
             base_url: None,
+            chat_path: None,
         },
         // Qwen3 large via Alibaba DashScope (>100B params).
         CloudModel {
@@ -78,6 +83,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("DASHSCOPE_API_KEY".into()),
             base_url: None,
+            chat_path: None,
         },
         CloudModel {
             name: "qwen3-max".into(),
@@ -88,6 +94,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("DASHSCOPE_API_KEY".into()),
             base_url: None,
+            chat_path: None,
         },
         // DeepSeek V4 — direct API (no Bifrost needed)
         // Both models: 128K ctx, chat+code+reasoning. Flash = fast/cheap
@@ -101,6 +108,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("DEEPSEEK_API_KEY".into()),
             base_url: Some("https://api.deepseek.com".into()),
+            chat_path: None,
         },
         CloudModel {
             name: "deepseek-v4-pro".into(),
@@ -111,6 +119,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: Some("DEEPSEEK_API_KEY".into()),
             base_url: Some("https://api.deepseek.com".into()),
+            chat_path: None,
         },
     ]
 }
@@ -129,6 +138,7 @@ pub fn provider_template(provider: &str) -> Option<CloudModel> {
         quota: QuotaState::Available,
         api_key_env: Some(env.to_string()),
         base_url: None,
+        chat_path: None,
     };
     match provider {
         "anthropic" => Some(make("anthropic", "ANTHROPIC_API_KEY", 200_000, "Anthropic Claude")),
@@ -189,6 +199,7 @@ pub fn add_via_wizard() -> Option<CloudModel> {
             quota: QuotaState::Available,
             api_key_env: None,
             base_url: None,
+            chat_path: None,
         }
     } else {
         match provider_template(&provider) {
@@ -389,6 +400,7 @@ mod tests {
             quota: QuotaState::Available,
             api_key_env: None,
             base_url: None,
+            chat_path: None,
         }
     }
 
@@ -415,6 +427,7 @@ mod tests {
             quota: QuotaState::Low,
             api_key_env: Some("MY_OWN_KEY_VAR".into()),
             base_url: None,
+            chat_path: None,
         }];
         let seed = default_seed();
         let _ = merge_seed_into(&mut existing, seed);

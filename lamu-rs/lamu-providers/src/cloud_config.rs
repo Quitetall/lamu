@@ -58,6 +58,15 @@ pub struct CloudModel {
     /// appended automatically. Omit for Bifrost-routed models.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional explicit path appended to base_url. When unset, the
+    /// default per provider applies (`/v1/messages` for anthropic,
+    /// `/chat/completions` otherwise). Set this when a provider uses
+    /// a non-standard endpoint shape (e.g. Anthropic-format proxies
+    /// served at `/anthropic/v1/messages`, or a vendor with its own
+    /// route layout). The value is appended verbatim — include the
+    /// leading slash.
+    #[serde(default)]
+    pub chat_path: Option<String>,
 }
 
 impl CloudModel {
@@ -81,15 +90,19 @@ impl CloudModel {
         self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok())
     }
 
-    /// Full chat URL. Provider-aware: Anthropic-shaped providers use
-    /// `/v1/messages`; everything else (OpenAI, DeepSeek, Moonshot,
-    /// Alibaba, Zhipu, etc.) uses `/chat/completions`. base_url is the
-    /// root (no path) — the provider router decides the path.
+    /// Full chat URL. Resolution order:
+    /// 1. `chat_path` (caller-supplied verbatim suffix), if set.
+    /// 2. Default per provider: anthropic → `/v1/messages`, else
+    ///    `/chat/completions`.
+    /// 3. `gateway_fallback` when `base_url` is absent.
     pub fn chat_url(&self, gateway_fallback: &str) -> String {
         let base = match &self.base_url {
             Some(b) => b.trim_end_matches('/').to_string(),
             None => return gateway_fallback.to_string(),
         };
+        if let Some(path) = &self.chat_path {
+            return format!("{}{}", base, path);
+        }
         if self.provider == "anthropic" {
             return format!("{}/v1/messages", base);
         }
@@ -162,6 +175,7 @@ mod tests {
             quota: QuotaState::Available,
             api_key_env: None,
             base_url: None,
+            chat_path: None,
         }
     }
 
@@ -208,6 +222,27 @@ mod tests {
         let mut m = dummy("ds-flash", "deepseek");
         m.base_url = Some("https://api.deepseek.com/".into());
         assert_eq!(m.chat_url("fallback"), "https://api.deepseek.com/chat/completions");
+    }
+
+    #[test]
+    fn chat_url_explicit_path_overrides_provider_default() {
+        // Anthropic-shaped proxy living at /anthropic/v1/messages.
+        let mut m = dummy("claude-via-proxy", "anthropic");
+        m.base_url = Some("https://gateway.example.com".into());
+        m.chat_path = Some("/anthropic/v1/messages".into());
+        assert_eq!(
+            m.chat_url("fallback"),
+            "https://gateway.example.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn chat_url_explicit_path_overrides_openai_default() {
+        // Vendor with non-standard route, OpenAI shape.
+        let mut m = dummy("vendor", "vendor-x");
+        m.base_url = Some("https://api.vendor.example".into());
+        m.chat_path = Some("/v2/chat".into());
+        assert_eq!(m.chat_url("fallback"), "https://api.vendor.example/v2/chat");
     }
 
     #[test]
