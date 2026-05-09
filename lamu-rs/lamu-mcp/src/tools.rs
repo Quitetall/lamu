@@ -237,20 +237,20 @@ fn dispatch_parallel_query<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn
 }
 
 fn dispatch_cloud_query(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
-    Box::pin(crate::server::handle_cloud_query(args))
+    Box::pin(crate::cloud::handle_cloud_query(args))
 }
 
 fn dispatch_list_cloud_models(_args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
-    let r = crate::server::handle_list_cloud_models();
+    let r = crate::cloud::handle_list_cloud_models();
     Box::pin(async move { r })
 }
 
 fn dispatch_review_commit(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
-    Box::pin(crate::server::handle_review_commit(args))
+    Box::pin(crate::cloud::handle_review_commit(args))
 }
 
 fn dispatch_review_diff(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
-    Box::pin(crate::server::handle_review_diff(args))
+    Box::pin(crate::cloud::handle_review_diff(args))
 }
 
 fn dispatch_write_file(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
