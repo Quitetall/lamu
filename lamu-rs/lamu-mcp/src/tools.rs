@@ -150,6 +150,16 @@ fn schema_set_routing_mode() -> Value {
     })
 }
 
+fn schema_warmup() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "plan_file": {"type": "string", "description": "Optional plan file to include in the cached prefix. Match the same `plan_file` you'll pass to review_commit so the prefix bytes line up."},
+            "repo": {"type": "string", "default": ".", "description": "Repo path for plan auto-detect. Defaults to cwd."}
+        }
+    })
+}
+
 fn schema_search_repo() -> Value {
     json!({
         "type": "object",
@@ -294,6 +304,10 @@ fn dispatch_review_diff(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_review_diff(args))
 }
 
+fn dispatch_warmup(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::cloud::handle_warmup(args))
+}
+
 fn dispatch_search_repo(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::cloud::handle_search_repo(args))
 }
@@ -401,6 +415,12 @@ pub static TOOLS: &[ToolDef] = &[
         handler: HandlerKind::Stateful(dispatch_routing_status),
     },
     ToolDef {
+        name: "warmup",
+        description: "Prime DeepSeek's prompt cache by sending a 1-token completion with the future review_commit's central+plan prefix. Subsequent calls in the session hit cache from byte 0 instead of paying full prefix-prefill on the first call. Cost: ~$0.0001 per warmup. Pass the same `plan_file` you'll use later.",
+        schema_fn: schema_warmup,
+        handler: HandlerKind::Free(dispatch_warmup),
+    },
+    ToolDef {
         name: "search_repo",
         description: "Find code in the repository. Modes: 'auto' (ripgrep first, semantic fallback when OPENAI_API_KEY is set), 'ripgrep' (instant grep), 'semantic' (cosine-sim against the embedding index — `index_repo` builds it). Returns up to k hits with file:line + snippet. Useful for the orchestrator to populate the Tactical-tier `context` arg of cloud_query / review_commit.",
         schema_fn: schema_search_repo,
@@ -476,7 +496,7 @@ mod tests {
         // letting new tools land without a forced test bump. The
         // critical-tools test below pins the named entries that
         // external callers (Claude Code, ultrareview, etc.) depend on.
-        assert!(TOOLS.len() >= 19, "catalog shrunk below 19: {}", TOOLS.len());
+        assert!(TOOLS.len() >= 20, "catalog shrunk below 20: {}", TOOLS.len());
     }
 
     #[test]
@@ -488,7 +508,7 @@ mod tests {
             "query", "cloud_query", "review_commit", "review_diff",
             "list_models", "list_cloud_models", "write_file",
             "parallel_query", "set_routing_mode", "recall_conversation",
-            "search_repo", "index_repo",
+            "search_repo", "index_repo", "warmup",
         ] {
             assert!(find(name).is_some(), "missing critical tool: {name}");
         }

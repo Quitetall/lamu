@@ -158,6 +158,39 @@ fn resolve_plan_path(arg: Option<&str>, repo: Option<&Path>) -> Option<(PathBuf,
     None
 }
 
+/// Recent-activity header for the plan tier. Last 50 commits, oneline.
+/// Best-effort: empty string on any git failure. Cached per-process via
+/// OnceLock keyed on repo path string so the cache prefix stays stable
+/// within a session.
+fn recent_activity_header(repo: &Path) -> String {
+    use std::collections::HashMap;
+    static CACHE: OnceLock<parking_lot::Mutex<HashMap<String, String>>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let key = repo.to_string_lossy().to_string();
+    {
+        let m = map.lock();
+        if let Some(cached) = m.get(&key) {
+            return cached.clone();
+        }
+    }
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["log", "--oneline", "-50"])
+        .output();
+    let body = match out {
+        Ok(o) if o.status.success() => {
+            let log = String::from_utf8_lossy(&o.stdout);
+            format!(
+                "## Recent activity (last 50 commits)\n\nUse this to ground the plan against what's already shipped — don't second-guess items that match a recent commit.\n\n```\n{}```",
+                log
+            )
+        }
+        _ => String::new(),
+    };
+    map.lock().insert(key, body.clone());
+    body
+}
+
 /// Read the plan file with a max-size guard. Truncates from the front
 /// (drops oldest content) so the tail — typically the active sprint
 /// section — stays in the prompt.
@@ -202,11 +235,23 @@ pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
             Some((body, truncated)) => {
                 stats.plan_source = source;
                 stats.plan_truncated = truncated;
-                body
+                // V4 staleness fix: prepend recent activity from the
+                // repo so the reviewer knows what's already shipped.
+                // Plans rot fast — adding a "what's done" header
+                // keeps reviewer from second-guessing plan items
+                // that landed weeks ago.
+                if let Some(repo) = cfg.repo {
+                    let header = recent_activity_header(repo);
+                    if !header.is_empty() {
+                        format!("{}\n\n---\n\n{}", header, body)
+                    } else {
+                        body
+                    }
+                } else {
+                    body
+                }
             }
             None => {
-                // File didn't read — silently skip rather than fail
-                // the whole assemble. Logged at debug for diagnosis.
                 tracing::debug!("context: plan file at {} unreadable", path.display());
                 String::new()
             }

@@ -230,6 +230,115 @@ pub fn shared() -> Result<&'static Memory> {
     M.get().ok_or_else(|| anyhow!("memory init race"))
 }
 
+/// V4 Batch 4: rank turns by semantic similarity to a query, return
+/// the top-K most relevant + the most-recent few. Falls back to
+/// chronological "last K" when OPENAI_API_KEY is unset or embedding
+/// fails. Used by cloud_query when conversation_id has many turns —
+/// raw chronological recall buries relevant prior turns under
+/// recency. Only kicks in when total turns > KEEP_RECENT + KEEP_TOP.
+pub async fn recall_ranked(
+    mem: &Memory,
+    conversation_id: &str,
+    query: &str,
+    keep_top: usize,
+    keep_recent: usize,
+) -> Result<Vec<Turn>> {
+    let all = mem.recall(conversation_id, 0)?;
+    let total = all.len();
+    if total <= keep_top + keep_recent {
+        return Ok(all);
+    }
+    let key = match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            // No embeddings available — fall back to chronological tail.
+            return mem.recall(conversation_id, keep_top + keep_recent);
+        }
+    };
+
+    // Embed the query + each prior turn. Reuse the rag module's
+    // helpers via a thin shim: build the same payload it builds.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let mut texts: Vec<String> = Vec::with_capacity(total + 1);
+    texts.push(query.to_string());
+    for t in &all {
+        texts.push(format!("{}: {}", t.role, t.content));
+    }
+
+    let body = serde_json::json!({
+        "model": "text-embedding-3-small",
+        "input": texts,
+    });
+    let resp = client
+        .post("https://api.openai.com/v1/embeddings")
+        .bearer_auth(&key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!(e))?;
+    let arr = v["data"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("embeddings missing data"))?;
+    if arr.len() != texts.len() {
+        return mem.recall(conversation_id, keep_top + keep_recent);
+    }
+
+    let parse_vec = |val: &serde_json::Value| -> Vec<f32> {
+        val["embedding"]
+            .as_array()
+            .map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+            .unwrap_or_default()
+    };
+    let q_vec = parse_vec(&arr[0]);
+
+    // Score each turn (skip the most-recent KEEP_RECENT — those
+    // always make the cut regardless of score).
+    let cutoff_recent_start = total.saturating_sub(keep_recent);
+    let mut scored: Vec<(f32, usize)> = (0..cutoff_recent_start)
+        .map(|i| {
+            let t_vec = parse_vec(&arr[i + 1]); // arr[0] is query
+            let score = cosine_local(&q_vec, &t_vec);
+            (score, i)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut keep_idxs: std::collections::BTreeSet<usize> = scored
+        .into_iter()
+        .take(keep_top)
+        .map(|(_, i)| i)
+        .collect();
+    for i in cutoff_recent_start..total {
+        keep_idxs.insert(i);
+    }
+
+    let out: Vec<Turn> = keep_idxs.into_iter().map(|i| all[i].clone()).collect();
+    Ok(out)
+}
+
+fn cosine_local(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
 /// Render a recalled transcript as a Markdown string suitable for
 /// dropping into the Tactical tier of the context layer.
 pub fn render_for_context(turns: &[Turn]) -> String {

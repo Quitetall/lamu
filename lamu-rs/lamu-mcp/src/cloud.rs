@@ -93,17 +93,23 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     let plan_arg = args["plan_file"].as_str();
     let conv_id = args["conversation_id"].as_str().unwrap_or("");
 
-    // When conversation_id is set, prepend the rendered prior turns to
-    // the Tactical tier. The recall is bounded (last 20 turns) so a
-    // long conversation doesn't blow the context window.
+    // V4 Batch 4: when conversation_id is set, recall prior turns via
+    // semantic ranking when available (top-K relevant + last 5
+    // recent). Falls back to chronological "last 20" when no
+    // embeddings key is available or scoring fails. Long
+    // conversations no longer bury relevant turns under recency.
     let conv_recall = if !conv_id.is_empty() {
         match crate::memory::shared() {
-            Ok(mem) => match mem.recall(conv_id, 20) {
+            Ok(mem) => match crate::memory::recall_ranked(mem, conv_id, prompt, 10, 5).await {
                 Ok(turns) if !turns.is_empty() => crate::memory::render_for_context(&turns),
                 Ok(_) => String::new(),
                 Err(e) => {
-                    tracing::warn!("memory recall({}) failed: {}", conv_id, e);
-                    String::new()
+                    tracing::warn!("memory recall_ranked({}) failed: {}", conv_id, e);
+                    // Fall back to plain chronological.
+                    mem.recall(conv_id, 20)
+                        .ok()
+                        .map(|turns| crate::memory::render_for_context(&turns))
+                        .unwrap_or_default()
                 }
             },
             Err(e) => {
@@ -314,6 +320,9 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         if let Some(err) = v.get("error") {
             return format!("provider error: {}", err);
         }
+        if let Some(usage) = v.get("usage") {
+            tracing::info!(target: "lamu_bench", "cloud_query usage model={} {}", model_name, usage);
+        }
         let msg = &v["choices"][0]["message"];
         let content = msg["content"].as_str().unwrap_or("");
         let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
@@ -343,6 +352,42 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     }
 
     result
+}
+
+// ── Cache warmup ────────────────────────────────────────────────────
+
+/// Prime DeepSeek's prompt cache with the central + plan tier of a
+/// future review_commit call. Runs a 1-token completion (cheapest
+/// possible response) so the prefix bytes are cached. Subsequent
+/// review_commit calls in this session hit cache from byte 0.
+pub(crate) async fn handle_warmup(args: Value) -> String {
+    let plan_arg = args["plan_file"].as_str();
+    let repo_str = args["repo"].as_str().unwrap_or(".");
+
+    let (system, _stats) = crate::context::prepend_to_system(
+        crate::context::ContextConfig {
+            central: true,
+            plan: plan_arg,
+            tactical: "",
+            repo: Some(std::path::Path::new(repo_str)),
+        },
+        REVIEW_SYSTEM_PROMPT,
+    );
+
+    let warmup_args = json!({
+        "model": "deepseek-v4-pro",
+        "prompt": "ACK only — warmup",
+        "system": system,
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "include_reasoning": false,
+    });
+    let _ = handle_cloud_query(warmup_args).await;
+    format!(
+        "warmup: cached central+plan prefix ({} bytes) for plan={:?}",
+        system.len(),
+        plan_arg
+    )
 }
 
 // ── Repo retrieval (RAG) ────────────────────────────────────────────
@@ -585,7 +630,56 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         "include_reasoning": false,
     });
     let review = handle_cloud_query(review_args).await;
+
+    // V4 Batch 2: self-reflection pass when full-stack mode (auto)
+    // is engaged. Feed the draft + central FP-list to a Flash call
+    // and ask it to drop findings that match a known-FP pattern.
+    // Cheap (~$0.0002 per review) but cuts the residual FP rate
+    // beyond what the central tier alone achieves.
+    let review = if auto && !review.starts_with("error:") {
+        verify_findings_via_flash(&review).await
+    } else {
+        review
+    };
+
     format!("=== Review of {} (DeepSeek V4 Pro) ===\n\n{}", commit, review)
+}
+
+/// Self-reflection: feed the V4 Pro draft + central FP-list to a
+/// cheap Flash call asking it to drop findings that match a known
+/// false-positive pattern. Returns either a filtered version of the
+/// draft, or the draft unchanged if Flash refuses / errors / the
+/// caller has no API key.
+///
+/// Best-effort: any failure path returns the original draft so the
+/// reviewer's signal is never lost — only filtered.
+async fn verify_findings_via_flash(draft: &str) -> String {
+    // Skip if draft says PASS — nothing to filter.
+    if draft.contains("PASS\n") || draft.starts_with("PASS\n") || draft.contains("PASS\nNo ") {
+        return draft.to_string();
+    }
+    let central = include_str!("../assets/central_review_policy.md");
+    let system = format!(
+        "You are filtering a code review draft. Drop findings that match a documented false-positive pattern. KEEP all real findings — when in doubt, keep.\n\n{}",
+        central
+    );
+    let prompt = format!(
+        "Here is a draft review. For each numbered finding, decide: KEEP if it identifies a real bug, or DROP if it matches a known FP pattern (see system prompt). Return the cleaned-up review verbatim with FP findings removed and the verdict line updated if needed (e.g. NEEDS CHANGES → PASS WITH NITS if all real findings dropped).\n\nDRAFT:\n\n{}",
+        draft
+    );
+    let args = json!({
+        "model": "deepseek-v4-flash",
+        "prompt": prompt,
+        "system": system,
+        "max_tokens": 4096,
+        "temperature": 0.0,
+        "include_reasoning": false,
+    });
+    let filtered = handle_cloud_query(args).await;
+    if filtered.starts_with("error:") || filtered.is_empty() {
+        return draft.to_string();
+    }
+    filtered
 }
 
 pub(crate) async fn handle_review_diff(args: Value) -> String {

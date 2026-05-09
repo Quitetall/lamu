@@ -54,8 +54,9 @@ pub fn assemble_auto_context(commit: &str, repo: &Path) -> Result<String> {
                     continue;
                 }
                 if let Ok(body) = git_show_file(commit, f, repo) {
+                    let trimmed = smart_truncate_file_body(&body);
                     out.push_str(&format!("### `{}`\n\n```\n", f));
-                    out.push_str(&body);
+                    out.push_str(&trimmed);
                     out.push_str("\n```\n\n");
                     if out.len() > MAX_AUTO_BYTES {
                         break;
@@ -82,9 +83,11 @@ pub fn assemble_auto_context(commit: &str, repo: &Path) -> Result<String> {
                     out.push('\n');
 
                     // Stage 4: caller search via ripgrep
-                    out.push_str("## Caller locations (ripgrep)\n\n");
+                    out.push_str("## Caller locations (ripgrep, production-only)\n\n");
                     for s in &symbols {
-                        let hits = ripgrep_callers(s, repo).unwrap_or_default();
+                        let mut hits = ripgrep_callers(s, repo).unwrap_or_default();
+                        // Production-only: drop tests/ paths.
+                        hits.retain(|l| is_caller_hit_meaningful(l));
                         if hits.is_empty() {
                             continue;
                         }
@@ -157,6 +160,48 @@ fn git_show_file(commit: &str, path: &str, repo: &Path) -> Result<String> {
         return Err(anyhow!("git show {} failed", spec));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Smart-truncate a long file body. Files > THRESHOLD_LINES get
+/// "first 60 + last 30" — preserves imports/headers + the file's
+/// trailing context (often where the changes landed) while dropping
+/// the middle. Below the threshold pass through unchanged.
+fn smart_truncate_file_body(body: &str) -> String {
+    const THRESHOLD_LINES: usize = 200;
+    const HEAD: usize = 60;
+    const TAIL: usize = 30;
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= THRESHOLD_LINES {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len() / 2);
+    for l in lines.iter().take(HEAD) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n[...{} lines elided ({} total)...]\n\n",
+        lines.len() - HEAD - TAIL,
+        lines.len()
+    ));
+    for l in lines.iter().skip(lines.len() - TAIL) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// Test-noise filter on ripgrep caller hits. Drops `tests/` /
+/// `*_test.rs` / `*tests.rs` paths so the caller list focuses on
+/// production callers — those are the ones a reviewer cares about
+/// when evaluating an API-shape change.
+fn is_caller_hit_meaningful(line: &str) -> bool {
+    // Hit format: "path:lineno:content"
+    let path = line.split(':').next().unwrap_or("");
+    !(path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.ends_with("_test.rs")
+        || path.ends_with("tests.rs"))
 }
 
 /// Reject paths with shell-meta or absolute roots. The `git show
@@ -383,6 +428,34 @@ diff --git a/src/x.rs b/src/x.rs
         let symbols = extract_added_symbols(diff);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0], "kept");
+    }
+
+    #[test]
+    fn smart_truncate_passes_through_short_files() {
+        let body: String = (0..50).map(|i| format!("line{}\n", i)).collect();
+        assert_eq!(smart_truncate_file_body(&body), body);
+    }
+
+    #[test]
+    fn smart_truncate_keeps_head_and_tail_for_long_files() {
+        let body: String = (0..400).map(|i| format!("line{}\n", i)).collect();
+        let out = smart_truncate_file_body(&body);
+        assert!(out.contains("line0"));   // head
+        assert!(out.contains("line59"));  // last of head
+        assert!(out.contains("line370")); // first of tail
+        assert!(out.contains("line399")); // last of tail
+        assert!(out.contains("elided"));
+        assert!(!out.contains("line200")); // middle dropped
+    }
+
+    #[test]
+    fn caller_hit_filter_drops_test_paths() {
+        assert!(!is_caller_hit_meaningful("tests/foo.rs:10:bar()"));
+        assert!(!is_caller_hit_meaningful("crate/tests/x.rs:1:y()"));
+        assert!(!is_caller_hit_meaningful("src/foo_test.rs:5:z()"));
+        assert!(!is_caller_hit_meaningful("src/foo/tests.rs:5:z()"));
+        assert!(is_caller_hit_meaningful("src/handlers.rs:42:do_thing()"));
+        assert!(is_caller_hit_meaningful("src/cloud.rs:100:helper()"));
     }
 
     #[test]

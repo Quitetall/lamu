@@ -54,7 +54,7 @@ async fn initialize_and_tools_list_round_trip() {
     for required in [
         "query", "cloud_query", "review_commit", "review_diff", "write_file",
         "list_models", "list_cloud_models", "parallel_query", "set_routing_mode",
-        "recall_conversation", "search_repo", "index_repo",
+        "recall_conversation", "search_repo", "index_repo", "warmup",
     ] {
         assert!(names.contains(&required), "tools/list missing {required}");
     }
