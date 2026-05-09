@@ -5,6 +5,7 @@
 //! Logs to stderr. Tools dispatched via `tools::*`.
 
 use anyhow::Result;
+use lamu_core::backends::{make_backend, Backend};
 use lamu_core::health::HealthRegistry;
 use lamu_core::observability::{emit, new_trace_id, trace_id_from_traceparent};
 use lamu_core::queue::{QueueRequest, RequestQueue, Strategy as QueueStrategy};
@@ -20,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::warn;
 
@@ -46,10 +46,13 @@ pub struct ServerState {
     /// `route(..., health_map=Some(health.all()))` so DEAD/QUARANTINED
     /// backends never get picked.
     pub health: HealthRegistry,
-    /// Owned child processes per loaded backend. Replaces the old
-    /// `std::mem::forget(child)` + `libc::kill` pattern — `start_kill()`
-    /// on these is the only path that ends a backend now.
-    pub loaded_procs: HashMap<String, Child>,
+    /// Loaded backends keyed by model name. Each Backend impl owns its
+    /// own Child + transport details; lamu-mcp only orchestrates
+    /// load/unload + routes to .generate(). Wrapped in
+    /// Arc<TokioMutex<…>> so handle_query can clone the Arc out of the
+    /// state lock and serialize per-backend access without re-locking
+    /// the whole ServerState across an await.
+    pub backends: HashMap<String, Arc<AsyncMutex<Box<dyn Backend>>>>,
 }
 
 impl LamuMcpServer {
@@ -87,7 +90,7 @@ impl LamuMcpServer {
                 router,
                 client,
                 health: HealthRegistry::new(),
-                loaded_procs: HashMap::new(),
+                backends: HashMap::new(),
             })),
             queues: Arc::new(AsyncMutex::new(HashMap::new())),
             queue_strategy,
@@ -458,7 +461,7 @@ impl LamuMcpServer {
         // Also pick a name-resolution mode: exact match wins; otherwise
         // require unique substring match. Ambiguous matches return an
         // error rather than silently picking one.
-        let (entry, to_evict, evict_children) = {
+        let (entry, to_evict, evict_backends) = {
             let mut st = self.state.lock();
 
             // 1. Resolve name: exact > unique-substring > error.
@@ -496,35 +499,35 @@ impl LamuMcpServer {
             }
 
             // Mark loading INSIDE the lock so no concurrent caller picks
-            // up the same plan. evict_children carries owned Child handles
-            // we must wait() outside the lock.
-            let mut evict_children: Vec<(String, tokio::process::Child)> = Vec::new();
+            // up the same plan. evict_backends carries Arc<Mutex<Box<dyn
+            // Backend>>> handles we'll unload outside the state lock.
+            let mut evict_backends: Vec<(String, Arc<AsyncMutex<Box<dyn Backend>>>)> = Vec::new();
             for evict_name in &evict {
-                if let Some(child) = st.loaded_procs.remove(evict_name) {
-                    evict_children.push((evict_name.clone(), child));
+                if let Some(b) = st.backends.remove(evict_name) {
+                    evict_backends.push((evict_name.clone(), b));
                 }
                 st.scheduler.mark_unloaded(evict_name);
                 st.health.drop(evict_name);
             }
             st.scheduler.mark_loading(entry.clone());
 
-            (entry, evict, evict_children)
+            (entry, evict, evict_backends)
         };
 
-        // Reap evicted children outside the lock — wait() with a timeout
-        // so a stuck backend can't hang the entire MCP server.
-        for (evict_name, mut child) in evict_children {
-            let _ = child.start_kill();
+        // Phase 6.3: route eviction through Backend::unload so per-impl
+        // cleanup (megakernel/dflash sigterm semantics) lives in the
+        // backend, not lamu-mcp. The unload guard is bounded by a 30s
+        // timeout so a stuck backend can't hang the MCP server.
+        for (evict_name, backend_arc) in evict_backends {
+            let mut backend = backend_arc.lock().await;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                child.wait()
+                backend.unload(),
             ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(
-                    "load_model: wait({}) errored: {}", evict_name, e
-                ),
+                Ok(Err(e)) => warn!("load_model: unload({}) errored: {}", evict_name, e),
                 Err(_) => warn!(
-                    "load_model: wait({}) timed out — leaving zombie", evict_name
+                    "load_model: unload({}) timed out — leaving zombie", evict_name
                 ),
             }
         }
@@ -543,93 +546,55 @@ impl LamuMcpServer {
             }
         };
 
-        // Build per-backend spawn command + health probe path.
-        let (mut cmd, health_path, expect_status_ok, max_wait_secs) =
-            match build_spawn_cmd(&entry, port).await {
-                Ok(t) => t,
-                Err(msg) => return msg,
-            };
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
+        // Construct the right Backend for this entry. The Backend impl
+        // owns spawn + health-poll + warmup — lamu-mcp doesn't manage
+        // that lifecycle anymore. make_backend dispatches on
+        // entry.backend (LlamaCpp / Megakernel / Dflash).
+        let mut backend: Box<dyn Backend> = match make_backend(&entry) {
+            Ok(b) => b,
+            Err(e) => {
+                let mut st = self.state.lock();
+                st.scheduler.mark_unloaded(&entry.name);
+                return format!("error: make_backend: {}", e);
+            }
+        };
         {
             let mut st = self.state.lock();
             st.scheduler.mark_loading(entry.clone());
         }
 
-        let child = match cmd.spawn() {
-            Ok(c) => c,
+        let pid = match backend.load(&entry, port).await {
+            Ok(pid) => pid,
             Err(e) => {
                 let mut st = self.state.lock();
                 st.scheduler.mark_unloaded(&entry.name);
-                return format!("spawn failed: {}", e);
+                st.health.drop(&entry.name);
+                return format!("error: load failed: {}", e);
             }
         };
-        let pid = child.id().unwrap_or(0);
-        // Take ownership of the Child — kill is now `start_kill()` on the
-        // stored value, no more libc::kill on a leaked PID.
+
+        // Healthy + warmed up by the time backend.load returned. Confirm
+        // load + insert into backends map.
+        let vram = {
+            let st = self.state.lock();
+            let pids = st.scheduler.query_gpu_pids();
+            pids.iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, m)| *m)
+                .unwrap_or(entry.vram_mb)
+        };
         {
             let mut st = self.state.lock();
-            st.loaded_procs.insert(entry.name.clone(), child);
+            let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
+            st.health.get_or_create(&entry.name).record_success();
+            st.backends.insert(entry.name.clone(), Arc::new(AsyncMutex::new(backend)));
         }
-
-        // Health poll
-        let client = self.state.lock().client.clone();
-        let url = format!("http://localhost:{}{}", port, health_path);
-        for _ in 0..max_wait_secs {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let healthy = if expect_status_ok {
-                match client.get(&url).send().await {
-                    Ok(r) => match r.json::<Value>().await {
-                        Ok(j) => j.get("status").and_then(|v| v.as_str()) == Some("ok"),
-                        Err(_) => false,
-                    },
-                    Err(_) => false,
-                }
-            } else {
-                client.get(&url).send().await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false)
-            };
-            if healthy {
-                let mut st = self.state.lock();
-                let pids = st.scheduler.query_gpu_pids();
-                let vram = pids.iter()
-                    .find(|(p, _)| *p == pid)
-                    .map(|(_, m)| *m)
-                    .unwrap_or(entry.vram_mb);
-                let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
-                // Healthy from the moment it answered; supervisor restart
-                // path will record_error on subsequent failures.
-                st.health.get_or_create(&entry.name).record_success();
-                let evict_msg = if to_evict.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (evicted: {:?})", to_evict)
-                };
-                return format!(
-                    "Loaded '{}' on :{} ({}MB VRAM){}",
-                    entry.name, port, vram, evict_msg
-                );
-            }
-        }
-
-        // Timeout — kill the stored Child and reap before returning.
-        let dead_child = {
-            let mut st = self.state.lock();
-            let dead = st.loaded_procs.remove(&entry.name);
-            st.scheduler.mark_unloaded(&entry.name);
-            st.health.drop(&entry.name);
-            dead
+        let evict_msg = if to_evict.is_empty() {
+            String::new()
+        } else {
+            format!(" (evicted: {:?})", to_evict)
         };
-        if let Some(mut child) = dead_child {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                child.wait()
-            ).await;
-        }
-        format!("error: failed to load '{}' (timeout {}s)", entry.name, max_wait_secs)
+        format!("Loaded '{}' on :{} ({}MB VRAM){}", entry.name, port, vram, evict_msg)
     }
 
     pub(crate) async fn handle_unload_model(&self, args: Value) -> String {
@@ -649,20 +614,20 @@ impl LamuMcpServer {
             let Some(target) = target else {
                 return format!("Model '{}' not loaded.", name);
             };
-            let child = st.loaded_procs.remove(&target);
+            let backend = st.backends.remove(&target);
             st.scheduler.mark_unloaded(&target);
             st.health.drop(&target);
-            (target, child)
+            (target, backend)
         };
-        let (target, child) = dead;
-        if let Some(mut child) = child {
-            let _ = child.start_kill();
+        let (target, backend) = dead;
+        if let Some(backend_arc) = backend {
+            let mut b = backend_arc.lock().await;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                child.wait()
+                b.unload(),
             ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!("unload({}): wait errored: {}", target, e),
+                Ok(Err(e)) => warn!("unload({}): backend errored: {}", target, e),
                 Err(_) => warn!("unload({}): timeout — leaving zombie", target),
             }
         }
@@ -722,18 +687,18 @@ impl LamuMcpServer {
         let old = current.clone();
         *current = mode.clone();
 
-        // cloud-only → drain loaded_procs + scheduler atomically inside
-        // the state lock, THEN kill outside the lock so wait() doesn't
-        // hold the state lock for 30s.
+        // cloud-only → drain backends + scheduler atomically inside the
+        // state lock, THEN unload outside the lock so the per-backend
+        // unload doesn't hold the state lock for 30s.
         let mut freed = Vec::new();
-        let mut to_kill: Vec<(String, Child)> = Vec::new();
+        let mut to_unload: Vec<(String, Arc<AsyncMutex<Box<dyn Backend>>>)> = Vec::new();
         if mode == "cloud-only" {
             let mut st = self.state.lock();
             let names: Vec<String> = st.scheduler.loaded_models()
                 .iter().map(|m| m.entry.name.clone()).collect();
             for n in &names {
-                if let Some(p) = st.loaded_procs.remove(n) {
-                    to_kill.push((n.clone(), p));
+                if let Some(b) = st.backends.remove(n) {
+                    to_unload.push((n.clone(), b));
                 }
                 st.scheduler.mark_unloaded(n);
                 freed.push(n.clone());
@@ -741,18 +706,21 @@ impl LamuMcpServer {
             drop(st);
         }
         // Routing mode still locked; release before any await on the
-        // child wait so other RPCs aren't blocked while llama-server
+        // backend unload so other RPCs aren't blocked while llama-server
         // tears down.
         drop(current);
 
-        for (name, mut p) in to_kill {
-            let _ = p.start_kill();
-            // Cap the wait — if llama-server ignores SIGTERM we move on
-            // rather than hang the entire MCP server.
-            match tokio::time::timeout(std::time::Duration::from_secs(30), p.wait()).await {
+        for (name, backend_arc) in to_unload {
+            let mut b = backend_arc.lock().await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                b.unload(),
+            ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!("set_routing_mode: wait({}) errored: {}", name, e),
-                Err(_) => warn!("set_routing_mode: wait({}) timed out after 30s — leaving zombie", name),
+                Ok(Err(e)) => warn!("set_routing_mode: unload({}) errored: {}", name, e),
+                Err(_) => warn!(
+                    "set_routing_mode: unload({}) timed out after 30s — leaving zombie", name
+                ),
             }
         }
 
@@ -961,85 +929,6 @@ fn tools_list_response(id: Option<Value>) -> Value {
     })
 }
 
-/// Build the right spawn `Command` for the entry's backend. Returns
-/// `(cmd, health_url_path, expect_status_ok, max_wait_secs)`.
-async fn build_spawn_cmd(
-    entry: &ModelEntry,
-    port: u16,
-) -> std::result::Result<(tokio::process::Command, &'static str, bool, u32), String> {
-    use tokio::process::Command;
-    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
-
-    match entry.backend {
-        BackendType::LlamaCpp => {
-            let bin = lamu_core::config::llama_bin();
-            if !bin.exists() {
-                return Err(format!("llama-server not found at {}", bin.display()));
-            }
-            // Phase 4: flag construction lives in lamu-core::backends::llamacpp.
-            // All three spawn paths (this one, the core Backend::load impl, and
-            // the TUI swap_to_model_if_needed) consume the same `build_llama_spawn`
-            // so they cannot drift again.
-            let supports_ngram = lamu_core::backends::llamacpp::detect_ngram_support(&bin).await;
-            let spawn = lamu_core::backends::llamacpp::build_llama_spawn(entry, port, supports_ngram)
-                .map_err(|e| e.to_string())?;
-            let mut cmd = Command::new(&bin);
-            cmd.args(&spawn.args);
-            for (k, v) in &spawn.envs {
-                cmd.env(k, v);
-            }
-            Ok((cmd, "/health", true, 45))
-        }
-        BackendType::Megakernel => {
-            let py = home.join("local-llm/.venv/bin/python");
-            let script = home.join("local-llm/server/megakernel_server.py");
-            let workdir = home.join("local-llm/lucebox-hub/megakernel");
-            if !py.exists() {
-                return Err(format!("python not found at {}", py.display()));
-            }
-            if !script.exists() {
-                return Err(format!("megakernel server not found at {}", script.display()));
-            }
-            let mut cmd = Command::new(&py);
-            cmd.arg(&script)
-                .arg("--port").arg(port.to_string())
-                .current_dir(&workdir)
-                .env("CUDA_VISIBLE_DEVICES", "0");
-            Ok((cmd, "/health", false, 30))
-        }
-        BackendType::Dflash | BackendType::DflashLucebox => {
-            let spec = entry.speculative.as_ref().ok_or_else(|| format!(
-                "dflash backend requires `speculative` config in entry '{}'", entry.name
-            ))?;
-            let py = home.join("local-llm/.venv/bin/python");
-            let script = home.join("local-llm/server/dflash_24gb.py");
-            let workdir = home.join("local-llm/lucebox-hub/dflash");
-            let test_bin = workdir.join("build/test_dflash");
-            if !py.exists() {
-                return Err(format!("python not found at {}", py.display()));
-            }
-            if !script.exists() {
-                return Err(format!("dflash server not found at {}", script.display()));
-            }
-            if !test_bin.exists() {
-                return Err(format!("test_dflash binary not found at {}", test_bin.display()));
-            }
-            let mut cmd = Command::new(&py);
-            cmd.arg(&script)
-                .arg("--port").arg(port.to_string())
-                .arg("--max-ctx").arg("8192")
-                .arg("--budget").arg("6")
-                .arg("--bin").arg(&test_bin)
-                .arg("--target").arg(&entry.path)
-                .arg("--draft").arg(&spec.draft_path)
-                .current_dir(&workdir)
-                .env("CUDA_VISIBLE_DEVICES", "0")
-                .env("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "1");
-            Ok((cmd, "/v1/models", false, 90))
-        }
-    }
-}
-
 
 // ── Sandboxed file write (Phase 6.1) ────────────────────────────────
 // Wraps lamu_core::sandbox::journal::safe_write so any agent
@@ -1127,83 +1016,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Phase 0 regression: build_spawn_cmd LlamaCpp arm must bind to
-    /// 127.0.0.1 by default, NEVER 0.0.0.0. The earlier hardening
-    /// (a91153f) only patched lamu-core and lamu-cli; this third spawn
-    /// path was missed. Lock the security default in.
-    ///
-    /// Skipped when llama-server isn't installed (CI without the
-    /// binary) — local dev with the bin available exercises the real
-    /// argv assertion. Phase 4 extracts the flag construction into a
-    /// pure free function which makes this testable everywhere.
-    #[tokio::test]
-    async fn build_spawn_cmd_llamacpp_binds_localhost_by_default() {
-        use std::path::PathBuf;
-        use lamu_core::types::{BackendType, Capability, ModelFormat, ModelEntry};
-
-        if !lamu_core::config::llama_bin().exists() {
-            eprintln!("skipping: llama-server bin not installed");
-            return;
-        }
-
-        // Belt-and-braces: clear any leaked env from another test.
-        // SAFETY: tokio::test runs on a runtime; env reads/writes here
-        // happen before any other thread reads them in this test.
-        unsafe {
-            std::env::remove_var("LAMU_BIND_HOST");
-            std::env::remove_var("LAMU_KV");
-            std::env::remove_var("LAMU_DEFAULT_CTX");
-        }
-
-        let entry = ModelEntry {
-            name: "test-bind".into(),
-            path: PathBuf::from("/tmp/nonexistent.gguf"), // not spawned
-            format: ModelFormat::Gguf,
-            backend: BackendType::LlamaCpp,
-            arch: "qwen35".into(),
-            params_b: 1.0,
-            quant: "Q4_K_M".into(),
-            vram_mb: 1000,
-            context_max: 8192,
-            capabilities: vec![Capability::Chat],
-            reasoning_marker: None,
-            speculative: None,
-            pinned: false,
-            notes: String::new(),
-            status: lamu_core::types::ModelStatus::default(),
-        };
-
-        let (cmd, _, _, _) = build_spawn_cmd(&entry, 18888).await
-            .expect("build_spawn_cmd should succeed when bin exists");
-
-        let args: Vec<String> = cmd.as_std().get_args()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-
-        // Find --host position, then check the next arg.
-        let host_idx = args.iter().position(|a| a == "--host")
-            .expect("--host flag missing entirely");
-        let host_val = args.get(host_idx + 1)
-            .expect("--host has no value");
-        assert_eq!(host_val, "127.0.0.1",
-            "build_spawn_cmd must bind 127.0.0.1 by default; got --host {}", host_val);
-        assert!(args.iter().all(|a| a != "0.0.0.0"),
-            "0.0.0.0 must not appear anywhere in the argv");
-
-        // Phase 0 also restored the rest of the flag set. Check the
-        // ones that protect us against silent perf regressions.
-        assert!(args.iter().any(|a| a == "--cache-reuse"),
-            "--cache-reuse missing");
-        assert!(args.iter().any(|a| a == "--batch-size"),
-            "--batch-size missing");
-        assert!(args.iter().any(|a| a == "--ubatch-size"),
-            "--ubatch-size missing");
-        // KV default is q8_0; ensure we didn't regress to q4_0.
-        let kv_idx = args.iter().position(|a| a == "--cache-type-k")
-            .expect("--cache-type-k missing");
-        assert_eq!(args[kv_idx + 1], "q8_0",
-            "default KV must be q8_0 (got {})", args[kv_idx + 1]);
-    }
 
     #[test]
     fn parse_capability_known() {
