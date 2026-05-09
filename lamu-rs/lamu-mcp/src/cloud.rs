@@ -783,7 +783,12 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     // available for callers who want Flash's tighter candidate
     // shortlist as a focusing aid (e.g. when Pro is the bottleneck
     // not the prefix), but default off.
-    let review = if auto && std::env::var("LAMU_TWO_STAGE_REVIEW")
+    let review = if auto && std::env::var("LAMU_ENSEMBLE_REVIEW")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        ensemble_review(&prompt, &system).await
+    } else if auto && std::env::var("LAMU_TWO_STAGE_REVIEW")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
@@ -888,6 +893,118 @@ async fn critic_pass(prompt: &str, system: &str) -> String {
         "\n\n---\n\n## Critic-pass findings (V6 Q — what could this break?)\n\n{}",
         resp
     )
+}
+
+/// V6 R: multi-model ensemble review. Pro + Flash run a full review
+/// in parallel via tokio::join. Findings are merged: Pro's review
+/// drives the verdict, but Flash findings that don't appear in Pro's
+/// review (jaccard < 0.4 on line-level similarity) are appended as
+/// ENSEMBLE-source. Two independent passes catch what one misses.
+///
+/// Note: ANTHROPIC_API_KEY is preferred for cross-provider diversity
+/// (claude-opus-4-7 second reviewer), but absent that we fall back to
+/// V4 Flash. Same wire format, same prompt cache.
+///
+/// Opt-in via LAMU_ENSEMBLE_REVIEW=1. Cost: ~+$0.0004 per review.
+async fn ensemble_review(prompt: &str, system: &str) -> String {
+    let pro_args = json!({
+        "model": "deepseek-v4-pro",
+        "prompt": prompt, "system": system,
+        "max_tokens": 8192, "temperature": 0.2,
+        "include_reasoning": false,
+    });
+    let second_model = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        "claude-opus-4-7"
+    } else {
+        "deepseek-v4-flash"
+    };
+    let second_args = json!({
+        "model": second_model,
+        "prompt": prompt, "system": system,
+        "max_tokens": 4096, "temperature": 0.3,
+        "include_reasoning": false,
+    });
+    let (pro, second) = tokio::join!(
+        handle_cloud_query(pro_args),
+        handle_cloud_query(second_args),
+    );
+    if pro.starts_with("error:") {
+        return pro;
+    }
+    if second.starts_with("error:") {
+        tracing::debug!("v6 R: second model failed, returning Pro alone");
+        return pro;
+    }
+    let added = merge_unique_findings(&pro, &second);
+    if added.is_empty() {
+        pro
+    } else {
+        format!(
+            "{}\n\n---\n\n## Ensemble findings (V6 R — second reviewer: {})\n\n{}",
+            pro, second_model, added
+        )
+    }
+}
+
+/// Extract numbered findings from a review string. Returns lines that
+/// look like `1. **BUG** ...`, `2. STYLE ...`, etc.
+fn extract_findings(review: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for line in review.lines() {
+        let trimmed = line.trim_start();
+        let starts_finding = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && trimmed.contains('.')
+            && trimmed.len() > 3;
+        if starts_finding {
+            if let Some(prev) = current.take() {
+                out.push(prev);
+            }
+            current = Some(line.to_string());
+        } else if let Some(buf) = current.as_mut() {
+            buf.push('\n');
+            buf.push_str(line);
+        }
+    }
+    if let Some(prev) = current.take() {
+        out.push(prev);
+    }
+    out
+}
+
+/// Tokenize a finding into lowercase word set for jaccard similarity.
+fn finding_tokens(finding: &str) -> std::collections::HashSet<String> {
+    finding
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
+        .filter(|w| w.len() > 2)
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
+}
+
+fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f32;
+    let union = a.union(b).count() as f32;
+    inter / union
+}
+
+/// Return findings from `extra` that don't overlap (jaccard >= 0.4)
+/// with any finding from `primary`. Concatenated as a numbered list.
+fn merge_unique_findings(primary: &str, extra: &str) -> String {
+    let primary_findings = extract_findings(primary);
+    let extra_findings = extract_findings(extra);
+    let primary_token_sets: Vec<_> = primary_findings.iter().map(|f| finding_tokens(f)).collect();
+    let mut new_findings = Vec::new();
+    for f in extra_findings {
+        let toks = finding_tokens(&f);
+        let dup = primary_token_sets.iter().any(|p| jaccard(&toks, p) >= 0.4);
+        if !dup {
+            new_findings.push(f);
+        }
+    }
+    new_findings.join("\n\n")
 }
 
 /// V6 L: two-stage review. Stage 1 (Flash) scans the diff and emits
