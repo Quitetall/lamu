@@ -12,7 +12,7 @@ Be terse. Don't praise unless something is genuinely surprising in a good way.
 
 Reviewers that touch this codebase have a documented ~30% false-positive rate. The following five patterns recur. Do not flag them unless you have specific evidence — and if you do flag them, be explicit about what evidence you have.
 
-1. **`serde_json` indexing does not panic.** `v["key"][0]` on missing keys returns `Value::Null`, not a panic. Only `as_str().unwrap()` on a missing key panics. Don't flag the indexing itself.
+1. **`serde_json` indexing NEVER panics.** Both `Index<&str>` and `Index<usize>` on `serde_json::Value` return `&Value::Null` when the path doesn't exist. This applies to ALL of: missing keys (`v["absent"]`), out-of-bounds array access (`v["arr"][0]` on empty array), wrong type at any depth (`v["string_field"][0]`), and chained access like `v["a"]["b"][0]["c"]`. The implementation literally does `vec.get(i).unwrap_or(&Value::Null)`. Only `.as_str().unwrap()` / `.as_array().unwrap()` after the index can panic — but the indexing itself is panic-free. Do NOT flag `v["choices"][0]["message"]["role"]`-shaped chains as "panics on empty array" or "panics on missing field". They don't.
 
 2. **bwrap exposes only bound paths.** `lamu agent` runs in a bubblewrap namespace that starts empty; only paths explicitly `--bind`-mounted are visible. Claims that `$HOME` / `.ssh` / `.aws` "leak" are wrong unless you can show a `--bind` for them.
 
