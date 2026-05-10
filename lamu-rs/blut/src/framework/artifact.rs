@@ -78,11 +78,23 @@ impl ContentHash {
     /// Errors propagate from `read_dir` / file open. Malformed
     /// non-UTF-8 paths are hashed via their lossy form — same
     /// fallback `Path::display` uses, deterministic per platform.
+    ///
+    /// Performance: file hashing is parallelized via rayon —
+    /// embarrassingly parallel and the dominant cost on a multi-
+    /// file checkpoint dir. The walk itself stays single-threaded
+    /// (cheap; deterministic). Output is identical to the serial
+    /// `hash_dir_serial` variant.
     pub fn hash_dir(path: &Path) -> std::io::Result<Self> {
-        let mut entries: Vec<(String, ContentHash)> = Vec::new();
-        Self::walk_dir(path, path, &mut entries)?;
-        // Sort lexicographically by relative path. This is the bit
-        // that makes the merkle deterministic across runs.
+        use rayon::prelude::*;
+        // Phase 1: cheap serial walk to gather (rel, abs) pairs.
+        let mut pairs: Vec<(String, std::path::PathBuf)> = Vec::new();
+        Self::collect_files(path, path, &mut pairs)?;
+        // Phase 2: parallel hash. Each file is independent; CPU
+        // and disk both benefit from multi-thread issue.
+        let mut entries: Vec<(String, ContentHash)> = pairs
+            .into_par_iter()
+            .map(|(rel, abs)| Self::hash_file(&abs).map(|h| (rel, h)))
+            .collect::<std::io::Result<Vec<_>>>()?;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let mut hasher = Sha256::new();
         for (rel, child) in &entries {
@@ -92,6 +104,45 @@ impl ContentHash {
         }
         let arr: [u8; 32] = hasher.finalize().into();
         Ok(Self(arr))
+    }
+
+    /// Single-threaded variant. Same output as `hash_dir`. Kept
+    /// for tests + environments where the rayon thread pool isn't
+    /// a fit (single-core, embedded).
+    pub fn hash_dir_serial(path: &Path) -> std::io::Result<Self> {
+        let mut entries: Vec<(String, ContentHash)> = Vec::new();
+        Self::walk_dir(path, path, &mut entries)?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut hasher = Sha256::new();
+        for (rel, child) in &entries {
+            hasher.update(rel.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(&child.0);
+        }
+        let arr: [u8; 32] = hasher.finalize().into();
+        Ok(Self(arr))
+    }
+
+    fn collect_files(
+        root: &Path,
+        cur: &Path,
+        out: &mut Vec<(String, std::path::PathBuf)>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(cur)? {
+            let entry = entry?;
+            let p = entry.path();
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                Self::collect_files(root, &p, out)?;
+            } else {
+                let rel = p
+                    .strip_prefix(root)
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| p.to_string_lossy().into_owned());
+                out.push((rel, p));
+            }
+        }
+        Ok(())
     }
 
     fn walk_dir(

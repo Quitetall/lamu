@@ -36,7 +36,13 @@ uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 schemars = "0.8"
 tokio-util = "0.7"
+rayon = "1"
 lamu-core = { path = "../lamu-core" }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "framework"
+harness = false
