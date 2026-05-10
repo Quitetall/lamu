@@ -183,6 +183,41 @@ impl Memory {
 
     /// Read up to `limit` most-recent turns for a conversation,
     /// oldest-first. Pass `limit = 0` for no cap.
+    /// Pull every turn whose `ts >= cutoff_unix_secs`, grouped under
+    /// its conversation id. Returns `(conversation_id, Turn)` pairs
+    /// in the natural sort order — same conversation's turns appear
+    /// contiguous and ordered by idx, conversations themselves sort
+    /// lexicographically by id.
+    ///
+    /// Used by `lamu-train --from-conversations` (read directly via
+    /// rusqlite to avoid linking lamu-mcp into lamu-train) and by
+    /// the future `train_from_conversations` MCP tool dry-run.
+    /// O(N) in returned rows; cap on the caller's side if needed.
+    pub fn recall_since(&self, cutoff_unix_secs: i64) -> Result<Vec<(String, Turn)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, idx, role, content, ts, metadata \
+             FROM turns WHERE ts >= ? ORDER BY conversation_id, idx ASC",
+        )?;
+        let rows = stmt.query_map(params![cutoff_unix_secs], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Turn {
+                    idx: r.get(1)?,
+                    role: r.get(2)?,
+                    content: r.get(3)?,
+                    ts: r.get(4)?,
+                    metadata: r.get(5)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn recall(&self, conversation_id: &str, limit: usize) -> Result<Vec<Turn>> {
         validate_conversation_id(conversation_id)?;
         let conn = self.conn.lock();
@@ -419,6 +454,56 @@ mod tests {
         assert_eq!(b_turns.len(), 1);
         assert_eq!(a_turns[0].content, "alpha");
         assert_eq!(b_turns[0].content, "beta");
+    }
+
+    #[test]
+    fn recall_since_filters_by_ts() {
+        // Two conversations, three turns each at ts = 100, 200, 300.
+        // recall_since(200) should keep the last 2 of each = 4 rows
+        // total.
+        use rusqlite::params;
+        let td = tempfile::tempdir().unwrap();
+        let mem = Memory::open(&td.path().join("test.db")).unwrap();
+        for conv in ["alpha", "bravo"] {
+            mem.append_turn(conv, "user", "ignored", None).unwrap();
+        }
+        // Backdate the rows: append created turns at "now"; rewrite ts
+        // directly via a raw query so the test controls the times.
+        let conn = mem.conn.lock();
+        conn.execute("DELETE FROM turns", []).unwrap();
+        for (conv, ts) in [
+            ("alpha", 100i64),
+            ("alpha", 200),
+            ("alpha", 300),
+            ("bravo", 100),
+            ("bravo", 200),
+            ("bravo", 300),
+        ] {
+            conn.execute(
+                "INSERT INTO turns (conversation_id, idx, role, content, ts) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![conv, ts, "user", format!("at-{ts}"), ts],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let rows = mem.recall_since(200).unwrap();
+        assert_eq!(rows.len(), 4, "expect 2 turns per conv after cutoff");
+        // Conv-grouped, idx-ordered.
+        assert_eq!(rows[0].0, "alpha");
+        assert_eq!(rows[3].0, "bravo");
+        assert_eq!(rows[0].1.ts, 200);
+        assert_eq!(rows[1].1.ts, 300);
+    }
+
+    #[test]
+    fn recall_since_empty_when_cutoff_in_future() {
+        let td = tempfile::tempdir().unwrap();
+        let mem = Memory::open(&td.path().join("test.db")).unwrap();
+        mem.append_turn("conv1", "user", "hi", None).unwrap();
+        let rows = mem.recall_since(i64::MAX).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]

@@ -31,6 +31,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod backend;
+pub mod conversations;
 pub mod convert;
 pub mod error;
 pub mod jobs;

@@ -191,7 +191,7 @@ async fn run_train(args: TrainArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("output-name is required (positional). See `lamu-train --help`."))?;
 
-    let dataset = build_dataset(&args)?;
+    let dataset_src = build_dataset(&args)?;
     let optimizer = pick_optimizer(args.optim, args.method);
     let method = build_method(args.method, args.rank, args.alpha);
 
@@ -201,6 +201,42 @@ async fn run_train(args: TrainArgs) -> Result<()> {
     let output_dir = job_dir.join("checkpoint");
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("create checkpoint dir {}", output_dir.display()))?;
+
+    // trainer.py only accepts JsonlPath at runtime. Materialize
+    // Conversations sources to a JSONL file under paths::data_dir
+    // before spec construction so the file path lands in the
+    // committed spec.json on disk for audit.
+    let dataset = match dataset_src {
+        DatasetSource::Conversations { .. } => {
+            let data_dir = paths::data_dir().context("resolve train-data dir")?;
+            std::fs::create_dir_all(&data_dir)
+                .with_context(|| format!("create {}", data_dir.display()))?;
+            let out_path = data_dir.join(format!("{job_id}.jsonl"));
+            let stats = lamu_train::conversations::dump_to_jsonl(
+                args.since,
+                &out_path,
+            )
+            .context("dump conversations to JSONL")?;
+            eprintln!(
+                "dataset materialized: {} conversations, {} turns → {}",
+                stats.n_conversations,
+                stats.n_turns,
+                stats.path.display()
+            );
+            if stats.n_conversations == 0 {
+                return Err(anyhow!(
+                    "no usable conversations in window (--since {:?}). \
+                     {} dropped as too short, {} as error-tagged, {} as oversize.",
+                    args.since,
+                    stats.n_dropped_short,
+                    stats.n_dropped_errors,
+                    stats.n_dropped_oversize
+                ));
+            }
+            DatasetSource::JsonlPath { path: out_path }
+        }
+        other => other,
+    };
 
     let spec = TrainSpec {
         base_model: args.base.clone(),

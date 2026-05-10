@@ -1387,6 +1387,7 @@ dependencies = [
  "lamu-core",
  "nix 0.29.0",
  "parking_lot",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

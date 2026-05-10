@@ -29,6 +29,8 @@ dirs = "5"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
 lamu-core = { path = "../lamu-core" }
 
 [dev-dependencies]
