@@ -1396,6 +1396,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "futures-util",
+ "humantime",
  "lamu-core",
  "lamu-providers",
  "parking_lot",
@@ -1410,6 +1411,7 @@ dependencies = [
  "tracing",
  "tree-sitter",
  "tree-sitter-rust",
+ "which",
 ]
 
 [[package]]

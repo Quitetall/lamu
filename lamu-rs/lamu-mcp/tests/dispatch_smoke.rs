@@ -55,9 +55,34 @@ async fn initialize_and_tools_list_round_trip() {
         "query", "cloud_query", "review_commit", "review_diff", "write_file",
         "list_models", "list_cloud_models", "parallel_query", "set_routing_mode",
         "recall_conversation", "search_repo", "index_repo", "warmup",
+        "train_from_conversations",
     ] {
         assert!(names.contains(&required), "tools/list missing {required}");
     }
+}
+
+#[tokio::test]
+async fn train_from_conversations_requires_output_name() {
+    let srv = fresh_server();
+    let resp = call_tool(&srv, "train_from_conversations", json!({})).await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("output_name"), "got: {text}");
+}
+
+#[tokio::test]
+async fn train_from_conversations_without_confirm_returns_estimate() {
+    let srv = fresh_server();
+    let resp = call_tool(
+        &srv,
+        "train_from_conversations",
+        json!({"output_name": "test-model"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm=true"), "missing confirm hint: {text}");
+    assert!(text.contains("Estimated dataset"), "missing estimate: {text}");
 }
 
 #[tokio::test]

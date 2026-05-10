@@ -185,6 +185,40 @@ fn schema_index_repo() -> Value {
     })
 }
 
+fn schema_train_from_conversations() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "output_name": {
+                "type": "string",
+                "description": "Registry name for the trained model. Must match [A-Za-z0-9_.-]+ with no leading '.' or '-' and no '..'."
+            },
+            "since": {
+                "type": "string",
+                "default": "30d",
+                "description": "How far back to pull conversations. Humantime duration: '7d', '30d', '12h', etc."
+            },
+            "base_model": {
+                "type": "string",
+                "default": "Qwen/Qwen3-7B",
+                "description": "HuggingFace base model id (org/name)."
+            },
+            "method": {
+                "type": "string",
+                "enum": ["qlora", "lora", "full"],
+                "default": "qlora",
+                "description": "Fine-tuning method. qlora is the 4090-friendly default."
+            },
+            "confirm": {
+                "type": "boolean",
+                "default": false,
+                "description": "Must be true to actually start. First call without confirm returns the dataset estimate so the caller can decide."
+            }
+        },
+        "required": ["output_name"]
+    })
+}
+
 fn schema_recall_conversation() -> Value {
     json!({
         "type": "object",
@@ -323,6 +357,12 @@ fn dispatch_recall_conversation(args: Value) -> Pin<Box<dyn Future<Output = Stri
     Box::pin(async move { r })
 }
 
+fn dispatch_train_from_conversations(
+    args: Value,
+) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::train_tool::handle_train_from_conversations(args))
+}
+
 fn dispatch_write_file(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::server::handle_write_file(args))
 }
@@ -439,6 +479,12 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Read recorded turns from a conversation logged via cloud_query's `conversation_id` arg. Returns oldest-first, optionally capped at `limit` most-recent turns. Storage: ~/.local/share/lamu/conversations.db (SQLite). Use this to inspect what was said in a prior session, or to replay a conversation thread into a fresh cloud_query via the `context` arg.",
         schema_fn: schema_recall_conversation,
         handler: HandlerKind::Free(dispatch_recall_conversation),
+    },
+    ToolDef {
+        name: "train_from_conversations",
+        description: "Fine-tune a local model on the user's recent conversation history. EXPENSIVE: 30 min – 4 h depending on dataset size; locks the GPU exclusively for the run. First call without `confirm: true` returns the dataset estimate (conversation count + turn count) so the caller can decide. With `confirm: true`, shells out to the `lamu-train` binary in detached background mode and returns immediately — check `lamu-train jobs` for the resulting job id. The MCP server does NOT depend on lamu-train; the binary must be installed separately (cargo install --path lamu-rs/lamu-train) or located via $LAMU_TRAIN_BIN.",
+        schema_fn: schema_train_from_conversations,
+        handler: HandlerKind::Free(dispatch_train_from_conversations),
     },
     ToolDef {
         name: "write_file",
