@@ -6,6 +6,7 @@
 pub mod types;
 pub mod registry;
 pub mod scheduler;
+pub mod scheduler_lock;
 pub mod router;
 pub mod reasoning;
 pub mod config;

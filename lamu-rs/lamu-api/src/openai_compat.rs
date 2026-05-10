@@ -140,6 +140,28 @@ async fn chat_completions(
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let t_start = Instant::now();
 
+    // Refuse before VRAM allocation if `lamu-train` (or another
+    // exclusive holder) owns the GPU. Check before taking the
+    // scheduler/router locks so a held GPU returns fast without
+    // contending on internal state.
+    if let Err(e) = lamu_core::scheduler_lock::check_unlocked() {
+        state.metrics.requests_total
+            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "gpu_locked"])
+            .inc();
+        let body = ErrorResponse {
+            error: ErrorBody {
+                message: format!("{e}"),
+                typ: "gpu_locked",
+            },
+        };
+        let body_json = serde_json::to_value(&body)
+            .unwrap_or_else(|err| json!({"error": {
+                "message": format!("internal serialization: {}", err),
+                "type": "serialization_error",
+            }}));
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body_json)).into_response();
+    }
+
     let (port, model_name, marker) = {
         let scheduler = state.scheduler.lock();
         let router = state.router.lock();

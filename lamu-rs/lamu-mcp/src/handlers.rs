@@ -48,6 +48,13 @@ impl LamuMcpServer {
             }
         }
 
+        // Refuse before any VRAM allocation if `lamu-train` (or
+        // another exclusive holder) owns the GPU. `--allow-evict`
+        // flag (future) flips this to a wait via await_unlock.
+        if let Err(e) = lamu_core::scheduler_lock::check_unlocked() {
+            return format!("error: {e}");
+        }
+
         let model = args.get("model").and_then(|v| v.as_str());
         let caps_raw = args.get("capabilities").and_then(|v| v.as_array());
         let system = args.get("system").and_then(|v| v.as_str()).unwrap_or("");
