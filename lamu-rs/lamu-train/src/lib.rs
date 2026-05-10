@@ -31,9 +31,11 @@
 pub mod backend;
 pub mod error;
 pub mod protocol;
+pub mod python_backend;
 pub mod spec;
 
 pub use backend::{TrainArtifact, TrainBackend};
 pub use error::TrainError;
 pub use protocol::StatusUpdate;
+pub use python_backend::PythonTrainBackend;
 pub use spec::{DatasetSource, Method, Optim, TrainSpec};

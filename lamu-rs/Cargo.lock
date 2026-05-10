@@ -1374,6 +1374,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dirs",
+ "nix 0.29.0",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
