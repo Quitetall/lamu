@@ -110,12 +110,18 @@ def transformers_optim(opt: str) -> str:
     """Map serde-cased Optim variant to the transformers `optim=`
     string. Used only when build_optimizer() determines the
     optimizer is supported as a TrainingArguments builtin."""
-    return {
+    table = {
         "adam_w": "adamw_torch",
         "adam_w8bit": "adamw_8bit",
         "apollo_mini": "apollo_mini",
         "apollo_rank4": "apollo",
-    }[opt]
+    }
+    if opt not in table:
+        raise RuntimeError(
+            f"unknown Optim variant {opt!r}; "
+            f"valid: {sorted(table.keys())}"
+        )
+    return table[opt]
 
 
 def build_optimizer(opt_name: str, model, lr: float):
@@ -160,9 +166,12 @@ def build_optimizer(opt_name: str, model, lr: float):
         builtin_names = {o.value for o in OptimizerNames}
         if optim_str in builtin_names:
             return optim_str, None
-    except Exception:
-        # Older transformers without OptimizerNames or import errors —
-        # treat as not-builtin and fall through to apollo_torch.
+    except (ImportError, AttributeError):
+        # ImportError: transformers too old to expose OptimizerNames.
+        # AttributeError: enum shape changed in a future version.
+        # Either way, treat as not-builtin and fall through to
+        # apollo_torch. Other exception types (RuntimeError, etc.)
+        # are real bugs and must propagate.
         pass
 
     # Fall back to the community apollo_torch package.
