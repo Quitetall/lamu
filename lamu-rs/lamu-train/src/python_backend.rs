@@ -231,7 +231,16 @@ async fn graceful_kill(pid: u32) {
             return;
         }
         Err(e) => {
-            tracing::warn!("SIGTERM trainer pid {}: {}", pid, e);
+            // Unexpected errno (EINVAL, etc.) — the SIGKILL escalation
+            // would fail for the same reason, so don't burn the 10 s
+            // wait. Log and bail.
+            tracing::error!(
+                "SIGTERM trainer pid {} returned unexpected errno: {}; \
+                 skipping grace period (SIGKILL would fail too)",
+                pid,
+                e
+            );
+            return;
         }
     }
     let deadline = Instant::now() + Duration::from_secs(10);
