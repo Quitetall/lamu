@@ -233,7 +233,16 @@ async fn run_auto() -> Result<()> {
     let pol = policy::load().context("load policy")?;
     let (now_unix, now_local_min) = policy::current_clock();
     let lock_held = lamu_core::scheduler_lock::check_unlocked().is_err();
-    let new_turns = conversations::count_turns_since(pol.last_train_ts).unwrap_or(0);
+    let new_turns = match conversations::count_turns_since(pol.last_train_ts) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                "count_turns_since failed ({e}); treating as 0. Auto will skip \
+                 on the threshold check rather than spawning blindly."
+            );
+            0
+        }
+    };
 
     let decision = policy::decide(&pol, now_unix, now_local_min, new_turns, lock_held);
     match decision {
@@ -276,10 +285,28 @@ async fn run_auto() -> Result<()> {
                     if let Err(e) = policy::save(&updated) {
                         tracing::warn!("failed to update last_train_ts: {e}");
                     }
-                    // Reap the zombie when training finishes;
+                    // Reap the zombie when training finishes; the
                     // cron-driven `auto` exits while the child runs.
+                    // Log non-zero exit so train-auto.log shows the
+                    // outcome instead of just the spawn line.
                     tokio::spawn(async move {
-                        let _ = child.wait().await;
+                        match child.wait().await {
+                            Ok(status) if !status.success() => {
+                                tracing::warn!(
+                                    "auto-train (pid={pid}) exited with {status}"
+                                );
+                            }
+                            Ok(status) => {
+                                tracing::info!(
+                                    "auto-train (pid={pid}) exited cleanly: {status}"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "auto-train (pid={pid}) wait failed: {e}"
+                                );
+                            }
+                        }
                     });
                 }
                 Err(e) => return Err(anyhow!("spawn lamu-train: {e}")),
@@ -314,8 +341,16 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "lamu-train".into());
+            // cron doesn't run through a shell that expands ~ , so
+            // resolve the log path to an absolute string before
+            // printing. Falls back to /tmp if XDG resolution fails.
+            let log_path = dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("lamu")
+                .join("train-auto.log");
             println!(
-                "*/30 * * * * {exe} auto >> ~/.local/share/lamu/train-auto.log 2>&1"
+                "*/30 * * * * {exe} auto >> {} 2>&1",
+                log_path.display()
             );
         }
         PolicyCommand::Disable => {
