@@ -155,18 +155,11 @@ impl SequentialExecutor {
                 }
             };
 
-            // Cache key.
-            let input_hash = ContentHash::from_hex(
-                &serde_json::to_value(&input.payload)
-                    .ok()
-                    .and_then(|_| Some(()))
-                    .map(|_| input_hash_from_payload(&input))
-                    .unwrap_or_else(|| input_hash_from_payload(&input)),
-            )
-            .unwrap_or_else(|_| input_hash_from_erased(&input));
-            // The above is a paranoid double-path; in practice
-            // input_hash_from_erased is what runs. Kept the
-            // structure for readability.
+            // Cache key. Hash of the canonical-JSON form of the
+            // erased input artifact (kind + schema + sorted-keys
+            // payload). Cheap; the cache lookup is on the hot
+            // path so this needs to be fast.
+            let input_hash = input_hash_from_erased(&input);
 
             let key = CacheHandle::key_for(stage_name, node.stage.schema(), input_hash, &node.args);
 
@@ -311,10 +304,6 @@ fn input_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
 
 fn output_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     input_hash_from_erased(art)
-}
-
-fn input_hash_from_payload(art: &ErasedArtifact) -> String {
-    art.payload.to_string()
 }
 
 fn canonical_value(value: &serde_json::Value) -> serde_json::Value {

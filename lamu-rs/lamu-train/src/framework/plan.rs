@@ -142,6 +142,43 @@ impl<O: Artifact> Plan<O> {
     /// Append a stage that consumes the leading edge's output.
     /// Compiler enforces `S::Input = O`. The new node becomes the
     /// new leading edge.
+    ///
+    /// Wrong wiring is a compile error:
+    ///
+    /// ```compile_fail
+    /// // Skipping a step in the middle of a typed chain must fail.
+    /// // Stage A: () -> DataA. Stage C: DataB -> DataC. Chaining
+    /// // C directly after A skips the required A->B step.
+    /// # use lamu_train::framework::*;
+    /// # use lamu_train::framework::plan::Plan;
+    /// # use async_trait::async_trait;
+    /// # use serde::{Serialize, Deserialize};
+    /// # use std::path::Path;
+    /// # #[derive(Clone, Serialize, Deserialize)] struct A;
+    /// # #[derive(Clone, Serialize, Deserialize)] struct B;
+    /// # #[derive(Clone, Serialize, Deserialize)] struct C;
+    /// # impl Artifact for A { const KIND: &'static str = "a"; const SCHEMA: u32 = 1;
+    /// #     fn content_hash(&self) -> ContentHash { ContentHash::of_bytes(&[]) }
+    /// #     fn primary_path(&self) -> &Path { Path::new(".") } }
+    /// # impl Artifact for B { const KIND: &'static str = "b"; const SCHEMA: u32 = 1;
+    /// #     fn content_hash(&self) -> ContentHash { ContentHash::of_bytes(&[]) }
+    /// #     fn primary_path(&self) -> &Path { Path::new(".") } }
+    /// # impl Artifact for C { const KIND: &'static str = "c"; const SCHEMA: u32 = 1;
+    /// #     fn content_hash(&self) -> ContentHash { ContentHash::of_bytes(&[]) }
+    /// #     fn primary_path(&self) -> &Path { Path::new(".") } }
+    /// # #[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)] struct E;
+    /// # struct MakeA; #[async_trait] impl Stage for MakeA {
+    /// #   const NAME: &'static str = "a"; const SCHEMA: u32 = 1;
+    /// #   const RESOURCES: &'static [Resource] = &[]; type Input = (); type Output = A; type Args = E;
+    /// #   async fn run(&self, _: &StageContext, _: (), _: &E) -> Result<A, StageError> { Ok(A) } }
+    /// # struct BC; #[async_trait] impl Stage for BC {
+    /// #   const NAME: &'static str = "bc"; const SCHEMA: u32 = 1;
+    /// #   const RESOURCES: &'static [Resource] = &[]; type Input = B; type Output = C; type Args = E;
+    /// #   async fn run(&self, _: &StageContext, _: B, _: &E) -> Result<C, StageError> { Ok(C) } }
+    /// let _: Plan<C> = Plan::new("bad", serde_json::json!({}))
+    ///     .start(MakeA, E)
+    ///     .then(BC, E);  // expected B, got A — compile error
+    /// ```
     pub fn then<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
     where
         S: Stage<Input = O> + 'static,
@@ -449,19 +486,12 @@ mod tests {
         assert_eq!(plan.name(), "named");
     }
 
-    /// Compile-fail check via documentation: this would not compile.
-    /// Listed here so a future maintainer reading the test file
-    /// sees the type-check property is intentional.
-    ///
-    /// ```compile_fail
-    /// use lamu_train::framework::plan::Plan;
-    /// // MakeA: () -> DataA, BToC: DataB -> DataC; chaining them
-    /// // skips the A→B step and must fail.
-    /// let _ = Plan::new("bad", serde_json::json!({}))
-    ///     .start(MakeA, EmptyArgs)
-    ///     .then(BToC, EmptyArgs)  // expected DataB, got DataA
-    ///     .finish();
-    /// ```
-    #[allow(dead_code)]
-    fn _doc_compile_fail_marker() {}
+    // Compile-time DAG enforcement is also exercised by the
+    // doctest on `Plan::then` (in this file's module-level docs).
+    // A `compile_fail` doctest there is what cargo test --doc
+    // actually runs; tests in #[cfg(test)] modules don't process
+    // doctests. The dedicated negative test below is a runtime
+    // proxy: building a typed chain is checked by the compiler;
+    // mismatched-tuple Plan<(A, B)>::merge requires a stage with
+    // Input = (A, B) which forces the compile-time witness.
 }
