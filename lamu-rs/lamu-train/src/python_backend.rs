@@ -207,8 +207,27 @@ impl TrainBackend for PythonTrainBackend {
 /// 10s grace, SIGKILL. Kept here so this crate has no upward
 /// dependency on lamu-core. If both copies drift, the bug is
 /// here — propagate the fix.
+///
+/// Public to the crate so `jobs::cancel_job` can reuse it for
+/// `lamu-train cancel <id>` without re-implementing the timing
+/// + EPERM/ESRCH handling.
+#[cfg(unix)]
+pub(crate) async fn graceful_kill_pid(pid: u32, grace: std::time::Duration) {
+    graceful_kill_inner(pid, grace).await
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn graceful_kill_pid(_pid: u32, _grace: std::time::Duration) {
+    // No-op on non-Unix; cancel is best-effort.
+}
+
 #[cfg(unix)]
 async fn graceful_kill(pid: u32) {
+    graceful_kill_inner(pid, Duration::from_secs(10)).await
+}
+
+#[cfg(unix)]
+async fn graceful_kill_inner(pid: u32, grace: Duration) {
     use nix::errno::Errno;
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -243,7 +262,7 @@ async fn graceful_kill(pid: u32) {
             return;
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         match pid_alive(pid) {
             PidStatus::Gone => {
@@ -259,8 +278,9 @@ async fn graceful_kill(pid: u32) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     tracing::warn!(
-        "trainer pid {} ignored SIGTERM for 10s, escalating to SIGKILL",
-        pid
+        "trainer pid {} ignored SIGTERM for {:?}, escalating to SIGKILL",
+        pid,
+        grace
     );
     let _ = kill(raw, Signal::SIGKILL);
 }

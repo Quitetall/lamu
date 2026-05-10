@@ -26,14 +26,24 @@
 //!     is pure; protocol is pure; even the trait method is `async`
 //!     only because the future implementations need it.
 
-#![forbid(unsafe_code)]
+// Production code stays unsafe-free; tests use unsafe env-var
+// mutations for hermetic env-injection patterns.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod backend;
 pub mod convert;
 pub mod error;
+pub mod jobs;
+pub mod paths;
 pub mod protocol;
 pub mod python_backend;
 pub mod spec;
+
+/// Process-wide lock for tests that mutate environment variables.
+/// Multiple test modules touch `LAMU_TRAIN_*` env vars; without a
+/// shared mutex parallel test execution races on the global env.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use backend::{TrainArtifact, TrainBackend};
 pub use error::TrainError;
