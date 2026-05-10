@@ -20,6 +20,31 @@ use lamu_train::{
     DatasetSource, Method, Optim, PythonTrainBackend, StatusUpdate, TrainBackend, TrainSpec,
 };
 
+/// Run the python-side test_build_optimizer.py as a subprocess.
+/// Confirms build_optimizer's resolution rules behave correctly
+/// for the AdamW path and the APOLLO not-available error case
+/// without needing torch/transformers/apollo-torch installed.
+#[test]
+fn build_optimizer_python_smoke() {
+    let Some(python) = have_python() else {
+        eprintln!("skipping: no python3 on PATH");
+        return;
+    };
+    let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join("test_build_optimizer.py");
+    let out = std::process::Command::new(&python)
+        .arg(&script)
+        .output()
+        .expect("spawn python test");
+    assert!(
+        out.status.success(),
+        "build_optimizer python tests failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 fn trainer_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/trainer.py")
 }

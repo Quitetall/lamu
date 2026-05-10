@@ -107,12 +107,84 @@ def parse_dataset(dataset: dict[str, Any]) -> Path:
 
 
 def transformers_optim(opt: str) -> str:
+    """Map serde-cased Optim variant to the transformers `optim=`
+    string. Used only when build_optimizer() determines the
+    optimizer is supported as a TrainingArguments builtin."""
     return {
         "adam_w": "adamw_torch",
         "adam_w8bit": "adamw_8bit",
         "apollo_mini": "apollo_mini",
         "apollo_rank4": "apollo",
     }[opt]
+
+
+def build_optimizer(opt_name: str, model, lr: float):
+    """Construct a (transformers_optim_str, optimizer_object_or_None)
+    pair for the given Optim variant.
+
+    Resolution rules:
+
+      AdamW / AdamW8bit
+        Always supported by transformers. Return the optim string;
+        SFTTrainer constructs the optimizer internally via
+        TrainingArguments(optim=...).
+
+      ApolloMini / ApolloRank4
+        Try in order:
+          1. transformers TrainingArguments(optim="apollo_mini") /
+             "apollo" — works once HF PR #35225 is merged into the
+             user's transformers (≥ ~4.50). Detected by inspecting
+             OptimizerNames at import time.
+          2. apollo_torch.APOLLOAdamW — community package matching
+             the paper's reference implementation. Constructed
+             manually + passed to SFTTrainer via optimizers=(opt, None).
+          3. Neither available → raise RuntimeError with install
+             hint. Trainer.py emits Failed and exits non-zero.
+
+    Returns (optim_str, optim_obj). If `optim_obj` is non-None the
+    caller MUST pass `optimizers=(optim_obj, None)` to SFTTrainer
+    AND set the TrainingArguments `optim="adamw_torch"` (any valid
+    builtin — the actual optimizer is the manual one). If `optim_obj`
+    is None, set `optim=optim_str` and let trl/transformers handle it.
+    """
+    if opt_name in ("adam_w", "adam_w8bit"):
+        return transformers_optim(opt_name), None
+
+    if opt_name not in ("apollo_mini", "apollo_rank4"):
+        raise RuntimeError(f"unknown optimizer: {opt_name!r}")
+
+    # APOLLO path. Attempt the transformers builtin first.
+    optim_str = transformers_optim(opt_name)  # 'apollo_mini' or 'apollo'
+    try:
+        from transformers.training_args import OptimizerNames
+        builtin_names = {o.value for o in OptimizerNames}
+        if optim_str in builtin_names:
+            return optim_str, None
+    except Exception:
+        # Older transformers without OptimizerNames or import errors —
+        # treat as not-builtin and fall through to apollo_torch.
+        pass
+
+    # Fall back to the community apollo_torch package.
+    try:
+        from apollo_torch import APOLLOAdamW  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            f"APOLLO optimizer not available. transformers builtin "
+            f"is too old (need PR #35225, ~4.50+) and apollo_torch is "
+            f"not installed. Either upgrade transformers or run: "
+            f"pip install apollo-torch. Underlying error: {e}"
+        ) from e
+
+    rank = 1 if opt_name == "apollo_mini" else 4
+    optim_obj = APOLLOAdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        rank=rank,
+        update_proj_gap=200,
+        scale=1.0,
+    )
+    return "adamw_torch", optim_obj
 
 
 def run(spec: dict[str, Any]) -> int:
@@ -204,24 +276,44 @@ def run(spec: dict[str, Any]) -> int:
         dataset_path, tokenizer=tokenizer, max_seq_len=int(spec["seq_len"])
     )
 
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_ds,
-        callbacks=[StatusEmitter()],
-        args=TrainingArguments(
-            output_dir=str(output_dir),
-            per_device_train_batch_size=int(spec["batch_size"]),
-            gradient_accumulation_steps=int(spec["grad_accum"]),
-            num_train_epochs=int(spec["epochs"]),
-            learning_rate=float(spec["lr"]),
-            optim=transformers_optim(spec["optimizer"]),
-            seed=int(spec["seed"]),
-            logging_steps=1,
-            report_to="none",
-            save_strategy="epoch",
-        ),
+    optim_str, optim_obj = build_optimizer(
+        spec["optimizer"], model, float(spec["lr"])
     )
+
+    training_args = TrainingArguments(
+        output_dir=str(output_dir),
+        per_device_train_batch_size=int(spec["batch_size"]),
+        gradient_accumulation_steps=int(spec["grad_accum"]),
+        num_train_epochs=int(spec["epochs"]),
+        learning_rate=float(spec["lr"]),
+        optim=optim_str,
+        seed=int(spec["seed"]),
+        logging_steps=1,
+        report_to="none",
+        save_strategy="epoch",
+    )
+
+    if optim_obj is not None:
+        # Manual APOLLO path: hand the optimizer object to trl;
+        # TrainingArguments(optim=...) is then ignored for the actual
+        # update step but must still be a valid builtin name to
+        # satisfy validation, hence "adamw_torch" above.
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_ds,
+            callbacks=[StatusEmitter()],
+            args=training_args,
+            optimizers=(optim_obj, None),
+        )
+    else:
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_ds,
+            callbacks=[StatusEmitter()],
+            args=training_args,
+        )
 
     started = time.time()
     result = trainer.train()
