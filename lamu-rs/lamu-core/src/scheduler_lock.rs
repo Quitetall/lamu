@@ -386,11 +386,15 @@ mod tests {
         let (_td, path) = temp_lock();
         let lock = acquire_exclusive_at(&path, "us", LockKind::Training).unwrap();
         // Stomp the file with a different body (different pid +
-        // since_unix) — simulates a misbehaving cleaner.
+        // since_unix) — simulates a misbehaving cleaner. Use a pid
+        // that's unambiguously not us and unambiguously not a real
+        // process (well above pid_max on Linux); wrapping_add could
+        // theoretically collide with a real pid in a container with
+        // remapped pid namespaces.
         let imposter = LockInfo {
             holder: "imposter".into(),
             kind: LockKind::Training,
-            pid: std::process::id().wrapping_add(1),
+            pid: 0xDEAD_BEEF,
             since_unix: lock.info().since_unix.wrapping_add(99),
         };
         std::fs::write(&path, serde_json::to_vec(&imposter).unwrap()).unwrap();
