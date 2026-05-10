@@ -192,12 +192,13 @@ impl TrainBackend for PythonTrainBackend {
     }
 
     async fn cancel(&mut self) -> Result<()> {
-        let pid = match *self.child_pid.lock() {
+        // Atomic take() rather than read-then-clear so two concurrent
+        // cancel() calls don't both fire the kill sequence.
+        let pid = match self.child_pid.lock().take() {
             Some(p) => p,
             None => return Ok(()),
         };
         graceful_kill(pid).await;
-        *self.child_pid.lock() = None;
         Ok(())
     }
 }
@@ -208,19 +209,50 @@ impl TrainBackend for PythonTrainBackend {
 /// here — propagate the fix.
 #[cfg(unix)]
 async fn graceful_kill(pid: u32) {
+    use nix::errno::Errno;
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     let raw = Pid::from_raw(pid as i32);
-    let _ = kill(raw, Signal::SIGTERM);
+    match kill(raw, Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(Errno::ESRCH) => {
+            // Already gone before we got here. Done.
+            return;
+        }
+        Err(Errno::EPERM) => {
+            // Process exists but we can't signal it (different user
+            // or capability-restricted namespace). The 10 s grace
+            // would just hang since SIGKILL would also fail. Log
+            // loudly and bail.
+            tracing::error!(
+                "trainer pid {} cannot be signalled (EPERM); cancel is a no-op",
+                pid
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("SIGTERM trainer pid {}: {}", pid, e);
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if !pid_alive(pid) {
-            tracing::debug!("trainer pid {} exited cleanly after SIGTERM", pid);
-            return;
+        match pid_alive(pid) {
+            PidStatus::Gone => {
+                tracing::debug!("trainer pid {} exited cleanly after SIGTERM", pid);
+                return;
+            }
+            PidStatus::Unsignalable => {
+                tracing::error!("trainer pid {} unreachable mid-wait (EPERM)", pid);
+                return;
+            }
+            PidStatus::Alive => {}
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    tracing::warn!("trainer pid {} ignored SIGTERM for 10s, escalating to SIGKILL", pid);
+    tracing::warn!(
+        "trainer pid {} ignored SIGTERM for 10s, escalating to SIGKILL",
+        pid
+    );
     let _ = kill(raw, Signal::SIGKILL);
 }
 
@@ -230,18 +262,26 @@ async fn graceful_kill(_pid: u32) {
 }
 
 #[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-    // Sending signal 0 returns Ok if the process is alive (and we
-    // have permission), Err if it's gone (ESRCH) or we lack perms.
-    matches!(
-        kill(Pid::from_raw(pid as i32), None),
-        Ok(()) | Err(nix::errno::Errno::EPERM)
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PidStatus {
+    Alive,
+    Gone,
+    Unsignalable,
 }
 
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    false
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> PidStatus {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // Sending signal 0 returns Ok if the process is alive AND we
+    // have permission. ESRCH means the process is gone. EPERM means
+    // it exists but we can't touch it — caller must treat that as
+    // "give up", not "wait longer".
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => PidStatus::Alive,
+        Err(Errno::ESRCH) => PidStatus::Gone,
+        Err(Errno::EPERM) => PidStatus::Unsignalable,
+        Err(_) => PidStatus::Alive,
+    }
 }

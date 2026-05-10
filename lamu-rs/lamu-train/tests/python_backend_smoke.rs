@@ -56,23 +56,22 @@ fn dummy_spec() -> TrainSpec {
     }
 }
 
+/// Protocol-only smoke: invokes `trainer.py --self-check` directly
+/// (bypassing `PythonTrainBackend::run`, which requires a full spec).
+/// Verifies the trainer's stdout shape matches `StatusUpdate` parse
+/// rules — the same parser used by the real run path.
 #[tokio::test]
-async fn self_check_round_trip() {
+async fn self_check_protocol_round_trip() {
     let Some(python) = have_python() else {
         eprintln!("skipping: no python3 on PATH");
         return;
     };
-    // For self-check, the spec is unused — trainer.py emits canned
-    // updates regardless. But we exercise the public path: spec
-    // validate, serialize, spawn, parse.
     let collected: Arc<Mutex<Vec<StatusUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_cb = Arc::clone(&collected);
     let on_status = Box::new(move |u: StatusUpdate| {
         collected_for_cb.lock().unwrap().push(u);
     });
 
-    // We can't reach trainer.py self-check via the normal `run`
-    // because run requires a real spec arg. Spawn directly.
     let out = std::process::Command::new(&python)
         .arg(trainer_script())
         .arg("--self-check")
@@ -80,7 +79,6 @@ async fn self_check_round_trip() {
         .expect("self-check spawn");
     assert!(out.status.success(), "trainer.py --self-check exit nonzero");
 
-    // Parse each line as StatusUpdate.
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -99,15 +97,32 @@ async fn self_check_round_trip() {
     assert!(updates.last().unwrap().is_terminal());
 }
 
+/// Real-run path: spawn trainer.py with a full spec, expect it to
+/// emit a Failed status because `import torch` (or unsloth) fails
+/// in the test environment.
+///
+/// Skipped if torch *is* installed — in that case the test would
+/// actually try to load Qwen3-7B and burn 40 GB of disk.
 #[tokio::test]
-async fn run_returns_failed_when_trainer_imports_missing() {
+async fn run_surfaces_trainer_failed_status() {
     let Some(python) = have_python() else {
         eprintln!("skipping: no python3 on PATH");
         return;
     };
-    // Real run path: trainer.py will try to `import torch` etc.
-    // and emit a Failed status with import error. This proves the
-    // TrainBackend::run path correctly ferries Failed → TrainError.
+    let torch_present = std::process::Command::new(&python)
+        .arg("-c")
+        .arg("import torch")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if torch_present {
+        eprintln!(
+            "skipping: torch is importable in this venv; \
+             this test only exercises the missing-deps path"
+        );
+        return;
+    }
+
     let mut backend = PythonTrainBackend::new(python, trainer_script());
     let collected: Arc<Mutex<Vec<StatusUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_cb = Arc::clone(&collected);
@@ -115,23 +130,17 @@ async fn run_returns_failed_when_trainer_imports_missing() {
         collected_for_cb.lock().unwrap().push(u);
     });
     let result = backend.run(dummy_spec(), on_status).await;
-    let updates = collected.lock().unwrap();
 
-    // Either trainer.py couldn't even import (Failed line + non-zero
-    // exit) OR torch happens to be on this host (unlikely in CI). In
-    // both branches we must have seen at least one StatusUpdate or
-    // a clean error.
-    if let Err(e) = &result {
-        let msg = format!("{}", e);
-        assert!(
-            msg.contains("missing python deps")
-                || msg.contains("trainer.py exited")
-                || msg.contains("emitted no Done")
-                || updates.iter().any(|u| matches!(u, StatusUpdate::Failed { .. })),
-            "unexpected error shape: {}",
-            msg
-        );
-    }
+    let err = result.expect_err("expected TrainError when torch is missing");
+    let msg = format!("{}", err);
+    let updates = collected.lock().unwrap();
+    assert!(
+        msg.contains("missing python deps")
+            || msg.contains("trainer.py exited")
+            || updates.iter().any(|u| matches!(u, StatusUpdate::Failed { .. })),
+        "unexpected error shape: {}",
+        msg
+    );
 }
 
 #[tokio::test]
@@ -140,19 +149,20 @@ async fn cancel_kills_long_running_subprocess() {
         eprintln!("skipping: no python3 on PATH");
         return;
     };
-    // Replace the trainer with a python sleeper so the test doesn't
-    // race against the real trainer's startup time.
-    let mut backend = PythonTrainBackend::new(
-        python,
-        // Inline-script trick: pass `-c` via the script slot won't
-        // work because our backend always passes script as first
-        // arg. Instead, write a tiny sleep script to a temp file.
-        write_temp_script(
-            "import time, sys, json\n\
-             print(json.dumps({\"kind\":\"step\",\"step\":1,\"total\":99,\"loss\":1.0,\"lr\":0.0,\"vram_mb\":0}), flush=True)\n\
-             time.sleep(60)\n",
-        ),
-    );
+    // Owned tempdir keeps the script file on disk for the lifetime
+    // of the test; Drop cleans it up when the test exits — no
+    // accumulation in /tmp across repeated `cargo test` runs.
+    let script_dir = tempfile::tempdir().expect("tempdir");
+    let script_path = script_dir.path().join("sleeper.py");
+    std::fs::write(
+        &script_path,
+        b"import time, sys, json\n\
+          print(json.dumps({\"kind\":\"step\",\"step\":1,\"total\":99,\"loss\":1.0,\"lr\":0.0,\"vram_mb\":0}), flush=True)\n\
+          time.sleep(60)\n",
+    )
+    .expect("write script");
+
+    let mut backend = PythonTrainBackend::new(python, script_path);
 
     let backend_handle = backend.clone();
     let on_status = Box::new(|_u: StatusUpdate| {});
@@ -170,17 +180,6 @@ async fn cancel_kills_long_running_subprocess() {
     // 10s graceful_kill window.
     let r = tokio::time::timeout(Duration::from_secs(15), run_fut).await;
     assert!(r.is_ok(), "run task did not complete after cancel");
-}
 
-fn write_temp_script(body: &str) -> PathBuf {
-    use std::io::Write;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("script.py");
-    let mut f = std::fs::File::create(&path).expect("create script");
-    f.write_all(body.as_bytes()).expect("write script");
-    f.flush().expect("flush");
-    // Leak the tempdir so the file outlives this function. The OS
-    // cleans /tmp on reboot; CI runs are throwaway.
-    std::mem::forget(dir);
-    path
+    // script_dir drops here, removing /tmp/<rand>/sleeper.py.
 }
