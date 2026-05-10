@@ -25,5 +25,15 @@
 //! kill-switch; commit 8 deletes the legacy path.
 
 pub mod artifact;
+pub mod cache;
+pub mod error;
+pub mod resource;
+pub mod stage;
+pub mod status;
 
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
+pub use cache::CacheHandle;
+pub use error::{PlanError, RecipeError, StageError};
+pub use resource::Resource;
+pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};
+pub use status::{StageEvent, make_broadcast};
