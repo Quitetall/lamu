@@ -603,9 +603,9 @@ pub(crate) fn handle_recall_conversation(args: Value) -> String {
 ///
 /// Resolution order: per-call `preset` arg > $LAMU_PRESET env > Fast.
 /// Individual env flags (LAMU_CRITIC_PASS, LAMU_ENSEMBLE_REVIEW,
-/// LAMU_TEST_PREFLIGHT, LAMU_TWO_STAGE_REVIEW, LAMU_K_LAZY_THRESHOLD)
-/// override the preset's defaults — useful for fine-grained tuning
-/// without writing a new preset.
+/// LAMU_TEST_PREFLIGHT, LAMU_TWO_STAGE_REVIEW) override the preset's
+/// defaults — useful for fine-grained tuning without writing a new
+/// preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Preset {
     /// Cache-stable single Pro pass + central FP-list + activity-log
@@ -849,9 +849,9 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     // available for callers who want Flash's tighter candidate
     // shortlist as a focusing aid (e.g. when Pro is the bottleneck
     // not the prefix), but default off.
-    let review = if auto && preset.ensemble_on() {
+    let review = if preset.ensemble_on() {
         ensemble_review(&prompt, &system).await
-    } else if auto && preset.two_stage_on() {
+    } else if preset.two_stage_on() {
         two_stage_review(&prompt, &system).await
     } else {
         let review_args = json!({
@@ -895,7 +895,7 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
 
     // V6 Q: critic pass — second-order regression hunting.
     // Default ON for Max preset, OFF for Fast.
-    let review = if auto && preset.critic_pass_on() {
+    let review = if preset.critic_pass_on() && !review.starts_with("error:") {
         let extra = critic_pass(&prompt, &system).await;
         if extra.is_empty() {
             review
