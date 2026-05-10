@@ -90,6 +90,44 @@ pub fn resolve_python() -> Result<PathBuf> {
 ///
 /// First existing path wins. Errors with the env var name if none
 /// resolve so the user has one sentence to fix.
+/// Resolve a paradigm-specific trainer script
+/// (`trainer_dpo.py`, `trainer_distill.py`, etc.). Same search
+/// order as `resolve_trainer_script` but with a configurable
+/// filename. Used by DPO + distill stages.
+pub fn resolve_trainer_script_named(name: &str) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var(format!("LAMU_{}_PY", name.to_uppercase())) {
+        return Ok(PathBuf::from(p));
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join(name),
+    );
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().and_then(|p| p.parent()) {
+            candidates.push(dir.join("share/lamu/python").join(name));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/share/lamu/python").join(name));
+    }
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.clone());
+        }
+    }
+    Err(TrainError::other(format!(
+        "{name} not found. Tried: {}. Set $LAMU_{}_PY to override.",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        name.to_uppercase()
+    )))
+}
+
 pub fn resolve_trainer_script() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("LAMU_TRAINER_PY") {
         return Ok(PathBuf::from(p));

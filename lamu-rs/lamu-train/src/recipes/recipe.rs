@@ -29,7 +29,10 @@ pub struct RecipeDef {
 /// fn-pointers that can't be Copy-moved into an array initializer.
 /// Each entry is a reference to the `pub static DEF` defined
 /// inside its recipe module.
-pub static RECIPES: &[&RecipeDef] = &[&crate::recipes::finetune_from_conversations::DEF];
+pub static RECIPES: &[&RecipeDef] = &[
+    &crate::recipes::finetune_from_conversations::DEF,
+    &crate::recipes::dpo_from_preferences::DEF,
+];
 
 pub fn find(name: &str) -> Option<&'static RecipeDef> {
     RECIPES.iter().copied().find(|r| r.name == name)

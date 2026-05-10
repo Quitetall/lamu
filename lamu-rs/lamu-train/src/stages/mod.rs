@@ -11,11 +11,15 @@
 //! commits.
 
 pub mod convert_gguf;
+pub mod distill_train;
+pub mod dpo_train;
 pub mod materialize_conversations;
 pub mod register_model;
 pub mod sft_train;
 
 pub use convert_gguf::ConvertGguf;
+pub use distill_train::DistillTrain;
+pub use dpo_train::DpoTrain;
 pub use materialize_conversations::MaterializeConversations;
 pub use register_model::RegisterModel;
 pub use sft_train::SftTrain;
