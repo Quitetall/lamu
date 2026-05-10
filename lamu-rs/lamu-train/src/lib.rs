@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod convert;
 pub mod error;
 pub mod protocol;
 pub mod python_backend;

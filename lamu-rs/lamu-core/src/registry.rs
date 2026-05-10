@@ -381,7 +381,71 @@ pub fn write_registry(models: &[ModelEntry], output: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let yaml = serde_yaml::to_string(&registry)?;
-    std::fs::write(output, yaml)?;
+    write_atomic(output, yaml.as_bytes())?;
+    Ok(())
+}
+
+/// Add (or replace, when `replace=true`) a single entry in the
+/// registry on disk. Loads the current registry, applies the change,
+/// writes it back atomically.
+///
+/// Returns `Error::Config` if `replace=false` and an entry with the
+/// same name already exists — caller has to opt in to overwriting,
+/// since trained-model names usually want a unique tag and a silent
+/// overwrite would erase the prior run.
+///
+/// Concurrency note: this is read-modify-write without a file lock.
+/// Two simultaneous `add_entry` calls can clobber one another. The
+/// expected caller is `lamu-train`, which holds the scheduler
+/// lockfile (step 4) for the duration of a job — that's the
+/// serialisation point. Don't call this from arbitrary parallel
+/// contexts.
+pub fn add_entry(entry: ModelEntry, registry_path: &Path, replace: bool) -> Result<()> {
+    let mut entries = load_registry(registry_path)?;
+    if let Some(idx) = entries.iter().position(|e| e.name == entry.name) {
+        if !replace {
+            return Err(crate::error::Error::Config(format!(
+                "registry already has an entry named '{}'; pass replace=true to overwrite",
+                entry.name
+            )));
+        }
+        entries[idx] = entry;
+    } else {
+        entries.push(entry);
+    }
+    write_registry(&entries, registry_path)
+}
+
+/// Write `bytes` to `dest` atomically: write to a sibling temp file,
+/// `fsync` (best effort), then `rename`. `rename` is atomic on the
+/// same filesystem, so a crash mid-write leaves either the old file
+/// or the new one — never a half-written one.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    // Temp file lives next to the destination so `rename` stays
+    // intra-filesystem (cross-fs rename would lose the atomicity
+    // guarantee).
+    let tmp = dest.with_file_name(format!(
+        ".{}.tmp.{}",
+        dest.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "registry".into()),
+        std::process::id()
+    ));
+
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    let _ = f.sync_all(); // best-effort; failure here doesn't justify aborting
+    drop(f);
+
+    // Rename overwrites the destination on POSIX.
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -398,4 +462,138 @@ pub fn load_registry(path: &Path) -> Result<Vec<ModelEntry>> {
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ModelStatus;
+
+    fn sample_entry(name: &str, path: &Path) -> ModelEntry {
+        ModelEntry {
+            name: name.into(),
+            path: path.into(),
+            format: ModelFormat::Gguf,
+            backend: BackendType::LlamaCpp,
+            arch: "qwen3".into(),
+            params_b: 7.0,
+            quant: "Q4_K_M".into(),
+            vram_mb: 8000,
+            context_max: 32768,
+            capabilities: vec![Capability::Chat],
+            reasoning_marker: None,
+            speculative: None,
+            pinned: false,
+            notes: String::new(),
+            status: ModelStatus::default(),
+        }
+    }
+
+    #[test]
+    fn add_entry_to_empty_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        let entry = sample_entry("alpha", Path::new("/models/alpha.gguf"));
+        add_entry(entry.clone(), &reg, false).expect("add");
+        let loaded = load_registry(&reg).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "alpha");
+        assert_eq!(loaded[0].path, entry.path);
+    }
+
+    #[test]
+    fn add_entry_appends_alongside_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        add_entry(
+            sample_entry("alpha", Path::new("/models/a.gguf")),
+            &reg,
+            false,
+        )
+        .unwrap();
+        add_entry(
+            sample_entry("bravo", Path::new("/models/b.gguf")),
+            &reg,
+            false,
+        )
+        .unwrap();
+        let loaded = load_registry(&reg).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let names: Vec<&str> = loaded.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn add_entry_refuses_duplicate_without_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        add_entry(
+            sample_entry("dup", Path::new("/models/x.gguf")),
+            &reg,
+            false,
+        )
+        .unwrap();
+        let err = add_entry(
+            sample_entry("dup", Path::new("/models/y.gguf")),
+            &reg,
+            false,
+        )
+        .expect_err("must refuse duplicate");
+        assert!(format!("{err}").contains("dup"));
+    }
+
+    #[test]
+    fn add_entry_replaces_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        add_entry(
+            sample_entry("dup", Path::new("/models/old.gguf")),
+            &reg,
+            false,
+        )
+        .unwrap();
+        let mut newer = sample_entry("dup", Path::new("/models/new.gguf"));
+        newer.vram_mb = 16000;
+        add_entry(newer, &reg, true).expect("replace must succeed");
+        let loaded = load_registry(&reg).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].path, PathBuf::from("/models/new.gguf"));
+        assert_eq!(loaded[0].vram_mb, 16000);
+    }
+
+    #[test]
+    fn write_atomic_creates_file_with_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a/b/c/output.txt");
+        write_atomic(&dest, b"hello").expect("write");
+        let read = std::fs::read(&dest).unwrap();
+        assert_eq!(read, b"hello");
+    }
+
+    #[test]
+    fn write_atomic_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload.bin");
+        std::fs::write(&dest, b"old contents").unwrap();
+        write_atomic(&dest, b"new contents").expect("write");
+        let read = std::fs::read(&dest).unwrap();
+        assert_eq!(read, b"new contents");
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_files_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("payload.bin");
+        write_atomic(&dest, b"x").unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files must not survive success");
+    }
 }
