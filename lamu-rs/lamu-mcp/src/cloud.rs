@@ -622,10 +622,10 @@ impl Preset {
     pub(crate) fn resolve(args: &Value) -> Self {
         let from_arg = args["preset"].as_str();
         let from_env = std::env::var("LAMU_PRESET").ok();
-        let raw = from_arg.or(from_env.as_deref()).unwrap_or("fast");
+        let raw = from_arg.or(from_env.as_deref()).unwrap_or("max");
         match raw.to_ascii_lowercase().as_str() {
-            "max" | "maximum" | "quality" => Preset::Max,
-            _ => Preset::Fast,
+            "fast" | "cheap" | "quick" => Preset::Fast,
+            _ => Preset::Max,
         }
     }
 
