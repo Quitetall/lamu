@@ -195,11 +195,29 @@ impl TrainSpec {
                 self.output_dir.display()
             )));
         }
+        if path_has_parent_dir(&self.output_dir) {
+            return Err(TrainError::invalid_spec(format!(
+                "output_dir '{}' must not contain '..' segments",
+                self.output_dir.display()
+            )));
+        }
         self.method.validate()?;
         match &self.dataset {
             DatasetSource::JsonlPath { path } => {
                 if path.as_os_str().is_empty() {
                     return Err(TrainError::invalid_spec("dataset.path is empty"));
+                }
+                if !path.is_absolute() {
+                    return Err(TrainError::invalid_spec(format!(
+                        "dataset.path '{}' must be an absolute path",
+                        path.display()
+                    )));
+                }
+                if path_has_parent_dir(path) {
+                    return Err(TrainError::invalid_spec(format!(
+                        "dataset.path '{}' must not contain '..' segments",
+                        path.display()
+                    )));
                 }
             }
             DatasetSource::Conversations { since_ts } => {
@@ -277,10 +295,21 @@ fn is_safe_hf_repo_id(repo: &str) -> bool {
     parts.iter().all(|p| {
         !p.is_empty()
             && *p != "."
-            && *p != ".."
+            && !p.contains("..")
             && p.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     })
+}
+
+/// True iff `p` contains a `..` component. Catches both literal `..`
+/// segments and `..` embedded in a longer name (per Path's component
+/// semantics, only the literal `..` segment counts as a parent ref —
+/// but we reject either way for defence in depth).
+fn path_has_parent_dir(p: &std::path::Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+        || p.to_string_lossy().contains("/..")
+        || p.to_string_lossy().starts_with("..")
 }
 
 fn is_supported_quant(q: &str) -> bool {
@@ -364,6 +393,49 @@ mod tests {
         let mut s = good_spec();
         s.output_dir = PathBuf::from("relative/path");
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_output_dir_with_parent_segment() {
+        let mut s = good_spec();
+        s.output_dir = PathBuf::from("/tmp/../etc/cron.d");
+        assert!(
+            s.validate().is_err(),
+            "absolute path with .. segment must reject"
+        );
+    }
+
+    #[test]
+    fn rejects_relative_dataset_path() {
+        let mut s = good_spec();
+        s.dataset = DatasetSource::JsonlPath {
+            path: PathBuf::from("relative/data.jsonl"),
+        };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_dataset_path_with_parent_segment() {
+        let mut s = good_spec();
+        s.dataset = DatasetSource::JsonlPath {
+            path: PathBuf::from("/tmp/../etc/passwd"),
+        };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_base_model_with_dotdot_in_name() {
+        let mut s = good_spec();
+        s.base_model = "org/...".into();
+        assert!(
+            s.validate().is_err(),
+            "three-dot segment must reject (contains '..')"
+        );
+        s.base_model = "or..g/name".into();
+        assert!(
+            s.validate().is_err(),
+            "embedded '..' in org segment must reject"
+        );
     }
 
     #[test]
