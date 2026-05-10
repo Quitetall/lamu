@@ -27,13 +27,17 @@
 pub mod artifact;
 pub mod cache;
 pub mod error;
+pub mod executor;
+pub mod plan;
 pub mod resource;
 pub mod stage;
 pub mod status;
 
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
-pub use cache::CacheHandle;
+pub use cache::{CacheHandle, CacheHit};
 pub use error::{PlanError, RecipeError, StageError};
+pub use executor::{ExecCtx, PlanResult, SequentialExecutor};
+pub use plan::{NodeId, Plan};
 pub use resource::Resource;
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};
-pub use status::{StageEvent, make_broadcast};
+pub use status::{make_broadcast, spawn_status_writer, StageEvent};

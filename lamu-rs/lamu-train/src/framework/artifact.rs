@@ -340,6 +340,23 @@ impl ArtifactMetadata {
 // `S: Stage<Input = (A, B)>`, and that requires
 // `(A, B): Artifact`. Generic blanket impls give us exactly that.
 
+/// `()` is the canonical "no upstream input" artifact. Used as
+/// `Stage::Input = ()` for graph-input stages
+/// (`materialize_conversations`, `materialize_dataset_path`, etc.)
+/// that take their data from outside the plan rather than from a
+/// predecessor stage. The hash is the SHA-256 of the empty byte
+/// string so cache keys are stable; primary_path is empty.
+impl Artifact for () {
+    const KIND: &'static str = "()";
+    const SCHEMA: u32 = 1;
+    fn content_hash(&self) -> ContentHash {
+        ContentHash::of_bytes(&[])
+    }
+    fn primary_path(&self) -> &Path {
+        Path::new("")
+    }
+}
+
 // Tuple hashes are domain-separated by arity: every tuple's hash
 // starts with `b"tuple"` and the arity as a u8. Without this, a
 // 2-tuple and a 3-tuple whose concatenated child-hashes happen to
@@ -600,6 +617,16 @@ mod tests {
         // Compile-time check that the impls disambiguate by arity.
         assert_eq!(<(TestArt, TestArt) as Artifact>::KIND, "tuple<2>");
         assert_eq!(<(TestArt, TestArt, TestArt) as Artifact>::KIND, "tuple<3>");
+    }
+
+    #[test]
+    fn unit_artifact_round_trips() {
+        let h: ContentHash = ().content_hash();
+        assert_eq!(h, ContentHash::of_bytes(&[]));
+        assert_eq!(<() as Artifact>::KIND, "()");
+        // serde round trip
+        let json = serde_json::to_value(&()).unwrap();
+        let _: () = serde_json::from_value(json).unwrap();
     }
 
     #[test]
