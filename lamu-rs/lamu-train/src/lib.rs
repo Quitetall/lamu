@@ -30,6 +30,7 @@
 // mutations for hermetic env-injection patterns.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod artifacts;
 pub mod backend;
 pub mod conversations;
 pub mod convert;
@@ -41,7 +42,9 @@ pub mod paths;
 pub mod policy;
 pub mod protocol;
 pub mod python_backend;
+pub mod recipes;
 pub mod spec;
+pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.
 /// Multiple test modules touch `LAMU_TRAIN_*` env vars; without a
