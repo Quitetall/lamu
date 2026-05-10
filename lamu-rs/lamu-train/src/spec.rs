@@ -169,9 +169,10 @@ impl TrainSpec {
         if self.base_model.trim().is_empty() {
             return Err(TrainError::invalid_spec("base_model is empty"));
         }
-        if !self.base_model.contains('/') {
+        if !is_safe_hf_repo_id(&self.base_model) {
             return Err(TrainError::invalid_spec(format!(
-                "base_model '{}' is not a HuggingFace repo id (expected 'org/name')",
+                "base_model '{}' is not a safe HuggingFace repo id \
+                 (expected 'org/name', no path traversal, no leading slash)",
                 self.base_model
             )));
         }
@@ -180,12 +181,19 @@ impl TrainSpec {
         }
         if !is_safe_registry_name(&self.output_name) {
             return Err(TrainError::invalid_spec(format!(
-                "output_name '{}' must match [A-Za-z0-9_.-]+",
+                "output_name '{}' must match [A-Za-z0-9_.-]+ \
+                 (no leading dot/dash, no '..')",
                 self.output_name
             )));
         }
         if self.output_dir.as_os_str().is_empty() {
             return Err(TrainError::invalid_spec("output_dir is empty"));
+        }
+        if !self.output_dir.is_absolute() {
+            return Err(TrainError::invalid_spec(format!(
+                "output_dir '{}' must be an absolute path",
+                self.output_dir.display()
+            )));
         }
         self.method.validate()?;
         match &self.dataset {
@@ -244,6 +252,35 @@ fn is_safe_registry_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         && !name.starts_with('.')
         && !name.starts_with('-')
+        && !name.contains("..")
+}
+
+/// Accept the standard HuggingFace `org/name` shape only. Rejects:
+///   - empty / whitespace
+///   - missing `/`
+///   - leading `/` (absolute path coercion attempts)
+///   - `..` segment (path traversal)
+///   - other path separators (`\`, NUL)
+///   - more than one `/` (sub-paths inside a repo aren't valid repo ids)
+fn is_safe_hf_repo_id(repo: &str) -> bool {
+    let trimmed = repo.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return false;
+    }
+    if trimmed.contains('\\') || trimmed.contains('\0') {
+        return false;
+    }
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty()
+            && *p != "."
+            && *p != ".."
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    })
 }
 
 fn is_supported_quant(q: &str) -> bool {
@@ -310,6 +347,52 @@ mod tests {
     fn rejects_unsafe_output_name_dot_prefix() {
         let mut s = good_spec();
         s.output_name = ".hidden".into();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_output_name_double_dot() {
+        let mut s = good_spec();
+        s.output_name = "a..b".into();
+        assert!(s.validate().is_err(), "registry name with '..' must reject");
+        s.output_name = "..".into();
+        assert!(s.validate().is_err(), "registry name '..' must reject");
+    }
+
+    #[test]
+    fn rejects_relative_output_dir() {
+        let mut s = good_spec();
+        s.output_dir = PathBuf::from("relative/path");
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_base_model_with_dotdot() {
+        let mut s = good_spec();
+        s.base_model = "../etc/passwd".into();
+        assert!(s.validate().is_err());
+        s.base_model = "org/..".into();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_base_model_with_leading_slash() {
+        let mut s = good_spec();
+        s.base_model = "/abs/path".into();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_base_model_with_too_many_slashes() {
+        let mut s = good_spec();
+        s.base_model = "org/name/sub".into();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_base_model_with_backslash() {
+        let mut s = good_spec();
+        s.base_model = "org\\name".into();
         assert!(s.validate().is_err());
     }
 
