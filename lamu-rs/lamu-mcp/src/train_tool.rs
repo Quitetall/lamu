@@ -53,52 +53,68 @@ fn resolve_train_binary() -> Result<PathBuf, String> {
 }
 
 /// Parse the `since` arg. Accepts humantime durations (`30d`,
-/// `7d`, `12h`, etc.). Empty / missing → default 30 days.
+/// `7d`, `12h`, etc.). Empty / missing → default 30 days. Caps at
+/// `MAX_SINCE` so a stray "100y" doesn't silently saturate to
+/// "all conversations since epoch" via SystemTime::checked_sub
+/// underflow.
+const MAX_SINCE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60); // 10 years
+
 fn parse_since(s: Option<&str>) -> Result<Duration, String> {
     let raw = s.unwrap_or("30d").trim();
     if raw.is_empty() {
         return Ok(Duration::from_secs(30 * 24 * 60 * 60));
     }
-    humantime::parse_duration(raw).map_err(|e| format!("--since '{raw}': {e}"))
+    let d = humantime::parse_duration(raw).map_err(|e| format!("--since '{raw}': {e}"))?;
+    if d > MAX_SINCE {
+        return Err(format!(
+            "--since '{raw}' exceeds the 10-year cap. \
+             That's almost certainly more history than the user has, \
+             and silently saturating would surprise the caller."
+        ));
+    }
+    Ok(d)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DatasetEstimate {
+    n_convs: usize,
+    n_turns: usize,
+    n_filtered_errors: usize,
+    n_filtered_oversize: usize,
 }
 
 /// Group `recall_since` rows by conversation id, applying the same
 /// filter rules as `lamu-train::conversations::dump_to_jsonl` so
-/// the estimate matches what the trainer will actually see.
-fn estimate_dataset(cutoff_unix_secs: i64) -> Result<(usize, usize), String> {
+/// the estimate matches what the trainer will actually see. The
+/// HashMap ordering doesn't matter — we only count.
+fn estimate_dataset(cutoff_unix_secs: i64) -> Result<DatasetEstimate, String> {
     const MIN_TURNS: usize = 4;
     let mem = memory::shared().map_err(|e| format!("open memory: {e}"))?;
     let rows = mem
         .recall_since(cutoff_unix_secs)
         .map_err(|e| format!("recall_since: {e}"))?;
 
-    let mut by_conv: std::collections::BTreeMap<String, Vec<()>> =
-        std::collections::BTreeMap::new();
-    let mut error_rows = 0usize;
-    let mut oversize_rows = 0usize;
+    let mut by_conv: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut est = DatasetEstimate::default();
     for (conv, turn) in rows {
         if turn.content.starts_with("error:") {
-            error_rows += 1;
+            est.n_filtered_errors += 1;
             continue;
         }
         if turn.content.len() > 200 * 1024 {
-            oversize_rows += 1;
+            est.n_filtered_oversize += 1;
             continue;
         }
-        by_conv.entry(conv).or_default().push(());
+        *by_conv.entry(conv).or_insert(0) += 1;
     }
-    let mut n_convs = 0usize;
-    let mut n_turns = 0usize;
-    for (_, turns) in by_conv {
-        if turns.len() >= MIN_TURNS {
-            n_convs += 1;
-            n_turns += turns.len();
+    for (_, count) in by_conv {
+        if count >= MIN_TURNS {
+            est.n_convs += 1;
+            est.n_turns += count;
         }
     }
-    let _ = (error_rows, oversize_rows); // counts available if we
-                                          // ever want to surface them
-                                          // in the estimate
-    Ok((n_convs, n_turns))
+    Ok(est)
 }
 
 /// Validate the output_name. Must be a safe registry name —
@@ -171,8 +187,18 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
         return format!("error: method '{method}' must be one of qlora|lora|full");
     }
 
-    let since_str = args.get("since").and_then(|v| v.as_str());
-    let since = match parse_since(since_str) {
+    let since_raw = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .unwrap_or("30d")
+        .trim()
+        .to_string();
+    let since_str = if since_raw.is_empty() {
+        "30d".to_string()
+    } else {
+        since_raw.clone()
+    };
+    let since = match parse_since(Some(&since_str)) {
         Ok(d) => d,
         Err(e) => return format!("error: {e}"),
     };
@@ -189,32 +215,44 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let (n_convs, n_turns) = match estimate_dataset(cutoff) {
+    let est = match estimate_dataset(cutoff) {
         Ok(c) => c,
         Err(e) => return format!("error: estimate dataset: {e}"),
     };
 
     if !confirm {
+        let mut filter_note = String::new();
+        if est.n_filtered_errors > 0 || est.n_filtered_oversize > 0 {
+            filter_note = format!(
+                "\nFiltered out before grouping: {} 'error:'-prefixed turns, \
+                 {} oversize (>200 KiB) turns.",
+                est.n_filtered_errors, est.n_filtered_oversize
+            );
+        }
         return format!(
             "error: training is expensive (30 min – 4 h, locks the GPU). \
              Pass confirm=true to proceed.\n\
-             Estimated dataset over the last {}: {} conversations, {} turns.\n\
+             Estimated dataset over the last {}: {} conversations, {} turns.{}\n\
              Output model would land in the registry as '{}'.\n\
              GPU will be unavailable to inference (`query`, HTTP server, \
              `lamu run`) until the run completes; clients return a clear \
              error and can pass --allow-evict to wait.",
             humantime::format_duration(since),
-            n_convs,
-            n_turns,
+            est.n_convs,
+            est.n_turns,
+            filter_note,
             output_name
         );
     }
 
-    if n_convs == 0 {
+    if est.n_convs == 0 {
         return format!(
             "error: no usable conversations in the last {}. \
-             A usable conversation has at least 4 non-error, non-oversize turns.",
-            humantime::format_duration(since)
+             A usable conversation has at least 4 non-error, non-oversize turns. \
+             ({} 'error:' turns, {} oversize turns filtered out.)",
+            humantime::format_duration(since),
+            est.n_filtered_errors,
+            est.n_filtered_oversize
         );
     }
 
@@ -224,12 +262,17 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
         Err(e) => return format!("error: {e}"),
     };
 
-    let since_arg = humantime::format_duration(since).to_string();
+    // Pass the user's raw `since` string straight through —
+    // re-formatting via humantime would round-trip through a
+    // potentially-different parser on the lamu-train side, and a
+    // mismatch between the estimate (computed here from `since`)
+    // and the trainer's view (parsed from this string) would be
+    // a confusing surprise.
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg(&output_name)
         .arg("--from-conversations")
         .arg("--since")
-        .arg(&since_arg)
+        .arg(&since_str)
         .arg("--base")
         .arg(&base_model)
         .arg("--method")
@@ -237,7 +280,10 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
         .arg("--background")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // Pipe stderr (NOT /dev/null) so a startup crash is
+        // recoverable via tracing instead of vanishing into
+        // the void. The drain task forwards each line.
+        .stderr(Stdio::piped());
 
     // Detach: do NOT kill on drop, do NOT wait on the child. The
     // training process must outlive the MCP request. We fire-and-
@@ -246,21 +292,29 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
     cmd.kill_on_drop(false);
 
     match cmd.spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
-            // Drop the Child handle in a background task that
-            // wait()s on it. Without this, the child becomes a
-            // zombie until the lamu-mcp daemon exits. The task
-            // outlives this request — fine, since our daemon is
-            // long-lived and one task per training run is cheap.
-            let mut child = child;
+            let stderr = child.stderr.take();
+            // Background task drains the child's stderr to tracing
+            // so a crashed trainer leaves a trail, then waits for
+            // exit so the child doesn't become a zombie. One task
+            // per run; cheap.
             tokio::spawn(async move {
+                if let Some(stderr) = stderr {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        tracing::info!(target: "lamu_mcp::train_spawn", "{}", line);
+                    }
+                }
                 let _ = child.wait().await;
             });
             format!(
                 "training started: pid={pid}, output_name='{output_name}'.\n\
                  Run `lamu-train jobs` to find the job id, \
-                 `lamu-train log <id>` for live progress."
+                 `lamu-train log <id>` for live progress.\n\
+                 Stderr from the spawned binary is logged under \
+                 target=lamu_mcp::train_spawn (RUST_LOG=lamu_mcp=info)."
             )
         }
         Err(e) => format!("error: spawn lamu-train: {e}"),
@@ -293,6 +347,19 @@ mod tests {
     #[test]
     fn parse_since_invalid_errors() {
         assert!(parse_since(Some("nonsense")).is_err());
+    }
+
+    #[test]
+    fn parse_since_rejects_above_max_cap() {
+        let r = parse_since(Some("100y"));
+        assert!(r.is_err(), "100y should exceed the 10-year cap");
+        assert!(format!("{}", r.unwrap_err()).contains("10-year cap"));
+    }
+
+    #[test]
+    fn parse_since_accepts_at_or_below_max_cap() {
+        let r = parse_since(Some("9y"));
+        assert!(r.is_ok(), "9y should fit");
     }
 
     #[test]
