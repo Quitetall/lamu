@@ -69,6 +69,18 @@ pub enum StageError {
         source: serde_json::Error,
     },
 
+    /// Erased dispatch: args JSON did not deserialize into the
+    /// stage's expected `Args` type. Distinct from `InputDeserialize`
+    /// so log readers + the CLI can tell "bad artifact" from "bad
+    /// recipe args". The latter is usually a recipe bug; the former
+    /// is usually a schema mismatch between producer + consumer.
+    #[error("args deserialize failed for stage '{stage}': {source}")]
+    ArgsDeserialize {
+        stage: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// Erased dispatch: stage produced an output that didn't
     /// serialize. Should be impossible if the output type derives
     /// `Serialize` correctly; here for completeness.

@@ -266,9 +266,12 @@ impl<S: Stage> StageDyn for S {
         })?;
 
         // 2. Decode args. Args validation is the stage's own
-        //    concern beyond serde — we just deserialize.
+        //    concern beyond serde — we just deserialize. Distinct
+        //    error variant from input deserialization so log
+        //    readers can disambiguate "bad recipe args" from "bad
+        //    upstream artifact".
         let typed_args: S::Args = serde_json::from_value(args).map_err(|source| {
-            StageError::InputDeserialize {
+            StageError::ArgsDeserialize {
                 stage: S::NAME,
                 source,
             }
@@ -454,13 +457,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn erased_dispatch_bad_args_returns_input_deserialize() {
+    async fn erased_dispatch_bad_args_returns_args_deserialize() {
         let ctx = ctx();
         let s: Box<dyn StageDyn> = Box::new(WordCount);
         let input = ErasedArtifact::from_typed(&Words { text: "x".into() }).unwrap();
-        // Args expects a `delimiter` String — pass an int.
+        // Args expects a `delimiter` String — pass an int. Must
+        // surface as ArgsDeserialize, NOT InputDeserialize, so log
+        // readers can tell "bad recipe args" from "bad upstream
+        // artifact".
         let bad_args = serde_json::json!({"delimiter": 42});
         let r = s.run_erased(&ctx, input, bad_args).await;
+        match r {
+            Err(StageError::ArgsDeserialize { stage, .. }) => {
+                assert_eq!(stage, "word_count");
+            }
+            other => panic!("wrong variant: {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn erased_dispatch_bad_input_returns_input_deserialize() {
+        let ctx = ctx();
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        // Hand-craft an input whose kind matches but whose payload
+        // doesn't deserialize as Words.
+        let bad_input = ErasedArtifact {
+            kind: "test.words".into(),
+            schema: 1,
+            payload: serde_json::json!({"text": 12345}),
+        };
+        let good_args = serde_json::json!({"delimiter": " "});
+        let r = s.run_erased(&ctx, bad_input, good_args).await;
         match r {
             Err(StageError::InputDeserialize { stage, .. }) => {
                 assert_eq!(stage, "word_count");
