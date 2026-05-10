@@ -1,18 +1,18 @@
 [package]
-name = "lamu-train"
+name = "blut"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Local fine-tuning subsystem — trainer specs, lifecycle, and runner backends"
+description = "BLUT — Brian Lam's Universal Trainer. Stage→Plan→Recipe orchestrator framework for local ML training (SFT, DPO, distillation, eval)."
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
-name = "lamu-train"
+name = "blut"
 path = "src/main.rs"
 
 [dependencies]

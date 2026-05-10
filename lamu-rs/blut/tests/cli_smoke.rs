@@ -15,7 +15,7 @@ fn binary() -> PathBuf {
     // Cargo puts the binary at target/<profile>/<name> when running
     // integration tests; CARGO_BIN_EXE_<name> is the env var Cargo
     // sets so tests don't have to guess the profile dir.
-    PathBuf::from(env!("CARGO_BIN_EXE_lamu-train"))
+    PathBuf::from(env!("CARGO_BIN_EXE_blut"))
 }
 
 #[test]
@@ -201,8 +201,8 @@ fn data_rm_unknown_errors() {
 
 #[test]
 fn log_subcommand_renders_status() {
-    use lamu_train::jobs::{self, JobState};
-    use lamu_train::protocol::StatusUpdate;
+    use blut::jobs::{self, JobState};
+    use blut::protocol::StatusUpdate;
     use std::path::PathBuf;
 
     let _g = ENV_LOCK.lock().unwrap();

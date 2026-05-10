@@ -213,6 +213,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "blut"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "dirs",
+ "humantime",
+ "lamu-core",
+ "nix 0.29.0",
+ "parking_lot",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1429,33 +1456,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
-]
-
-[[package]]
-name = "lamu-train"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "dirs",
- "humantime",
- "lamu-core",
- "nix 0.29.0",
- "parking_lot",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

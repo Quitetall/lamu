@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use lamu_core::scheduler_lock::{self, LockKind};
-use lamu_train::{
+use blut::{
     backend::{StatusFn, TrainBackend},
     convert,
     jobs::{self, JobState},
@@ -257,8 +257,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
-    use lamu_train::framework::{ExecCtx, SequentialExecutor};
-    use lamu_train::recipes::recipe::{find as find_recipe, RECIPES};
+    use blut::framework::{ExecCtx, SequentialExecutor};
+    use blut::recipes::recipe::{find as find_recipe, RECIPES};
     match cmd {
         RecipeCommand::List => {
             println!("{:<32} {}", "name", "description");
@@ -286,11 +286,11 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             let plan = (r.compile_fn)(raw)
                 .map_err(|e| anyhow!("recipe compile failed: {e}"))?;
 
-            let job_id = lamu_train::jobs::new_job_id();
-            let job_dir = lamu_train::paths::job_dir(&job_id)?;
+            let job_id = blut::jobs::new_job_id();
+            let job_dir = blut::paths::job_dir(&job_id)?;
             let mut ctx = ExecCtx::new(job_dir.clone());
             if shared_cache {
-                if let Some(global) = lamu_train::framework::CacheHandle::default_global_path() {
+                if let Some(global) = blut::framework::CacheHandle::default_global_path() {
                     std::fs::create_dir_all(&global).with_context(|| {
                         format!("create global cache dir {}", global.display())
                     })?;
@@ -314,7 +314,7 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
 }
 
 async fn run_auto() -> Result<()> {
-    use lamu_train::{conversations, policy};
+    use blut::{conversations, policy};
 
     let pol = policy::load().context("load policy")?;
     let (now_unix, now_local_min) = policy::current_clock();
@@ -343,7 +343,7 @@ async fn run_auto() -> Result<()> {
             );
             let bin = std::env::current_exe()
                 .context("locate own binary for auto-spawn")?;
-            let auto_name = format!("auto-{}", lamu_train::jobs::new_job_id());
+            let auto_name = format!("auto-{}", blut::jobs::new_job_id());
             let mut cmd = tokio::process::Command::new(&bin);
             cmd.arg(&auto_name)
                 .arg("--from-conversations")
@@ -403,7 +403,7 @@ async fn run_auto() -> Result<()> {
 }
 
 fn run_policy(cmd: PolicyCommand) -> Result<()> {
-    use lamu_train::policy;
+    use blut::policy;
     match cmd {
         PolicyCommand::Show => {
             let p = policy::load().context("load policy")?;
@@ -450,7 +450,7 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
 }
 
 fn run_data(cmd: DataCommand) -> Result<()> {
-    use lamu_train::datasets_db;
+    use blut::datasets_db;
     let conn = datasets_db::open()?;
     match cmd {
         DataCommand::List => {
@@ -516,9 +516,9 @@ fn register_dataset(
     kind: &str,
     metadata: Option<String>,
 ) -> Result<()> {
-    let conn = lamu_train::datasets_db::open()?;
-    let rec = lamu_train::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
-    lamu_train::datasets_db::add(&conn, &rec)?;
+    let conn = blut::datasets_db::open()?;
+    let rec = blut::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
+    blut::datasets_db::add(&conn, &rec)?;
     Ok(())
 }
 
@@ -540,7 +540,7 @@ fn init_tracing() {
     let _ = fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,lamu_train=info,hyper=warn,reqwest=warn")),
+                .unwrap_or_else(|_| EnvFilter::new("info,blut=info,hyper=warn,reqwest=warn")),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
@@ -574,7 +574,7 @@ async fn run_train(args: TrainArgs) -> Result<()> {
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("create {}", data_dir.display()))?;
             let out_path = data_dir.join(format!("{job_id}.jsonl"));
-            let stats = lamu_train::conversations::dump_to_jsonl(
+            let stats = blut::conversations::dump_to_jsonl(
                 args.since,
                 &out_path,
             )

@@ -6,7 +6,7 @@ members = [
     "lamu-api",
     "lamu-cli",
     "lamu-providers",
-    "lamu-train",
+    "blut",
 ]
 
 [workspace.package]

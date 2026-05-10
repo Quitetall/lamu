@@ -1,4 +1,4 @@
-//! Integration test for `lamu_train::convert::convert_to_gguf`.
+//! Integration test for `blut::convert::convert_to_gguf`.
 //!
 //! No real llama.cpp required: creates a fake `LAMU_LLAMACPP_DIR`
 //! containing shell stubs for `convert_hf_to_gguf.py` (parses argv,
@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use lamu_train::convert::convert_to_gguf;
+use blut::convert::convert_to_gguf;
 
 // All env-var mutating tests in this binary serialize on this lock
 // because $LAMU_LLAMACPP_DIR is process-global.

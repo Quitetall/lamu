@@ -2,7 +2,7 @@
 //!
 //! Pulls turns from LAMU's read-only conversations.db and writes a
 //! filtered JSONL training set to the stage_dir. Wraps
-//! `lamu_train::conversations::dump_to_jsonl` so the
+//! `blut::conversations::dump_to_jsonl` so the
 //! filter / sha256 / count logic stays in one place.
 
 use std::time::Duration;

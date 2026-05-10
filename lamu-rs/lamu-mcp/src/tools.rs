@@ -482,7 +482,7 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "train_from_conversations",
-        description: "Fine-tune a local model on the user's recent conversation history. EXPENSIVE: 30 min – 4 h depending on dataset size; locks the GPU exclusively for the run. First call without `confirm: true` returns the dataset estimate (conversation count + turn count) so the caller can decide. With `confirm: true`, shells out to the `lamu-train` binary in detached background mode and returns immediately — check `lamu-train jobs` for the resulting job id. The MCP server does NOT depend on lamu-train; the binary must be installed separately (cargo install --path lamu-rs/lamu-train) or located via $LAMU_TRAIN_BIN.",
+        description: "Fine-tune a local model on the user's recent conversation history. EXPENSIVE: 30 min – 4 h depending on dataset size; locks the GPU exclusively for the run. First call without `confirm: true` returns the dataset estimate (conversation count + turn count) so the caller can decide. With `confirm: true`, shells out to the `blut` binary (BLUT — Brian Lam's Universal Trainer) in detached background mode and returns immediately — check `blut jobs` for the resulting job id. The MCP server does NOT depend on blut; the binary must be installed separately (cargo install --path lamu-rs/blut) or located via $BLUT_BIN. ($LAMU_TRAIN_BIN remains accepted as a back-compat alias.)",
         schema_fn: schema_train_from_conversations,
         handler: HandlerKind::Free(dispatch_train_from_conversations),
     },

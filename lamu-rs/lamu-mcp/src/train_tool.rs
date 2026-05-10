@@ -33,22 +33,31 @@ use serde_json::Value;
 
 use crate::memory;
 
-/// Locate the `lamu-train` binary. Resolution:
-///   1. `$LAMU_TRAIN_BIN` env (explicit override; useful for tests
-///      and bespoke installs)
-///   2. `lamu-train` on `$PATH` via `which`
+/// Locate the `blut` (BLUT — Brian Lam's Universal Trainer)
+/// binary. Resolution:
+///   1. `$BLUT_BIN` env (preferred new name)
+///   2. `$LAMU_TRAIN_BIN` env (back-compat alias from pre-v2)
+///   3. `blut` on `$PATH` via `which`
+///   4. `lamu-train` on `$PATH` (fallback for environments where
+///      the user hasn't reinstalled yet)
 ///
 /// Errors with the env var name in the message so users have one
 /// sentence to fix.
 fn resolve_train_binary() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("BLUT_BIN") {
+        return Ok(PathBuf::from(p));
+    }
     if let Ok(p) = std::env::var("LAMU_TRAIN_BIN") {
         return Ok(PathBuf::from(p));
     }
+    if let Ok(p) = which::which("blut") {
+        return Ok(p);
+    }
     which::which("lamu-train")
         .map_err(|e| format!(
-            "lamu-train binary not found on $PATH: {e}. \
-             Install via `cargo install --path lamu-rs/lamu-train` \
-             or set $LAMU_TRAIN_BIN."
+            "blut binary not found on $PATH: {e}. \
+             Install via `cargo install --path lamu-rs/blut` \
+             or set $BLUT_BIN."
         ))
 }
 
@@ -312,14 +321,14 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
             });
             format!(
                 "training started: pid={pid}, output_name='{output_name}'.\n\
-                 Run `lamu-train jobs` to find the job id, \
-                 `lamu-train log <id>` for live progress.\n\
+                 Run `blut jobs` to find the job id, \
+                 `blut log <id>` for live progress.\n\
                  Stderr from the spawned binary is logged under \
                  target=lamu_mcp::train_spawn at debug level — set \
                  RUST_LOG=lamu_mcp::train_spawn=debug to surface."
             )
         }
-        Err(e) => format!("error: spawn lamu-train: {e}"),
+        Err(e) => format!("error: spawn blut: {e}"),
     }
 }
 

@@ -146,7 +146,7 @@ impl TrainBackend for PythonTrainBackend {
         let stderr_reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                tracing::info!(target: "lamu_train::trainer_stderr", "{}", line);
+                tracing::info!(target: "blut::trainer_stderr", "{}", line);
             }
         });
 

@@ -149,8 +149,8 @@ impl<O: Artifact> Plan<O> {
     /// // Skipping a step in the middle of a typed chain must fail.
     /// // Stage A: () -> DataA. Stage C: DataB -> DataC. Chaining
     /// // C directly after A skips the required A->B step.
-    /// # use lamu_train::framework::*;
-    /// # use lamu_train::framework::plan::Plan;
+    /// # use blut::framework::*;
+    /// # use blut::framework::plan::Plan;
     /// # use async_trait::async_trait;
     /// # use serde::{Serialize, Deserialize};
     /// # use std::path::Path;
