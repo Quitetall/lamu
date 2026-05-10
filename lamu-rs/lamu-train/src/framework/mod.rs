@@ -34,7 +34,7 @@ pub mod stage;
 pub mod status;
 
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
-pub use cache::{CacheHandle, CacheHit};
+pub use cache::{lru_prune, CacheHandle, CacheHit};
 pub use error::{PlanError, RecipeError, StageError};
 pub use executor::{ExecCtx, PlanResult, SequentialExecutor};
 pub use plan::{NodeId, Plan};
