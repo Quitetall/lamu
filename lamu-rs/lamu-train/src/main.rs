@@ -66,6 +66,15 @@ enum Command {
         #[command(subcommand)]
         cmd: DataCommand,
     },
+    /// Cron entry point: read train-policy.toml, decide whether
+    /// to spawn a training run, exit. Prints the decision reason
+    /// on stdout regardless of outcome (for cron log readers).
+    Auto,
+    /// Inspect or modify the auto-trigger policy.
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -91,6 +100,18 @@ enum DataCommand {
     Show {
         name: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// Print the current policy (TOML).
+    Show,
+    /// Set enabled=true and write the policy file. Prints a
+    /// suggested cron line on success.
+    Enable,
+    /// Set enabled=false. The policy file is preserved so
+    /// thresholds + cooldowns aren't lost on re-enable.
+    Disable,
 }
 
 #[derive(Args, Debug)]
@@ -200,8 +221,111 @@ async fn main() -> Result<()> {
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail }) => run_log(&id, tail),
         Some(Command::Data { cmd }) => run_data(cmd),
+        Some(Command::Auto) => run_auto().await,
+        Some(Command::Policy { cmd }) => run_policy(cmd),
         None => run_train(cli.train_args).await,
     }
+}
+
+async fn run_auto() -> Result<()> {
+    use lamu_train::{conversations, policy};
+
+    let pol = policy::load().context("load policy")?;
+    let (now_unix, now_local_min) = policy::current_clock();
+    let lock_held = lamu_core::scheduler_lock::check_unlocked().is_err();
+    let new_turns = conversations::count_turns_since(pol.last_train_ts).unwrap_or(0);
+
+    let decision = policy::decide(&pol, now_unix, now_local_min, new_turns, lock_held);
+    match decision {
+        policy::Decision::Skip(reason) => {
+            println!("auto: {reason}");
+            return Ok(());
+        }
+        policy::Decision::Run { base, method, since } => {
+            println!(
+                "auto: triggering training (new_turns={new_turns}, threshold={})",
+                pol.threshold_new_turns
+            );
+            let bin = std::env::current_exe()
+                .context("locate own binary for auto-spawn")?;
+            let auto_name = format!("auto-{}", lamu_train::jobs::new_job_id());
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.arg(&auto_name)
+                .arg("--from-conversations")
+                .arg("--since").arg(&since)
+                .arg("--base").arg(&base)
+                .arg("--method").arg(&method)
+                .arg("--background")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(false);
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let pid = child.id().unwrap_or(0);
+                    println!(
+                        "auto: spawned lamu-train pid={pid} as '{auto_name}'"
+                    );
+                    // Update last_train_ts at spawn time. Failed
+                    // runs still count toward cooldown — better
+                    // than retrying immediately on every cron tick
+                    // when something's broken.
+                    let mut updated = pol.clone();
+                    updated.last_train_ts = now_unix;
+                    updated.last_train_n_turns = new_turns;
+                    if let Err(e) = policy::save(&updated) {
+                        tracing::warn!("failed to update last_train_ts: {e}");
+                    }
+                    // Reap the zombie when training finishes;
+                    // cron-driven `auto` exits while the child runs.
+                    tokio::spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                }
+                Err(e) => return Err(anyhow!("spawn lamu-train: {e}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_policy(cmd: PolicyCommand) -> Result<()> {
+    use lamu_train::policy;
+    match cmd {
+        PolicyCommand::Show => {
+            let p = policy::load().context("load policy")?;
+            print!(
+                "{}",
+                toml::to_string_pretty(&p)
+                    .map_err(|e| anyhow!("serialize policy: {e}"))?
+            );
+            let path = policy::policy_path()?;
+            eprintln!("# loaded from: {}", path.display());
+        }
+        PolicyCommand::Enable => {
+            let mut p = policy::load().context("load policy")?;
+            p.enabled = true;
+            policy::validate(&p).context("validate policy")?;
+            policy::save(&p).context("save policy")?;
+            let path = policy::policy_path()?;
+            println!("auto-trigger enabled (policy: {})", path.display());
+            println!();
+            println!("# Add to crontab so the heuristic runs every 30 min:");
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "lamu-train".into());
+            println!(
+                "*/30 * * * * {exe} auto >> ~/.local/share/lamu/train-auto.log 2>&1"
+            );
+        }
+        PolicyCommand::Disable => {
+            let mut p = policy::load().context("load policy")?;
+            p.enabled = false;
+            policy::save(&p).context("save policy")?;
+            println!("auto-trigger disabled");
+        }
+    }
+    Ok(())
 }
 
 fn run_data(cmd: DataCommand) -> Result<()> {

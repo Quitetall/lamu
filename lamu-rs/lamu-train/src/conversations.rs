@@ -208,6 +208,37 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
     })
 }
 
+/// Cheap raw count of turns at or after `cutoff_unix_secs`. Does
+/// not apply filtering — intended for the auto-trigger
+/// `threshold_new_turns` gate where we want a fast "have things
+/// happened since last train" check, not a precise dataset
+/// estimate.
+pub fn count_turns_since(cutoff_unix_secs: i64) -> Result<i64> {
+    count_turns_since_at(&memory_db_path()?, cutoff_unix_secs)
+}
+
+pub fn count_turns_since_at(db_path: &Path, cutoff_unix_secs: i64) -> Result<i64> {
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| TrainError::DatasetUnresolvable(format!(
+        "open {} read-only: {e}",
+        db_path.display()
+    )))?;
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE ts >= ?",
+            params![cutoff_unix_secs],
+            |r| r.get(0),
+        )
+        .map_err(|e| TrainError::other(format!("count_turns_since: {e}")))?;
+    Ok(n)
+}
+
 /// Dry-run variant: count what `dump_to_jsonl` would emit without
 /// writing. Used by the future MCP `train_from_conversations`
 /// confirmation gate to estimate dataset size before the user opts in.

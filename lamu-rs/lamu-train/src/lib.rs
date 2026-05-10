@@ -37,6 +37,7 @@ pub mod datasets_db;
 pub mod error;
 pub mod jobs;
 pub mod paths;
+pub mod policy;
 pub mod protocol;
 pub mod python_backend;
 pub mod spec;
