@@ -35,6 +35,7 @@ pub mod conversations;
 pub mod convert;
 pub mod datasets_db;
 pub mod error;
+pub mod framework;
 pub mod jobs;
 pub mod paths;
 pub mod policy;
