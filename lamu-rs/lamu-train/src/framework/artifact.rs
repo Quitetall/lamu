@@ -268,17 +268,25 @@ impl ArtifactMetadata {
     /// path is `primary`. Files get `<primary>.metadata.json`;
     /// directories get `<primary>/.lamu-meta.json` (leading dot
     /// keeps it out of recursive content-hash walks).
+    ///
+    /// Convention: callers must write the primary artifact BEFORE
+    /// calling `write_alongside`. The dir/file branch is decided by
+    /// querying the primary path on disk; calling early would
+    /// classify a not-yet-existing dir as a file. This matches the
+    /// natural lifecycle (stage produces output → writes sidecar
+    /// last) so it's rarely a footgun in practice.
     pub fn sidecar_path_for(primary: &Path) -> PathBuf {
         if primary.is_dir() {
             primary.join(".lamu-meta.json")
         } else {
-            let mut p = primary.to_path_buf();
-            // OsString append is awkward; reach for display + push.
-            // Lossy is fine — the sidecar location is informational.
+            // Append `.metadata.json` to the raw OsString so paths
+            // with no extension and paths with multiple dots both
+            // round-trip correctly. `with_extension` would replace
+            // an existing one, which is wrong for `data.jsonl` →
+            // `data.metadata.json` (we want `.jsonl.metadata.json`).
             let mut s = primary.as_os_str().to_os_string();
             s.push(".metadata.json");
-            p = PathBuf::from(s);
-            p
+            PathBuf::from(s)
         }
     }
 
@@ -332,12 +340,21 @@ impl ArtifactMetadata {
 // `S: Stage<Input = (A, B)>`, and that requires
 // `(A, B): Artifact`. Generic blanket impls give us exactly that.
 
+// Tuple hashes are domain-separated by arity: every tuple's hash
+// starts with `b"tuple"` and the arity as a u8. Without this, a
+// 2-tuple and a 3-tuple whose concatenated child-hashes happen to
+// align could collide — vanishingly unlikely under SHA-256, but
+// cheap insurance and makes the hash space self-documenting.
+const TUPLE_DOMAIN: &[u8] = b"tuple";
+
 impl<A: Artifact, B: Artifact> Artifact for (A, B) {
     const KIND: &'static str = "tuple<2>";
     const SCHEMA: u32 = 1;
 
     fn content_hash(&self) -> ContentHash {
         let mut hasher = Sha256::new();
+        hasher.update(TUPLE_DOMAIN);
+        hasher.update([2u8]);
         hasher.update(self.0.content_hash().0);
         hasher.update(self.1.content_hash().0);
         let arr: [u8; 32] = hasher.finalize().into();
@@ -357,6 +374,8 @@ impl<A: Artifact, B: Artifact, C: Artifact> Artifact for (A, B, C) {
 
     fn content_hash(&self) -> ContentHash {
         let mut hasher = Sha256::new();
+        hasher.update(TUPLE_DOMAIN);
+        hasher.update([3u8]);
         hasher.update(self.0.content_hash().0);
         hasher.update(self.1.content_hash().0);
         hasher.update(self.2.content_hash().0);
@@ -581,5 +600,16 @@ mod tests {
         // Compile-time check that the impls disambiguate by arity.
         assert_eq!(<(TestArt, TestArt) as Artifact>::KIND, "tuple<2>");
         assert_eq!(<(TestArt, TestArt, TestArt) as Artifact>::KIND, "tuple<3>");
+    }
+
+    #[test]
+    fn tuple_arity_domain_separation() {
+        // 2-tuple of (a, a) and 3-tuple of (a, a, a) must produce
+        // distinct hashes even when child hashes are identical —
+        // the arity byte in the domain prefix prevents collisions.
+        let a = TestArt { byte: 7, path: PathBuf::from("/a") };
+        let h2 = (a.clone(), a.clone()).content_hash();
+        let h3 = (a.clone(), a.clone(), a.clone()).content_hash();
+        assert_ne!(h2, h3, "tuple arity must affect hash");
     }
 }
