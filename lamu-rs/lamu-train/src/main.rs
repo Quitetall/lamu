@@ -61,6 +61,36 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         tail: usize,
     },
+    /// Manage the datasets registry.
+    Data {
+        #[command(subcommand)]
+        cmd: DataCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DataCommand {
+    /// List registered datasets, newest first.
+    List,
+    /// Register a JSONL file under a name.
+    Add {
+        /// Registry name (must match [A-Za-z0-9_.-]+).
+        name: String,
+        /// Path to a JSONL file.
+        path: PathBuf,
+        /// Free-form kind tag stored in the record.
+        #[arg(long, default_value = "jsonl")]
+        kind: String,
+    },
+    /// Remove a registered dataset (deletes the registry row only,
+    /// not the JSONL file on disk).
+    Rm {
+        name: String,
+    },
+    /// Print metadata for one dataset as JSON.
+    Show {
+        name: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -169,7 +199,94 @@ async fn main() -> Result<()> {
         Some(Command::Jobs) => run_jobs(),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail }) => run_log(&id, tail),
+        Some(Command::Data { cmd }) => run_data(cmd),
         None => run_train(cli.train_args).await,
+    }
+}
+
+fn run_data(cmd: DataCommand) -> Result<()> {
+    use lamu_train::datasets_db;
+    let conn = datasets_db::open()?;
+    match cmd {
+        DataCommand::List => {
+            let rows = datasets_db::list(&conn)?;
+            if rows.is_empty() {
+                println!("no datasets registered.");
+                return Ok(());
+            }
+            println!(
+                "{:<24} {:<12} {:>10} {:<16} {}",
+                "name", "kind", "examples", "sha256[:8]", "path"
+            );
+            for r in rows {
+                println!(
+                    "{:<24} {:<12} {:>10} {:<16} {}",
+                    truncate_for_col(&r.name, 24),
+                    truncate_for_col(&r.kind, 12),
+                    r.n_examples,
+                    truncate_for_col(&r.sha256, 16),
+                    r.source_path.display()
+                );
+            }
+        }
+        DataCommand::Add { name, path, kind } => {
+            let rec =
+                datasets_db::record_from_jsonl(&name, &path, &kind, None)?;
+            datasets_db::add(&conn, &rec)?;
+            println!(
+                "registered '{name}' ({} examples, sha256={})",
+                rec.n_examples, rec.sha256
+            );
+        }
+        DataCommand::Rm { name } => {
+            let removed = datasets_db::remove(&conn, &name)?;
+            if removed {
+                println!("removed '{name}'");
+            } else {
+                return Err(anyhow!("no dataset named '{name}'"));
+            }
+        }
+        DataCommand::Show { name } => {
+            match datasets_db::get_by_name(&conn, &name)? {
+                Some(rec) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&rec)
+                            .unwrap_or_else(|e| format!("serialize error: {e}"))
+                    );
+                }
+                None => return Err(anyhow!("no dataset named '{name}'")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Register a JSONL dataset in the datasets registry. Best-effort:
+/// callers handle failure by logging + continuing. Used by
+/// auto-registration after `--from-conversations` materialization.
+fn register_dataset(
+    name: &str,
+    path: &PathBuf,
+    kind: &str,
+    metadata: Option<String>,
+) -> Result<()> {
+    let conn = lamu_train::datasets_db::open()?;
+    let rec = lamu_train::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
+    lamu_train::datasets_db::add(&conn, &rec)?;
+    Ok(())
+}
+
+fn truncate_for_col(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let cut = s
+            .char_indices()
+            .nth(max.saturating_sub(1))
+            .map(|(i, _)| i)
+            .unwrap_or(s.len().min(max));
+        format!("{}…", &s[..cut])
     }
 }
 
@@ -234,6 +351,32 @@ async fn run_train(args: TrainArgs) -> Result<()> {
                     stats.n_dropped_errors,
                     stats.n_dropped_oversize
                 ));
+            }
+            // Lineage: register the materialized dataset under
+            // 'conversations-<since>-<jobid>' so the trained model
+            // can be traced back to its source. Failure to register
+            // is a warning, not a hard error — the training itself
+            // doesn't depend on the registry, only its audit trail.
+            let dataset_name = format!(
+                "conversations-{}-{job_id}",
+                humantime::format_duration(args.since)
+            );
+            let metadata = serde_json::json!({
+                "source": "conversations",
+                "since": humantime::format_duration(args.since).to_string(),
+                "n_dropped_short": stats.n_dropped_short,
+                "n_dropped_filtered_below_min": stats.n_dropped_filtered_below_min,
+                "n_dropped_errors": stats.n_dropped_errors,
+                "n_dropped_oversize": stats.n_dropped_oversize,
+                "job_id": job_id,
+            })
+            .to_string();
+            match register_dataset(&dataset_name, &out_path, "conversations", Some(metadata)) {
+                Ok(()) => eprintln!("dataset registered as '{dataset_name}'"),
+                Err(e) => tracing::warn!(
+                    "failed to register dataset '{dataset_name}': {e}; \
+                     training will continue without lineage record"
+                ),
             }
             DatasetSource::JsonlPath { path: out_path }
         }

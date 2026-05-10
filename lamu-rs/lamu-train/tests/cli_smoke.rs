@@ -79,6 +79,76 @@ fn cancel_unknown_id_errors() {
 }
 
 #[test]
+fn data_list_empty_returns_no_datasets() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let td = tempfile::tempdir().unwrap();
+    let db = td.path().join("test.db");
+    let out = Command::new(binary())
+        .env("LAMU_MEMORY_DB", &db)
+        .args(["data", "list"])
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no datasets"), "got: {stdout}");
+}
+
+#[test]
+fn data_add_then_list_then_rm() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let td = tempfile::tempdir().unwrap();
+    let db = td.path().join("test.db");
+    let jsonl = td.path().join("data.jsonl");
+    std::fs::write(
+        &jsonl,
+        b"{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n\
+          {\"messages\":[{\"role\":\"assistant\",\"content\":\"hello\"}]}\n",
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .env("LAMU_MEMORY_DB", &db)
+        .args(["data", "add", "smoke-ds"])
+        .arg(&jsonl)
+        .output()
+        .expect("spawn add");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("registered 'smoke-ds'"));
+
+    let out = Command::new(binary())
+        .env("LAMU_MEMORY_DB", &db)
+        .args(["data", "list"])
+        .output()
+        .expect("spawn list");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("smoke-ds"), "list output: {stdout}");
+    assert!(stdout.contains("2"), "expected example count: {stdout}");
+
+    let out = Command::new(binary())
+        .env("LAMU_MEMORY_DB", &db)
+        .args(["data", "rm", "smoke-ds"])
+        .output()
+        .expect("spawn rm");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("removed 'smoke-ds'"));
+}
+
+#[test]
+fn data_rm_unknown_errors() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let td = tempfile::tempdir().unwrap();
+    let db = td.path().join("test.db");
+    let out = Command::new(binary())
+        .env("LAMU_MEMORY_DB", &db)
+        .args(["data", "rm", "definitely-not-here"])
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("definitely-not-here"));
+}
+
+#[test]
 fn log_subcommand_renders_status() {
     use lamu_train::jobs::{self, JobState};
     use lamu_train::protocol::StatusUpdate;
