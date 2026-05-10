@@ -135,23 +135,45 @@ pub fn open() -> Result<Connection> {
 }
 
 pub fn open_at(path: &Path) -> Result<Connection> {
+    // Use the default mutex mode (SERIALIZED) — connections may
+    // be shared across threads in future callers, and the perf
+    // hit of an extra rwlock per query is negligible for a
+    // few-rows-per-minute table.
     let conn = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| TrainError::other(format!("open {}: {e}", path.display())))?;
-    // WAL — same mode lamu-mcp::memory sets. Idempotent.
-    let _: String = conn
-        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-        .unwrap_or_default();
-    let _: i64 = conn
-        .query_row("PRAGMA synchronous=NORMAL", [], |r| r.get(0))
-        .unwrap_or_default();
+    // WAL — same mode lamu-mcp::memory sets. Idempotent. Retry
+    // on SQLITE_BUSY: a concurrent startup with lamu-mcp can
+    // briefly hold the writer lock during its own pragma calls.
+    apply_pragma_with_retry(&conn, "PRAGMA journal_mode=WAL");
+    apply_pragma_with_retry(&conn, "PRAGMA synchronous=NORMAL");
     conn.execute_batch(CREATE_SCHEMA)
         .map_err(|e| TrainError::other(format!("create datasets schema: {e}")))?;
     Ok(conn)
+}
+
+fn apply_pragma_with_retry(conn: &Connection, sql: &str) {
+    use std::time::Duration;
+    let mut tries = 0u32;
+    loop {
+        let r: rusqlite::Result<rusqlite::types::Value> =
+            conn.query_row(sql, [], |row| row.get(0));
+        match r {
+            Ok(_) => return,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && tries < 5 =>
+            {
+                std::thread::sleep(Duration::from_millis(50 << tries));
+                tries += 1;
+            }
+            Err(e) => {
+                tracing::warn!("pragma '{sql}' failed: {e}; continuing with defaults");
+                return;
+            }
+        }
+    }
 }
 
 /// Build a `DatasetRecord` for a JSONL file on disk. Computes
@@ -167,7 +189,7 @@ pub fn record_from_jsonl(
     if !is_safe_dataset_name(&name) {
         return Err(TrainError::other(format!(
             "dataset name '{name}' must match [A-Za-z0-9_.-]+ \
-             (no leading dot/dash, no '..')"
+             with no leading '.' or '-' and no '..' substring"
         )));
     }
     if !path.exists() {
@@ -384,15 +406,11 @@ mod tests {
         let f = td.path().join("data.jsonl");
         make_jsonl(&f, 4);
         // Build two records with same content (so same sha) but
-        // different names.
-        let mut r1 = record_from_jsonl("alpha", &f, "jsonl", None).unwrap();
-        let mut r2 = record_from_jsonl("bravo", &f, "jsonl", None).unwrap();
-        // record_from_jsonl assigns a fresh uuid each call so the
-        // primary keys don't collide.
+        // different names. record_from_jsonl assigns a fresh uuid
+        // each call so the primary keys don't collide.
+        let r1 = record_from_jsonl("alpha", &f, "jsonl", None).unwrap();
+        let r2 = record_from_jsonl("bravo", &f, "jsonl", None).unwrap();
         assert_eq!(r1.sha256, r2.sha256);
-        // But artificially zero out the uuids' equality assumptions
-        // — they are different by construction, no fix needed.
-        let _ = (&mut r1, &mut r2);
 
         add(&conn, &r1).unwrap();
         add(&conn, &r2).expect("same sha + different name = warn + accept");
