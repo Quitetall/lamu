@@ -26,9 +26,13 @@
 //!     is pure; protocol is pure; even the trait method is `async`
 //!     only because the future implementations need it.
 
-// Production code stays unsafe-free; tests use unsafe env-var
-// mutations for hermetic env-injection patterns.
-#![cfg_attr(not(test), forbid(unsafe_code))]
+// Production code is unsafe-free EXCEPT one narrow place: mmap
+// in framework::artifact::hash_file_mmap. Tests also use unsafe
+// std::env::set_var for hermetic env injection. The combination:
+// deny by default (so audit grep stays easy), allow per-call-site
+// with #[allow(unsafe_code)] + SAFETY comment, plus tests get
+// blanket allow.
+#![cfg_attr(not(test), deny(unsafe_code))]
 
 pub mod artifacts;
 pub mod backend;

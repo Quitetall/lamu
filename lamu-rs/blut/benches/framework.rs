@@ -28,6 +28,27 @@ fn bench_hash_file_10mib(c: &mut Criterion) {
     });
 }
 
+fn bench_hash_file_100mib_mmap(c: &mut Criterion) {
+    // Above the 16 MiB threshold → mmap path.
+    let td = tempfile::tempdir().unwrap();
+    let p = td.path().join("blob.bin");
+    let bytes = vec![0xEF_u8; 100 * 1024 * 1024];
+    std::fs::write(&p, &bytes).unwrap();
+    c.bench_function("hash_file 100 MiB (mmap)", |b| {
+        b.iter(|| {
+            let h = ContentHash::hash_file(black_box(&p)).unwrap();
+            black_box(h);
+        });
+    });
+}
+
+fn bench_to_hex(c: &mut Criterion) {
+    let h = ContentHash::of_bytes(b"x");
+    c.bench_function("ContentHash::to_hex", |b| {
+        b.iter(|| black_box(h).to_hex());
+    });
+}
+
 fn bench_hash_dir_50_files(c: &mut Criterion) {
     let td = tempfile::tempdir().unwrap();
     // 50 × 1 MiB files — small-but-many shape typical of an HF
@@ -118,8 +139,10 @@ fn bench_erased_round_trip(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_hash_file_10mib,
+    bench_hash_file_100mib_mmap,
     bench_hash_dir_50_files,
     bench_cache_key,
+    bench_to_hex,
     bench_erased_round_trip,
 );
 criterion_main!(benches);
