@@ -45,6 +45,11 @@ pub struct ExecCtx {
     pub cache: Arc<CacheHandle>,
     pub status_tx: broadcast::Sender<StageEvent>,
     pub cancel: CancellationToken,
+    /// Per-resource semaphores. Stages acquire all permits in
+    /// their `RESOURCES` slice before `run` is called. Default
+    /// limits: Gpu=1 (single-card), Cpu=num_cpus, Network=4,
+    /// Disk=2. Override via ExecCtx::with_resource_limit.
+    pub resources: std::collections::HashMap<crate::framework::resource::Resource, Arc<tokio::sync::Semaphore>>,
 }
 
 impl ExecCtx {
@@ -54,12 +59,32 @@ impl ExecCtx {
         let cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")));
         let status_tx = crate::framework::status::make_broadcast();
         let cancel = CancellationToken::new();
+        let mut resources = std::collections::HashMap::new();
+        use crate::framework::resource::Resource;
+        let cpu_n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        resources.insert(Resource::Gpu, Arc::new(tokio::sync::Semaphore::new(1)));
+        resources.insert(Resource::Cpu, Arc::new(tokio::sync::Semaphore::new(cpu_n)));
+        resources.insert(Resource::Network, Arc::new(tokio::sync::Semaphore::new(4)));
+        resources.insert(Resource::Disk, Arc::new(tokio::sync::Semaphore::new(2)));
         Self {
             job_dir,
             cache,
             status_tx,
             cancel,
+            resources,
         }
+    }
+
+    pub fn with_resource_limit(
+        mut self,
+        resource: crate::framework::resource::Resource,
+        permits: usize,
+    ) -> Self {
+        self.resources
+            .insert(resource, Arc::new(tokio::sync::Semaphore::new(permits)));
+        self
     }
 }
 
@@ -147,11 +172,30 @@ impl SequentialExecutor {
                     ))
                 })?,
                 multi => {
-                    return Err(PlanError::Other(format!(
-                        "multi-input merge nodes not supported in commit 3 (node {} has {} preds); fork/merge land commit 6",
-                        node_id,
-                        multi.len()
-                    )));
+                    // Gather predecessors' outputs as a tuple
+                    // ErasedArtifact. Commit-3 commit message
+                    // promised this lands here. Tuple kind is
+                    // "tuple<N>" where N is the arity; payload is
+                    // [child0, child1, ...] preserving fork order
+                    // (the order the predecessors appear in the
+                    // edges Vec, which corresponds to the order
+                    // the recipe author called fork/fork3).
+                    let mut payloads = Vec::with_capacity(multi.len());
+                    for &pid in multi {
+                        let art = outputs.get(&pid).cloned().ok_or_else(|| {
+                            PlanError::Other(format!(
+                                "node {} predecessor {} produced no output",
+                                node_id, pid
+                            ))
+                        })?;
+                        payloads.push(art.payload);
+                    }
+                    let tuple_kind = format!("tuple<{}>", multi.len());
+                    ErasedArtifact {
+                        kind: tuple_kind,
+                        schema: 1,
+                        payload: serde_json::Value::Array(payloads),
+                    }
                 }
             };
 
@@ -192,11 +236,40 @@ impl SequentialExecutor {
                 cache: ctx.cache.clone(),
             };
 
+            // Acquire resource permits in declared order. We keep
+            // the OwnedSemaphorePermits in a Vec dropped at end of
+            // the loop iteration so the next stage can acquire.
+            let mut permits = Vec::new();
+            for resource in node.stage.resources() {
+                if let Some(sem) = ctx.resources.get(resource) {
+                    let _ = ctx.status_tx.send(StageEvent::StageBlocked {
+                        node_idx: idx as u32,
+                        stage_name: stage_name.to_string(),
+                        resource: *resource,
+                    });
+                    match sem.clone().acquire_owned().await {
+                        Ok(p) => permits.push(p),
+                        Err(_) => {
+                            // Semaphore closed (shouldn't happen);
+                            // fail the stage cleanly rather than
+                            // panicking.
+                            return Err(PlanError::Other(format!(
+                                "resource '{}' semaphore closed",
+                                resource
+                            )));
+                        }
+                    }
+                }
+            }
+
             let stage_started = Instant::now();
             let run_result = node
                 .stage
                 .run_erased(&stage_ctx, input, node.args.clone())
                 .await;
+            // Permits drop here, releasing the resource for the
+            // next stage.
+            drop(permits);
             // Drop the stage_ctx (and its status_tx clone)
             // BEFORE awaiting the writer handle on the failure
             // path — otherwise the writer's broadcast channel
@@ -478,12 +551,8 @@ mod tests {
         // Second run with a fresh ExecCtx but the SAME cache dir.
         let td_keepalive_for_second_run = tempfile::tempdir().unwrap();
         let job_dir2 = td_keepalive_for_second_run.path().to_path_buf();
-        let ctx2 = ExecCtx {
-            job_dir: job_dir2,
-            cache,
-            status_tx: crate::framework::status::make_broadcast(),
-            cancel: CancellationToken::new(),
-        };
+        let ctx2 = ExecCtx::new(job_dir2);
+        let ctx2 = ExecCtx { cache, ..ctx2 };
         let plan2 = Plan::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)

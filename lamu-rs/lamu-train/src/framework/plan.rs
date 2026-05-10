@@ -224,6 +224,151 @@ impl<O: Artifact> Plan<O> {
             _phantom: PhantomData,
         }
     }
+
+    /// Branch into two siblings consuming `O`. Both stages take
+    /// the leading edge as input; their outputs land in a typed
+    /// tuple at the new leading edge. Rejoin via `Plan<(L::Output,
+    /// R::Output)>::merge<S>` requiring `S::Input = (L::Output,
+    /// R::Output)`.
+    pub fn fork<L, R>(
+        mut self,
+        left: L,
+        l_args: L::Args,
+        right: R,
+        r_args: R::Args,
+    ) -> Plan<(L::Output, R::Output)>
+    where
+        L: Stage<Input = O> + 'static,
+        R: Stage<Input = O> + 'static,
+    {
+        let l_id = self.nodes.len() as NodeId;
+        let l_args_json = serde_json::to_value(&l_args).expect("Stage::Args serialize");
+        self.nodes.push(PlanNode {
+            id: l_id,
+            stage: Box::new(left),
+            args: l_args_json,
+        });
+        let r_id = self.nodes.len() as NodeId;
+        let r_args_json = serde_json::to_value(&r_args).expect("Stage::Args serialize");
+        self.nodes.push(PlanNode {
+            id: r_id,
+            stage: Box::new(right),
+            args: r_args_json,
+        });
+        for &from in &self.leading {
+            self.edges.push(PlanEdge { from, to: l_id });
+            self.edges.push(PlanEdge { from, to: r_id });
+        }
+        self.leading = vec![l_id, r_id];
+        Plan {
+            name: self.name,
+            nodes: self.nodes,
+            edges: self.edges,
+            leading: self.leading,
+            initial: self.initial,
+            recipe_args: self.recipe_args,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// 3-way fork. Same shape as `fork` but with three siblings
+    /// rejoining via `Plan<(A, B, C)>::merge`.
+    pub fn fork3<A, B, C>(
+        mut self,
+        a: A,
+        a_args: A::Args,
+        b: B,
+        b_args: B::Args,
+        c: C,
+        c_args: C::Args,
+    ) -> Plan<(A::Output, B::Output, C::Output)>
+    where
+        A: Stage<Input = O> + 'static,
+        B: Stage<Input = O> + 'static,
+        C: Stage<Input = O> + 'static,
+    {
+        let mut new_ids = Vec::with_capacity(3);
+        for (stage, args) in [
+            (Box::new(a) as Box<dyn StageDyn>, serde_json::to_value(&a_args).expect("a_args")),
+            (Box::new(b) as Box<dyn StageDyn>, serde_json::to_value(&b_args).expect("b_args")),
+            (Box::new(c) as Box<dyn StageDyn>, serde_json::to_value(&c_args).expect("c_args")),
+        ] {
+            let id = self.nodes.len() as NodeId;
+            self.nodes.push(PlanNode { id, stage, args });
+            for &from in &self.leading {
+                self.edges.push(PlanEdge { from, to: id });
+            }
+            new_ids.push(id);
+        }
+        self.leading = new_ids;
+        Plan {
+            name: self.name,
+            nodes: self.nodes,
+            edges: self.edges,
+            leading: self.leading,
+            initial: self.initial,
+            recipe_args: self.recipe_args,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<A: Artifact, B: Artifact> Plan<(A, B)> {
+    /// Merge a forked branch via a stage that consumes the tuple.
+    pub fn merge<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
+    where
+        S: Stage<Input = (A, B)> + 'static,
+    {
+        let id = self.nodes.len() as NodeId;
+        let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
+        self.nodes.push(PlanNode {
+            id,
+            stage: Box::new(stage),
+            args: args_json,
+        });
+        for &from in &self.leading {
+            self.edges.push(PlanEdge { from, to: id });
+        }
+        self.leading = vec![id];
+        Plan {
+            name: self.name,
+            nodes: self.nodes,
+            edges: self.edges,
+            leading: self.leading,
+            initial: self.initial,
+            recipe_args: self.recipe_args,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<A: Artifact, B: Artifact, C: Artifact> Plan<(A, B, C)> {
+    /// Merge a 3-way forked branch.
+    pub fn merge3<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
+    where
+        S: Stage<Input = (A, B, C)> + 'static,
+    {
+        let id = self.nodes.len() as NodeId;
+        let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
+        self.nodes.push(PlanNode {
+            id,
+            stage: Box::new(stage),
+            args: args_json,
+        });
+        for &from in &self.leading {
+            self.edges.push(PlanEdge { from, to: id });
+        }
+        self.leading = vec![id];
+        Plan {
+            name: self.name,
+            nodes: self.nodes,
+            edges: self.edges,
+            leading: self.leading,
+            initial: self.initial,
+            recipe_args: self.recipe_args,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl Plan<()> {
@@ -474,6 +619,23 @@ mod tests {
         for id in order {
             assert!(seen.insert(id), "duplicate id {id}");
         }
+    }
+
+    #[test]
+    fn fork_creates_two_branches_from_one_input() {
+        // MakeA -> [AToB | AToB] -> tuple<2>
+        let plan = Plan::new("forked", serde_json::json!({}))
+            .start(MakeA, EmptyArgs)
+            .fork(AToB, EmptyArgs, AToB, EmptyArgs)
+            .finish();
+        assert_eq!(plan.n_nodes(), 3);
+        // 2 edges from MakeA → each branch.
+        assert_eq!(plan.n_edges(), 2);
+        let order = plan.topo_order().unwrap();
+        assert_eq!(order[0], 0);
+        // Branches are 1 and 2 in some order.
+        assert!(order[1..].contains(&1));
+        assert!(order[1..].contains(&2));
     }
 
     #[test]
