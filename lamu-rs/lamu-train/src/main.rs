@@ -14,7 +14,6 @@
 //! held by an inference exclusive instead of erroring.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -240,6 +239,15 @@ async fn run_train(args: TrainArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Resolve subprocess paths BEFORE acquiring the GPU lock so a
+    // path-resolution failure doesn't hold the lock. Cheap (a few
+    // env reads + stat calls); failure here means the user's setup
+    // is wrong and they need a clear error, not a held lock.
+    let python = paths::resolve_python().context("resolve python")?;
+    let trainer_script = paths::resolve_trainer_script().context("resolve trainer.py")?;
+    eprintln!("python {}", python.display());
+    eprintln!("trainer {}", trainer_script.display());
+
     // Acquire the GPU lock. --allow-evict waits for an existing
     // inference exclusive to release; otherwise hard error.
     let lock = if args.allow_evict {
@@ -255,19 +263,22 @@ async fn run_train(args: TrainArgs) -> Result<()> {
     };
     eprintln!("lock acquired ({})", lock.path().display());
 
-    // Run training.
-    let python = paths::resolve_python().context("resolve python")?;
-    let trainer_script = paths::resolve_trainer_script().context("resolve trainer.py")?;
-    eprintln!("python {}", python.display());
-    eprintln!("trainer {}", trainer_script.display());
-
     let mut backend = PythonTrainBackend::new(python, trainer_script);
 
     let job_id_for_cb = job_id.clone();
-    let on_status: StatusFn = Arc::new(move |u: StatusUpdate| {
+    let on_status: StatusFn = Box::new(move |u: StatusUpdate| {
         // Persist to status.jsonl + render to stderr so the user
-        // sees progress live in foreground mode.
-        let _ = jobs::append_status(&job_id_for_cb, &u);
+        // sees progress live in foreground mode. A persist failure
+        // (full disk, permissions, etc.) is logged but doesn't stop
+        // the run — losing status history is bad but losing the
+        // training job mid-flight is worse.
+        if let Err(e) = jobs::append_status(&job_id_for_cb, &u) {
+            tracing::warn!(
+                "failed to persist status to {}: {}",
+                job_id_for_cb,
+                e
+            );
+        }
         match &u {
             StatusUpdate::Step {
                 step, total, loss, lr, vram_mb,
@@ -285,7 +296,7 @@ async fn run_train(args: TrainArgs) -> Result<()> {
             ),
             StatusUpdate::Failed { error } => eprintln!("FAILED: {error}"),
         }
-    }).into_box();
+    });
 
     let result = backend.run(spec.clone(), on_status).await;
 
@@ -381,10 +392,12 @@ fn build_dataset(args: &TrainArgs) -> Result<DatasetSource> {
     if args.from_conversations {
         // Step 7 materializes this to a JsonlPath; for v1 the CLI
         // accepts the flag and constructs the variant so the spec
-        // round-trips cleanly. Validation refuses anything below
-        // since_ts < 0 — humantime guarantees a positive Duration.
-        let cutoff = (std::time::SystemTime::now() - args.since)
-            .duration_since(std::time::UNIX_EPOCH)
+        // round-trips cleanly. Use checked_sub so a since-window
+        // larger than time-since-epoch (~55 years) saturates at 0
+        // instead of panicking on SystemTime underflow.
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(args.since)
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         Ok(DatasetSource::Conversations { since_ts: cutoff })
@@ -452,19 +465,3 @@ fn register_in_registry(
         .map_err(|e| anyhow!("registry update failed: {e}"))
 }
 
-/// Tiny adapter: the lamu_train::backend::StatusFn is a Box<dyn Fn>,
-/// but the closure I'm building in run_train captures jobs::append_status
-/// which I want to write once and reuse. `into_box` converts an Arc'd
-/// closure to the Box the trait wants.
-trait IntoBox {
-    fn into_box(self) -> StatusFn;
-}
-
-impl<F> IntoBox for Arc<F>
-where
-    F: Fn(StatusUpdate) + Send + Sync + 'static,
-{
-    fn into_box(self) -> StatusFn {
-        Box::new(move |u| (self)(u))
-    }
-}

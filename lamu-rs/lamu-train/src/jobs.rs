@@ -16,7 +16,7 @@
 //! the same second don't collide. Stable sort order matches start
 //! time when listing.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -294,6 +294,11 @@ fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 /// can type `lamu-train cancel 20260510` instead of pasting the
 /// full id. Errors when zero or multiple matches.
 pub fn resolve_job_id(query: &str) -> Result<String> {
+    if query.trim().is_empty() {
+        return Err(TrainError::other(
+            "job id is empty. Run `lamu-train jobs` to list.",
+        ));
+    }
     let jobs = list_jobs()?;
     let exact: Vec<_> = jobs.iter().filter(|j| j.id == query).collect();
     if exact.len() == 1 {
@@ -355,17 +360,14 @@ pub fn tail_log(job_id: &str, lines: usize) -> Result<String> {
 }
 
 /// Test-friendly: ensure a job_id round-trips through the file
-/// system. Used by integration tests that need a real on-disk
-/// shape but don't want to invoke the trainer.
-pub fn debug_init_job(job_id: &str, spec: &TrainSpec) -> Result<PathBuf> {
+/// system. crate-internal — never call from production code.
+#[cfg(test)]
+pub(crate) fn debug_init_job(job_id: &str, spec: &TrainSpec) -> Result<PathBuf> {
     let dir = paths::job_dir(job_id)?;
     write_spec(job_id, spec)?;
     write_state(job_id, JobState::Running)?;
     Ok(dir)
 }
-
-#[allow(dead_code)]
-fn _unused_path_marker(_p: &Path) {}
 
 #[cfg(test)]
 mod tests {
