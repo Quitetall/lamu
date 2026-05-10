@@ -226,9 +226,11 @@ async fn run_train(args: TrainArgs) -> Result<()> {
             if stats.n_conversations == 0 {
                 return Err(anyhow!(
                     "no usable conversations in window (--since {:?}). \
-                     {} dropped as too short, {} as error-tagged, {} as oversize.",
+                     {} short raw, {} gutted by filters, \
+                     {} error messages, {} oversize messages.",
                     args.since,
                     stats.n_dropped_short,
+                    stats.n_dropped_filtered_below_min,
                     stats.n_dropped_errors,
                     stats.n_dropped_oversize
                 ));

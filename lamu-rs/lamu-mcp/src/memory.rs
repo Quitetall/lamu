@@ -181,8 +181,6 @@ impl Memory {
         Ok(())
     }
 
-    /// Read up to `limit` most-recent turns for a conversation,
-    /// oldest-first. Pass `limit = 0` for no cap.
     /// Pull every turn whose `ts >= cutoff_unix_secs`, grouped under
     /// its conversation id. Returns `(conversation_id, Turn)` pairs
     /// in the natural sort order — same conversation's turns appear
@@ -218,6 +216,8 @@ impl Memory {
         Ok(out)
     }
 
+    /// Read up to `limit` most-recent turns for a conversation,
+    /// oldest-first. Pass `limit = 0` for no cap.
     pub fn recall(&self, conversation_id: &str, limit: usize) -> Result<Vec<Turn>> {
         validate_conversation_id(conversation_id)?;
         let conn = self.conn.lock();

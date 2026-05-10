@@ -17,13 +17,17 @@
 //! ```
 //!
 //! Filter rules baked into `dump_to_jsonl`:
-//!   - drop conversations with fewer than 4 turns (noise — almost
-//!     always single-turn pings, half-broken sessions, etc.)
+//!   - drop conversations whose RAW turn count is below
+//!     `MIN_TURNS_PER_CONVERSATION` (noise — single-turn pings,
+//!     half-broken sessions, etc.)
 //!   - drop messages whose content starts with `error:` (tool
 //!     failure echoes from MCP — they teach the wrong thing)
 //!   - cap at the 200 KiB per-message rendering limit so a stray
 //!     large blob doesn't dominate the training distribution
-//!   - whole conversation skipped if every message is filtered out
+//!   - drop a conversation whose POST-FILTER turn count falls
+//!     below `MIN_TURNS_PER_CONVERSATION` (counted separately as
+//!     `n_dropped_filtered_below_min` so callers can tell the
+//!     difference between raw-too-short and gutted-by-filters)
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -50,7 +54,12 @@ const MIN_TURNS_PER_CONVERSATION: usize = 4;
 pub struct DumpStats {
     pub n_conversations: usize,
     pub n_turns: usize,
+    /// Raw conversation had < MIN_TURNS_PER_CONVERSATION turns
+    /// before any filtering ran.
     pub n_dropped_short: usize,
+    /// Conversation passed the raw-length check but post-filter
+    /// (errors + oversize removed) it fell below the threshold.
+    pub n_dropped_filtered_below_min: usize,
     pub n_dropped_errors: usize,
     pub n_dropped_oversize: usize,
     pub path: PathBuf,
@@ -144,6 +153,7 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
     let mut n_conversations = 0usize;
     let mut n_turns = 0usize;
     let mut n_dropped_short = 0usize;
+    let mut n_dropped_filtered_below_min = 0usize;
     let mut n_dropped_errors = 0usize;
     let mut n_dropped_oversize = 0usize;
 
@@ -165,7 +175,7 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
             filtered.push((role, content));
         }
         if filtered.len() < MIN_TURNS_PER_CONVERSATION {
-            n_dropped_short += 1;
+            n_dropped_filtered_below_min += 1;
             continue;
         }
         let messages: Vec<serde_json::Value> = filtered
@@ -191,6 +201,7 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
         n_conversations,
         n_turns,
         n_dropped_short,
+        n_dropped_filtered_below_min,
         n_dropped_errors,
         n_dropped_oversize,
         path: out_path.to_path_buf(),
@@ -328,7 +339,10 @@ mod tests {
         let stats = dump_with_db(&db, 0, &out).unwrap();
         assert_eq!(stats.n_dropped_errors, 2);
         assert_eq!(stats.n_conversations, 0);
-        assert_eq!(stats.n_dropped_short, 1);
+        // Raw 5 turns ≥ 4, but after filtering 2 errors only 3 remain
+        // → counts under filtered_below_min, not short.
+        assert_eq!(stats.n_dropped_short, 0);
+        assert_eq!(stats.n_dropped_filtered_below_min, 1);
     }
 
     #[test]
