@@ -34,6 +34,12 @@ pub async fn convert_to_gguf(
     name: &str,
     quant: &str,
 ) -> Result<PathBuf> {
+    if !is_safe_filename(name) {
+        return Err(TrainError::Convert(format!(
+            "name '{name}' must be a non-empty bare filename \
+             ([A-Za-z0-9_.-]+, no leading dot/dash, no '..', no path separators)"
+        )));
+    }
     if !checkpoint_dir.exists() {
         return Err(TrainError::Convert(format!(
             "checkpoint_dir does not exist: {}",
@@ -116,4 +122,51 @@ pub async fn convert_to_gguf(
     }
 
     Ok(q_path)
+}
+
+/// Bare filename safety check. Mirrors `spec::is_safe_registry_name`
+/// shape so converted-model names stay registry-safe AND
+/// filesystem-safe. Catches: empty, leading `.` / `-`, any path
+/// separator (`/` or `\\`), `..` substring, NUL.
+fn is_safe_filename(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_filename_accepts_normal_names() {
+        for n in ["model", "test-7b", "qwen3.6", "personal_v2"] {
+            assert!(is_safe_filename(n), "{n} should be safe");
+        }
+    }
+
+    #[test]
+    fn safe_filename_rejects_path_traversal() {
+        for n in [
+            "../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "a..b",
+            ".hidden",
+            "-leading",
+            "",
+            "name\0bad",
+            "name with space",
+        ] {
+            assert!(!is_safe_filename(n), "{n} should be rejected");
+        }
+    }
 }

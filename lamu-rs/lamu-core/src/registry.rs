@@ -427,18 +427,35 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
 
     // Temp file lives next to the destination so `rename` stays
     // intra-filesystem (cross-fs rename would lose the atomicity
-    // guarantee).
-    let tmp = dest.with_file_name(format!(
-        ".{}.tmp.{}",
-        dest.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "registry".into()),
-        std::process::id()
-    ));
-
-    let mut f = std::fs::File::create(&tmp)?;
+    // guarantee). Uniqueness combines pid + nanosecond timestamp +
+    // an O_EXCL create so concurrent writers within the same process
+    // can't collide on the same tmp filename. If the unlikely
+    // collision still happens, retry once with a fresh stamp.
+    let stem = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "registry".into());
+    let mut tmp = make_tmp_name(dest, &stem);
+    let mut f = match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tmp = make_tmp_name(dest, &stem);
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?
+        }
+        Err(e) => return Err(e.into()),
+    };
     f.write_all(bytes)?;
-    let _ = f.sync_all(); // best-effort; failure here doesn't justify aborting
+    // sync_all is best-effort: tmpfs / FUSE / some test envs return
+    // EINVAL or ENOTSUP even though the write hit the page cache.
+    // Failing here would falsely abort an otherwise-correct write.
+    let _ = f.sync_all();
     drop(f);
 
     // Rename overwrites the destination on POSIX.
@@ -447,6 +464,17 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
         return Err(e.into());
     }
     Ok(())
+}
+
+fn make_tmp_name(dest: &Path, stem: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dest.with_file_name(format!(
+        ".{stem}.tmp.{}.{nanos}",
+        std::process::id()
+    ))
 }
 
 pub fn load_registry(path: &Path) -> Result<Vec<ModelEntry>> {
