@@ -599,6 +599,63 @@ pub(crate) fn handle_recall_conversation(args: Value) -> String {
 // model's reasoning_content is included so the human can see HOW the
 // review was reached, not just the conclusion.
 
+/// Quality/cost preset for review_commit + review_diff.
+///
+/// Resolution order: per-call `preset` arg > $LAMU_PRESET env > Fast.
+/// Individual env flags (LAMU_CRITIC_PASS, LAMU_ENSEMBLE_REVIEW,
+/// LAMU_TEST_PREFLIGHT, LAMU_TWO_STAGE_REVIEW, LAMU_K_LAZY_THRESHOLD)
+/// override the preset's defaults — useful for fine-grained tuning
+/// without writing a new preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Preset {
+    /// Cache-stable single Pro pass + central FP-list + activity-log
+    /// cache lock + structural cross-ref marker. ~$0.003/review.
+    /// 2-3 findings typical. Routine commit gating.
+    Fast,
+    /// Fast + critic-role parallel pass + multi-model ensemble +
+    /// test pre-flight. ~$0.013/review (~4× Fast). 5-7 findings.
+    /// Pre-merge / pre-release / security-sensitive.
+    Max,
+}
+
+impl Preset {
+    pub(crate) fn resolve(args: &Value) -> Self {
+        let from_arg = args["preset"].as_str();
+        let from_env = std::env::var("LAMU_PRESET").ok();
+        let raw = from_arg.or(from_env.as_deref()).unwrap_or("fast");
+        match raw.to_ascii_lowercase().as_str() {
+            "max" | "maximum" | "quality" => Preset::Max,
+            _ => Preset::Fast,
+        }
+    }
+
+    /// Critic-role parallel pass on. Env override wins.
+    pub(crate) fn critic_pass_on(self) -> bool {
+        env_flag_on("LAMU_CRITIC_PASS").unwrap_or(matches!(self, Preset::Max))
+    }
+
+    /// Multi-model ensemble on. Env override wins.
+    pub(crate) fn ensemble_on(self) -> bool {
+        env_flag_on("LAMU_ENSEMBLE_REVIEW").unwrap_or(matches!(self, Preset::Max))
+    }
+
+    /// Test pre-flight on. Env override wins.
+    pub(crate) fn test_preflight_on(self) -> bool {
+        env_flag_on("LAMU_TEST_PREFLIGHT").unwrap_or(matches!(self, Preset::Max))
+    }
+
+    /// Two-stage review (Flash candidates → Pro verify). Off in both
+    /// presets — kept available via explicit LAMU_TWO_STAGE_REVIEW=1
+    /// for callers who want it (proven cost regression in our setup).
+    pub(crate) fn two_stage_on(self) -> bool {
+        env_flag_on("LAMU_TWO_STAGE_REVIEW").unwrap_or(false)
+    }
+}
+
+fn env_flag_on(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 const REVIEW_SYSTEM_PROMPT: &str = "You are a senior staff engineer doing a code review. Your job is to find real issues, not to pat anyone on the back.\n\nAlways check:\n  1. SECURITY — injection (SQL/shell/XSS/prompt), auth/authz holes, secrets in code, unsafe deserialization, TOCTOU, missing input validation.\n  2. CORRECTNESS — off-by-one, null/empty cases, integer overflow, floating-point traps, race conditions, deadlocks, missing error handling.\n  3. EDGE CASES — what happens at boundaries, with empty inputs, with hostile inputs, under concurrency, on partial failure, on retry.\n  4. ARCHITECTURE — does this fit the existing design? Does it leak abstraction? Does it create coupling that will hurt later? Is there a simpler shape?\n  5. CLARITY — would a stranger understand the intent? Are names accurate? Are comments necessary or noise?\n\nFormat your output:\n  - One-sentence verdict (PASS / PASS WITH NITS / NEEDS CHANGES / REJECT).\n  - Numbered list of findings, each: severity [BUG/SECURITY/STYLE/QUESTION], file:line if knowable, the problem, the suggested fix.\n  - End with a single 'Recommend' line.\n\nBe terse. Be honest. Don't praise unless something is genuinely surprising in a good way. If the code is fine, say so in one line and stop.";
 
 /// Cap on diff size sent to the reviewer. 200 KiB is generous (≈ 4K
@@ -671,6 +728,8 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     let commit = args["commit"].as_str().unwrap_or("HEAD");
     let repo = args["repo"].as_str().unwrap_or(".");
     let focus = args["focus"].as_str().unwrap_or("");
+    let preset = Preset::resolve(&args);
+    tracing::debug!(?preset, "review_commit preset resolved");
 
     if !is_safe_git_ref(commit) {
         return format!(
@@ -740,7 +799,14 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
             tracing::debug!("auto_context: skipped (trivial diff under threshold)");
             String::new()
         } else {
-            match crate::auto_context::assemble_auto_context(commit, std::path::Path::new(repo)) {
+            let opts = crate::auto_context::AutoContextOpts {
+                test_preflight: preset.test_preflight_on(),
+            };
+            match crate::auto_context::assemble_auto_context_with_opts(
+                commit,
+                std::path::Path::new(repo),
+                opts,
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("auto_context: assemble failed: {}", e);
@@ -783,15 +849,9 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     // available for callers who want Flash's tighter candidate
     // shortlist as a focusing aid (e.g. when Pro is the bottleneck
     // not the prefix), but default off.
-    let review = if auto && std::env::var("LAMU_ENSEMBLE_REVIEW")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    let review = if auto && preset.ensemble_on() {
         ensemble_review(&prompt, &system).await
-    } else if auto && std::env::var("LAMU_TWO_STAGE_REVIEW")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    } else if auto && preset.two_stage_on() {
         two_stage_review(&prompt, &system).await
     } else {
         let review_args = json!({
@@ -833,11 +893,9 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         review
     };
 
-    // V6 Q: critic pass — second-order regression hunting. Opt-in.
-    let review = if auto && std::env::var("LAMU_CRITIC_PASS")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    // V6 Q: critic pass — second-order regression hunting.
+    // Default ON for Max preset, OFF for Fast.
+    let review = if auto && preset.critic_pass_on() {
         let extra = critic_pass(&prompt, &system).await;
         if extra.is_empty() {
             review
@@ -1147,6 +1205,8 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
     let raw_tactical = args["context"].as_str().unwrap_or("");
     let tactical = truncate_with_marker(raw_tactical, MAX_TACTICAL_CONTEXT_BYTES);
     let focus = args["focus"].as_str().unwrap_or("");
+    let preset = Preset::resolve(&args);
+    tracing::debug!(?preset, "review_diff preset resolved");
 
     // Step 6: `context` moves from in-prompt body to Tactical-tier
     // prefix on the system prompt. Cache-friendlier (DeepSeek caches
@@ -1170,15 +1230,33 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
         REVIEW_SYSTEM_PROMPT,
     );
 
-    let review_args = json!({
-        "model": "deepseek-v4-pro",
-        "prompt": prompt,
-        "system": system,
-        "max_tokens": 8192,
-        "temperature": 0.2,
-        "include_reasoning": false,
-    });
-    let review = handle_cloud_query(review_args).await;
+    let review = if preset.ensemble_on() {
+        ensemble_review(&prompt, &system).await
+    } else if preset.two_stage_on() {
+        two_stage_review(&prompt, &system).await
+    } else {
+        let review_args = json!({
+            "model": "deepseek-v4-pro",
+            "prompt": prompt,
+            "system": system,
+            "max_tokens": 8192,
+            "temperature": 0.2,
+            "include_reasoning": false,
+        });
+        handle_cloud_query(review_args).await
+    };
+
+    let review = if preset.critic_pass_on() && !review.starts_with("error:") {
+        let extra = critic_pass(&prompt, &system).await;
+        if extra.is_empty() {
+            review
+        } else {
+            format!("{}{}", review, extra)
+        }
+    } else {
+        review
+    };
+
     format!("=== Diff review (DeepSeek V4 Pro) ===\n\n{}", review)
 }
 

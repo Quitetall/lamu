@@ -85,6 +85,15 @@ pub fn run_test_preflight(repo: &Path) -> String {
     )
 }
 
+/// Per-call options for `assemble_auto_context_with_opts`. The
+/// no-arg `assemble_auto_context` keeps env-var-driven defaults so
+/// existing callers (and the LAMU_TEST_PREFLIGHT escape hatch) still
+/// work.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AutoContextOpts {
+    pub test_preflight: bool,
+}
+
 /// Assemble the full auto-context payload for one commit.
 ///
 /// Best-effort: each step (git show, tree-sitter parse, ripgrep)
@@ -92,18 +101,27 @@ pub fn run_test_preflight(repo: &Path) -> String {
 /// least the diff itself; the symbol/caller layers add value when
 /// they succeed.
 pub fn assemble_auto_context(commit: &str, repo: &Path) -> Result<String> {
+    let opts = AutoContextOpts {
+        test_preflight: std::env::var("LAMU_TEST_PREFLIGHT")
+            .map(|v| v == "1")
+            .unwrap_or(false),
+    };
+    assemble_auto_context_with_opts(commit, repo, opts)
+}
+
+pub fn assemble_auto_context_with_opts(
+    commit: &str,
+    repo: &Path,
+    opts: AutoContextOpts,
+) -> Result<String> {
     let mut out = String::with_capacity(8 * 1024);
     out.push_str("# Auto-context for commit ");
     out.push_str(commit);
     out.push_str("\n\n");
 
-    // V6 P: test pre-flight — opt-in via LAMU_TEST_PREFLIGHT=1.
-    // Slow (up to 60s), so default-off; turn on for review-on-merge
-    // flows where the wall-time cost is acceptable.
-    if std::env::var("LAMU_TEST_PREFLIGHT")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    // V6 P: test pre-flight — preset Max enables, env LAMU_TEST_PREFLIGHT=1
+    // forces on regardless of preset. Slow (up to 60s).
+    if opts.test_preflight {
         let pre = run_test_preflight(repo);
         if !pre.is_empty() {
             out.push_str(&pre);
