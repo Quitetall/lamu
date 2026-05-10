@@ -75,6 +75,34 @@ enum Command {
         #[command(subcommand)]
         cmd: PolicyCommand,
     },
+    /// Recipe catalog. List / show / run named recipes.
+    Recipe {
+        #[command(subcommand)]
+        cmd: RecipeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RecipeCommand {
+    /// List the recipe catalog.
+    List,
+    /// Print one recipe's args JSON schema.
+    Show {
+        /// Recipe name (e.g. finetune_from_conversations).
+        name: String,
+    },
+    /// Execute a recipe with given args.
+    Run {
+        /// Recipe name.
+        name: String,
+        /// Args as inline JSON.
+        #[arg(long)]
+        args: String,
+        /// Promote this run's outputs to the global cache for
+        /// future re-use. Default: per-job cache only.
+        #[arg(long, default_value_t = false)]
+        shared_cache: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,8 +251,66 @@ async fn main() -> Result<()> {
         Some(Command::Data { cmd }) => run_data(cmd),
         Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
+        Some(Command::Recipe { cmd }) => run_recipe(cmd).await,
         None => run_train(cli.train_args).await,
     }
+}
+
+async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
+    use lamu_train::framework::{ExecCtx, SequentialExecutor};
+    use lamu_train::recipes::recipe::{find as find_recipe, RECIPES};
+    match cmd {
+        RecipeCommand::List => {
+            println!("{:<32} {}", "name", "description");
+            for r in RECIPES {
+                println!("{:<32} {}", r.name, r.description);
+            }
+        }
+        RecipeCommand::Show { name } => {
+            let r = find_recipe(&name)
+                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            println!("name        : {}", r.name);
+            println!("description : {}", r.description);
+            let schema = (r.args_schema_fn)();
+            println!(
+                "args schema :\n{}",
+                serde_json::to_string_pretty(&schema)
+                    .unwrap_or_else(|e| format!("(serialize error: {e})"))
+            );
+        }
+        RecipeCommand::Run { name, args, shared_cache } => {
+            let r = find_recipe(&name)
+                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let raw: serde_json::Value = serde_json::from_str(&args)
+                .with_context(|| format!("parse --args as JSON: {args}"))?;
+            let plan = (r.compile_fn)(raw)
+                .map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+
+            let job_id = lamu_train::jobs::new_job_id();
+            let job_dir = lamu_train::paths::job_dir(&job_id)?;
+            let mut ctx = ExecCtx::new(job_dir.clone());
+            if shared_cache {
+                if let Some(global) = lamu_train::framework::CacheHandle::default_global_path() {
+                    std::fs::create_dir_all(&global).with_context(|| {
+                        format!("create global cache dir {}", global.display())
+                    })?;
+                    let cache_handle = (*ctx.cache).clone().with_global(global);
+                    ctx.cache = std::sync::Arc::new(cache_handle);
+                }
+            }
+            eprintln!("recipe {name}");
+            eprintln!("job    {job_id}");
+            eprintln!("dir    {}", job_dir.display());
+            let result = SequentialExecutor::execute(plan, ctx)
+                .await
+                .map_err(|e| anyhow!("plan execution failed: {e}"))?;
+            eprintln!(
+                "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                result.n_stages, result.n_cache_hits, result.n_cache_misses, result.elapsed
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_auto() -> Result<()> {
