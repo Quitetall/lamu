@@ -187,17 +187,13 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
         return format!("error: method '{method}' must be one of qlora|lora|full");
     }
 
-    let since_raw = args
+    let since_str = args
         .get("since")
         .and_then(|v| v.as_str())
         .unwrap_or("30d")
         .trim()
         .to_string();
-    let since_str = if since_raw.is_empty() {
-        "30d".to_string()
-    } else {
-        since_raw.clone()
-    };
+    // parse_since handles empty input; no separate normalization here.
     let since = match parse_since(Some(&since_str)) {
         Ok(d) => d,
         Err(e) => return format!("error: {e}"),
@@ -303,8 +299,13 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
                 if let Some(stderr) = stderr {
                     use tokio::io::{AsyncBufReadExt, BufReader};
                     let mut lines = BufReader::new(stderr).lines();
+                    // debug! (not info!) — a verbose trainer can
+                    // emit a line per training step; capping the
+                    // log volume by default keeps casual users'
+                    // logs readable. Set RUST_LOG=lamu_mcp::train_spawn=debug
+                    // to surface for active debugging.
                     while let Ok(Some(line)) = lines.next_line().await {
-                        tracing::info!(target: "lamu_mcp::train_spawn", "{}", line);
+                        tracing::debug!(target: "lamu_mcp::train_spawn", "{}", line);
                     }
                 }
                 let _ = child.wait().await;
@@ -314,7 +315,8 @@ pub async fn handle_train_from_conversations(args: Value) -> String {
                  Run `lamu-train jobs` to find the job id, \
                  `lamu-train log <id>` for live progress.\n\
                  Stderr from the spawned binary is logged under \
-                 target=lamu_mcp::train_spawn (RUST_LOG=lamu_mcp=info)."
+                 target=lamu_mcp::train_spawn at debug level — set \
+                 RUST_LOG=lamu_mcp::train_spawn=debug to surface."
             )
         }
         Err(e) => format!("error: spawn lamu-train: {e}"),
