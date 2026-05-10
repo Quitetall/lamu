@@ -403,6 +403,11 @@ mod tests {
             s.validate().is_err(),
             "absolute path with .. segment must reject"
         );
+        s.output_dir = PathBuf::from("/tmp/..");
+        assert!(
+            s.validate().is_err(),
+            "absolute path with trailing .. must reject"
+        );
     }
 
     #[test]
