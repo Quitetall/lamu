@@ -6,8 +6,11 @@ members = [
     "lamu-api",
     "lamu-cli",
     "lamu-providers",
-    "blut",
 ]
+
+# BLUT (Brian Lam's Universal Trainer) extracted to its own repo
+# at ../blut/. lamu-mcp's train_from_conversations tool shells out
+# to the `blut` binary; there is no Rust dep across the boundary.
 
 [workspace.package]
 version = "0.1.0"
