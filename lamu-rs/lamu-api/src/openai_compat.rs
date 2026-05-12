@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -52,6 +52,12 @@ pub struct ChatRequest {
     /// shave wall time on simple queries.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// OpenAI tools array. Forwarded verbatim to bee. Anthropic
+    /// translates its own tool schema → this on entry.
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
 }
 
 fn default_max_tokens() -> u32 { 16384 }
@@ -80,6 +86,10 @@ pub fn build_app(state: AppState) -> AxumRouter {
         // /v1/messages payload → OpenAI ChatRequest, delegates to
         // chat_completions, then maps the response back.
         .route("/v1/messages", post(anthropic_messages))
+        // Ollama-compat shim for AnythingLLM, Open WebUI (Ollama mode),
+        // and other tools that hardcode the Ollama API surface.
+        .route("/api/tags", get(ollama_tags))
+        .route("/api/chat", post(ollama_chat))
         .with_state(state)
 }
 
@@ -236,6 +246,12 @@ async fn chat_completions(
     // (Qwen3.6 / Qwen3.5 chat templates honor it).
     if let Some(et) = req.enable_thinking {
         payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
+    }
+    if let Some(tools) = req.tools.as_ref() {
+        payload["tools"] = json!(tools);
+    }
+    if let Some(tc) = req.tool_choice.as_ref() {
+        payload["tool_choice"] = tc.clone();
     }
 
     // Routing: by default, forward straight to the loaded backend on its
@@ -604,6 +620,49 @@ struct AnthropicRequest {
     top_k: Option<u32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// Anthropic tool spec. Translated to OpenAI tools array.
+    /// Each tool: {name, description, input_schema}.
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
+}
+
+fn anthropic_tools_to_openai(tools: &[Value]) -> Vec<Value> {
+    tools.iter().map(|t| {
+        let name = t.get("name").cloned().unwrap_or_else(|| Value::String("tool".into()));
+        let desc = t.get("description").cloned().unwrap_or_else(|| Value::String("".into()));
+        let schema = t.get("input_schema").cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": schema,
+            }
+        })
+    }).collect()
+}
+
+fn anthropic_tool_choice_to_openai(tc: &Value) -> Value {
+    // Anthropic: {type:"auto"|"any"|"tool"|"none", name?:"..."}
+    // OpenAI:   "auto"|"none"|"required" | {type:"function",function:{name:"..."}}
+    match tc {
+        Value::Object(o) => {
+            let ty = o.get("type").and_then(|v| v.as_str()).unwrap_or("auto");
+            match ty {
+                "any" => Value::String("required".into()),
+                "tool" => json!({
+                    "type": "function",
+                    "function": {"name": o.get("name").cloned().unwrap_or(Value::Null)},
+                }),
+                "none" => Value::String("none".into()),
+                _ => Value::String("auto".into()),
+            }
+        }
+        _ => Value::String("auto".into()),
+    }
 }
 
 fn anthropic_content_to_string(v: &serde_json::Value) -> String {
@@ -627,23 +686,102 @@ fn anthropic_content_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Expand an Anthropic message's content into one-or-more OpenAI-style
+/// `Message`s. Handles text + tool_use + tool_result blocks so multi-turn
+/// tool flows survive the bridge. Our `Message` is string-only; tool_use
+/// is encoded as readable JSON for the model to parse from context.
+fn anthropic_message_to_openai(
+    role: &str,
+    content: &Value,
+    out: &mut Vec<Message>,
+) {
+    let blocks: Vec<Value> = match content {
+        Value::String(s) => {
+            out.push(Message {
+                role: role.to_string(),
+                content: s.clone(),
+            });
+            return;
+        }
+        Value::Array(arr) => arr.clone(),
+        _ => return,
+    };
+
+    let mut text_buf = String::new();
+    for b in &blocks {
+        let ty = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match ty {
+            "text" => {
+                if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                    if !text_buf.is_empty() {
+                        text_buf.push('\n');
+                    }
+                    text_buf.push_str(t);
+                }
+            }
+            "tool_use" => {
+                // Flush any pending text first under the message's role.
+                if !text_buf.is_empty() {
+                    out.push(Message {
+                        role: role.to_string(),
+                        content: std::mem::take(&mut text_buf),
+                    });
+                }
+                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                let input = b.get("input").cloned().unwrap_or(json!({}));
+                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                // Render the tool call as readable JSON. bee's llama-server
+                // sees this as plain text — won't preserve tool_call_id
+                // wiring, but conversation context survives.
+                out.push(Message {
+                    role: "assistant".to_string(),
+                    content: format!(
+                        "[Tool call id={id}] {}({})",
+                        name,
+                        serde_json::to_string(&input).unwrap_or_default()
+                    ),
+                });
+            }
+            "tool_result" => {
+                if !text_buf.is_empty() {
+                    out.push(Message {
+                        role: role.to_string(),
+                        content: std::mem::take(&mut text_buf),
+                    });
+                }
+                let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                let body = b.get("content").cloned().unwrap_or(Value::String("".into()));
+                let body_str = match &body {
+                    Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                out.push(Message {
+                    // OpenAI uses role:"tool" for these. bee llama-server
+                    // accepts it via its chat template. tool_call_id link
+                    // is lost (we'd need a richer Message struct).
+                    role: "tool".to_string(),
+                    content: format!("[Tool result id={id}]\n{body_str}"),
+                });
+            }
+            _ => {} // ignore image / unknown blocks
+        }
+    }
+    if !text_buf.is_empty() {
+        out.push(Message {
+            role: role.to_string(),
+            content: text_buf,
+        });
+    }
+}
+
 async fn anthropic_messages(
     State(state): State<AppState>,
     Json(req): Json<AnthropicRequest>,
-) -> impl IntoResponse {
-    if req.stream {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "type": "error",
-                "error": {"type": "not_implemented",
-                          "message": "streaming on /v1/messages not yet supported by lamu"}
-            })),
-        )
-            .into_response();
-    }
-
-    // Translate to OpenAI-style ChatRequest.
+) -> Response {
+    // Translate to OpenAI-style messages. For multi-turn tool flows,
+    // expand each Anthropic message's content blocks into one or more
+    // OpenAI messages — preserves tool_use / tool_result semantics so
+    // Claude Code's tool agent loop works.
     let mut messages: Vec<Message> = Vec::new();
     if let Some(sys) = req.system.as_ref() {
         let sys_text = anthropic_content_to_string(sys);
@@ -655,11 +793,17 @@ async fn anthropic_messages(
         }
     }
     for m in &req.messages {
-        messages.push(Message {
-            role: m.role.clone(),
-            content: anthropic_content_to_string(&m.content),
-        });
+        anthropic_message_to_openai(&m.role, &m.content, &mut messages);
     }
+
+    if req.stream {
+        return stream_response_anthropic(state, messages, req.model.clone(),
+                                         req.max_tokens, req.temperature,
+                                         req.top_k, req.top_p).await;
+    }
+
+    let oai_tools = req.tools.as_ref().map(|t| anthropic_tools_to_openai(t));
+    let oai_tool_choice = req.tool_choice.as_ref().map(anthropic_tool_choice_to_openai);
 
     let oai_req = ChatRequest {
         model: req.model.clone(),
@@ -670,6 +814,8 @@ async fn anthropic_messages(
         top_k: req.top_k,
         top_p: req.top_p,
         enable_thinking: None,
+        tools: oai_tools,
+        tool_choice: oai_tool_choice,
     };
 
     let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
@@ -728,16 +874,43 @@ async fn anthropic_messages(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    // Build content blocks. Text block first (if any), then tool_use blocks
+    // for any tool_calls the model emitted. Mirrors Anthropic's native
+    // response shape so Claude Code can drive multi-turn tool flows.
+    let mut content_blocks: Vec<Value> = Vec::new();
+    if !oai_content.is_empty() {
+        content_blocks.push(json!({"type":"text","text": oai_content}));
+    }
+    let mut had_tool_use = false;
+    if let Some(tcs) = oai_msg.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
+        for tc in tcs {
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let fname = tc.get("function").and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let args_raw = tc.get("function").and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str()).unwrap_or("{}");
+            let args_val: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
+            content_blocks.push(json!({
+                "type":"tool_use",
+                "id": id,
+                "name": fname,
+                "input": args_val,
+            }));
+            had_tool_use = true;
+        }
+    }
+    if content_blocks.is_empty() {
+        content_blocks.push(json!({"type":"text","text":""}));
+    }
+    let stop_reason = if had_tool_use { "tool_use" } else { "end_turn" };
+
     let anthro = json!({
         "id": format!("msg_{}", random_hex(12)),
         "type": "message",
         "role": "assistant",
         "model": oai_model,
-        "content": [{
-            "type": "text",
-            "text": oai_content,
-        }],
-        "stop_reason": "end_turn",
+        "content": content_blocks,
+        "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
         "usage": {
             "input_tokens": in_tokens,
@@ -745,4 +918,407 @@ async fn anthropic_messages(
         },
     });
     (StatusCode::OK, Json(anthro)).into_response()
+}
+
+// Anthropic streaming: bridge OpenAI SSE → Anthropic event-typed SSE.
+// Re-uses chat_completions routing/lock acquisition by calling backend
+// directly via the routing decision pulled from state.
+async fn stream_response_anthropic(
+    state: AppState,
+    messages: Vec<Message>,
+    model_req: Option<String>,
+    max_tokens: u32,
+    temperature: f32,
+    top_k: Option<u32>,
+    top_p: Option<f32>,
+) -> Response {
+    // Route → pick backend port.
+    let (port, model_name, _marker) = {
+        let scheduler = state.scheduler.lock();
+        let router = state.router.lock();
+        let health = state.health.lock();
+        let decision = router.route(&scheduler, model_req.as_deref(), None, Some(health.all()));
+        if decision.model_name.is_empty() || !decision.loaded {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+                "type": "error",
+                "error": {"type": "model_not_available",
+                          "message": format!("No model: {}", decision.reason)}
+            }))).into_response();
+        }
+        let Some(_loaded) = scheduler.get_loaded(&decision.model_name) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "type": "error", "error": {"type":"internal","message":"lost loaded model"}
+            }))).into_response();
+        };
+        let port = _loaded.port;
+        let entry = state.entries.get(&decision.model_name).cloned();
+        let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
+        (port, decision.model_name, marker)
+    };
+
+    let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
+    let payload = json!({
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": true,
+        "top_k": top_k,
+        "top_p": top_p,
+    });
+
+    let msg_id = format!("msg_{}", random_hex(12));
+    let client = state.client.clone();
+
+    let s = async_stream::stream! {
+        // message_start
+        let start = json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model_name,
+                "content": [],
+                "stop_reason": serde_json::Value::Null,
+                "stop_sequence": serde_json::Value::Null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        });
+        yield Ok::<_, Infallible>(Event::default().event("message_start").data(start.to_string()));
+
+        // content_block_start (single text block)
+        let cb_start = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        yield Ok(Event::default().event("content_block_start").data(cb_start.to_string()));
+
+        let resp = match client.post(&backend_url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = json!({
+                    "type": "error",
+                    "error": {"type":"backend_error","message": format!("{e}")}
+                });
+                yield Ok(Event::default().event("error").data(err.to_string()));
+                return;
+            }
+        };
+
+        let mut byte_stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut out_tokens: u64 = 0;
+
+        use futures_util::stream::StreamExt;
+        while let Some(chunk_res) = byte_stream.next().await {
+            let Ok(bytes) = chunk_res else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("data: ") else { continue };
+                if rest == "[DONE]" {
+                    let cb_stop = json!({"type":"content_block_stop","index":0});
+                    yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
+
+                    let m_delta = json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason":"end_turn","stop_sequence": serde_json::Value::Null},
+                        "usage": {"output_tokens": out_tokens}
+                    });
+                    yield Ok(Event::default().event("message_delta").data(m_delta.to_string()));
+
+                    let m_stop = json!({"type":"message_stop"});
+                    yield Ok(Event::default().event("message_stop").data(m_stop.to_string()));
+                    return;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
+                let Some(token) = val.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                else { continue };
+                if token.is_empty() { continue; }
+                out_tokens += 1;
+                let delta = json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type":"text_delta","text": token}
+                });
+                yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+            }
+        }
+
+        // Stream ended without [DONE]; emit close events anyway.
+        let cb_stop = json!({"type":"content_block_stop","index":0});
+        yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
+        let m_delta = json!({
+            "type":"message_delta",
+            "delta":{"stop_reason":"end_turn","stop_sequence": serde_json::Value::Null},
+            "usage":{"output_tokens": out_tokens}
+        });
+        yield Ok(Event::default().event("message_delta").data(m_delta.to_string()));
+        let m_stop = json!({"type":"message_stop"});
+        yield Ok(Event::default().event("message_stop").data(m_stop.to_string()));
+    };
+
+    Sse::new(Box::pin(s)).into_response()
+}
+
+// ── Ollama-compat shim ───────────────────────────────────────────────
+//
+// Supports /api/tags (list models) and /api/chat (chat with stream).
+// AnythingLLM, Open WebUI in Ollama mode, and a few other tools
+// expect this surface. Body format is line-delimited JSON, not SSE.
+
+#[derive(Debug, Clone, Deserialize)]
+struct OllamaChatRequest {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<OllamaMessage>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OllamaMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct OllamaOptions {
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    num_predict: Option<u32>,
+}
+
+async fn ollama_tags(State(state): State<AppState>) -> impl IntoResponse {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let models: Vec<Value> = state.entries.iter().map(|(name, e)| {
+        json!({
+            "name": name,
+            "model": name,
+            "modified_at": now,
+            "size": (e.vram_mb as u64) * 1024 * 1024,
+            "details": {
+                "family": e.arch,
+                "parameter_size": format!("{}B", e.params_b),
+                "quantization_level": e.quant,
+            }
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!({"models": models}))).into_response()
+}
+
+async fn ollama_chat(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaChatRequest>,
+) -> Response {
+    let stream_on = req.stream.unwrap_or(true);
+    let opts = req.options.unwrap_or_default();
+    let max_tokens = opts.num_predict.unwrap_or(default_max_tokens());
+    let temperature = opts.temperature.unwrap_or(default_temperature());
+
+    let messages: Vec<Message> = req.messages.iter().map(|m| Message {
+        role: m.role.clone(),
+        content: m.content.clone(),
+    }).collect();
+
+    if stream_on {
+        return stream_response_ollama(state, messages, req.model.clone(),
+                                      max_tokens, temperature, opts.top_k, opts.top_p).await;
+    }
+
+    let oai_req = ChatRequest {
+        model: req.model.clone(),
+        messages,
+        max_tokens,
+        temperature,
+        stream: false,
+        top_k: opts.top_k,
+        top_p: opts.top_p,
+        enable_thinking: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
+    let (parts, body) = resp.into_parts();
+    if parts.status != StatusCode::OK {
+        return (parts.status, body).into_response();
+    }
+    let body_bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("body read: {e}")}))).into_response();
+        }
+    };
+    let oai: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("json: {e}")}))).into_response();
+        }
+    };
+    let content = oai.get("choices").and_then(|c| c.get(0))
+        .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str()).unwrap_or("");
+    let model = oai.get("model").and_then(|v| v.as_str()).unwrap_or("lamu");
+    let usage = oai.get("usage");
+    let in_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+    let out_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let ollama = json!({
+        "model": model,
+        "created_at": rfc3339_now(),
+        "message": {"role":"assistant","content": content},
+        "done_reason": "stop",
+        "done": true,
+        "total_duration": 0,
+        "load_duration": 0,
+        "prompt_eval_count": in_tok,
+        "eval_count": out_tok,
+        "eval_duration": 0,
+    });
+    (StatusCode::OK, Json(ollama)).into_response()
+}
+
+fn rfc3339_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // Coarse-grained RFC3339; nanos zeroed. Good enough for clients
+    // that only check the field exists.
+    let (y, mo, d, h, mi, s) = epoch_to_civil(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
+fn epoch_to_civil(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    // Howard Hinnant's algorithm
+    let z = (secs / 86400) as i64;
+    let s = secs % 86400;
+    let h = (s / 3600) as u32;
+    let mi = ((s % 3600) / 60) as u32;
+    let sc = (s % 60) as u32;
+    let z2 = z + 719468;
+    let era = if z2 >= 0 { z2 } else { z2 - 146096 } / 146097;
+    let doe = (z2 - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let yr = if mo <= 2 { y + 1 } else { y } as u32;
+    (yr, mo, d, h, mi, sc)
+}
+
+async fn stream_response_ollama(
+    state: AppState,
+    messages: Vec<Message>,
+    model_req: Option<String>,
+    max_tokens: u32,
+    temperature: f32,
+    top_k: Option<u32>,
+    top_p: Option<f32>,
+) -> Response {
+    let (port, model_name, _marker) = {
+        let scheduler = state.scheduler.lock();
+        let router = state.router.lock();
+        let health = state.health.lock();
+        let decision = router.route(&scheduler, model_req.as_deref(), None, Some(health.all()));
+        if decision.model_name.is_empty() || !decision.loaded {
+            return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("No model: {}", decision.reason)}))).into_response();
+        }
+        let Some(_loaded) = scheduler.get_loaded(&decision.model_name) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"lost loaded model"}))).into_response();
+        };
+        let port = _loaded.port;
+        let entry = state.entries.get(&decision.model_name).cloned();
+        let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
+        (port, decision.model_name, marker)
+    };
+
+    let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
+    let payload = json!({
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": true,
+        "top_k": top_k,
+        "top_p": top_p,
+    });
+
+    let client = state.client.clone();
+    let body_stream = async_stream::stream! {
+        let resp = match client.post(&backend_url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = json!({"error": format!("backend: {e}")});
+                yield Ok::<_, std::io::Error>(format!("{}\n", err).into_bytes());
+                return;
+            }
+        };
+        let mut byte_stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut out_tokens: u64 = 0;
+
+        use futures_util::stream::StreamExt;
+        while let Some(chunk_res) = byte_stream.next().await {
+            let Ok(bytes) = chunk_res else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("data: ") else { continue };
+                if rest == "[DONE]" {
+                    let final_obj = json!({
+                        "model": model_name,
+                        "created_at": rfc3339_now(),
+                        "message": {"role":"assistant","content":""},
+                        "done_reason":"stop",
+                        "done": true,
+                        "total_duration": 0,
+                        "load_duration": 0,
+                        "prompt_eval_count": 0,
+                        "eval_count": out_tokens,
+                        "eval_duration": 0,
+                    });
+                    yield Ok(format!("{}\n", final_obj).into_bytes());
+                    return;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
+                let Some(token) = val.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                else { continue };
+                if token.is_empty() { continue; }
+                out_tokens += 1;
+                let chunk = json!({
+                    "model": model_name,
+                    "created_at": rfc3339_now(),
+                    "message": {"role":"assistant","content": token},
+                    "done": false,
+                });
+                yield Ok(format!("{}\n", chunk).into_bytes());
+            }
+        }
+    };
+
+    let stream_body = axum::body::Body::from_stream(body_stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-ndjson")
+        .body(stream_body)
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
 }
