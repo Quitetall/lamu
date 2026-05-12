@@ -82,6 +82,12 @@ pub struct ModelEntry {
     pub speculative: Option<SpeculativeConfig>,
     #[serde(default)]
     pub pinned: bool,
+    /// Designate this entry as the default model when external harnesses
+    /// (Claude Code, Codex, Cursor, etc.) call /v1/chat/completions
+    /// without a `model` field, or with the alias `default`/`main`/`lamu`.
+    /// Exactly one entry should set `main: true`. First match wins.
+    #[serde(default)]
+    pub main: bool,
     /// Free-text description shown in `mcp__local-llm__list_models`
     /// output. Used by humans (and orchestrating agents) to pick the
     /// right model for a task. (TUI dashboard rendering is a TODO —

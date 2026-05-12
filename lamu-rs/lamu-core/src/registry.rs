@@ -285,6 +285,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             reasoning_marker,
             speculative: None,
             pinned: false,
+            main: false,
             notes: String::new(),
             status: crate::types::ModelStatus::default(),
         });
@@ -318,6 +319,8 @@ struct ModelEntryYaml {
     speculative: Option<SpeculativeConfig>,
     #[serde(default, skip_serializing_if = "is_false")]
     pinned: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    main: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     notes: String,
     #[serde(default, deserialize_with = "crate::types::ModelStatus::deserialize_lenient",
@@ -342,6 +345,7 @@ impl From<ModelEntry> for ModelEntryYaml {
             reasoning_marker: e.reasoning_marker,
             speculative: e.speculative,
             pinned: e.pinned,
+            main: e.main,
             notes: e.notes,
             status: e.status,
         }
@@ -364,6 +368,7 @@ impl ModelEntryYaml {
             reasoning_marker: self.reasoning_marker,
             speculative: self.speculative,
             pinned: self.pinned,
+            main: self.main,
             notes: self.notes,
             status: self.status,
         }

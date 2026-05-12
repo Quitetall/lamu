@@ -42,8 +42,24 @@ impl Router {
             }
         };
 
+        // Resolve aliases: "default", "main", "lamu" → the entry flagged
+        // with `main: true` in models.yaml. Lets external harnesses pin
+        // their config to "model: lamu" and stay agnostic of which model
+        // is actually backing the call.
+        let resolved_model: Option<String> = model.and_then(|n| {
+            let lc = n.to_ascii_lowercase();
+            if matches!(lc.as_str(), "default" | "main" | "lamu") {
+                self.registry.values()
+                    .find(|e| e.main)
+                    .map(|e| e.name.clone())
+            } else {
+                None
+            }
+        });
+        let model_eff: Option<&str> = resolved_model.as_deref().or(model);
+
         // Explicit model override
-        if let Some(name) = model {
+        if let Some(name) = model_eff {
             let Some(entry) = self.find_model(name) else {
                 return RouteDecision {
                     model_name: name.to_string(),
@@ -97,6 +113,24 @@ impl Router {
             Some(c) if !c.is_empty() => c.iter().copied().collect(),
             _ => [Capability::Chat].into_iter().collect(),
         };
+
+        // If model unspecified AND no specific capability set, prefer the
+        // operator-designated `main: true` entry (if loaded + healthy).
+        // Lets external harnesses (Claude Code, Codex, Cursor, etc.)
+        // call /v1/chat/completions with no model field and land on the
+        // current main provider deterministically.
+        if model.is_none() {
+            if let Some(main_entry) = self.registry.values().find(|e| e.main) {
+                if is_usable(&main_entry.name) && scheduler.is_loaded(&main_entry.name) {
+                    return RouteDecision {
+                        model_name: main_entry.name.clone(),
+                        reason: "operator-designated main model (loaded)".to_string(),
+                        loaded: true,
+                        would_evict: vec![],
+                    };
+                }
+            }
+        }
 
         // Try loaded models first (filter unhealthy)
         let loaded_matches: Vec<&LoadedModel> = self

@@ -76,6 +76,10 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        // Anthropic Messages API shim for Claude Code et al. Translates
+        // /v1/messages payload → OpenAI ChatRequest, delegates to
+        // chat_completions, then maps the response back.
+        .route("/v1/messages", post(anthropic_messages))
         .with_state(state)
 }
 
@@ -568,4 +572,177 @@ pub fn build_state(registry_path: &Path) -> anyhow::Result<AppState> {
         health: Arc::new(Mutex::new(HealthRegistry::new())),
         metrics: Arc::new(metrics),
     })
+}
+
+// ── Anthropic Messages API shim ─────────────────────────────────────
+//
+// Claude Code, Continue (anthropic mode), and other tools call this
+// surface. We translate to our internal ChatRequest, reuse the OpenAI
+// pipeline, then map the response back into Anthropic's envelope.
+// Streaming SSE is not yet implemented — non-streaming only.
+
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicMessage {
+    role: String,
+    content: serde_json::Value, // string OR vec of content blocks
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicRequest {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    #[serde(default)]
+    system: Option<serde_json::Value>, // string OR vec of content blocks
+    #[serde(default = "default_max_tokens")]
+    max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+}
+
+fn anthropic_content_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => {
+            // Concatenate text blocks; ignore tool_use / image blocks for now.
+            arr.iter()
+                .filter_map(|b| {
+                    let ty = b.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                    if ty == "text" {
+                        b.get("text").and_then(|x| x.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    Json(req): Json<AnthropicRequest>,
+) -> impl IntoResponse {
+    if req.stream {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "type": "error",
+                "error": {"type": "not_implemented",
+                          "message": "streaming on /v1/messages not yet supported by lamu"}
+            })),
+        )
+            .into_response();
+    }
+
+    // Translate to OpenAI-style ChatRequest.
+    let mut messages: Vec<Message> = Vec::new();
+    if let Some(sys) = req.system.as_ref() {
+        let sys_text = anthropic_content_to_string(sys);
+        if !sys_text.is_empty() {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: sys_text,
+            });
+        }
+    }
+    for m in &req.messages {
+        messages.push(Message {
+            role: m.role.clone(),
+            content: anthropic_content_to_string(&m.content),
+        });
+    }
+
+    let oai_req = ChatRequest {
+        model: req.model.clone(),
+        messages,
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        stream: false,
+        top_k: req.top_k,
+        top_p: req.top_p,
+        enable_thinking: None,
+    };
+
+    let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
+    let (parts, body) = resp.into_parts();
+    if parts.status != StatusCode::OK {
+        // Pass error envelope through (already JSON).
+        return (parts.status, body).into_response();
+    }
+    let body_bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "type": "error",
+                    "error": {"type": "internal", "message": format!("body read: {e}")}
+                })),
+            )
+                .into_response();
+        }
+    };
+    let oai_resp: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "type": "error",
+                    "error": {"type": "bad_response", "message": format!("json: {e}")}
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Map OAI response → Anthropic envelope.
+    let oai_msg = oai_resp
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"));
+    let oai_content = oai_msg
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let oai_model = oai_resp
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("lamu");
+    let usage = oai_resp.get("usage");
+    let in_tokens = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let out_tokens = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let anthro = json!({
+        "id": format!("msg_{}", random_hex(12)),
+        "type": "message",
+        "role": "assistant",
+        "model": oai_model,
+        "content": [{
+            "type": "text",
+            "text": oai_content,
+        }],
+        "stop_reason": "end_turn",
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": in_tokens,
+            "output_tokens": out_tokens,
+        },
+    });
+    (StatusCode::OK, Json(anthro)).into_response()
 }

@@ -153,6 +153,11 @@ models:
       close_tag: </think>
       family: qwen35
     status: recommended
+    # `main: true` makes this the default when external harnesses
+    # (Claude Code via /v1/messages, Codex / Cursor / Continue via
+    # /v1/chat/completions) call without specifying `model`. Aliases
+    # `default`, `main`, `lamu` also resolve here.
+    main: true
     notes: |
       27B dense daily driver. Q4_K_M speed/quality sweet spot, ~70 t/s on
       4090. Heretic v2 fine-tune drops alignment refusals without hurting
