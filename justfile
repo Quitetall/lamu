@@ -173,6 +173,78 @@ setup-agents:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# BeeLlama.cpp — DFlash + TurboQuant/TCQ KV fork (additive, side-by-side).
+# Bench 2026-05-11: 82 t/s @ 4k (1.84x vanilla), 101.7 t/s @ 262k ctx on 4090.
+# Default port :8021. Override with BEE_PORT, BEE_CTX, BEE_KV_K, BEE_KV_V env.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Start BeeLlama Qwen3.6-27B + DFlash + turbo3_tcq KV on :8021
+[group: 'bee']
+serve-bee:
+    bash {{root}}/scripts/serve-qwen36-bee.sh
+
+# Stop BeeLlama server
+[group: 'bee']
+stop-bee:
+    -test -f /tmp/bee-server.pid && kill $(cat /tmp/bee-server.pid) 2>/dev/null && rm /tmp/bee-server.pid
+    -pkill -f "beellama.cpp/build/bin/llama-server" 2>/dev/null
+    @echo "BeeLlama stopped."
+
+# Status: port + spec accept rate + ctx + processing flag
+[group: 'bee']
+status-bee port="8021":
+    @echo "BeeLlama :{{port}}  $(curl -sf http://localhost:{{port}}/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
+    @curl -sf http://localhost:{{port}}/slots 2>/dev/null | python3 -c "import sys,json; s=json.load(sys.stdin)[0]; print(f\"  slot 0: n_ctx={s['n_ctx']}, spec={s['speculative']}, processing={s['is_processing']}\")" 2>/dev/null || echo "  (no slots yet)"
+    @curl -sf http://localhost:{{port}}/metrics 2>/dev/null | grep -E "llamacpp:n_(decode|past|draft|accepted)" | head -10 | sed 's/^/  /' || echo "  (metrics unavailable)"
+
+# Smoke: send 20-token hello to BeeLlama, measure tok/s
+[group: 'bee']
+smoke-bee port="8021":
+    @curl -s http://localhost:{{port}}/v1/chat/completions -H "Content-Type: application/json" \
+      -d '{"model":"any","messages":[{"role":"user","content":"Say hi in one short sentence."}],"max_tokens":40,"temperature":0}' \
+      | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content']); u=r.get('usage',{}); print(f\"tokens: prompt={u.get('prompt_tokens')}, completion={u.get('completion_tokens')}\")"
+
+# Stream chat to bee. Thinking ON by default. Pass `THINK=0 just chat-bee ...` to disable.
+[group: 'bee']
+chat-bee +prompt:
+    @python3 {{root}}/scripts/chat-bee.py {{prompt}}
+
+# Chat with thinking explicitly off (faster wall time)
+[group: 'bee']
+ask-bee +prompt:
+    @python3 {{root}}/scripts/chat-bee.py --no-think {{prompt}}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MTP — native Multi-Token Prediction heads via llama.cpp PR #22673.
+# Bench 2026-05-12: 74.1 t/s @ 8k (1.41x bee, 1.87x vanilla), 96.9% accept.
+# Use for ≤16k ctx daily. For >32k ctx use serve-bee.
+# Default port :8023. Override with MTP_PORT, MTP_CTX, MTP_N_MAX env.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[group: 'mtp']
+serve-mtp:
+    bash {{root}}/scripts/serve-qwen36-mtp.sh
+
+[group: 'mtp']
+stop-mtp:
+    -test -f /tmp/mtp-server.pid && kill $(cat /tmp/mtp-server.pid) 2>/dev/null && rm /tmp/mtp-server.pid
+    -pkill -f "llama-mtp/llama.cpp/build/bin/llama-server" 2>/dev/null
+    @echo "MTP stopped."
+
+[group: 'mtp']
+status-mtp port="8023":
+    @echo "MTP :{{port}}  $(curl -sf http://localhost:{{port}}/v1/models >/dev/null 2>&1 && echo '✓' || echo '✗')"
+    @curl -sf http://localhost:{{port}}/slots 2>/dev/null | python3 -c "import sys,json; s=json.load(sys.stdin)[0]; print(f\"  slot 0: n_ctx={s['n_ctx']}, spec={s['speculative']}, processing={s['is_processing']}\")" 2>/dev/null || echo "  (no slots yet)"
+
+[group: 'mtp']
+smoke-mtp port="8023":
+    @curl -s http://localhost:{{port}}/v1/chat/completions -H "Content-Type: application/json" \
+      -d '{"model":"any","messages":[{"role":"user","content":"Say hi in one short sentence."}],"max_tokens":40,"temperature":0}' \
+      | python3 -c "import sys,json; r=json.load(sys.stdin); t=r['timings']; print(f\"gen {t['predicted_per_second']:.1f} t/s, accept {t.get('draft_n_accepted',0)}/{t.get('draft_n',0)}\")"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Bifrost + benchmarks (parallel infrastructure, kept per Phase 1 verdict)
 # ═══════════════════════════════════════════════════════════════════════════
 

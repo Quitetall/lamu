@@ -22,6 +22,16 @@ pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
     }
 }
 
+/// Per-call backend options. Backends without a corresponding feature
+/// silently ignore unknown fields.
+#[derive(Debug, Clone, Default)]
+pub struct GenerateOpts {
+    /// Qwen3.6 / Qwen3.5 reasoning toggle. `Some(false)` disables the
+    /// `<think>` block via `chat_template_kwargs.enable_thinking`. `None`
+    /// leaves the model's default behaviour (thinking on).
+    pub enable_thinking: Option<bool>,
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Load model. Returns PID.
@@ -40,6 +50,19 @@ pub trait Backend: Send + Sync {
         max_tokens: u32,
         temperature: f32,
     ) -> Result<String>;
+
+    /// Generate non-streaming with extended options. Default impl ignores
+    /// `opts` and forwards to `generate()`. Backends override to honor
+    /// per-call params like `enable_thinking`.
+    async fn generate_with_opts(
+        &self,
+        messages: Vec<ChatMessage>,
+        max_tokens: u32,
+        temperature: f32,
+        _opts: GenerateOpts,
+    ) -> Result<String> {
+        self.generate(messages, max_tokens, temperature).await
+    }
 
     /// Generate streaming. Yields tokens.
     async fn stream(

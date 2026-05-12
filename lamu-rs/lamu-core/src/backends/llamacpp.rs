@@ -227,12 +227,28 @@ impl Backend for LlamaCppBackend {
         max_tokens: u32,
         temperature: f32,
     ) -> Result<String> {
-        let payload = json!({
+        self.generate_with_opts(messages, max_tokens, temperature,
+                                crate::backends::GenerateOpts::default()).await
+    }
+
+    async fn generate_with_opts(
+        &self,
+        messages: Vec<ChatMessage>,
+        max_tokens: u32,
+        temperature: f32,
+        opts: crate::backends::GenerateOpts,
+    ) -> Result<String> {
+        let mut payload = json!({
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": false,
         });
+        // bee llama-server honors chat_template_kwargs.enable_thinking for
+        // Qwen3.6 / Qwen3.5. None = leave default (model decides).
+        if let Some(et) = opts.enable_thinking {
+            payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
+        }
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;

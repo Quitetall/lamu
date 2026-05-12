@@ -46,6 +46,12 @@ pub struct ChatRequest {
     pub top_k: Option<u32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// Toggle Qwen3.6 / Qwen3.5 reasoning mode. When None, defaults to
+    /// the backend's chat template default (typically thinking ON for
+    /// Qwen3.6). Set false to skip the `<think>` block entirely and
+    /// shave wall time on simple queries.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 fn default_max_tokens() -> u32 { 16384 }
@@ -221,6 +227,12 @@ async fn chat_completions(
     });
     if let Some(k) = req.top_k { payload["top_k"] = json!(k); }
     if let Some(p) = req.top_p { payload["top_p"] = json!(p); }
+    // Thread enable_thinking through to backend's chat template kwargs.
+    // bee llama-server consumes chat_template_kwargs.enable_thinking
+    // (Qwen3.6 / Qwen3.5 chat templates honor it).
+    if let Some(et) = req.enable_thinking {
+        payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
+    }
 
     // Routing: by default, forward straight to the loaded backend on its
     // local port. If LAMU_GATEWAY_URL is set (e.g. a Bifrost endpoint),

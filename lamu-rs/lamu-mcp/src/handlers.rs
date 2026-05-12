@@ -63,6 +63,12 @@ impl LamuMcpServer {
         let include_reasoning = args.get("include_reasoning").and_then(|v| v.as_bool()).unwrap_or(false);
         let priority = args.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let origin = args.get("origin").and_then(|v| v.as_str()).unwrap_or("anonymous").to_string();
+        // Qwen3.6 / Qwen3.5 reasoning toggle: when explicitly false, append
+        // `/no_think` to the system message. Qwen's chat template honors
+        // this directive and skips the `<think>` block, cutting wall time
+        // 4× on tiny prompts and ~20% on long. Unset = leave default
+        // (thinking on).
+        let enable_thinking = args.get("enable_thinking").and_then(|v| v.as_bool());
 
         // Trace ID: accept W3C traceparent from `_meta`, else generate.
         let trace_id = args
@@ -177,7 +183,10 @@ impl LamuMcpServer {
                     model_name
                 );
             }
-            match backend.generate(chat_messages, max_tokens, temperature).await {
+            let opts = lamu_core::backends::GenerateOpts {
+                enable_thinking,
+            };
+            match backend.generate_with_opts(chat_messages, max_tokens, temperature, opts).await {
                 Ok(s) => s,
                 Err(e) => {
                     emit(

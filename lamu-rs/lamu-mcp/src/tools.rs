@@ -63,6 +63,7 @@ fn schema_query() -> Value {
             "max_tokens": {"type": "integer", "default": 16384},
             "temperature": {"type": "number", "default": 0.7},
             "include_reasoning": {"type": "boolean", "default": false},
+            "enable_thinking": {"type": "boolean", "description": "Toggle Qwen3.6/3.5 <think> reasoning. False = direct answer (4× faster wall on simple queries, ~1.2× on long). Routed via Backend::generate_with_opts → bee chat_template_kwargs.enable_thinking. Default: model's choice (thinking on)."},
             "priority": {"type": "integer", "default": 0, "description": "Higher served first (priority strategy only)"},
             "origin": {"type": "string", "default": "anonymous", "description": "Agent identifier for queue observability"},
         },
