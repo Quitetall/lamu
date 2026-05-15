@@ -162,6 +162,66 @@ impl AppState {
         self.model_view.iter().position(|r| matches!(r, ModelRef::Local(i) if *i == main_pos))
     }
 
+    /// **Test fixture only.** Returns an AppState with all sources empty
+    /// (no registry, no harnesses, no MCP servers, no cloud models).
+    /// Skips every filesystem + NVML access that `new()` performs so
+    /// unit tests stay hermetic in CI / sandboxes without GPU drivers
+    /// or a populated $HOME.
+    ///
+    /// Public because integration-test crates need it; the `_for_tests`
+    /// suffix + this docstring discourage production callers. Calling
+    /// it from prod would just yield an empty dashboard.
+    #[doc(hidden)]
+    pub fn new_for_tests() -> Self {
+        let mut list_state = ListState::default();
+        list_state.select(None);
+        let mut launcher_state = ListState::default();
+        launcher_state.select(None);
+        let mut mcp_state = ListState::default();
+        mcp_state.select(None);
+        let mut settings_state = ListState::default();
+        settings_state.select(Some(0));
+        Self {
+            entries: Vec::new(),
+            list_state,
+            vram: VramBudget {
+                total_mb: 0,
+                used_mb: 0,
+                free_mb: 0,
+                loaded_models: Vec::new(),
+                available_mb: 0,
+            },
+            gpu_available: false,
+            gpu_reason: None,
+            last_refresh: Instant::now(),
+            status_msg: String::new(),
+            serve_up: false,
+            bifrost_up: false,
+            mode: Mode::Dashboard,
+            launcher_state,
+            harness_installed: Vec::new(),
+            last_harness: None,
+            favorites: Favorites::default(),
+            model_sort: SortKey::Default,
+            model_filter: String::new(),
+            harness_sort: SortKey::Default,
+            harness_filter: String::new(),
+            input_mode: InputMode::Normal,
+            quit_confirm: false,
+            api_key_input: String::new(),
+            api_key_for: None,
+            harness_view: Vec::new(),
+            mcp_servers: Vec::new(),
+            mcp_state,
+            cloud_models: Vec::new(),
+            source_filter: SourceFilter::All,
+            model_view: Vec::new(),
+            config: LamuConfig::default(),
+            settings_state,
+            gpu_procs: Vec::new(),
+        }
+    }
+
     /// Snapshot the GPU process list. Looks up each PID's command name
     /// from /proc/<pid>/comm so the user can identify the offender.
     pub fn refresh_gpu_procs(&mut self) {
@@ -490,14 +550,13 @@ mod default_main_idx_tests {
     }
 
     fn mk_state_with(entries: Vec<ModelEntry>) -> AppState {
-        // Skip AppState::new() (touches filesystem + GPU). Construct a
-        // minimal AppState that has just enough state for the methods
-        // under test: entries + an empty model_view that we fill via
-        // recompute_views().
-        let mut s = AppState::new().expect("AppState::new");
+        // Use new_for_tests() — skips filesystem + NVML probes so the
+        // test runs cleanly in CI / sandboxed builds without GPU drivers
+        // or a populated $HOME/local-llm/config/. Only the fields
+        // exercised by view-index logic (entries + model_filter +
+        // source_filter + model_view + list_state) need to be touched.
+        let mut s = AppState::new_for_tests();
         s.entries = entries;
-        s.model_filter.clear();
-        s.source_filter = SourceFilter::All;
         s.recompute_views();
         s
     }
@@ -550,13 +609,16 @@ mod default_main_idx_tests {
         let idx1 = s.default_main_view_idx().expect("must find a main");
         let idx2 = s.default_main_view_idx().expect("must find a main");
         assert_eq!(idx1, idx2, "deterministic resolution across calls");
-        // Confirm it picks one of the main entries.
+        // `default_main_view_idx` calls `entries.iter().position(|e| e.main)`
+        // — `entries` is a Vec (insertion-ordered), NOT a HashMap. The
+        // first entry with `main: true` always wins regardless of build
+        // or run. Tighten the assertion to require that specific entry.
         let picked_name = match s.model_view[idx1] {
             ModelRef::Local(i) => s.entries[i].name.clone(),
             _ => panic!("expected Local ref"),
         };
-        assert!(picked_name == "main-a" || picked_name == "main-b",
-            "first-wins picks one of the flagged entries; got {picked_name}");
+        assert_eq!(picked_name, "main-a",
+            "first-wins must pick the FIRST flagged entry by Vec insertion order");
     }
 
     #[test]
