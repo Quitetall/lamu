@@ -461,3 +461,131 @@ impl AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod default_main_idx_tests {
+    use super::*;
+    use lamu_core::types::{BackendType, Capability, ModelFormat, ModelStatus};
+    use std::path::PathBuf;
+
+    fn mk_entry(name: &str, main: bool) -> ModelEntry {
+        ModelEntry {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/tmp/{name}.gguf")),
+            format: ModelFormat::Gguf,
+            backend: BackendType::LlamaCpp,
+            arch: "qwen35".into(),
+            params_b: 1.0,
+            quant: "Q4".into(),
+            vram_mb: 1000,
+            context_max: 4096,
+            capabilities: vec![Capability::Chat],
+            reasoning_marker: None,
+            speculative: None,
+            pinned: false,
+            main,
+            notes: String::new(),
+            status: ModelStatus::Unspecified,
+        }
+    }
+
+    fn mk_state_with(entries: Vec<ModelEntry>) -> AppState {
+        // Skip AppState::new() (touches filesystem + GPU). Construct a
+        // minimal AppState that has just enough state for the methods
+        // under test: entries + an empty model_view that we fill via
+        // recompute_views().
+        let mut s = AppState::new().expect("AppState::new");
+        s.entries = entries;
+        s.model_filter.clear();
+        s.source_filter = SourceFilter::All;
+        s.recompute_views();
+        s
+    }
+
+    #[test]
+    fn no_main_returns_none() {
+        let s = mk_state_with(vec![mk_entry("a", false), mk_entry("b", false)]);
+        assert_eq!(s.default_main_view_idx(), None);
+    }
+
+    #[test]
+    fn single_main_returns_its_view_position() {
+        let s = mk_state_with(vec![
+            mk_entry("first", false),
+            mk_entry("main-one", true),
+            mk_entry("last", false),
+        ]);
+        let idx = s.default_main_view_idx().expect("must find main");
+        // Confirm the index points at the main entry in the view.
+        match s.model_view[idx] {
+            ModelRef::Local(i) => assert!(s.entries[i].main),
+            other => panic!("expected Local ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_filtered_out_returns_none() {
+        let mut s = mk_state_with(vec![
+            mk_entry("alpha", false),
+            mk_entry("hidden-main", true),
+        ]);
+        // Filter that excludes 'hidden-main'. Filter matches name OR
+        // capability name; "alpha" is a clean substring.
+        s.model_filter = "alpha".to_string();
+        s.recompute_views();
+        assert_eq!(
+            s.default_main_view_idx(),
+            None,
+            "main entry filtered out → idx is None"
+        );
+    }
+
+    #[test]
+    fn duplicate_main_first_wins() {
+        let s = mk_state_with(vec![
+            mk_entry("main-a", true),
+            mk_entry("main-b", true),
+            mk_entry("other", false),
+        ]);
+        let idx1 = s.default_main_view_idx().expect("must find a main");
+        let idx2 = s.default_main_view_idx().expect("must find a main");
+        assert_eq!(idx1, idx2, "deterministic resolution across calls");
+        // Confirm it picks one of the main entries.
+        let picked_name = match s.model_view[idx1] {
+            ModelRef::Local(i) => s.entries[i].name.clone(),
+            _ => panic!("expected Local ref"),
+        };
+        assert!(picked_name == "main-a" || picked_name == "main-b",
+            "first-wins picks one of the flagged entries; got {picked_name}");
+    }
+
+    #[test]
+    fn recompute_views_clamps_oob_selection_to_main() {
+        let mut s = mk_state_with(vec![
+            mk_entry("small", false),
+            mk_entry("the-main", true),
+            mk_entry("other", false),
+        ]);
+        // Pre-select an out-of-bounds index, then apply a filter that
+        // drops it. Clamp logic should land us on the main entry.
+        s.list_state.select(Some(99));
+        s.model_filter = "the-main".to_string();
+        s.recompute_views();
+        let landed = s.list_state.selected().expect("must select something");
+        match s.model_view[landed] {
+            ModelRef::Local(i) => assert!(s.entries[i].main, "clamp must land on main"),
+            _ => panic!("expected Local ref"),
+        }
+    }
+
+    #[test]
+    fn recompute_views_clamps_to_none_on_empty_view() {
+        let mut s = mk_state_with(vec![mk_entry("x", false)]);
+        // Filter excludes everything.
+        s.model_filter = "no-such-substring".to_string();
+        s.list_state.select(Some(0));
+        s.recompute_views();
+        assert_eq!(s.list_state.selected(), None,
+            "empty view → selection must be None, not a dangling index");
+    }
+}

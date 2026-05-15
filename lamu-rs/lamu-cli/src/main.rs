@@ -331,50 +331,65 @@ async fn cmd_status() -> Result<()> {
 
     let client = reqwest::Client::builder().timeout(Duration::from_secs(1)).build()?;
     for port in [PORT_MAIN, PORT_SIDECAR, 8000u16] {
-        let health_url = format!("http://localhost:{}/health", port);
-        let Ok(r) = client.get(&health_url).send().await else {
-            println!("  ⚪ :{} — not running", port);
-            continue;
-        };
-        let Ok(health_json) = r.json::<Value>().await else {
-            println!("  ⚪ :{} — not running", port);
-            continue;
-        };
-        if health_json.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            println!("  ⚪ :{} — not running", port);
-            continue;
-        }
-        let n_loaded = health_json.get("models_loaded")
+        let health = fetch_json(&client, port, "/health").await;
+        let models = if health
+            .as_ref()
+            .and_then(|h| h.get("models_loaded"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if n_loaded == 0 {
-            println!("  🟡 :{} — http up, no model loaded", port);
-            continue;
-        }
-        let models_url = format!("http://localhost:{}/v1/models", port);
-        let mut loaded_names: Vec<String> = Vec::new();
-        if let Ok(r) = client.get(&models_url).send().await {
-            if let Ok(jj) = r.json::<Value>().await {
-                if let Some(arr) = jj.get("data").and_then(|d| d.as_array()) {
-                    for m in arr {
-                        let is_loaded = m.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if !is_loaded { continue; }
-                        if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                            loaded_names.push(id.to_string());
-                        }
-                    }
+            .unwrap_or(0)
+            > 0
+        {
+            fetch_json(&client, port, "/v1/models").await
+        } else {
+            None
+        };
+        println!("{}", format_status_line(port, health.as_ref(), models.as_ref()));
+    }
+    Ok(())
+}
+
+async fn fetch_json(client: &reqwest::Client, port: u16, path: &str) -> Option<Value> {
+    let url = format!("http://localhost:{}{}", port, path);
+    let r = client.get(&url).send().await.ok()?;
+    r.json::<Value>().await.ok()
+}
+
+/// Render the status line for one probed port. Pure function over the
+/// probe results so it can be exhaustively unit-tested:
+///
+/// - `health: None` → "⚪ :{port} — not running" (HTTP layer not reachable)
+/// - `health.status != "ok"` → same as above
+/// - `health.models_loaded == 0` → "🟡 :{port} — http up, no model loaded"
+/// - `health.models_loaded > 0` + `models` has loaded entries → green line listing names
+/// - `health.models_loaded > 0` + `models` missing → green count fallback
+fn format_status_line(port: u16, health: Option<&Value>, models: Option<&Value>) -> String {
+    let Some(h) = health else {
+        return format!("  ⚪ :{} — not running", port);
+    };
+    if h.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return format!("  ⚪ :{} — not running", port);
+    }
+    let n_loaded = h.get("models_loaded").and_then(|v| v.as_u64()).unwrap_or(0);
+    if n_loaded == 0 {
+        return format!("  🟡 :{} — http up, no model loaded", port);
+    }
+    let mut loaded_names: Vec<String> = Vec::new();
+    if let Some(arr) = models.and_then(|m| m.get("data")).and_then(|d| d.as_array()) {
+        for m in arr {
+            if m.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                    loaded_names.push(id.to_string());
                 }
             }
         }
-        if loaded_names.is_empty() {
-            // Health says loaded > 0 but /v1/models didn't surface them.
-            // Fall back to a count-only line rather than fabricating a name.
-            println!("  🟢 :{} — {} model(s) loaded (names unavailable)", port, n_loaded);
-        } else {
-            println!("  🟢 :{} — {}", port, loaded_names.join(", "));
-        }
     }
-    Ok(())
+    if loaded_names.is_empty() {
+        // /health says loaded > 0 but /v1/models didn't surface them.
+        // Don't fabricate a name; report a count.
+        format!("  🟢 :{} — {} model(s) loaded (names unavailable)", port, n_loaded)
+    } else {
+        format!("  🟢 :{} — {}", port, loaded_names.join(", "))
+    }
 }
 
 async fn cmd_start() -> Result<()> {
@@ -623,5 +638,76 @@ fn load_api_keys_env() {
                 unsafe { std::env::set_var(k, v); }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn status_line_down_when_health_missing() {
+        let line = format_status_line(8020, None, None);
+        assert_eq!(line, "  ⚪ :8020 — not running");
+    }
+
+    #[test]
+    fn status_line_down_when_status_not_ok() {
+        let health = json!({"status": "degraded", "models_loaded": 1});
+        let line = format_status_line(8020, Some(&health), None);
+        assert_eq!(line, "  ⚪ :8020 — not running");
+    }
+
+    #[test]
+    fn status_line_yellow_when_zero_models() {
+        let health = json!({"status": "ok", "models_loaded": 0});
+        let line = format_status_line(8020, Some(&health), None);
+        assert_eq!(line, "  🟡 :8020 — http up, no model loaded");
+    }
+
+    #[test]
+    fn status_line_green_with_loaded_names() {
+        let health = json!({"status": "ok", "models_loaded": 2});
+        let models = json!({
+            "data": [
+                {"id": "qwen3.6-27b", "loaded": true},
+                {"id": "draft", "loaded": false},
+                {"id": "qwen3.6-35b-a3b", "loaded": true},
+            ]
+        });
+        let line = format_status_line(8020, Some(&health), Some(&models));
+        assert_eq!(line, "  🟢 :8020 — qwen3.6-27b, qwen3.6-35b-a3b");
+    }
+
+    #[test]
+    fn status_line_green_count_fallback_when_models_missing() {
+        let health = json!({"status": "ok", "models_loaded": 3});
+        let line = format_status_line(8020, Some(&health), None);
+        assert_eq!(line, "  🟢 :8020 — 3 model(s) loaded (names unavailable)");
+    }
+
+    #[test]
+    fn status_line_green_count_fallback_when_data_is_not_array() {
+        // /v1/models returned something but `data` was missing or malformed.
+        // Fall back to the count rather than printing nothing or panicking.
+        let health = json!({"status": "ok", "models_loaded": 1});
+        let models = json!({"unexpected": "shape"});
+        let line = format_status_line(8020, Some(&health), Some(&models));
+        assert_eq!(line, "  🟢 :8020 — 1 model(s) loaded (names unavailable)");
+    }
+
+    #[test]
+    fn status_line_green_skips_loaded_false_entries() {
+        // All entries `loaded: false` → no names → count fallback.
+        let health = json!({"status": "ok", "models_loaded": 1});
+        let models = json!({
+            "data": [
+                {"id": "a", "loaded": false},
+                {"id": "b", "loaded": false},
+            ]
+        });
+        let line = format_status_line(8020, Some(&health), Some(&models));
+        assert_eq!(line, "  🟢 :8020 — 1 model(s) loaded (names unavailable)");
     }
 }
