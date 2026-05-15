@@ -1,139 +1,4 @@
 models:
-  qwen3.6-27b-dflash-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/Qwen3.6-27B-DFlash-Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: dflash-draft
-    params_b: 1.7
-    quant: Q4_K_M
-    vram_mb: 1083
-    context_max: 131072
-    capabilities:
-    - chat
-    - long_context
-    status: utility
-    notes: |
-      Speculative decoding DRAFT for Qwen3.6-27B. Lucebox/dflash port.
-      Not standalone — pair with 27B target via DFlash + DDTree to hit
-      ~3.4× speedup (HumanEval 129 t/s vs 38 t/s baseline). Q4 quant of
-      the DFlash draft itself.
-  gpt2-xl.q4_k_m:
-    path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: gpt2
-    params_b: 2.0
-    quant: Q4_K_M
-    vram_mb: 1246
-    context_max: 1024
-    capabilities:
-    - chat
-    - long_context
-    status: deprecated
-    notes: |
-      Project origin (2021 InferKit / GPT-2 nostalgia). Kept for
-      historical reasons. Quality way below modern small models — use
-      qwen3.5-4b for any actual sub-3B task.
-  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: qwen35moe
-    params_b: 35.3
-    quant: Q4_K_M
-    vram_mb: 22204
-    context_max: 131072
-    capabilities:
-    - chat
-    - long_context
-    status: recommended
-    notes: |
-      Best speed × quality. MoE A3B = 3B active params per token, runs at
-      ~3B speeds with full 35B knowledge. Faster than 27B dense AND higher
-      quality. 22.2 GB tight on 24 GB GPU — use only when no other GPU
-      contention.
-  dflash-3.6-q4km:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: dflash
-    params_b: 1.7
-    quant: unknown
-    vram_mb: 1083
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-    status: utility
-    notes: |
-      Same as qwen3.6-27b-dflash-q4_k_m — DFlash speculator draft. Use
-      paired with the 27B target via Lucebox dflash; not standalone.
-  qwen3.6-27b-q4_k_m:
-    path: /home/brianklam/models/qwen3.6-official-gguf/Qwen3.6-27B-Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: qwen35
-    params_b: 28.0
-    quant: Q4_K_M
-    vram_mb: 17641
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-    reasoning_marker:
-      open_tag: <think>
-      close_tag: </think>
-      family: qwen35
-    notes: |
-      Official Qwen3.6-27B Q4 (no heretic fine-tune). Use heretic-v2
-      variant instead for daily work — strictly better behavior. Keep
-      this one for alignment comparisons only.
-  dflash-3.6-f16:
-    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: dflash
-    params_b: 5.8
-    quant: F16
-    vram_mb: 3641
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-    status: utility
-    notes: |
-      Larger F16 DFlash draft variant. Higher draft accuracy → better
-      acceptance length, but uses more VRAM (3.6 GB). Try only if the
-      Q4 draft's acceptance rate is too low for the target's complexity.
-  qwen3.5-27b-q4_k_m:
-    path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
-    format: gguf
-    backend: llama_cpp
-    arch: qwen35
-    params_b: 27.9
-    quant: Q4_K_M
-    vram_mb: 17561
-    context_max: 131072
-    capabilities:
-    - chat
-    - code
-    - reasoning
-    - long_context
-    reasoning_marker:
-      open_tag: <think>
-      close_tag: </think>
-      family: qwen35
-    status: deprecated
-    notes: |
-      Superseded by qwen3.6-27b-uncensored-heretic-v2-q4_k_m. Same VRAM
-      footprint, slightly older base model. Keep only for ablation /
-      regression comparisons.
   qwen3.6-27b-uncensored-heretic-v2-q4_k_m:
     path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
     format: gguf
@@ -152,26 +17,15 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
-    status: recommended
-    # `main: true` makes this the default when external harnesses
-    # (Claude Code via /v1/messages, Codex / Cursor / Continue via
-    # /v1/chat/completions) call without specifying `model`. Aliases
-    # `default`, `main`, `lamu` also resolve here.
-    main: true
-    notes: |
-      27B dense daily driver. Q4_K_M speed/quality sweet spot, ~70 t/s on
-      4090. Heretic v2 fine-tune drops alignment refusals without hurting
-      capability. Use when 35B-A3B is too tight on VRAM (this leaves 6+
-      GB headroom for other GPU work).
-  qwen3.5-4b-q4_k_m:
-    path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
+  27b_mtp:
+    path: /home/brianklam/models/qwen3.6-27b-mtp/27B_MTP.gguf
     format: gguf
     backend: llama_cpp
     arch: qwen35
-    params_b: 4.6
-    quant: Q4_K_M
-    vram_mb: 2874
-    context_max: 32768
+    params_b: 0.8
+    quant: Q8_0
+    vram_mb: 478
+    context_max: 131072
     capabilities:
     - chat
     - code
@@ -181,11 +35,36 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
-    status: utility
-    notes: |
-      Tiny tier (~3 GB VRAM). Useful for batch background tasks, format
-      conversion, or fast first-pass triage where 27B is overkill.
-      Quality limited compared to 27B+; not for hard reasoning.
+  gpt2-xl.q4_k_m:
+    path: /home/brianklam/models/gpt2-xl-gguf/gpt2-xl.Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: gpt2
+    params_b: 2.0
+    quant: Q4_K_M
+    vram_mb: 1246
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  qwen3.5-4b-q4_k_m:
+    path: /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 4.6
+    quant: Q4_K_M
+    vram_mb: 2874
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
   qwen3.6-27b-uncensored-heretic-v2-q5_k_s:
     path: /home/brianklam/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q5_K_S.gguf
     format: gguf
@@ -204,9 +83,152 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+  qwen3.6-27b-dflash-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/Qwen3.6-27B-DFlash-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash-draft
+    params_b: 1.7
+    quant: Q4_K_M
+    vram_mb: 1083
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  dflash-35b-a3b-q8:
+    path: /home/brianklam/models/qwen36-35b-a3b-dflash/dflash-35b-a3b-q8.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash-draft
+    params_b: 0.9
+    quant: Q8_0
+    vram_mb: 539
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  dflash-3.6-f16:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-f16.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash
+    params_b: 5.8
+    quant: F16
+    vram_mb: 3641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+  gemma-4-26b-a4b-it-q4_k_m:
+    path: /home/brianklam/models/gemma-4-26b-gguf/gemma-4-26B-A4B-it-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: gemma4
+    params_b: 28.0
+    quant: Q4_K_M
+    vram_mb: 17618
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  qwen3.6-27b-mtp-ud-q4_k_xl:
+    path: /home/brianklam/models/qwen3.6-27b-mtp/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 30.1
+    quant: unknown
+    vram_mb: 18949
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  dflash-3.6-q4km:
+    path: /home/brianklam/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash
+    params_b: 1.7
+    quant: unknown
+    vram_mb: 1083
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+  qwen3.6-27b-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-official-gguf/Qwen3.6-27B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 28.0
+    quant: Q4_K_M
+    vram_mb: 17641
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+  qwen3.6-35b-a3b-uncensored-heretic-q4_k_m:
+    path: /home/brianklam/models/qwen3.6-35b-a3b-heretic/Qwen3.6-35B-A3B-uncensored-heretic-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35moe
+    params_b: 35.3
+    quant: Q4_K_M
+    vram_mb: 22204
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
     status: recommended
+    main: true
     notes: |
-      Quality-first 27B variant. Same model as Q4 heretic-v2 but more bits
-      → ~1-2% lower perplexity for ~12% slower throughput (~60 t/s).
-      Pick when quality matters most: code generation, long reasoning
-      chains where small token errors compound.
+      Largest model that fits the 4090. MoE A3B = 3B active params per token,
+      ~102 t/s on bee config. 35B knowledge at 3B speeds. 22.2 GB → 2.4 GB
+      headroom; no parallel CUDA work while loaded. `default`/`main`/`lamu`
+      aliases resolve here.
+  gemma-4-26b-dflash-q8:
+    path: /home/brianklam/models/gemma-4-26b-dflash/gemma-4-26b-dflash-q8.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: dflash-draft
+    params_b: 0.8
+    quant: Q8_0
+    vram_mb: 493
+    context_max: 131072
+    capabilities:
+    - chat
+    - long_context
+  qwen3.5-27b-q4_k_m:
+    path: /home/brianklam/models/qwen3.5-27b-gguf/Qwen3.5-27B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 27.9
+    quant: Q4_K_M
+    vram_mb: 17561
+    context_max: 131072
+    capabilities:
+    - chat
+    - code
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35

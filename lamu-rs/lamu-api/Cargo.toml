@@ -21,6 +21,9 @@ parking_lot = "0.12"
 futures-util = "0.3"
 async-stream = "0.3"
 prometheus = { version = "0.13", default-features = false }
+socket2 = "0.5"
+nix = { version = "0.29", features = ["signal"] }
+dirs = "5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

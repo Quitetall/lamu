@@ -152,6 +152,32 @@ Observability:
 
 ---
 
+## Harnesses — point any client at lamu
+
+Lamu speaks three API flavors on the same port:
+
+| Flavor | Routes | Clients |
+|--------|--------|---------|
+| OpenAI | `/v1/chat/completions`, `/v1/models` | Codex, Cursor, Aider, Continue, pi |
+| Anthropic | `/v1/messages` (SSE + `tool_use`) | Claude Code, Crush, Hermes |
+| Ollama | `/api/chat`, `/api/tags` (NDJSON) | AnythingLLM, Open WebUI |
+
+The default model is whichever `config/models.yaml` entry has `main: true`. Aliases `default` / `main` / `lamu` all resolve there, so harnesses don't need a model name configured.
+
+Registered harnesses live in `config/harnesses.yaml`. Launch one with the right env wired up:
+
+```bash
+just open                # default (claude-code)
+just open codex          # named entry
+just open list           # show all configured harnesses
+```
+
+Per-harness API flavor + cmd + extra env is yaml-only — no rebuild to add a new one. Full reference: [`wiki/pages/harness-setup.md`](wiki/pages/harness-setup.md).
+
+Per-request `enable_thinking: false` turns off Qwen3.6 reasoning (works on all three surfaces + MCP `query` tool).
+
+---
+
 ## Model Registry
 
 `lamu scan` walks `~/models/`, parses GGUF headers, writes `config/models.yaml`:
@@ -266,7 +292,7 @@ Bifrost (`:8080`) is dead on the v3 request path — kept under `scripts/serve-b
 
 13 pages in `wiki/pages/`:
 
-`dflash-speculative.md` · `build-requirements.md` · `262k-context.md` · `ngram-speculation.md` · `vram-budget.md` · `eagle-training.md` · `eagle-cpp-integration.md` · `mcp-setup.md` · `model-selection.md` · `serving-engine.md` · `token-efficiency.md` · `training-loop.md` · `vllm-limitations.md` · `bifrost-bench.md`.
+`dflash-speculative.md` · `build-requirements.md` · `262k-context.md` · `ngram-speculation.md` · `vram-budget.md` · `eagle-training.md` · `eagle-cpp-integration.md` · `mcp-setup.md` · `harness-setup.md` · `model-selection.md` · `serving-engine.md` · `token-efficiency.md` · `training-loop.md` · `vllm-limitations.md` · `bifrost-bench.md`.
 
 Knowledge graph (~1,600 nodes, 162 communities) in `graphify-out/graph.html`. Query with `/graphify query "<question>"`.
 

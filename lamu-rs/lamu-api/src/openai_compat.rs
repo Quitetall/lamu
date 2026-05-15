@@ -74,6 +74,10 @@ pub struct AppState {
     /// works, just per-surface state.
     pub health: Arc<Mutex<HealthRegistry>>,
     pub metrics: Arc<LamuMetrics>,
+    /// The port this lamu serve listens on. Passed to
+    /// `lamu_core::loader::ensure_loaded` so spawned backends don't try
+    /// to bind the same port we already own.
+    pub http_port: u16,
 }
 
 pub fn build_app(state: AppState) -> AxumRouter {
@@ -112,6 +116,70 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let n = state.scheduler.lock().loaded_models().len();
     Json(json!({"status": "ok", "models_loaded": n}))
+}
+
+/// Route the request to a loaded model, spawning the backend on demand
+/// if the router says "will load". Returns `(port, model_name, marker)`
+/// on success or an `IntoResponse` error envelope (503/500) on failure.
+///
+/// Single place where `lamu serve` decides whether to spawn a backend.
+/// Used by the OpenAI, Anthropic-stream, and Ollama-stream entry points.
+async fn resolve_and_ensure_loaded(
+    state: &AppState,
+    model_req: Option<&str>,
+) -> std::result::Result<(u16, String, Option<ReasoningMarker>), Response> {
+    let decision = {
+        let scheduler = state.scheduler.lock();
+        let router = state.router.lock();
+        let health = state.health.lock();
+        router.route(&scheduler, model_req, None, Some(health.all()))
+    };
+
+    if decision.model_name.is_empty() {
+        state.metrics.requests_total
+            .with_label_values(&[model_req.unwrap_or("unknown"), "no_candidate"])
+            .inc();
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": {
+                "message": format!("No model: {}", decision.reason),
+                "type": "model_not_available",
+            }
+        }))).into_response());
+    }
+
+    if !decision.loaded {
+        match lamu_core::loader::ensure_loaded(
+            &decision.model_name,
+            state.entries.as_ref(),
+            &state.scheduler,
+            &state.health,
+            Some(state.http_port),
+        ).await {
+            Ok(_lm) => {}
+            Err(e) => {
+                state.metrics.requests_total
+                    .with_label_values(&[&decision.model_name, "spawn_failed"])
+                    .inc();
+                return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+                    "error": {
+                        "message": format!("Failed to load '{}': {}", decision.model_name, e),
+                        "type": "spawn_failed",
+                    }
+                }))).into_response());
+            }
+        }
+    }
+
+    let scheduler = state.scheduler.lock();
+    let Some(loaded) = scheduler.get_loaded(&decision.model_name) else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+            "error": {"message": "internal: lost loaded model after spawn"}
+        }))).into_response());
+    };
+    let port = loaded.port;
+    let entry = state.entries.get(&decision.model_name).cloned();
+    let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
+    Ok((port, decision.model_name, marker))
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
@@ -182,46 +250,12 @@ async fn chat_completions(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body_json)).into_response();
     }
 
-    let (port, model_name, marker) = {
-        let scheduler = state.scheduler.lock();
-        let router = state.router.lock();
-        let health = state.health.lock();
-        // health_map filters DEAD/QUARANTINED. health is populated as the
-        // OpenAI-compat layer sees failures from backends — see the error
-        // arms below.
-        let decision = router.route(
-            &scheduler,
-            req.model.as_deref(),
-            None,
-            Some(health.all()),
-        );
-
-        if decision.model_name.is_empty() || !decision.loaded {
-            state.metrics.requests_total
-                .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "no_backend"])
-                .inc();
-            let body = ErrorResponse {
-                error: ErrorBody {
-                    message: format!("No loaded model available: {}", decision.reason),
-                    typ: "model_not_available",
-                },
-            };
-            let body_json = serde_json::to_value(&body)
-                .unwrap_or_else(|e| json!({"error": {
-                    "message": format!("internal serialization: {}", e),
-                    "type": "internal"
-                }}));
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(body_json)).into_response();
-        }
-
-        let Some(loaded) = scheduler.get_loaded(&decision.model_name) else {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": "internal: lost loaded model"}}))).into_response();
-        };
-        let port = loaded.port;
-        let entry = state.entries.get(&decision.model_name).cloned();
-        let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
-        (port, decision.model_name, marker)
+    let (port, model_name, marker) = match resolve_and_ensure_loaded(
+        &state,
+        req.model.as_deref(),
+    ).await {
+        Ok(triple) => triple,
+        Err(resp) => return resp,
     };
 
     {
@@ -335,6 +369,33 @@ async fn chat_completions(
     let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
     let raw_content = msg.and_then(|m| m.get("content")).and_then(|v| v.as_str()).unwrap_or("");
     let reasoning_content = msg.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).unwrap_or("");
+    let has_tool_calls = msg.and_then(|m| m.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let raw_finish = data.get("choices").and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()).unwrap_or("");
+
+    // 502 when the backend gave us a structurally-empty response: no
+    // content, no reasoning, no tool calls, AND no recognized finish
+    // reason. Distinguishes silent backend failure from a legitimate
+    // empty completion (which always carries a finish_reason).
+    if msg.is_none()
+        || (raw_content.is_empty() && reasoning_content.is_empty() && !has_tool_calls
+            && !matches!(raw_finish, "stop" | "length" | "tool_calls" | "content_filter"))
+    {
+        state.metrics.requests_total
+            .with_label_values(&[&model_name, "backend_empty"])
+            .inc();
+        return (StatusCode::BAD_GATEWAY, Json(json!({
+            "error": {
+                "type": "backend_returned_empty",
+                "message": format!(
+                    "backend on :{} returned no usable content (finish_reason='{}')",
+                    port, raw_finish
+                ),
+            }
+        }))).into_response();
+    }
 
     let extractor = get_extractor(marker);
     let (reasoning, content) = if !reasoning_content.is_empty() {
@@ -569,7 +630,7 @@ pub async fn auto_register(state: &AppState) {
 }
 
 /// Load registry from default path + build app state.
-pub fn build_state(registry_path: &Path) -> anyhow::Result<AppState> {
+pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppState> {
     let entries_vec = load_registry(registry_path)?;
     let scheduler = VramScheduler::new();
     let router = Router::new(&scheduler, entries_vec.clone());
@@ -587,6 +648,7 @@ pub fn build_state(registry_path: &Path) -> anyhow::Result<AppState> {
         client,
         health: Arc::new(Mutex::new(HealthRegistry::new())),
         metrics: Arc::new(metrics),
+        http_port,
     })
 }
 
@@ -626,6 +688,11 @@ struct AnthropicRequest {
     tools: Option<Vec<Value>>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    /// Qwen3.6 / Qwen3.5 reasoning toggle. Not part of Anthropic's spec —
+    /// extension that lamu honors so harnesses on this surface can opt
+    /// out of the `<think>` block for latency-sensitive calls.
+    #[serde(default)]
+    enable_thinking: Option<bool>,
 }
 
 fn anthropic_tools_to_openai(tools: &[Value]) -> Vec<Value> {
@@ -799,7 +866,8 @@ async fn anthropic_messages(
     if req.stream {
         return stream_response_anthropic(state, messages, req.model.clone(),
                                          req.max_tokens, req.temperature,
-                                         req.top_k, req.top_p).await;
+                                         req.top_k, req.top_p,
+                                         req.enable_thinking).await;
     }
 
     let oai_tools = req.tools.as_ref().map(|t| anthropic_tools_to_openai(t));
@@ -813,7 +881,7 @@ async fn anthropic_messages(
         stream: false,
         top_k: req.top_k,
         top_p: req.top_p,
-        enable_thinking: None,
+        enable_thinking: req.enable_thinking,
         tools: oai_tools,
         tool_choice: oai_tool_choice,
     };
@@ -900,7 +968,17 @@ async fn anthropic_messages(
         }
     }
     if content_blocks.is_empty() {
-        content_blocks.push(json!({"type":"text","text":""}));
+        // chat_completions already filters structurally-empty backend
+        // responses to 502 (see backend_returned_empty gate), so reaching
+        // this is unexpected. Surface a 502 here too instead of silently
+        // returning an empty text block — clients can retry.
+        return (StatusCode::BAD_GATEWAY, Json(json!({
+            "type": "error",
+            "error": {
+                "type": "backend_returned_empty",
+                "message": "backend produced neither text nor tool_use blocks",
+            }
+        }))).into_response();
     }
     let stop_reason = if had_tool_use { "tool_use" } else { "end_turn" };
 
@@ -931,33 +1009,18 @@ async fn stream_response_anthropic(
     temperature: f32,
     top_k: Option<u32>,
     top_p: Option<f32>,
+    enable_thinking: Option<bool>,
 ) -> Response {
-    // Route → pick backend port.
-    let (port, model_name, _marker) = {
-        let scheduler = state.scheduler.lock();
-        let router = state.router.lock();
-        let health = state.health.lock();
-        let decision = router.route(&scheduler, model_req.as_deref(), None, Some(health.all()));
-        if decision.model_name.is_empty() || !decision.loaded {
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-                "type": "error",
-                "error": {"type": "model_not_available",
-                          "message": format!("No model: {}", decision.reason)}
-            }))).into_response();
-        }
-        let Some(_loaded) = scheduler.get_loaded(&decision.model_name) else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
-                "type": "error", "error": {"type":"internal","message":"lost loaded model"}
-            }))).into_response();
-        };
-        let port = _loaded.port;
-        let entry = state.entries.get(&decision.model_name).cloned();
-        let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
-        (port, decision.model_name, marker)
+    let (port, model_name, _marker) = match resolve_and_ensure_loaded(
+        &state,
+        model_req.as_deref(),
+    ).await {
+        Ok(triple) => triple,
+        Err(resp) => return resp,
     };
 
     let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
-    let payload = json!({
+    let mut payload = json!({
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -965,6 +1028,9 @@ async fn stream_response_anthropic(
         "top_k": top_k,
         "top_p": top_p,
     });
+    if let Some(et) = enable_thinking {
+        payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
+    }
 
     let msg_id = format!("msg_{}", random_hex(12));
     let client = state.client.clone();
@@ -1081,6 +1147,12 @@ struct OllamaChatRequest {
     stream: Option<bool>,
     #[serde(default)]
     options: Option<OllamaOptions>,
+    /// Qwen3.6 / Qwen3.5 reasoning toggle. Not in Ollama's spec —
+    /// extension that lamu honors so harnesses on this surface can opt
+    /// out of the `<think>` block. Accepted at top level for symmetry
+    /// with /v1/chat/completions.
+    #[serde(default)]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1135,7 +1207,9 @@ async fn ollama_chat(
 
     if stream_on {
         return stream_response_ollama(state, messages, req.model.clone(),
-                                      max_tokens, temperature, opts.top_k, opts.top_p).await;
+                                      max_tokens, temperature,
+                                      opts.top_k, opts.top_p,
+                                      req.enable_thinking).await;
     }
 
     let oai_req = ChatRequest {
@@ -1146,7 +1220,7 @@ async fn ollama_chat(
         stream: false,
         top_k: opts.top_k,
         top_p: opts.top_p,
-        enable_thinking: None,
+        enable_thinking: req.enable_thinking,
         tools: None,
         tool_choice: None,
     };
@@ -1228,28 +1302,18 @@ async fn stream_response_ollama(
     temperature: f32,
     top_k: Option<u32>,
     top_p: Option<f32>,
+    enable_thinking: Option<bool>,
 ) -> Response {
-    let (port, model_name, _marker) = {
-        let scheduler = state.scheduler.lock();
-        let router = state.router.lock();
-        let health = state.health.lock();
-        let decision = router.route(&scheduler, model_req.as_deref(), None, Some(health.all()));
-        if decision.model_name.is_empty() || !decision.loaded {
-            return (StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": format!("No model: {}", decision.reason)}))).into_response();
-        }
-        let Some(_loaded) = scheduler.get_loaded(&decision.model_name) else {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error":"lost loaded model"}))).into_response();
-        };
-        let port = _loaded.port;
-        let entry = state.entries.get(&decision.model_name).cloned();
-        let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
-        (port, decision.model_name, marker)
+    let (port, model_name, _marker) = match resolve_and_ensure_loaded(
+        &state,
+        model_req.as_deref(),
+    ).await {
+        Ok(triple) => triple,
+        Err(resp) => return resp,
     };
 
     let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
-    let payload = json!({
+    let mut payload = json!({
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -1257,6 +1321,9 @@ async fn stream_response_ollama(
         "top_k": top_k,
         "top_p": top_p,
     });
+    if let Some(et) = enable_thinking {
+        payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
+    }
 
     let client = state.client.clone();
     let body_stream = async_stream::stream! {

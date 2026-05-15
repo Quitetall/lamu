@@ -1,0 +1,59 @@
+# Harnesses installed on this machine that should talk to lamu.
+# Exactly one entry should set `default: true` — `just open` (no args)
+# launches that one with the right env wired up.
+#
+# flavor: anthropic | openai | ollama  — picks which env vars are set
+#         to point the harness at lamu (:8020 by default).
+# cmd:    shell command to launch. Args appended verbatim after `open`.
+# extra_env: optional extra env vars (e.g. ANTHROPIC_MODEL).
+
+harnesses:
+  claude-code:
+    default: true
+    flavor: anthropic
+    cmd: claude
+    # ANTHROPIC_MODEL is best left unset so the harness's own pick goes
+    # through; lamu's router resolves "lamu"/"default"/null → main entry.
+
+  crush:
+    flavor: anthropic
+    cmd: crush
+
+  codex:
+    flavor: openai
+    cmd: codex
+
+  cursor:
+    flavor: openai
+    # Cursor is GUI — `just open cursor` is mostly aspirational; you set
+    # the base URL inside Cursor settings once.
+    cmd: cursor
+
+  aider:
+    flavor: openai
+    cmd: aider
+    extra_env:
+      AIDER_MODEL: openai/lamu
+
+  continue:
+    flavor: openai
+    # ~/.continue/config.json must be edited once to point at lamu.
+    cmd: code  # opens VS Code; Continue lives inside it.
+
+  pi:
+    flavor: openai
+    cmd: pi
+
+  hermes:
+    flavor: anthropic
+    # ECC operator. Adjust to the right launch verb on your install.
+    cmd: hermes
+
+  anything-llm:
+    flavor: ollama
+    cmd: anythingllm-desktop
+
+  open-webui:
+    flavor: ollama
+    # `open-webui serve --port 7070` is one pattern; tweak per install.
+    cmd: open-webui serve

@@ -517,6 +517,7 @@ mod tests {
             reasoning_marker: None,
             speculative: None,
             pinned: false,
+            main: false,
             notes: String::new(),
             status: ModelStatus::default(),
         }

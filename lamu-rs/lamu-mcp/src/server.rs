@@ -105,6 +105,12 @@ impl LamuMcpServer {
     }
 
     pub async fn run(self) -> Result<()> {
+        // Ask the kernel to send us SIGTERM if our parent process dies
+        // (e.g. the Claude Code harness crashes without closing stdin).
+        // Without this, an orphaned `lamu start` keeps running indefinitely
+        // because stdin never reaches EOF when the parent dies abruptly.
+        install_parent_death_signal();
+
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin).lines();
@@ -116,6 +122,36 @@ impl LamuMcpServer {
         eprintln!("LAMU MCP server ready (rust)");
 
         loop {
+            #[cfg(unix)]
+            let line = {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut term = signal(SignalKind::terminate())
+                    .map_err(|e| anyhow::anyhow!("SIGTERM handler: {e}"))?;
+                let mut int = signal(SignalKind::interrupt())
+                    .map_err(|e| anyhow::anyhow!("SIGINT handler: {e}"))?;
+                tokio::select! {
+                    res = reader.next_line() => match res {
+                        Ok(Some(l)) => l,
+                        Ok(None) => {
+                            tracing::info!("stdin EOF — parent harness closed pipe, shutting down");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("read error: {}", e);
+                            break;
+                        }
+                    },
+                    _ = term.recv() => {
+                        tracing::info!("SIGTERM received, shutting down");
+                        break;
+                    }
+                    _ = int.recv() => {
+                        tracing::info!("SIGINT received, shutting down");
+                        break;
+                    }
+                }
+            };
+            #[cfg(not(unix))]
             let line = match reader.next_line().await {
                 Ok(Some(l)) => l,
                 Ok(None) => break,
@@ -218,6 +254,26 @@ impl LamuMcpServer {
 
 }
 
+/// Linux-specific: ask the kernel to deliver SIGTERM to us if our parent
+/// process dies. Prevents orphaned `lamu start` daemons when the Claude
+/// Code (or any) parent harness crashes without closing stdin.
+///
+/// On non-Linux Unix and Windows this is a no-op; EOF-on-stdin handling
+/// + tokio signal handlers cover those platforms (less reliably for
+/// abrupt parent death, but better than nothing).
+#[cfg(target_os = "linux")]
+fn install_parent_death_signal() {
+    // PR_SET_PDEATHSIG, second arg = signal number (SIGTERM = 15).
+    // The fifth arg is unused; pass 0. The cast to c_ulong matches
+    // `nix::sys::prctl` but we use `libc` directly since `nix` doesn't
+    // expose PDEATHSIG on all targets.
+    unsafe {
+        let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_parent_death_signal() {}
 
 fn initialize_response(id: Option<Value>) -> Value {
     json!({

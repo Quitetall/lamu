@@ -331,28 +331,47 @@ async fn cmd_status() -> Result<()> {
 
     let client = reqwest::Client::builder().timeout(Duration::from_secs(1)).build()?;
     for port in [PORT_MAIN, PORT_SIDECAR, 8000u16] {
-        let url = format!("http://localhost:{}/health", port);
-        match client.get(&url).send().await {
-            Ok(r) => {
-                if let Ok(j) = r.json::<Value>().await {
-                    if j.get("status").and_then(|v| v.as_str()) == Some("ok") {
-                        let url2 = format!("http://localhost:{}/v1/models", port);
-                        let model = match client.get(&url2).send().await {
-                            Ok(r) => match r.json::<Value>().await {
-                                Ok(jj) => jj.get("data").and_then(|d| d.get(0))
-                                    .and_then(|m| m.get("id")).and_then(|v| v.as_str())
-                                    .map(String::from).unwrap_or_else(|| "unknown".into()),
-                                Err(_) => "unknown".into(),
-                            },
-                            Err(_) => "unknown".into(),
-                        };
-                        println!("  🟢 :{} — {}", port, model);
-                        continue;
+        let health_url = format!("http://localhost:{}/health", port);
+        let Ok(r) = client.get(&health_url).send().await else {
+            println!("  ⚪ :{} — not running", port);
+            continue;
+        };
+        let Ok(health_json) = r.json::<Value>().await else {
+            println!("  ⚪ :{} — not running", port);
+            continue;
+        };
+        if health_json.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            println!("  ⚪ :{} — not running", port);
+            continue;
+        }
+        let n_loaded = health_json.get("models_loaded")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if n_loaded == 0 {
+            println!("  🟡 :{} — http up, no model loaded", port);
+            continue;
+        }
+        let models_url = format!("http://localhost:{}/v1/models", port);
+        let mut loaded_names: Vec<String> = Vec::new();
+        if let Ok(r) = client.get(&models_url).send().await {
+            if let Ok(jj) = r.json::<Value>().await {
+                if let Some(arr) = jj.get("data").and_then(|d| d.as_array()) {
+                    for m in arr {
+                        let is_loaded = m.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !is_loaded { continue; }
+                        if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                            loaded_names.push(id.to_string());
+                        }
                     }
                 }
-                println!("  ⚪ :{} — not running", port);
             }
-            Err(_) => println!("  ⚪ :{} — not running", port),
+        }
+        if loaded_names.is_empty() {
+            // Health says loaded > 0 but /v1/models didn't surface them.
+            // Fall back to a count-only line rather than fabricating a name.
+            println!("  🟢 :{} — {} model(s) loaded (names unavailable)", port, n_loaded);
+        } else {
+            println!("  🟢 :{} — {}", port, loaded_names.join(", "));
         }
     }
     Ok(())

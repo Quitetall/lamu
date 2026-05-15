@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod backends;
+pub mod loader;
 pub mod observability;
 pub mod queue;
 pub mod sandbox;
