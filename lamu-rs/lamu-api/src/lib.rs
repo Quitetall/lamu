@@ -64,13 +64,24 @@ fn bind_reuseaddr(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
 ///
 /// Path: `$XDG_RUNTIME_DIR/lamu-serve-{port}.pid` if available, else
 /// `/tmp/lamu-serve-{port}.pid`.
+#[derive(Debug)]
 struct PidFile {
     path: PathBuf,
 }
 
 impl PidFile {
     fn acquire(port: u16) -> anyhow::Result<Self> {
-        let path = pidfile_path(port);
+        PidFile::acquire_at(pidfile_path(port), Some(port))
+    }
+
+    /// Path-injected version of `acquire`. Pulled out so tests can pass
+    /// `tempdir().path().join("pid")` and exercise the atomic-create +
+    /// stale-reclaim + live-refuse + lost-race paths without touching
+    /// `$XDG_RUNTIME_DIR`.
+    ///
+    /// `port` is informational — only surfaces in the live-holder error
+    /// message. Pass `None` from tests that don't care.
+    pub(crate) fn acquire_at(path: PathBuf, port: Option<u16>) -> anyhow::Result<Self> {
         // Up to two attempts: first tries atomic O_CREAT|O_EXCL; if that
         // fails with AlreadyExists we inspect the holder, reclaim if dead,
         // and try once more. Two parallel `lamu serve` invocations can't
@@ -104,10 +115,13 @@ impl PidFile {
                         Ok(s) => {
                             if let Ok(pid) = s.trim().parse::<i32>() {
                                 if is_process_alive(pid) {
+                                    let port_str = port
+                                        .map(|p| format!(":{p} "))
+                                        .unwrap_or_default();
                                     anyhow::bail!(
-                                        "lamu serve already running on :{} (pid {}). \
+                                        "lamu serve already running on {}(pid {}). \
                                          Use `lamu status` to inspect, then `kill {}` to stop.",
-                                        port, pid, pid
+                                        port_str, pid, pid
                                     );
                                 }
                                 tracing::warn!(
@@ -202,4 +216,83 @@ fn spawn_main_preload(state: openai_compat::AppState) {
             ),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_pidfile() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lamu-serve-9999.pid");
+        (dir, path)
+    }
+
+    #[test]
+    fn pidfile_acquire_creates_file_with_our_pid() {
+        let (_dir, path) = temp_pidfile();
+        let _pf = PidFile::acquire_at(path.clone(), Some(9999)).expect("acquire");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let pid: u32 = body.trim().parse().expect("parse pid");
+        assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn pidfile_acquire_refuses_live_holder() {
+        let (_dir, path) = temp_pidfile();
+        // Write our OWN pid — guaranteed live.
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let err = PidFile::acquire_at(path, Some(9999)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already running"), "got: {msg}");
+        assert!(msg.contains(&format!("{}", std::process::id())),
+            "error must name the live holder PID; got: {msg}");
+    }
+
+    #[test]
+    fn pidfile_acquire_reclaims_stale_pid() {
+        let (_dir, path) = temp_pidfile();
+        // PID that should not exist on any reasonable host. POSIX caps
+        // pids at PID_MAX_LIMIT (4M typical); 2^31 - 1 is never assigned.
+        let dead_pid: i32 = i32::MAX;
+        std::fs::write(&path, format!("{}\n", dead_pid)).unwrap();
+        let _pf = PidFile::acquire_at(path.clone(), Some(9999))
+            .expect("must reclaim stale pidfile");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let pid: u32 = body.trim().parse().expect("parse pid");
+        assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn pidfile_acquire_reclaims_unparseable() {
+        let (_dir, path) = temp_pidfile();
+        std::fs::write(&path, b"this is not a pid number").unwrap();
+        let _pf = PidFile::acquire_at(path.clone(), Some(9999))
+            .expect("must reclaim unparseable pidfile");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.trim().parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn pidfile_drop_unlinks() {
+        let (_dir, path) = temp_pidfile();
+        {
+            let _pf = PidFile::acquire_at(path.clone(), Some(9999)).unwrap();
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "Drop must unlink the pidfile");
+    }
+
+    #[test]
+    fn pidfile_port_field_in_error_message() {
+        let (_dir, path) = temp_pidfile();
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let err = PidFile::acquire_at(path.clone(), Some(12345)).unwrap_err();
+        assert!(format!("{err}").contains("12345"),
+            "port should surface in the error; got: {err}");
+        // None case: just confirm it doesn't panic + still mentions the live PID.
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let err = PidFile::acquire_at(path, None).unwrap_err();
+        assert!(format!("{err}").contains("already running"));
+    }
 }

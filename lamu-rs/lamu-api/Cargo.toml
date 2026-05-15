@@ -28,3 +28,5 @@ dirs = "5"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 serde_json = { workspace = true }
+proptest = "1"
+tempfile = "3"

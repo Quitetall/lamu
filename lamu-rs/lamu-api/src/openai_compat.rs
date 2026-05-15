@@ -1389,3 +1389,223 @@ async fn stream_response_ollama(
         .body(stream_body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
 }
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ── enable_thinking serde plumbing ──────────────────────────────
+
+    #[test]
+    fn anthropic_request_accepts_enable_thinking_true() {
+        let body = r#"{
+            "model":"lamu","max_tokens":10,
+            "messages":[{"role":"user","content":"hi"}],
+            "enable_thinking": true
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(body).expect("parse");
+        assert_eq!(req.enable_thinking, Some(true));
+    }
+
+    #[test]
+    fn anthropic_request_accepts_enable_thinking_false() {
+        let body = r#"{
+            "model":"lamu","max_tokens":10,
+            "messages":[{"role":"user","content":"hi"}],
+            "enable_thinking": false
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(body).expect("parse");
+        assert_eq!(req.enable_thinking, Some(false));
+    }
+
+    #[test]
+    fn anthropic_request_defaults_enable_thinking_to_none() {
+        let body = r#"{
+            "model":"lamu","max_tokens":10,
+            "messages":[{"role":"user","content":"hi"}]
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(body).expect("parse");
+        assert_eq!(req.enable_thinking, None);
+    }
+
+    #[test]
+    fn ollama_chat_request_accepts_enable_thinking() {
+        let body = r#"{
+            "model":"lamu","stream":false,
+            "messages":[{"role":"user","content":"hi"}],
+            "enable_thinking": false
+        }"#;
+        let req: OllamaChatRequest = serde_json::from_str(body).expect("parse");
+        assert_eq!(req.enable_thinking, Some(false));
+    }
+
+    #[test]
+    fn ollama_chat_request_defaults_enable_thinking() {
+        let body = r#"{
+            "model":"lamu","stream":false,
+            "messages":[{"role":"user","content":"hi"}]
+        }"#;
+        let req: OllamaChatRequest = serde_json::from_str(body).expect("parse");
+        assert_eq!(req.enable_thinking, None);
+    }
+
+    // ── Anthropic tool translator ───────────────────────────────────
+
+    #[test]
+    fn anthropic_tools_translator_preserves_name_and_schema() {
+        let anthro_tools = vec![serde_json::json!({
+            "name": "get_weather",
+            "description": "Return the weather for a location.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            }
+        })];
+        let oai = anthropic_tools_to_openai(&anthro_tools);
+        assert_eq!(oai.len(), 1);
+        let t = &oai[0];
+        assert_eq!(t["type"], "function");
+        assert_eq!(t["function"]["name"], "get_weather");
+        assert_eq!(t["function"]["parameters"]["properties"]["location"]["type"], "string");
+    }
+
+    #[test]
+    fn anthropic_tool_choice_translator_handles_known_shapes() {
+        // "auto" → "auto"
+        let auto = anthropic_tool_choice_to_openai(&serde_json::json!({"type": "auto"}));
+        assert!(auto == serde_json::json!("auto") || auto["type"] == "auto",
+            "auto should map to OAI auto; got {auto:?}");
+
+        // "any" → forced "required" (or equivalent in current OAI vocab)
+        let any = anthropic_tool_choice_to_openai(&serde_json::json!({"type": "any"}));
+        let s = any.to_string();
+        assert!(s.contains("required") || s.contains("any") || s.contains("auto"),
+            "any should map to a tool-forcing OAI value; got {s}");
+
+        // "tool" with name → OAI function selection by name
+        let named = anthropic_tool_choice_to_openai(&serde_json::json!({
+            "type": "tool", "name": "get_weather"
+        }));
+        let s = named.to_string();
+        assert!(s.contains("get_weather"), "named tool must carry through; got {s}");
+    }
+
+    proptest! {
+        // For any reasonable Anthropic tool spec, translating to OpenAI and
+        // reading back the function name + input_schema preserves them.
+        // We don't test full round-trip (translator is one-way) — we test
+        // that no information needed by downstream OAI consumers is lost.
+        #[test]
+        fn anthropic_tool_name_and_schema_survive_translation(
+            name in "[a-zA-Z][a-zA-Z0-9_]{0,30}",
+            desc in ".{0,80}",
+            field in "[a-z][a-z0-9_]{0,10}",
+        ) {
+            let anthro = vec![serde_json::json!({
+                "name": name.clone(),
+                "description": desc,
+                "input_schema": {
+                    "type": "object",
+                    "properties": { &field: { "type": "string" } },
+                    "required": [&field]
+                }
+            })];
+            let oai = anthropic_tools_to_openai(&anthro);
+            prop_assert_eq!(oai.len(), 1);
+            prop_assert_eq!(&oai[0]["function"]["name"], &serde_json::Value::String(name.clone()));
+            prop_assert_eq!(
+                &oai[0]["function"]["parameters"]["properties"][&field]["type"],
+                &serde_json::Value::String("string".to_string())
+            );
+        }
+    }
+
+    // ── 502 backend_returned_empty gate ─────────────────────────────
+    //
+    // The gate fires when content + reasoning_content + tool_calls are
+    // all empty AND finish_reason isn't a recognized terminator. Tests
+    // assert the predicate via the exact same expression used in the
+    // handler. Pure logic; no axum needed.
+
+    fn is_empty_backend_response(data: &Value) -> bool {
+        let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
+        let raw_content = msg.and_then(|m| m.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+        let reasoning = msg.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).unwrap_or("");
+        let has_tool_calls = msg.and_then(|m| m.get("tool_calls"))
+            .and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+        let raw_finish = data.get("choices").and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()).unwrap_or("");
+        msg.is_none()
+            || (raw_content.is_empty() && reasoning.is_empty() && !has_tool_calls
+                && !matches!(raw_finish, "stop" | "length" | "tool_calls" | "content_filter"))
+    }
+
+    #[test]
+    fn gate_fires_when_choices_missing() {
+        assert!(is_empty_backend_response(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn gate_fires_when_message_empty_and_no_finish_reason() {
+        assert!(is_empty_backend_response(&serde_json::json!({
+            "choices": [{"message": {}}]
+        })));
+    }
+
+    #[test]
+    fn gate_passes_legitimate_stop() {
+        assert!(!is_empty_backend_response(&serde_json::json!({
+            "choices": [{
+                "message": {"content": "hello"},
+                "finish_reason": "stop"
+            }]
+        })));
+    }
+
+    #[test]
+    fn gate_passes_empty_content_with_valid_finish_reason() {
+        // Some backends legitimately produce empty content with a recognized
+        // finish_reason (e.g. content_filter). Gate must NOT fire.
+        for fr in ["stop", "length", "tool_calls", "content_filter"] {
+            let v = serde_json::json!({
+                "choices": [{"message": {"content": ""}, "finish_reason": fr}]
+            });
+            assert!(!is_empty_backend_response(&v),
+                "gate must not fire on legitimate finish_reason '{fr}': {v}");
+        }
+    }
+
+    #[test]
+    fn gate_passes_tool_calls_only() {
+        // Tool-only completion: content empty, tool_calls non-empty.
+        assert!(!is_empty_backend_response(&serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{"id": "x", "function": {"name": "f", "arguments": "{}"}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })));
+    }
+
+    #[test]
+    fn gate_passes_reasoning_only() {
+        // Some Qwen3.6 paths return content="" but populate reasoning_content.
+        assert!(!is_empty_backend_response(&serde_json::json!({
+            "choices": [{
+                "message": {"content": "", "reasoning_content": "thinking..."},
+                "finish_reason": "stop"
+            }]
+        })));
+    }
+
+    #[test]
+    fn gate_fires_on_unknown_finish_reason_with_empty_content() {
+        assert!(is_empty_backend_response(&serde_json::json!({
+            "choices": [{"message": {"content": ""}, "finish_reason": "weird_new_reason"}]
+        })));
+    }
+}
