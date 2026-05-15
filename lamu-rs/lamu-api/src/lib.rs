@@ -252,8 +252,9 @@ mod tests {
     #[test]
     fn pidfile_acquire_reclaims_stale_pid() {
         let (_dir, path) = temp_pidfile();
-        // PID that should not exist on any reasonable host. POSIX caps
-        // pids at PID_MAX_LIMIT (4M typical); 2^31 - 1 is never assigned.
+        // `i32::MAX` (2^31 - 1) is never assigned by the Linux kernel:
+        // PID_MAX_LIMIT is 2^22 on 64-bit, much smaller. The check is
+        // `kill(pid, 0)` which returns ESRCH for unassigned PIDs.
         let dead_pid: i32 = i32::MAX;
         std::fs::write(&path, format!("{}\n", dead_pid)).unwrap();
         let _pf = PidFile::acquire_at(path.clone(), Some(9999))

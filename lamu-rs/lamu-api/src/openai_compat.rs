@@ -1473,39 +1473,52 @@ mod compat_tests {
 
     #[test]
     fn anthropic_tool_choice_translator_handles_known_shapes() {
-        // "auto" → "auto"
+        // Exact OAI values per anthropic_tool_choice_to_openai contract:
+        //   {type:"auto"} → "auto"
+        //   {type:"any"}  → "required" (forces tool use)
+        //   {type:"none"} → "none"
+        //   {type:"tool",name:N} → {type:"function",function:{name:N}}
+        // Tight equality so a translator regression that silently
+        // collapses "any" to "auto" (or any other semantic drift)
+        // fails this test immediately.
         let auto = anthropic_tool_choice_to_openai(&serde_json::json!({"type": "auto"}));
-        assert!(auto == serde_json::json!("auto") || auto["type"] == "auto",
-            "auto should map to OAI auto; got {auto:?}");
+        assert_eq!(auto, serde_json::json!("auto"));
 
-        // "any" → forced "required" (or equivalent in current OAI vocab)
         let any = anthropic_tool_choice_to_openai(&serde_json::json!({"type": "any"}));
-        let s = any.to_string();
-        assert!(s.contains("required") || s.contains("any") || s.contains("auto"),
-            "any should map to a tool-forcing OAI value; got {s}");
+        assert_eq!(any, serde_json::json!("required"),
+            "any must map to forced 'required', NOT 'auto' (semantic mismatch)");
 
-        // "tool" with name → OAI function selection by name
+        let none = anthropic_tool_choice_to_openai(&serde_json::json!({"type": "none"}));
+        assert_eq!(none, serde_json::json!("none"));
+
         let named = anthropic_tool_choice_to_openai(&serde_json::json!({
             "type": "tool", "name": "get_weather"
         }));
-        let s = named.to_string();
-        assert!(s.contains("get_weather"), "named tool must carry through; got {s}");
+        assert_eq!(named, serde_json::json!({
+            "type": "function",
+            "function": {"name": "get_weather"}
+        }));
+
+        // Non-object input falls through to "auto".
+        let str_only = anthropic_tool_choice_to_openai(&serde_json::json!("anything"));
+        assert_eq!(str_only, serde_json::json!("auto"));
     }
 
     proptest! {
-        // For any reasonable Anthropic tool spec, translating to OpenAI and
-        // reading back the function name + input_schema preserves them.
-        // We don't test full round-trip (translator is one-way) — we test
-        // that no information needed by downstream OAI consumers is lost.
+        // For any reasonable Anthropic tool spec, translating to OpenAI
+        // preserves every field downstream OAI consumers depend on:
+        // name, description, and schema properties. Translator is one-way
+        // (Anthropic → OAI), so we check field-by-field equality, not
+        // round-trip equivalence.
         #[test]
-        fn anthropic_tool_name_and_schema_survive_translation(
+        fn anthropic_tool_translation_preserves_all_fields(
             name in "[a-zA-Z][a-zA-Z0-9_]{0,30}",
             desc in ".{0,80}",
             field in "[a-z][a-z0-9_]{0,10}",
         ) {
             let anthro = vec![serde_json::json!({
                 "name": name.clone(),
-                "description": desc,
+                "description": desc.clone(),
                 "input_schema": {
                     "type": "object",
                     "properties": { &field: { "type": "string" } },
@@ -1514,10 +1527,16 @@ mod compat_tests {
             })];
             let oai = anthropic_tools_to_openai(&anthro);
             prop_assert_eq!(oai.len(), 1);
+            prop_assert_eq!(&oai[0]["type"], &serde_json::Value::String("function".to_string()));
             prop_assert_eq!(&oai[0]["function"]["name"], &serde_json::Value::String(name.clone()));
+            prop_assert_eq!(&oai[0]["function"]["description"], &serde_json::Value::String(desc.clone()));
             prop_assert_eq!(
                 &oai[0]["function"]["parameters"]["properties"][&field]["type"],
                 &serde_json::Value::String("string".to_string())
+            );
+            prop_assert_eq!(
+                &oai[0]["function"]["parameters"]["required"][0],
+                &serde_json::Value::String(field.clone())
             );
         }
     }
@@ -1525,9 +1544,15 @@ mod compat_tests {
     // ── 502 backend_returned_empty gate ─────────────────────────────
     //
     // The gate fires when content + reasoning_content + tool_calls are
-    // all empty AND finish_reason isn't a recognized terminator. Tests
-    // assert the predicate via the exact same expression used in the
-    // handler. Pure logic; no axum needed.
+    // all empty AND finish_reason isn't a recognized terminator.
+    //
+    // KEEP IN SYNC WITH `chat_completions` in this file (search for
+    // "backend_returned_empty"). The helper below is a verbatim mirror
+    // of the production predicate; changing one without the other
+    // leaves the test passing while the real gate diverges. Until the
+    // predicate gets extracted into a shared `pub(crate)` function,
+    // the discipline is: every edit to the production expression
+    // must edit this mirror too.
 
     fn is_empty_backend_response(data: &Value) -> bool {
         let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
