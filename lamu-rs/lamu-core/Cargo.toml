@@ -31,5 +31,6 @@ which = "6"
 
 [dev-dependencies]
 futures-util = "0.3"
+proptest = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

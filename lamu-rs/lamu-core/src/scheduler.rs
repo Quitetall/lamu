@@ -242,3 +242,21 @@ impl VramScheduler {
 impl Default for VramScheduler {
     fn default() -> Self { Self::new() }
 }
+
+impl VramScheduler {
+    /// **Test fixture only.** Override the GPU's total VRAM AND null out
+    /// NVML so `available_mb` derives usage entirely from `register_loaded`
+    /// state. Production code reads NVML at construction time; this exists
+    /// because dev-machine GPU contention otherwise leaks into unit tests
+    /// (e.g. a real `lamu serve` holding 22 GB makes plan_load reject
+    /// every synthetic test entry as VRAM-exhausted).
+    ///
+    /// Marked `pub` because integration tests under `lamu-core/tests/`
+    /// build as separate crates — `#[cfg(test)]` here would scope it to
+    /// the lib's own unit tests only. Don't call this from production
+    /// code.
+    pub fn set_total_mb_for_tests(&mut self, mb: u32) {
+        self.total_mb = mb;
+        self.nvml = None;
+    }
+}
