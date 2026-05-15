@@ -133,7 +133,16 @@ impl AppState {
         // resolution that the HTTP router uses for the "lamu" / "main" /
         // "default" aliases — keeps the TUI's "what's highlighted" in
         // lockstep with "what an unqualified API call would hit".
-        if let Some(idx) = s.default_main_view_idx() {
+        //
+        // Three cases land here:
+        //   - model_view non-empty + main entry visible → select main's idx
+        //   - model_view non-empty + main absent/filtered → keep Some(0)
+        //   - model_view empty (no entries OR everything filtered) →
+        //     force Some -> None so downstream `.selected()` callers see
+        //     no selection instead of a dangling out-of-range index.
+        if s.model_view.is_empty() {
+            s.list_state.select(None);
+        } else if let Some(idx) = s.default_main_view_idx() {
             s.list_state.select(Some(idx));
         }
         s.refresh_gpu_procs();
@@ -142,6 +151,12 @@ impl AppState {
 
     /// Position in `model_view` of the registry entry flagged `main: true`,
     /// or `None` if no entry has the flag (or it's filtered out of view).
+    ///
+    /// First-wins on duplicate `main: true` entries — matches the HTTP
+    /// router's behaviour so the TUI and API agree on which model is
+    /// the default. Operators should set the flag on exactly one entry.
+    /// `main` is currently only honored on `ModelRef::Local` rows; a
+    /// future cloud-side main flag would need an extension here.
     pub fn default_main_view_idx(&self) -> Option<usize> {
         let main_pos = self.entries.iter().position(|e| e.main)?;
         self.model_view.iter().position(|r| matches!(r, ModelRef::Local(i) if *i == main_pos))
