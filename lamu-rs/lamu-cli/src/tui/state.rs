@@ -74,6 +74,10 @@ impl AppState {
 
         let mut list_state = ListState::default();
         if !entries.is_empty() {
+            // Real default-position set below after recompute_views runs;
+            // ListState wants Some(_) so render doesn't render an empty
+            // selection in the gap between Self construction and the
+            // explicit re-selection at the end of new().
             list_state.select(Some(0));
         }
         let mut launcher_state = ListState::default();
@@ -125,8 +129,22 @@ impl AppState {
             gpu_procs: Vec::new(),
         };
         s.recompute_views();
+        // Move cursor to the operator-designated default model. Same
+        // resolution that the HTTP router uses for the "lamu" / "main" /
+        // "default" aliases — keeps the TUI's "what's highlighted" in
+        // lockstep with "what an unqualified API call would hit".
+        if let Some(idx) = s.default_main_view_idx() {
+            s.list_state.select(Some(idx));
+        }
         s.refresh_gpu_procs();
         Ok(s)
+    }
+
+    /// Position in `model_view` of the registry entry flagged `main: true`,
+    /// or `None` if no entry has the flag (or it's filtered out of view).
+    pub fn default_main_view_idx(&self) -> Option<usize> {
+        let main_pos = self.entries.iter().position(|e| e.main)?;
+        self.model_view.iter().position(|r| matches!(r, ModelRef::Local(i) if *i == main_pos))
     }
 
     /// Snapshot the GPU process list. Looks up each PID's command name
@@ -335,10 +353,17 @@ impl AppState {
         });
         self.harness_view = hidx;
 
-        // Clamp selection to view length.
+        // Clamp selection to view length. On reset, prefer the `main: true`
+        // entry over position 0 so the operator-designated default stays
+        // selected across sort/filter changes.
         if let Some(sel) = self.list_state.selected() {
             if sel >= self.model_view.len() {
-                self.list_state.select(if self.model_view.is_empty() { None } else { Some(0) });
+                let fallback = if self.model_view.is_empty() {
+                    None
+                } else {
+                    Some(self.default_main_view_idx().unwrap_or(0))
+                };
+                self.list_state.select(fallback);
             }
         }
         if let Some(sel) = self.launcher_state.selected() {
