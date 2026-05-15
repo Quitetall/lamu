@@ -121,34 +121,41 @@ impl LamuMcpServer {
         // before sending requests.
         eprintln!("LAMU MCP server ready (rust)");
 
+        // Install signal handlers ONCE outside the loop — each
+        // `signal(SignalKind::*)` call registers a fresh handler with
+        // the runtime; doing it per-iteration leaks file descriptors.
+        #[cfg(unix)]
+        let (mut sig_term, mut sig_int) = {
+            use tokio::signal::unix::{signal, SignalKind};
+            (
+                signal(SignalKind::terminate())
+                    .map_err(|e| anyhow::anyhow!("SIGTERM handler: {e}"))?,
+                signal(SignalKind::interrupt())
+                    .map_err(|e| anyhow::anyhow!("SIGINT handler: {e}"))?,
+            )
+        };
+
         loop {
             #[cfg(unix)]
-            let line = {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut term = signal(SignalKind::terminate())
-                    .map_err(|e| anyhow::anyhow!("SIGTERM handler: {e}"))?;
-                let mut int = signal(SignalKind::interrupt())
-                    .map_err(|e| anyhow::anyhow!("SIGINT handler: {e}"))?;
-                tokio::select! {
-                    res = reader.next_line() => match res {
-                        Ok(Some(l)) => l,
-                        Ok(None) => {
-                            tracing::info!("stdin EOF — parent harness closed pipe, shutting down");
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!("read error: {}", e);
-                            break;
-                        }
-                    },
-                    _ = term.recv() => {
-                        tracing::info!("SIGTERM received, shutting down");
+            let line = tokio::select! {
+                res = reader.next_line() => match res {
+                    Ok(Some(l)) => l,
+                    Ok(None) => {
+                        tracing::info!("stdin EOF — parent harness closed pipe, shutting down");
                         break;
                     }
-                    _ = int.recv() => {
-                        tracing::info!("SIGINT received, shutting down");
+                    Err(e) => {
+                        tracing::error!("read error: {}", e);
                         break;
                     }
+                },
+                _ = sig_term.recv() => {
+                    tracing::info!("SIGTERM received, shutting down");
+                    break;
+                }
+                _ = sig_int.recv() => {
+                    tracing::info!("SIGINT received, shutting down");
+                    break;
                 }
             };
             #[cfg(not(unix))]
@@ -267,8 +274,16 @@ fn install_parent_death_signal() {
     // The fifth arg is unused; pass 0. The cast to c_ulong matches
     // `nix::sys::prctl` but we use `libc` directly since `nix` doesn't
     // expose PDEATHSIG on all targets.
-    unsafe {
-        let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+    let rc = unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0)
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            "PR_SET_PDEATHSIG failed (rc={}, errno={}); orphan-on-parent-death \
+             cleanup is degraded — kill stale `lamu start` daemons manually",
+            rc, err
+        );
     }
 }
 

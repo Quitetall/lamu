@@ -71,26 +71,62 @@ struct PidFile {
 impl PidFile {
     fn acquire(port: u16) -> anyhow::Result<Self> {
         let path = pidfile_path(port);
-        if path.exists() {
-            if let Ok(s) = std::fs::read_to_string(&path) {
-                if let Ok(pid) = s.trim().parse::<i32>() {
-                    if is_process_alive(pid) {
-                        anyhow::bail!(
-                            "lamu serve already running on :{} (pid {}). \
-                             Use `lamu status` to inspect, then `kill {}` to stop.",
-                            port, pid, pid
-                        );
-                    }
-                    tracing::warn!(
-                        "stale pidfile at {} (pid {} dead) — reclaiming",
-                        path.display(), pid
-                    );
+        // Up to two attempts: first tries atomic O_CREAT|O_EXCL; if that
+        // fails with AlreadyExists we inspect the holder, reclaim if dead,
+        // and try once more. Two parallel `lamu serve` invocations can't
+        // both win — `create_new` is atomic at the syscall level.
+        for attempt in 0..2 {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    write!(f, "{}\n", std::process::id())?;
+                    return Ok(PidFile { path });
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    // Inspect the existing pidfile. If holder is alive,
+                    // bail; if dead or unreadable, reclaim.
+                    match std::fs::read_to_string(&path) {
+                        Ok(s) => {
+                            if let Ok(pid) = s.trim().parse::<i32>() {
+                                if is_process_alive(pid) {
+                                    anyhow::bail!(
+                                        "lamu serve already running on :{} (pid {}). \
+                                         Use `lamu status` to inspect, then `kill {}` to stop.",
+                                        port, pid, pid
+                                    );
+                                }
+                                tracing::warn!(
+                                    "stale pidfile at {} (pid {} dead) — reclaiming",
+                                    path.display(), pid
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "unparseable pidfile at {} — reclaiming",
+                                    path.display()
+                                );
+                            }
+                        }
+                        Err(read_err) => {
+                            tracing::warn!(
+                                "pidfile at {} unreadable ({}) — reclaiming",
+                                path.display(), read_err
+                            );
+                        }
+                    }
+                    let _ = std::fs::remove_file(&path);
+                    // fall through to next loop iteration
+                }
+                Err(e) => return Err(e.into()),
             }
-            let _ = std::fs::remove_file(&path);
         }
-        std::fs::write(&path, format!("{}\n", std::process::id()))?;
-        Ok(PidFile { path })
+        anyhow::bail!(
+            "lamu serve: pidfile {} acquisition raced — another instance won",
+            path.display()
+        )
     }
 }
 
