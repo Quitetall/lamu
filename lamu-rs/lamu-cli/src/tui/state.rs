@@ -216,6 +216,10 @@ impl AppState {
             cloud_models: Vec::new(),
             source_filter: SourceFilter::All,
             model_view: Vec::new(),
+            // `LamuConfig::default()` returns hardcoded defaults (see
+            // `lamu_config::Default` impl) — no $HOME / disk reads. Stays
+            // hermetic. Don't replace with `LamuConfig::load()` which DOES
+            // read from `dirs::config_dir()`.
             config: LamuConfig::default(),
             settings_state,
             gpu_procs: Vec::new(),
@@ -552,9 +556,7 @@ mod default_main_idx_tests {
     fn mk_state_with(entries: Vec<ModelEntry>) -> AppState {
         // Use new_for_tests() — skips filesystem + NVML probes so the
         // test runs cleanly in CI / sandboxed builds without GPU drivers
-        // or a populated $HOME/local-llm/config/. Only the fields
-        // exercised by view-index logic (entries + model_filter +
-        // source_filter + model_view + list_state) need to be touched.
+        // or a populated $HOME/local-llm/config/.
         let mut s = AppState::new_for_tests();
         s.entries = entries;
         s.recompute_views();
