@@ -86,9 +86,20 @@ impl PidFile {
                     write!(f, "{}\n", std::process::id())?;
                     return Ok(PidFile { path });
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    // Inspect the existing pidfile. If holder is alive,
-                    // bail; if dead or unreadable, reclaim.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt == 1 {
+                        // Second attempt already lost the race against a
+                        // concurrent winner. Don't reclaim again — the new
+                        // holder is presumed live; surface a clear message.
+                        anyhow::bail!(
+                            "lamu serve: pidfile {} acquisition raced — \
+                             another `lamu serve` won the second attempt. \
+                             Run `lamu status` or `cat {}` to find the holder.",
+                            path.display(), path.display()
+                        );
+                    }
+                    // attempt == 0: inspect the existing pidfile. Live
+                    // holder → bail. Dead/unreadable → reclaim + retry.
                     match std::fs::read_to_string(&path) {
                         Ok(s) => {
                             if let Ok(pid) = s.trim().parse::<i32>() {
@@ -123,10 +134,8 @@ impl PidFile {
                 Err(e) => return Err(e.into()),
             }
         }
-        anyhow::bail!(
-            "lamu serve: pidfile {} acquisition raced — another instance won",
-            path.display()
-        )
+        // Unreachable: both attempts cover every Err case explicitly.
+        unreachable!("pidfile retry loop exited without returning")
     }
 }
 
