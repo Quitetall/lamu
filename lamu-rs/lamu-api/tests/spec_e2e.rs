@@ -81,7 +81,14 @@ fn pick_test_model() -> Option<String> {
             let name = k.as_str()?.to_string();
             let vram = v.get("vram_mb")?.as_u64()?;
             let arch = v.get("arch").and_then(|x| x.as_str()).unwrap_or("");
-            let params_b = v.get("params_b").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            // `as_f64()` returns None when the YAML field is a plain
+            // integer (e.g. `params_b: 7`). Fall back to as_u64/as_i64
+            // so integer-typed entries aren't silently filtered out.
+            let params_b = v.get("params_b")
+                .and_then(|x| x.as_f64()
+                    .or_else(|| x.as_u64().map(|u| u as f64))
+                    .or_else(|| x.as_i64().map(|i| i as f64)))
+                .unwrap_or(0.0);
             if arch.starts_with("dflash") || arch == "gpt2" { return None; }
             if params_b < 3.0 { return None; }
             let caps = v.get("capabilities").and_then(|c| c.as_sequence())?;
@@ -113,10 +120,21 @@ impl Drop for ServeHandle {
             use nix::unistd::Pid;
             let pid = self.child.id();
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            // Best-effort wait; the integration test is single-threaded
-            // so a short blocking sleep doesn't interfere with anything.
-            std::thread::sleep(Duration::from_millis(500));
+            // Poll for exit up to 5 seconds — graceful shutdown can be
+            // slow on a busy host (flush logs, run preload teardown,
+            // unlink pidfile). 5s is generous enough that the SIGKILL
+            // escalation only fires on a genuinely-stuck binary; the
+            // test then runs its pidfile assertion against the result
+            // of a real graceful exit, not a half-killed process.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
+        // SIGTERM didn't take or non-Unix: hard kill.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -158,7 +176,9 @@ async fn three_surfaces_round_trip_against_real_serve() {
         return;
     };
     let Some(model) = pick_test_model() else {
-        eprintln!("spec_e2e: registry missing or empty — skipping.");
+        eprintln!("spec_e2e: no suitable test model — registry missing, \
+                   empty, or every candidate filtered (no chat capability, \
+                   draft arch, or GGUF missing on disk). Skipping.");
         return;
     };
     let port = ephemeral_port();
@@ -175,8 +195,28 @@ async fn three_surfaces_round_trip_against_real_serve() {
 
     eprintln!("spec_e2e: testing against model '{model}' on :{port}");
 
+    /// Returns Ok(json_body) on 2xx. On error: if body looks like host-VRAM
+    /// contention, returns Err(skip_reason) so the caller skips; otherwise
+    /// panics with the full response.
+    async fn assert_2xx_or_skip(
+        resp: reqwest::Response, surface: &str,
+    ) -> std::result::Result<Value, String> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp.json::<Value>().await.expect("success body should parse"));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("vram exhausted")
+            || body.contains("requires evicting")
+            || body.contains("VRAM")
+        {
+            return Err(format!("{surface}: host VRAM contention — {body}"));
+        }
+        panic!("{surface} returned {status}; body: {body}");
+    }
+
     // OpenAI surface.
-    let oai = client
+    let oai_resp = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .json(&serde_json::json!({
             "model": model,
@@ -188,27 +228,15 @@ async fn three_surfaces_round_trip_against_real_serve() {
         .send()
         .await
         .expect("openai POST");
-    let status = oai.status();
-    if !status.is_success() {
-        let body = oai.text().await.unwrap_or_default();
-        // Host-environment skips: another process holding the GPU, or
-        // the picked model doesn't fit. The wire-up is fine; the host
-        // can't run the test. Don't fail.
-        if body.contains("vram exhausted")
-            || body.contains("requires evicting")
-            || body.contains("VRAM")
-        {
-            eprintln!("spec_e2e: SKIP — host VRAM contention: {body}");
-            return;
-        }
-        panic!("OpenAI surface returned {status}; body: {body}");
-    }
-    let body: Value = oai.json().await.expect("oai json");
+    let body = match assert_2xx_or_skip(oai_resp, "OpenAI").await {
+        Ok(b) => b,
+        Err(reason) => { eprintln!("spec_e2e: SKIP — {reason}"); return; }
+    };
     let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("");
     assert!(!content.is_empty(), "OpenAI surface returned empty content");
 
     // Anthropic surface (non-stream).
-    let anthro = client
+    let anthro_resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .json(&serde_json::json!({
             "model": model,
@@ -219,13 +247,15 @@ async fn three_surfaces_round_trip_against_real_serve() {
         .send()
         .await
         .expect("anthropic POST");
-    assert!(anthro.status().is_success(), "Anthropic surface returned {}", anthro.status());
-    let body: Value = anthro.json().await.expect("anthropic json");
+    let body = match assert_2xx_or_skip(anthro_resp, "Anthropic").await {
+        Ok(b) => b,
+        Err(reason) => { eprintln!("spec_e2e: SKIP — {reason}"); return; }
+    };
     let text = body["content"][0]["text"].as_str().unwrap_or("");
     assert!(!text.is_empty(), "Anthropic surface returned empty text");
 
     // Ollama surface (non-stream).
-    let ollama = client
+    let ollama_resp = client
         .post(format!("http://127.0.0.1:{port}/api/chat"))
         .json(&serde_json::json!({
             "model": model,
@@ -236,8 +266,10 @@ async fn three_surfaces_round_trip_against_real_serve() {
         .send()
         .await
         .expect("ollama POST");
-    assert!(ollama.status().is_success(), "Ollama surface returned {}", ollama.status());
-    let body: Value = ollama.json().await.expect("ollama json");
+    let body = match assert_2xx_or_skip(ollama_resp, "Ollama").await {
+        Ok(b) => b,
+        Err(reason) => { eprintln!("spec_e2e: SKIP — {reason}"); return; }
+    };
     let content = body["message"]["content"].as_str().unwrap_or("");
     assert!(!content.is_empty(), "Ollama surface returned empty content");
 
