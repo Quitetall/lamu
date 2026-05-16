@@ -204,6 +204,12 @@ smoke-bee port="8021":
       -d '{"model":"any","messages":[{"role":"user","content":"Say hi in one short sentence."}],"max_tokens":40,"temperature":0}' \
       | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content']); u=r.get('usage',{}); print(f\"tokens: prompt={u.get('prompt_tokens')}, completion={u.get('completion_tokens')}\")"
 
+# Open the default harness (or named one) with env wired to lamu.
+# `just open` → default. `just open codex` → named. `just open list` → list configured.
+[group: 'v3']
+open +args="":
+    @bash {{root}}/scripts/open-harness.sh {{args}}
+
 # Stream chat to bee. Thinking ON by default. Pass `THINK=0 just chat-bee ...` to disable.
 [group: 'bee']
 chat-bee +prompt:
