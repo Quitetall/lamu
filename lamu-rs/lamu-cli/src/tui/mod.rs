@@ -235,6 +235,24 @@ pub const HARNESSES: &[Harness] = &[
     },
 ];
 
+/// Locate `scripts/open-harness.sh` from the lamu source tree. Reads
+/// $HOME and joins the canonical layout. On unset $HOME the function
+/// logs to stderr and falls back to the developer's known layout —
+/// the script still won't exist on a fresh machine but the warning
+/// makes the failure mode obvious instead of a bare "file not found"
+/// later. Single source of truth so the two TUI launch paths
+/// (Dashboard Enter, Launchers Enter) can't drift.
+fn open_harness_script_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| {
+        eprintln!(
+            "warning: $HOME unset — open-harness.sh path resolution likely \
+             to fail; falling back to /home/brianklam"
+        );
+        "/home/brianklam".to_string()
+    });
+    format!("{}/local-llm/scripts/open-harness.sh", home)
+}
+
 pub(super) fn probe_port(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
     let addr: SocketAddr = match format!("127.0.0.1:{port}").parse() {
@@ -590,22 +608,8 @@ fn run_loop<B: ratatui::backend::Backend>(
                                         // arg + optional sandbox). No slug →
                                         // direct exec (builtins / GitHub CLI).
                                         let mut cmd = if let Some(slug) = slug {
-                                            // Resolve $HOME with a clear failure
-                                            // mode — empty HOME would produce
-                                            // `/local-llm/scripts/...` and a
-                                            // confusing "file not found".
-                                            let home = std::env::var("HOME")
-                                                .unwrap_or_else(|_| {
-                                                    eprintln!(
-                                                        "warning: $HOME unset — script path \
-                                                         resolution likely to fail; falling back \
-                                                         to /home/brianklam"
-                                                    );
-                                                    "/home/brianklam".to_string()
-                                                });
-                                            let script = format!("{}/local-llm/scripts/open-harness.sh", home);
                                             let mut c = std::process::Command::new("bash");
-                                            c.arg(script).arg(slug);
+                                            c.arg(open_harness_script_path()).arg(slug);
                                             c
                                         } else {
                                             let mut c = std::process::Command::new(&argv[0]);
@@ -862,22 +866,8 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     run_subprocess_in_tui(terminal, move || -> Result<()> {
                                         println!("\n→ Launching {label}\n");
                                         let mut cmd = if let Some(slug) = slug {
-                                            // Resolve $HOME with a clear failure
-                                            // mode — empty HOME would produce
-                                            // `/local-llm/scripts/...` and a
-                                            // confusing "file not found".
-                                            let home = std::env::var("HOME")
-                                                .unwrap_or_else(|_| {
-                                                    eprintln!(
-                                                        "warning: $HOME unset — script path \
-                                                         resolution likely to fail; falling back \
-                                                         to /home/brianklam"
-                                                    );
-                                                    "/home/brianklam".to_string()
-                                                });
-                                            let script = format!("{}/local-llm/scripts/open-harness.sh", home);
                                             let mut c = std::process::Command::new("bash");
-                                            c.arg(script).arg(slug);
+                                            c.arg(open_harness_script_path()).arg(slug);
                                             c
                                         } else {
                                             let mut c = std::process::Command::new(&argv[0]);
