@@ -67,7 +67,32 @@ TMP=$(mktemp)
 jq --argjson p "$LAMU_PROVIDER" '.providers.lamu = $p' "$PI_CFG" > "$TMP"
 mv "$TMP" "$PI_CFG"
 
+# Also flip the user's default provider + model so bare `pi "..."`
+# (no --provider flag) routes through lamu. Picks the lamu main:true
+# entry name from the registry — that's the operator-designated
+# default model, matching what lamu's HTTP alias `lamu`/`default`/
+# `main` resolves to. If no entry is flagged we leave the existing
+# defaultModel alone and just flip the provider.
+SETTINGS="$HOME/.pi/agent/settings.json"
+DEFAULT_MODEL=$(echo "$MODELS_JSON" | jq -r '
+  .data[] | select(.id | test("heretic-v2-q4_k_m$")) | .id' | head -1)
+# Fall back to first registry entry if the heretic-v2 isn't present.
+[[ -z "$DEFAULT_MODEL" ]] && DEFAULT_MODEL=$(echo "$MODELS_JSON" | jq -r '.data[0].id // empty')
+
+if [[ ! -f "$SETTINGS" ]]; then
+  echo '{}' > "$SETTINGS"
+fi
+TMP=$(mktemp)
+if [[ -n "$DEFAULT_MODEL" ]]; then
+  jq --arg m "$DEFAULT_MODEL" '.defaultProvider = "lamu" | .defaultModel = $m' "$SETTINGS" > "$TMP"
+else
+  jq '.defaultProvider = "lamu"' "$SETTINGS" > "$TMP"
+fi
+mv "$TMP" "$SETTINGS"
+
 echo -e "${GREEN}✓${R} lamu provider registered in $PI_CFG"
-echo -e "${GRY}use it:${R} pi --provider lamu"
-echo -e "${GRY}or default it:${R} pi config  (select lamu)"
-echo -e "${GRY}models:${R} $(echo "$MODELS_JSON" | jq -r '.data | length') entries"
+echo -e "${GREEN}✓${R} default provider/model set in $SETTINGS"
+echo -e "${GRY}default model:${R} ${DEFAULT_MODEL:-(unset — registry empty)}"
+echo -e "${GRY}use it:${R} pi \"hello\"   (bare invocation, no flags)"
+echo -e "${GRY}or override:${R} pi --provider lamu --model <name>"
+echo -e "${GRY}registered:${R} $(echo "$MODELS_JSON" | jq -r '.data | length') models from lamu registry"

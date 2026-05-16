@@ -540,7 +540,16 @@ async fn stream_response(
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("data: ") else { continue };
                 if rest == "[DONE]" {
-                    if !pending.trim().is_empty() && reasoning_done {
+                    // Flush whatever's buffered. The reasoning-tag scan
+                    // buffers tokens until either (a) it spots `<think>`
+                    // and routes to reasoning, or (b) ~24 chars arrive
+                    // without one and we declare reasoning_done. Short
+                    // outputs (e.g. "ok\n") never hit either branch, so
+                    // we have to flush at end-of-stream. Buffered content
+                    // is only safe to drop if we're MID-reasoning — in
+                    // that case the close_tag never arrived and emitting
+                    // the partial think-block would leak it to the user.
+                    if !pending.trim().is_empty() && !in_reasoning {
                         let chunk = make_chunk(&completion_id, created, &model_name, &pending);
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
@@ -602,6 +611,15 @@ async fn stream_response(
             }
         }
 
+        // Stream ended without an explicit [DONE] line (some backends
+        // just close the connection). Flush the same way the [DONE]
+        // branch does: emit pending if not still mid-reasoning, then
+        // emit the synthetic close envelope so clients see a proper
+        // finish_reason.
+        if !pending.trim().is_empty() && !in_reasoning {
+            let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+            yield Ok(Event::default().data(chunk.to_string()));
+        }
         let done_chunk = json!({
             "id": completion_id,
             "object": "chat.completion.chunk",

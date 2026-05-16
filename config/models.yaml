@@ -17,10 +17,17 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    status: recommended
+    main: true
     speculative:
       draft_path: /home/brianklam/models/qwen3.6-27b-dflash-spiritbuun/dflash-draft-3.6-q4_k_m.gguf
       method: dflash
       draft_max: 8
+    notes: |
+      Daily-driver main entry. Bee + DFlash + turbo3_tcq KV → ~98-101 t/s
+      on RTX 4090 (vs 44.6 baseline, 2.2× faster). 17.4 GB → 6+ GB
+      headroom for other GPU work. `default`/`main`/`lamu` aliases
+      resolve here.
   27b_mtp:
     path: /home/brianklam/models/qwen3.6-27b-mtp/27B_MTP.gguf
     format: gguf
@@ -200,7 +207,6 @@ models:
     - chat
     - long_context
     status: recommended
-    main: true
     speculative:
       draft_path: /home/brianklam/models/qwen36-35b-a3b-dflash/dflash-35b-a3b-q8.gguf
       method: dflash
