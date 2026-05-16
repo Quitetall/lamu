@@ -24,10 +24,12 @@ if [[ ! -f "$HERMES_CFG" ]]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo -e "${RED}python3 required.${R}"
-  exit 1
-fi
+for dep in python3 curl; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    echo -e "${RED}'$dep' is required. Install with your distro's package manager.${R}"
+    exit 1
+  fi
+done
 
 if ! curl -sf -m 3 "$LAMU_URL/v1/models" >/dev/null 2>&1; then
   echo -e "${YEL}warning:${R} lamu not reachable at $LAMU_URL — config will still install."

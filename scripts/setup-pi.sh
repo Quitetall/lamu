@@ -25,10 +25,12 @@ if [[ ! -d "$HOME/.pi/agent" ]]; then
   exit 1
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo -e "${RED}jq is required. Install with: pacman -S jq (or your distro's equivalent)${R}"
-  exit 1
-fi
+for dep in jq curl; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    echo -e "${RED}'$dep' is required. Install with your distro's package manager.${R}"
+    exit 1
+  fi
+done
 
 if ! curl -sf -m 3 "$LAMU_URL/v1/models" >/dev/null 2>&1; then
   echo -e "${YEL}warning:${R} lamu not reachable at $LAMU_URL — config will still install."
@@ -36,8 +38,11 @@ fi
 
 # Pull current model registry from lamu so the provider knows about
 # every entry (pi requires explicit `models: [...]` per provider).
+# Includes the full registry — pi's UI scales fine to hundreds of
+# entries, and capping silently would surprise users who add more
+# models after `lamu scan`.
 MODELS_JSON=$(curl -sf -m 3 "$LAMU_URL/v1/models" 2>/dev/null || echo '{"data":[]}')
-MODEL_IDS=$(echo "$MODELS_JSON" | jq -r '.data[].id' | head -30 | jq -R . | jq -s .)
+MODEL_IDS=$(echo "$MODELS_JSON" | jq -r '.data[].id' | jq -R . | jq -s .)
 
 LAMU_PROVIDER=$(jq -n \
   --arg url "$LAMU_URL/v1" \
