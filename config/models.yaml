@@ -17,6 +17,10 @@ models:
       open_tag: <think>
       close_tag: </think>
       family: qwen35
+    speculative:
+      draft_path: /home/brianklam/models/qwen3.6-27b-dflash-spiritbuun/dflash-draft-3.6-q4_k_m.gguf
+      method: dflash
+      draft_max: 8
   27b_mtp:
     path: /home/brianklam/models/qwen3.6-27b-mtp/27B_MTP.gguf
     format: gguf
@@ -197,6 +201,10 @@ models:
     - long_context
     status: recommended
     main: true
+    speculative:
+      draft_path: /home/brianklam/models/qwen36-35b-a3b-dflash/dflash-35b-a3b-q8.gguf
+      method: dflash
+      draft_max: 8
     notes: |
       Largest model that fits the 4090. MoE A3B = 3B active params per token,
       ~102 t/s on bee config. 35B knowledge at 3B speeds. 22.2 GB → 2.4 GB

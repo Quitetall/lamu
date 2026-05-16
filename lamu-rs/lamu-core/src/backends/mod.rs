@@ -12,9 +12,14 @@ use futures_util::stream::Stream;
 use std::pin::Pin;
 
 /// Construct the right backend impl for the entry's declared type.
+///
+/// For `LlamaCpp`, uses `new_for_entry` so registry entries carrying a
+/// `speculative: { method: dflash, ... }` config transparently spawn
+/// the BeeLlama fork binary with DFlash drafter + `turbo3_tcq` KV.
+/// Entries without spec config get the generic `llama_bin()`.
 pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
     match entry.backend {
-        BackendType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppBackend::new(None)?)),
+        BackendType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppBackend::new_for_entry(entry)?)),
         BackendType::Megakernel => Ok(Box::new(megakernel::MegakernelBackend::new()?)),
         BackendType::Dflash | BackendType::DflashLucebox => {
             Ok(Box::new(dflash::DflashBackend::new()?))

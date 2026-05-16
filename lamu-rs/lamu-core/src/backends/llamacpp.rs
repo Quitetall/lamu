@@ -29,23 +29,33 @@ pub struct LlamaSpawn {
 
 /// Build the canonical llama-server argv + env for `entry` on `port`.
 ///
+/// `bin` is the llama-server binary that will run the args. When `bin`
+/// is the BeeLlama fork (`is_bee_binary(bin) == true`) AND the entry
+/// has a usable DFlash speculative config, this function emits the
+/// matching `--spec-dflash-default` + `-md <draft>` flags and switches
+/// the KV cache to `turbo3_tcq` (bee's TurboQuant TCQ encoding).
+///
 /// `supports_ngram` is the result of probing `llama-server --help` for
-/// `--spec-ngram-mod-n-match`. Pass `false` if the binary doesn't
-/// support speculative ngram-mod (older builds) — the spec flags will
-/// be omitted instead of failing the spawn.
+/// the full ngram-mod sub-flag set. Pass `false` if the binary doesn't
+/// support speculative ngram-mod (older builds) — the ngram flags
+/// will be omitted instead of failing the spawn. Ignored when the
+/// DFlash path is taken (DFlash > ngram on the bee binary).
 ///
 /// Env knobs read here:
 /// - `LAMU_DEFAULT_CTX` — caps the context window (default: full).
 /// - `LAMU_KV` — KV cache type. Validated against the set llama.cpp
 ///   actually accepts; an unknown value is rejected up front rather
 ///   than crashing the server at startup or silently falling back to
-///   f16. Default: `q8_0` (speed/VRAM sweet spot).
+///   f16. Default: `q8_0` (speed/VRAM sweet spot) — auto-upgraded to
+///   `turbo3_tcq` when the bee binary + DFlash spec path is active,
+///   unless `LAMU_KV` is explicitly set.
 /// - `LAMU_BIND_HOST` — bind address (default: `127.0.0.1`). Set to
 ///   `0.0.0.0` to opt in to remote exposure.
 pub fn build_llama_spawn(
     entry: &ModelEntry,
     port: u16,
     supports_ngram: bool,
+    bin: &std::path::Path,
 ) -> Result<LlamaSpawn> {
     let ctx_cap = std::env::var("LAMU_DEFAULT_CTX")
         .ok()
@@ -53,16 +63,30 @@ pub fn build_llama_spawn(
         .unwrap_or(u32::MAX);
     let ctx = entry.context_max.min(ctx_cap);
 
-    let kv_raw = std::env::var("LAMU_KV");
-    let kv_type = match kv_raw.as_deref() {
+    // Decide whether the DFlash-on-bee path applies. Requires:
+    //   - bin is a BeeLlama build (only fork that ships --spec-type dflash)
+    //   - entry has a `speculative:` config in the registry
+    //   - method == "dflash"
+    //   - draft GGUF actually exists on disk
+    let dflash_spec = entry.speculative.as_ref().filter(|sc| {
+        is_bee_binary(bin)
+            && sc.method.eq_ignore_ascii_case("dflash")
+            && sc.draft_path.exists()
+    });
+    let bee_dflash_active = dflash_spec.is_some();
+
+    let kv_env = std::env::var("LAMU_KV");
+    let kv_type = match kv_env.as_deref() {
         Ok("q8_0") | Ok("q4_0") | Ok("q4_1") | Ok("q5_0") | Ok("q5_1")
-            | Ok("f16") | Ok("bf16") | Ok("f32") => kv_raw.unwrap(),
+            | Ok("f16") | Ok("bf16") | Ok("f32")
+            | Ok("turbo2") | Ok("turbo3") | Ok("turbo3_tcq") | Ok("turbo4") => kv_env.unwrap(),
         Ok(other) => {
             return Err(Error::Backend(format!(
-                "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32",
+                "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32, turbo2, turbo3, turbo3_tcq, turbo4",
                 other
             )));
         }
+        Err(_) if bee_dflash_active => "turbo3_tcq".to_string(),
         Err(_) => "q8_0".to_string(),
     };
 
@@ -88,7 +112,20 @@ pub fn build_llama_spawn(
         "--cache-reuse".into(), "256".into(),
     ];
 
-    if supports_ngram && (entry.arch == "qwen35" || entry.arch == "qwen3") {
+    if let Some(sc) = dflash_spec {
+        // DFlash drafter pairing — biggest single t/s win on bee.
+        // ~82-101 t/s on Qwen3.6-27B vs ~44 t/s vanilla. Uses
+        // `--spec-dflash-default` (convenience flag setting spec-type
+        // dflash + sensible cross-ctx / max-slots defaults), matching
+        // the validated `scripts/serve-qwen36-bee.sh` config.
+        args.extend([
+            "-md".into(), sc.draft_path.display().to_string(),
+            "-ngld".into(), "99".into(),
+            "--spec-dflash-default".into(),
+        ]);
+    } else if supports_ngram && (entry.arch == "qwen35" || entry.arch == "qwen3") {
+        // Fallback for binaries without DFlash but with ngram-mod (~10-15%
+        // over baseline on warm runs). Only fires when DFlash didn't.
         args.extend([
             "--spec-type".into(), "ngram-mod".into(),
             "--spec-ngram-mod-n-match".into(), "24".into(),
@@ -103,10 +140,50 @@ pub fn build_llama_spawn(
     })
 }
 
+/// Resolve the BeeLlama llama-server binary, if available.
+///
+/// Resolution order:
+///   1. `LAMU_BEE_BIN` env var — explicit override.
+///   2. `~/local-llm/beellama.cpp/build/bin/llama-server` — default
+///      build layout matching `scripts/serve-qwen36-bee.sh`.
+///
+/// Returns `None` when neither path exists, so callers can fall back
+/// to the generic `llama_bin()`.
+pub fn bee_bin() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("LAMU_BEE_BIN") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    let default = dirs::home_dir()?
+        .join("local-llm")
+        .join("beellama.cpp")
+        .join("build")
+        .join("bin")
+        .join("llama-server");
+    default.exists().then_some(default)
+}
+
+/// True if `bin` looks like a BeeLlama fork build. Currently a path
+/// substring check — bee's repo name `beellama.cpp` is distinctive
+/// enough that any binary built there will live under that directory.
+/// Robust against rename of the `llama-server` filename itself.
+pub fn is_bee_binary(bin: &std::path::Path) -> bool {
+    bin.to_string_lossy().contains("beellama")
+}
+
 /// Async helper: probe `llama-server --help` for ngram-mod support.
+///
+/// Probes for ALL THREE flags `build_llama_spawn` emits (`-n-match`,
+/// `-n-min`, `-n-max`) — older `llama-server` builds (the Lucebox
+/// `dflash-pr` branch in particular) advertise `--spec-type ngram-mod`
+/// in the generic enum but lack the supporting sub-flags; passing only
+/// `--spec-type ngram-mod` without `-n-min`/`-n-max` would let the
+/// server start with a broken speculator config.
 pub async fn detect_ngram_support(bin: &std::path::Path) -> bool {
     match Command::new(bin).arg("--help").output().await {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("--spec-ngram-mod-n-match"),
+        Ok(o) => has_full_ngram_mod_flags(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => false,
     }
 }
@@ -114,9 +191,19 @@ pub async fn detect_ngram_support(bin: &std::path::Path) -> bool {
 /// Sync helper for blocking callers (the TUI swap path).
 pub fn detect_ngram_support_blocking(bin: &std::path::Path) -> bool {
     match std::process::Command::new(bin).arg("--help").output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("--spec-ngram-mod-n-match"),
+        Ok(o) => has_full_ngram_mod_flags(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => false,
     }
+}
+
+/// Returns true when the help text contains all three ngram-mod
+/// sub-flags `build_llama_spawn` emits. Factored out so the async and
+/// blocking probes can share the predicate (and so it's
+/// straight-forward to unit-test against captured help output).
+fn has_full_ngram_mod_flags(help: &str) -> bool {
+    help.contains("--spec-ngram-mod-n-match")
+        && help.contains("--spec-ngram-mod-n-min")
+        && help.contains("--spec-ngram-mod-n-max")
 }
 
 pub struct LlamaCppBackend {
@@ -144,6 +231,25 @@ impl LlamaCppBackend {
         })
     }
 
+    /// Entry-aware constructor. Picks the BeeLlama fork binary when the
+    /// entry has a usable DFlash speculative config + the bee build is
+    /// available; falls back to the generic `llama_bin()` otherwise.
+    ///
+    /// This is what `make_backend(entry)` should call so a registry
+    /// entry with `speculative: { method: dflash, draft_path: ... }`
+    /// transparently picks up DFlash drafting + `turbo3_tcq` KV in
+    /// `build_llama_spawn` without the caller knowing which binary
+    /// got selected.
+    pub fn new_for_entry(entry: &ModelEntry) -> Result<Self> {
+        let bin_path = if entry.speculative.as_ref()
+            .is_some_and(|sc| sc.method.eq_ignore_ascii_case("dflash") && sc.draft_path.exists())
+        {
+            bee_bin().unwrap_or_else(llama_bin)
+        } else {
+            llama_bin()
+        };
+        Self::new(Some(bin_path))
+    }
 }
 
 #[async_trait]
@@ -160,7 +266,7 @@ impl Backend for LlamaCppBackend {
         }
 
         let supports_ngram = detect_ngram_support(&self.bin_path).await;
-        let spawn = build_llama_spawn(entry, port, supports_ngram)?;
+        let spawn = build_llama_spawn(entry, port, supports_ngram, &self.bin_path)?;
 
         let mut cmd = Command::new(&self.bin_path);
         cmd.args(&spawn.args);
@@ -380,7 +486,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         let entry = dummy_entry("llama", 8192);
-        let s = build_llama_spawn(&entry, 8020, false).unwrap();
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server")).unwrap();
         let joined = s.args.join(" ");
         assert!(joined.contains("--host 127.0.0.1"), "{joined}");
         assert!(joined.contains("--cache-type-k q8_0"), "{joined}");
@@ -400,7 +506,7 @@ mod tests {
         clear_env();
         unsafe { std::env::set_var("LAMU_KV", "garbage"); }
         let entry = dummy_entry("llama", 8192);
-        let r = build_llama_spawn(&entry, 8020, false);
+        let r = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"));
         clear_env();
         assert!(matches!(r, Err(Error::Backend(_))), "expected Backend err, got {:?}", r);
     }
@@ -411,7 +517,7 @@ mod tests {
         clear_env();
         unsafe { std::env::set_var("LAMU_DEFAULT_CTX", "4096"); }
         let entry = dummy_entry("llama", 131072);
-        let s = build_llama_spawn(&entry, 8020, false).unwrap();
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server")).unwrap();
         clear_env();
         assert!(s.args.join(" ").contains("--ctx-size 4096"));
     }
@@ -421,7 +527,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         let entry = dummy_entry("qwen3", 32768);
-        let s = build_llama_spawn(&entry, 8020, true).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, std::path::Path::new("/usr/bin/llama-server")).unwrap();
         let joined = s.args.join(" ");
         assert!(joined.contains("--spec-type ngram-mod"));
         assert!(joined.contains("--spec-ngram-mod-n-match 24"));
@@ -432,7 +538,152 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         let entry = dummy_entry("llama", 8192);
-        let s = build_llama_spawn(&entry, 8020, true).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, std::path::Path::new("/usr/bin/llama-server")).unwrap();
         assert!(!s.args.join(" ").contains("--spec-type"));
+    }
+
+    // ── has_full_ngram_mod_flags ────────────────────────────────────
+
+    #[test]
+    fn ngram_probe_requires_all_three_subflags() {
+        // Bee v0.1.2 help text contains all three.
+        let bee_like = "\
+            --spec-ngram-mod-n-min N    minimum number of ngram tokens\n\
+            --spec-ngram-mod-n-max N    maximum number of ngram tokens\n\
+            --spec-ngram-mod-n-match N  ngram-mod lookup length\n";
+        assert!(has_full_ngram_mod_flags(bee_like));
+    }
+
+    #[test]
+    fn ngram_probe_rejects_dflash_pr_style() {
+        // dflash-pr branch advertises `ngram-mod` in --spec-type enum but
+        // ships none of the supporting -n-* sub-flags. Probe must NOT
+        // greenlight ngram-mod here — passing --spec-type ngram-mod
+        // without -n-min/-n-max would start a broken speculator.
+        let dflash_pr_like = "\
+            --spec-type [none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]\n\
+            --spec-ngram-size-n N       ngram size N for ngram-simple\n\
+            --spec-ngram-size-m N       ngram size M for ngram-simple\n";
+        assert!(!has_full_ngram_mod_flags(dflash_pr_like));
+    }
+
+    #[test]
+    fn ngram_probe_rejects_partial_subflags() {
+        // A future build that ships -n-min but not -n-match should also
+        // be refused — we emit all three, so all three must be supported.
+        let partial = "--spec-ngram-mod-n-min N    minimum\n\
+                       --spec-ngram-mod-n-max N    maximum\n";
+        assert!(!has_full_ngram_mod_flags(partial));
+    }
+
+    // ── BeeLlama / DFlash detection + spawn args ────────────────────
+
+    #[test]
+    fn is_bee_binary_matches_beellama_path() {
+        let bee = std::path::Path::new("/home/u/local-llm/beellama.cpp/build/bin/llama-server");
+        assert!(is_bee_binary(bee));
+    }
+
+    #[test]
+    fn is_bee_binary_rejects_vanilla() {
+        let vanilla = std::path::Path::new("/usr/bin/llama-server");
+        assert!(!is_bee_binary(vanilla));
+        let dflash_pr = std::path::Path::new("/home/u/llama.cpp/build/bin/llama-server");
+        assert!(!is_bee_binary(dflash_pr));
+    }
+
+    fn dummy_entry_with_spec(arch: &str, draft: PathBuf) -> ModelEntry {
+        let mut e = dummy_entry(arch, 32768);
+        e.speculative = Some(crate::types::SpeculativeConfig {
+            draft_path: draft,
+            method: "dflash".into(),
+            draft_max: 8,
+        });
+        e
+    }
+
+    #[test]
+    fn build_llama_spawn_emits_dflash_on_bee_when_draft_exists() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // Use the test binary itself as a stand-in for a real GGUF —
+        // `Path::exists()` is what build_llama_spawn checks.
+        let real_path = std::env::current_exe().expect("current_exe");
+        let entry = dummy_entry_with_spec("qwen35", real_path.clone());
+        let bee_path = PathBuf::from(
+            "/home/u/local-llm/beellama.cpp/build/bin/llama-server"
+        );
+        let s = build_llama_spawn(&entry, 8020, true, &bee_path).unwrap();
+        let joined = s.args.join(" ");
+        assert!(joined.contains("--spec-dflash-default"), "{joined}");
+        assert!(joined.contains(&format!("-md {}", real_path.display())), "{joined}");
+        assert!(joined.contains("-ngld 99"), "{joined}");
+        // DFlash > ngram on bee — must not also emit ngram-mod.
+        assert!(!joined.contains("--spec-type ngram-mod"), "{joined}");
+        // KV auto-upgrade to turbo3_tcq when LAMU_KV unset.
+        assert!(joined.contains("--cache-type-k turbo3_tcq"), "{joined}");
+        assert!(joined.contains("--cache-type-v turbo3_tcq"), "{joined}");
+    }
+
+    #[test]
+    fn build_llama_spawn_skips_dflash_on_vanilla_binary() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let real_path = std::env::current_exe().expect("current_exe");
+        let entry = dummy_entry_with_spec("qwen35", real_path);
+        // Not under the beellama.cpp tree → not bee.
+        let vanilla = PathBuf::from("/usr/bin/llama-server");
+        let s = build_llama_spawn(&entry, 8020, true, &vanilla).unwrap();
+        let joined = s.args.join(" ");
+        assert!(!joined.contains("--spec-dflash-default"), "{joined}");
+        // Default KV stays at q8_0 (no bee → no auto-turbo).
+        assert!(joined.contains("--cache-type-k q8_0"), "{joined}");
+    }
+
+    #[test]
+    fn build_llama_spawn_skips_dflash_when_draft_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let entry = dummy_entry_with_spec("qwen35", PathBuf::from("/tmp/definitely-not-here.gguf"));
+        let bee_path = PathBuf::from(
+            "/home/u/local-llm/beellama.cpp/build/bin/llama-server"
+        );
+        let s = build_llama_spawn(&entry, 8020, false, &bee_path).unwrap();
+        let joined = s.args.join(" ");
+        assert!(!joined.contains("--spec-dflash-default"), "{joined}");
+        // No DFlash → KV stays at the default q8_0.
+        assert!(joined.contains("--cache-type-k q8_0"), "{joined}");
+    }
+
+    #[test]
+    fn build_llama_spawn_honors_explicit_lamu_kv_over_turbo() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe { std::env::set_var("LAMU_KV", "f16"); }
+        let real_path = std::env::current_exe().expect("current_exe");
+        let entry = dummy_entry_with_spec("qwen35", real_path);
+        let bee_path = PathBuf::from(
+            "/home/u/local-llm/beellama.cpp/build/bin/llama-server"
+        );
+        let s = build_llama_spawn(&entry, 8020, true, &bee_path).unwrap();
+        clear_env();
+        let joined = s.args.join(" ");
+        // LAMU_KV=f16 must win even when bee+DFlash would auto-upgrade.
+        assert!(joined.contains("--cache-type-k f16"), "{joined}");
+        assert!(joined.contains("--cache-type-v f16"), "{joined}");
+        // Still emits DFlash args.
+        assert!(joined.contains("--spec-dflash-default"), "{joined}");
+    }
+
+    #[test]
+    fn build_llama_spawn_accepts_turbo3_tcq_via_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe { std::env::set_var("LAMU_KV", "turbo3_tcq"); }
+        let entry = dummy_entry("llama", 8192);
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server")).unwrap();
+        clear_env();
+        let joined = s.args.join(" ");
+        assert!(joined.contains("--cache-type-k turbo3_tcq"), "{joined}");
     }
 }
