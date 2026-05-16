@@ -186,7 +186,11 @@ pub fn bee_bin() -> Option<std::path::PathBuf> {
         .join("build")
         .join("bin")
         .join("llama-server");
-    default.exists().then_some(default)
+    // Same executability gate the env-var path uses — if the default
+    // location is e.g. a stale directory or non-executable file we
+    // refuse rather than handing back a path that will fail at
+    // `Command::new` time with a confusing OS error.
+    (default.exists() && is_file_executable(&default)).then_some(default)
 }
 
 /// True if `bin` resides under a `beellama.cpp` directory component.
@@ -208,6 +212,10 @@ fn is_file_executable(path: &std::path::Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_file_executable(path: &std::path::Path) -> bool {
+    // No portable executable-bit on Windows; defer to file existence.
+    // Lamu's target platform is Linux per CLAUDE.md — this stub exists
+    // only so the crate keeps compiling under cross / cargo check on
+    // non-Unix targets.
     path.is_file()
 }
 
