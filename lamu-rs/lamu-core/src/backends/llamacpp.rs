@@ -63,16 +63,15 @@ pub fn build_llama_spawn(
         .unwrap_or(u32::MAX);
     let ctx = entry.context_max.min(ctx_cap);
 
-    // Decide whether the DFlash-on-bee path applies. Requires:
-    //   - bin is a BeeLlama build (only fork that ships --spec-type dflash)
-    //   - entry has a `speculative:` config in the registry
-    //   - method == "dflash"
-    //   - draft GGUF actually exists on disk
-    let dflash_spec = entry.speculative.as_ref().filter(|sc| {
-        is_bee_binary(bin)
-            && sc.method.eq_ignore_ascii_case("dflash")
-            && sc.draft_path.exists()
-    });
+    // Decide whether the DFlash-on-bee path applies. Both the binary-
+    // selection logic in `new_for_entry` and this arg-emission path
+    // gate on `entry_has_usable_dflash(entry)`; if those diverge a
+    // bee binary would spawn without `-md`, defeating the speedup.
+    let dflash_spec = if is_bee_binary(bin) && entry_has_usable_dflash(entry) {
+        entry.speculative.as_ref()
+    } else {
+        None
+    };
     let bee_dflash_active = dflash_spec.is_some();
 
     let kv_env = std::env::var("LAMU_KV");
@@ -143,7 +142,13 @@ pub fn build_llama_spawn(
 /// Resolve the BeeLlama llama-server binary, if available.
 ///
 /// Resolution order:
-///   1. `LAMU_BEE_BIN` env var — explicit override.
+///   1. `LAMU_BEE_BIN` env var — explicit override. The path must be
+///      under a `beellama.cpp` directory component so a hostile env
+///      can't redirect to an attacker-controlled binary outside the
+///      bee tree (substring `contains("beellama")` wasn't enough —
+///      e.g. `/tmp/notbeellama.cpp/x` matched). If the env var is set
+///      but invalid (missing / non-executable / wrong directory),
+///      a warning is logged and the default is tried.
 ///   2. `~/local-llm/beellama.cpp/build/bin/llama-server` — default
 ///      build layout matching `scripts/serve-qwen36-bee.sh`.
 ///
@@ -151,12 +156,31 @@ pub fn build_llama_spawn(
 /// to the generic `llama_bin()`.
 pub fn bee_bin() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("LAMU_BEE_BIN") {
-        let pb = std::path::PathBuf::from(p);
-        if pb.exists() {
+        let pb = std::path::PathBuf::from(&p);
+        if !pb.exists() {
+            tracing::warn!(
+                "LAMU_BEE_BIN points to non-existent path '{}'; falling back to default",
+                p
+            );
+        } else if !is_bee_binary(&pb) {
+            tracing::warn!(
+                "LAMU_BEE_BIN='{}' not under a `beellama.cpp` directory — refusing to \
+                 spawn an out-of-tree binary as the bee fork. Place the binary under a \
+                 `beellama.cpp` path or rebuild bee at the default location.",
+                p
+            );
+        } else if !is_file_executable(&pb) {
+            tracing::warn!(
+                "LAMU_BEE_BIN='{}' is not an executable file; falling back to default",
+                p
+            );
+        } else {
             return Some(pb);
         }
     }
-    let default = dirs::home_dir()?
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    let default = home
         .join("local-llm")
         .join("beellama.cpp")
         .join("build")
@@ -165,12 +189,38 @@ pub fn bee_bin() -> Option<std::path::PathBuf> {
     default.exists().then_some(default)
 }
 
-/// True if `bin` looks like a BeeLlama fork build. Currently a path
-/// substring check — bee's repo name `beellama.cpp` is distinctive
-/// enough that any binary built there will live under that directory.
-/// Robust against rename of the `llama-server` filename itself.
+/// True if `bin` resides under a `beellama.cpp` directory component.
+/// Tighter than a substring check: paths like
+/// `/tmp/notbeellama.cpp/llama-server` no longer match, closing a
+/// LAMU_BEE_BIN injection vector.
 pub fn is_bee_binary(bin: &std::path::Path) -> bool {
-    bin.to_string_lossy().contains("beellama")
+    bin.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("beellama.cpp"))
+}
+
+#[cfg(unix)]
+fn is_file_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_file_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// Returns true when `entry` carries a usable DFlash speculative
+/// config — single source of truth for both binary selection
+/// (`LlamaCppBackend::new_for_entry`) and arg emission
+/// (`build_llama_spawn`). Keeping these in lockstep prevents the
+/// pick-bee-but-emit-no-DFlash drift V4 Pro flagged.
+fn entry_has_usable_dflash(entry: &ModelEntry) -> bool {
+    entry.speculative.as_ref().is_some_and(|sc| {
+        sc.method.eq_ignore_ascii_case("dflash")
+            && sc.draft_path.is_file()
+    })
 }
 
 /// Async helper: probe `llama-server --help` for ngram-mod support.
@@ -231,19 +281,14 @@ impl LlamaCppBackend {
         })
     }
 
-    /// Entry-aware constructor. Picks the BeeLlama fork binary when the
-    /// entry has a usable DFlash speculative config + the bee build is
-    /// available; falls back to the generic `llama_bin()` otherwise.
-    ///
-    /// This is what `make_backend(entry)` should call so a registry
-    /// entry with `speculative: { method: dflash, draft_path: ... }`
-    /// transparently picks up DFlash drafting + `turbo3_tcq` KV in
-    /// `build_llama_spawn` without the caller knowing which binary
-    /// got selected.
+    /// Entry-aware constructor. Tries the BeeLlama fork binary first
+    /// when the entry carries a usable DFlash spec; falls back to the
+    /// generic `llama_bin()` when bee isn't available OR the entry
+    /// has no DFlash config. `build_llama_spawn` checks the same
+    /// predicate (`entry_has_usable_dflash`) before emitting DFlash
+    /// args, so the selection here can never mismatch the args.
     pub fn new_for_entry(entry: &ModelEntry) -> Result<Self> {
-        let bin_path = if entry.speculative.as_ref()
-            .is_some_and(|sc| sc.method.eq_ignore_ascii_case("dflash") && sc.draft_path.exists())
-        {
+        let bin_path = if entry_has_usable_dflash(entry) {
             bee_bin().unwrap_or_else(llama_bin)
         } else {
             llama_bin()
@@ -590,6 +635,58 @@ mod tests {
         assert!(!is_bee_binary(vanilla));
         let dflash_pr = std::path::Path::new("/home/u/llama.cpp/build/bin/llama-server");
         assert!(!is_bee_binary(dflash_pr));
+    }
+
+    #[test]
+    fn is_bee_binary_rejects_substring_decoys() {
+        // V4 Pro flagged: substring match `contains("beellama")` matched
+        // attacker-controlled paths like `/tmp/notbeellama.cpp/x`.
+        // Component match closes that hole — only a *directory named*
+        // `beellama.cpp` in the path qualifies.
+        let decoy = std::path::Path::new("/tmp/notbeellama.cpp/build/bin/llama-server");
+        assert!(!is_bee_binary(decoy));
+        let backup = std::path::Path::new("/home/u/beellama.cpp.backup/bin/llama-server");
+        assert!(!is_bee_binary(backup));
+        let prefix = std::path::Path::new("/home/u/beellama-fork/bin/llama-server");
+        assert!(!is_bee_binary(prefix));
+    }
+
+    #[test]
+    fn entry_has_usable_dflash_predicate() {
+        let real = std::env::current_exe().expect("current_exe");
+        let with_real = dummy_entry_with_spec("qwen35", real);
+        assert!(entry_has_usable_dflash(&with_real));
+
+        let with_missing = dummy_entry_with_spec("qwen35", PathBuf::from("/tmp/nope.gguf"));
+        assert!(!entry_has_usable_dflash(&with_missing));
+
+        let mut wrong_method = dummy_entry_with_spec("qwen35", std::env::current_exe().unwrap());
+        wrong_method.speculative.as_mut().unwrap().method = "ngram".into();
+        assert!(!entry_has_usable_dflash(&wrong_method));
+
+        let no_spec = dummy_entry("qwen35", 32768);
+        assert!(!entry_has_usable_dflash(&no_spec));
+    }
+
+    #[test]
+    fn is_file_executable_rejects_dirs_and_regular_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A directory is never executable for our purposes (we'd
+        // `Command::new` it and the kernel would refuse).
+        assert!(!is_file_executable(tmp.path()));
+        // A regular file with no exec bit is rejected.
+        let regular = tmp.path().join("plain.txt");
+        std::fs::write(&regular, b"hi").unwrap();
+        assert!(!is_file_executable(&regular));
+        // Same file with exec bit set on Unix → accepted.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&regular).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&regular, perm).unwrap();
+            assert!(is_file_executable(&regular));
+        }
     }
 
     fn dummy_entry_with_spec(arch: &str, draft: PathBuf) -> ModelEntry {
