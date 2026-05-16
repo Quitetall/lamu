@@ -25,10 +25,48 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+}
+
+// Custom deserializer for `Message.content` — pi (and other harnesses
+// modeled on OpenAI's Vision spec) send `content` as an array of
+// content parts: `[{type: "text", text: "..."}]`. lamu and bee's
+// chat templates want a plain string. Flatten on the way in by
+// concatenating any text parts and ignoring image / tool blocks
+// (downstream will reject them with a clearer error if applicable).
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            role: String,
+            content: Value,
+        }
+        let r = Raw::deserialize(d)?;
+        let content = match r.content {
+            Value::String(s) => s,
+            Value::Array(arr) => {
+                let mut buf = String::new();
+                for part in arr {
+                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                        if !buf.is_empty() {
+                            buf.push('\n');
+                        }
+                        buf.push_str(t);
+                    }
+                }
+                buf
+            }
+            Value::Null => String::new(),
+            // Anything else — bool, number, object — render as JSON so
+            // we don't silently drop it. Edge case; production callers
+            // shouldn't hit it.
+            other => other.to_string(),
+        };
+        Ok(Message { role: r.role, content })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1438,6 +1476,50 @@ mod compat_tests {
         }"#;
         let req: OllamaChatRequest = serde_json::from_str(body).expect("parse");
         assert_eq!(req.enable_thinking, Some(false));
+    }
+
+    // ── Multipart content lenient deserializer ──────────────────────
+
+    #[test]
+    fn message_accepts_plain_string_content() {
+        let raw = r#"{"role":"user","content":"hello"}"#;
+        let m: Message = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn message_accepts_openai_vision_array_content() {
+        // pi (Earendil) sends content as an array of parts per the
+        // OpenAI Vision spec. Lamu flattens text parts; non-text parts
+        // (image_url, etc) drop silently.
+        let raw = r#"{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"part one"},
+                {"type":"image_url","image_url":{"url":"x"}},
+                {"type":"text","text":"part two"}
+            ]
+        }"#;
+        let m: Message = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "part one\npart two");
+    }
+
+    #[test]
+    fn message_accepts_empty_content_array() {
+        let raw = r#"{"role":"user","content":[]}"#;
+        let m: Message = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "");
+    }
+
+    #[test]
+    fn message_accepts_null_content() {
+        // Some OpenAI tool-call responses set content: null when the
+        // assistant only emits tool_calls. Treat as empty string.
+        let raw = r#"{"role":"assistant","content":null}"#;
+        let m: Message = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "");
     }
 
     #[test]

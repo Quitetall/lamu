@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# scripts/setup-pi.sh — register lamu as a `pi` custom provider.
+#
+# pi (Earendil pi-coding-agent) doesn't read OPENAI_BASE_URL. It reads
+# ~/.pi/agent/models.json — a JSON registry of OpenAI-compatible
+# providers. This script merges a `lamu` provider entry into that file
+# so `pi --provider lamu` (or `pi config` → pick `lamu`) routes through
+# lamu serve on :8020.
+#
+# Idempotent: re-running updates the lamu entry without touching others.
+#
+# Usage:
+#   bash scripts/setup-pi.sh                 # uses LAMU_URL=http://127.0.0.1:8020
+#   LAMU_URL=http://host:port bash setup-pi.sh
+
+set -euo pipefail
+
+LAMU_URL="${LAMU_URL:-http://127.0.0.1:8020}"
+PI_CFG="$HOME/.pi/agent/models.json"
+
+GRY="\033[90m"; GREEN="\033[32m"; YEL="\033[33m"; RED="\033[31m"; R="\033[0m"
+
+if [[ ! -d "$HOME/.pi/agent" ]]; then
+  echo -e "${RED}~/.pi/agent does not exist — run 'pi' once to initialize it, then re-run.${R}"
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo -e "${RED}jq is required. Install with: pacman -S jq (or your distro's equivalent)${R}"
+  exit 1
+fi
+
+if ! curl -sf -m 3 "$LAMU_URL/v1/models" >/dev/null 2>&1; then
+  echo -e "${YEL}warning:${R} lamu not reachable at $LAMU_URL — config will still install."
+fi
+
+# Pull current model registry from lamu so the provider knows about
+# every entry (pi requires explicit `models: [...]` per provider).
+MODELS_JSON=$(curl -sf -m 3 "$LAMU_URL/v1/models" 2>/dev/null || echo '{"data":[]}')
+MODEL_IDS=$(echo "$MODELS_JSON" | jq -r '.data[].id' | head -30 | jq -R . | jq -s .)
+
+LAMU_PROVIDER=$(jq -n \
+  --arg url "$LAMU_URL/v1" \
+  --argjson models "$MODEL_IDS" \
+  '{
+    api: "openai-completions",
+    apiKey: "lamu-local",
+    baseUrl: $url,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false
+    },
+    models: ($models | map({id: .}))
+  }')
+
+if [[ ! -f "$PI_CFG" ]]; then
+  echo '{"providers":{}}' > "$PI_CFG"
+fi
+
+# Merge: keep existing providers, replace just the `lamu` key.
+TMP=$(mktemp)
+jq --argjson p "$LAMU_PROVIDER" '.providers.lamu = $p' "$PI_CFG" > "$TMP"
+mv "$TMP" "$PI_CFG"
+
+echo -e "${GREEN}✓${R} lamu provider registered in $PI_CFG"
+echo -e "${GRY}use it:${R} pi --provider lamu"
+echo -e "${GRY}or default it:${R} pi config  (select lamu)"
+echo -e "${GRY}models:${R} $(echo "$MODELS_JSON" | jq -r '.data | length') entries"

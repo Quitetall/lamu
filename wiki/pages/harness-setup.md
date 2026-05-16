@@ -123,6 +123,48 @@ If the harness uses a non-standard env var, add it under `extra_env` instead of 
 
 ---
 
+## Harnesses that read config files, not env vars
+
+Some harnesses ignore `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` and instead read a config file. The env-var trick in `open-harness.sh` won't work for them. lamu ships per-harness setup scripts that patch the config file once; afterwards the harness just runs.
+
+### `pi` (Earendil pi-coding-agent)
+
+Reads `~/.pi/agent/models.json`. Run once to register `lamu` as a custom OpenAI-compatible provider with the full lamu registry pulled in:
+
+```bash
+bash scripts/setup-pi.sh
+pi --provider lamu --model qwen3.6-27b-uncensored-heretic-v2-q4_k_m "hello"
+```
+
+Or set `lamu` as the default in `pi config` (interactive). Re-running `setup-pi.sh` refreshes the model list against the current lamu registry — useful after `lamu scan`.
+
+Requires `jq`.
+
+### `hermes` (Nous Research agent)
+
+Reads `~/.hermes/config.yaml`. Run once to patch the three relevant keys under `model:` (`default`, `provider`, `base_url`):
+
+```bash
+bash scripts/setup-hermes.sh
+hermes -z "hello" chat
+```
+
+`default` is set to the `"lamu"` alias so lamu's router picks the `main: true` entry. Override per-call with `-m <name>`. Backup of the original config goes to `~/.hermes/config.yaml.bak`.
+
+### Other config-file harnesses
+
+| Harness | Config file | Field to set |
+|---|---|---|
+| **Cursor** | Settings UI → "OpenAI API Key" + "OpenAI Base URL" | `http://localhost:8020/v1` |
+| **Aider** | `--openai-api-base http://localhost:8020/v1 --model openai/lamu` or `~/.aider.conf.yml` | `openai-api-base: http://localhost:8020/v1` |
+| **Continue** | `~/.continue/config.json` → `models[].provider: openai` + `apiBase: http://localhost:8020/v1` | model object |
+| **AnythingLLM** | Settings → LLM Preference → "Generic OpenAI" → `http://localhost:8020/v1` | `apiBase` |
+| **Open WebUI** | Settings → Connections → OpenAI → URL `http://localhost:8020/v1` | URL field |
+
+Pattern: any "custom OpenAI-compatible endpoint" field accepts lamu at `http://localhost:8020/v1`. Lamu's `/v1/chat/completions`, `/v1/messages`, and `/api/chat` cover the three wire formats most tools speak. Pick whichever flavor the tool natively supports — translation is server-side.
+
+---
+
 ## Thinking toggle (`enable_thinking`)
 
 Qwen3.6 reasoning can be turned off per-request. Two paths exposed:
