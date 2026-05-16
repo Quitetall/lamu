@@ -165,6 +165,47 @@ Pattern: any "custom OpenAI-compatible endpoint" field accepts lamu at `http://l
 
 ---
 
+## Launching with a specific model
+
+`open-harness.sh` honours `LAMU_MODEL` and threads it into the harness's native model flag/env:
+
+| Harness | How model is passed |
+|---|---|
+| pi | `--provider lamu --model $LAMU_MODEL` |
+| hermes | `-m $LAMU_MODEL` |
+| codex | `OPENAI_MODEL=$LAMU_MODEL` |
+| claude-code, crush | `ANTHROPIC_MODEL=$LAMU_MODEL` |
+| aider | `--model openai/$LAMU_MODEL` |
+| (other) | `LAMU_MODEL` + `OPENAI_MODEL` + `ANTHROPIC_MODEL` env all set |
+
+```bash
+# CLI: explicit model
+LAMU_MODEL=qwen3.6-27b-uncensored-heretic-v2-q4_k_m just open pi
+
+# TUI: highlight a model in the dashboard, press Enter (default harness)
+# or 'h' → Launchers → Enter. The cursor's model flows through as
+# LAMU_MODEL automatically.
+```
+
+Omitting `LAMU_MODEL` is fine — bare `just open pi` uses the harness's own default, which the per-harness `setup-pi.sh` / `setup-hermes.sh` scripts set to the `lamu` alias → `main: true` registry entry.
+
+## Hardening knobs
+
+`open-harness.sh` exposes safety knobs as environment variables:
+
+| Env | Default | Effect |
+|---|---|---|
+| `LAMU_SANDBOX` | `0` | `1` → wrap in `lamu agent --` (bubblewrap, cwd-rw, no $HOME). Most harnesses need their `$HOME` config to start; opt-in only after pre-staging or when running config-less. |
+| `LAMU_SANDBOX_NET` | `1` | `0` → pass `--no-net` to `lamu agent`. Required: lamu serve lives outside the sandbox, so without network the harness can't reach it. Flip off only for fully-offline runs. |
+| `LAMU_GIT_SNAP` | `1` | When cwd is a git repo, writes `.lamu-harness-snap` with HEAD + branch + dirty-count + timestamp. After session, `git reset --hard $(grep git_head .lamu-harness-snap | cut -d= -f2)` reverts tracked-file damage. |
+| `LAMU_PI_TOOLS` | `read,grep,find,ls` | pi tool allowlist passed as `--tools`. Default is read-only; pi otherwise enables `bash`/`edit`/`write` which turn a prompt-injection into arbitrary code/file execution. Escalate per-session: `LAMU_PI_TOOLS=read,bash,edit,write just open pi`. Empty string skips the flag entirely. |
+
+**Why pi defaults to read-only:** pi has no built-in approval prompts and no native rollback. A successful prompt injection on the model can call the `bash` tool with `rm -rf ~` and execute it without confirmation. The read-only allowlist makes lamu the trust boundary: bash/edit/write require operator opt-in per session. Other harnesses (Claude Code) have their own native permission UI; Hermes uses hook-based approval. Pi is the gap.
+
+**Why sandbox is opt-in not default:** `lamu agent` masks `$HOME` and every harness reads its config from there (pi → `~/.pi/agent/models.json`, hermes → `~/.hermes/config.yaml`, claude-code → `~/.claude/`). Default-on sandbox would break every launch. Future work: add `lamu agent --ro-bind <path>` so config dirs can be exposed read-only.
+
+---
+
 ## Thinking toggle (`enable_thinking`)
 
 Qwen3.6 reasoning can be turned off per-request. Two paths exposed:

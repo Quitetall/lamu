@@ -158,6 +158,14 @@ pub struct Harness {
     pub install: &'static str,
     pub launch_argv: &'static [&'static str],
     pub notes: &'static str,
+    /// Matching entry name in `config/harnesses.yaml`. When `Some`,
+    /// the TUI routes launches through `scripts/open-harness.sh` so
+    /// LAMU_MODEL pinning + lamu URL env + per-flavor model arg
+    /// injection + sandbox + git-snap all fire. When `None`, the TUI
+    /// falls back to direct `Command::new(launch_argv[0])` — for
+    /// builtins like `lamu repl` and external tools (`gh`) that don't
+    /// talk to lamu over HTTP.
+    pub slug: Option<&'static str>,
 }
 
 pub const HARNESSES: &[Harness] = &[
@@ -167,6 +175,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "(built-in)",
         launch_argv: &["lamu", "repl"],
         notes: "Built-in REPL talking to `lamu serve`",
+        slug: None,
     },
     Harness {
         name: "Claude Code",
@@ -174,6 +183,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "npm install -g @anthropic-ai/claude-code",
         launch_argv: &["claude"],
         notes: "Anthropic CLI w/ MCP — best paired with `lamu start`",
+        slug: Some("claude-code"),
     },
     Harness {
         name: "Codex",
@@ -181,6 +191,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "npm install -g @openai/codex",
         launch_argv: &["codex"],
         notes: "OpenAI Codex CLI",
+        slug: Some("codex"),
     },
     Harness {
         name: "OpenCode",
@@ -188,6 +199,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "npm install -g opencode-ai",
         launch_argv: &["opencode"],
         notes: "sst/opencode terminal coding agent",
+        slug: None,
     },
     Harness {
         name: "Hermes",
@@ -195,6 +207,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "cargo install hermes-cli  # check the upstream you want",
         launch_argv: &["hermes"],
         notes: "Hermes function-calling CLI (any binary on PATH named `hermes`)",
+        slug: Some("hermes"),
     },
     Harness {
         name: "Pi",
@@ -202,6 +215,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "npm install -g @inflection-ai/pi-cli  # if/when published",
         launch_argv: &["pi"],
         notes: "Pi assistant CLI",
+        slug: Some("pi"),
     },
     Harness {
         name: "GitHub CLI",
@@ -209,6 +223,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "pacman -S github-cli   # or your distro's package",
         launch_argv: &["gh"],
         notes: "GitHub CLI — `gh issue/pr/repo`. Use `gh copilot` for chat.",
+        slug: None,
     },
     Harness {
         name: "GitHub Copilot",
@@ -216,6 +231,7 @@ pub const HARNESSES: &[Harness] = &[
         install: "gh extension install github/gh-copilot",
         launch_argv: &["gh", "copilot"],
         notes: "Requires `gh` first — Copilot is a gh extension",
+        slug: None,
     },
 ];
 
@@ -564,13 +580,29 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 if let Some(h) = default {
                                     let argv: Vec<String> = h.launch_argv.iter().map(|s| s.to_string()).collect();
                                     let label = h.name;
+                                    let slug = h.slug;
                                     let model_for_env = local_name.clone();
                                     run_subprocess_in_tui(terminal, move || -> Result<()> {
                                         println!("\n→ Launching {label} (default harness, model={})\n", model_for_env);
-                                        // Pass the selected model name in env so harnesses
-                                        // that read it (claude/codex via env override) pick it up.
-                                        let mut cmd = std::process::Command::new(&argv[0]);
-                                        cmd.args(&argv[1..]).env("LAMU_MODEL", &model_for_env);
+                                        // Slug present → route through
+                                        // `scripts/open-harness.sh` for full env
+                                        // injection (lamu URL + per-flavor model
+                                        // arg + optional sandbox). No slug →
+                                        // direct exec (builtins / GitHub CLI).
+                                        let mut cmd = if let Some(slug) = slug {
+                                            let script = format!(
+                                                "{}/local-llm/scripts/open-harness.sh",
+                                                std::env::var("HOME").unwrap_or_default()
+                                            );
+                                            let mut c = std::process::Command::new("bash");
+                                            c.arg(script).arg(slug);
+                                            c
+                                        } else {
+                                            let mut c = std::process::Command::new(&argv[0]);
+                                            c.args(&argv[1..]);
+                                            c
+                                        };
+                                        cmd.env("LAMU_MODEL", &model_for_env);
                                         let _ = cmd.status();
                                         Ok(())
                                     })?;
@@ -808,10 +840,33 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 if installed {
                                     let argv: Vec<String> = h.launch_argv.iter().map(|s| s.to_string()).collect();
                                     let label = h.name;
+                                    let slug = h.slug;
+                                    // Selected-model pin (from the dashboard's
+                                    // model cursor) flows through to the
+                                    // harness here too, so Launchers screen
+                                    // Enter has the same semantics as Dashboard
+                                    // Enter: launches the harness using the
+                                    // model the user has highlighted.
+                                    let model_for_env =
+                                        state.selected_entry().map(|e| e.name.clone());
                                     run_subprocess_in_tui(terminal, move || -> Result<()> {
                                         println!("\n→ Launching {label}\n");
-                                        let mut cmd = std::process::Command::new(&argv[0]);
-                                        cmd.args(&argv[1..]);
+                                        let mut cmd = if let Some(slug) = slug {
+                                            let script = format!(
+                                                "{}/local-llm/scripts/open-harness.sh",
+                                                std::env::var("HOME").unwrap_or_default()
+                                            );
+                                            let mut c = std::process::Command::new("bash");
+                                            c.arg(script).arg(slug);
+                                            c
+                                        } else {
+                                            let mut c = std::process::Command::new(&argv[0]);
+                                            c.args(&argv[1..]);
+                                            c
+                                        };
+                                        if let Some(m) = model_for_env {
+                                            cmd.env("LAMU_MODEL", m);
+                                        }
                                         let _ = cmd.status();
                                         Ok(())
                                     })?;

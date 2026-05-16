@@ -2,18 +2,47 @@
 # Launch a configured harness with env wired to talk to lamu.
 #
 # Usage:
-#   open-harness.sh          # launches the default harness
-#   open-harness.sh codex    # launches the named entry
-#   open-harness.sh list     # show configured harnesses
+#   open-harness.sh                         # default harness, default model
+#   open-harness.sh codex                   # named harness
+#   open-harness.sh list                    # show configured harnesses
+#   LAMU_MODEL=name open-harness.sh codex   # pick model for the harness
 #
-# Config: config/harnesses.yaml.
-# Lamu base URL: $LAMU_URL or default http://localhost:8020
+# Knobs:
+#   LAMU_URL          base URL of lamu serve (default http://localhost:8020)
+#   LAMU_MODEL        model id from `lamu list` (default: lamu alias →
+#                     registry main: true entry; the alias resolves
+#                     server-side, no client-side lookup needed).
+#   LAMU_SANDBOX      0 = exec the harness directly (no sandbox)
+#                     1 = wrap in `lamu agent --` (cwd-rw, no $HOME,
+#                         no network unless LAMU_SANDBOX_NET=1).
+#                     default 0. Most harnesses (pi, hermes,
+#                     claude-code) need $HOME-resident config files
+#                     to start, which the sandbox masks; opt-in only
+#                     when running a config-less command or when
+#                     `lamu agent` grows config-dir bind-mounts.
+#   LAMU_SANDBOX_NET  1 = pass --net to `lamu agent`. Required when
+#                     the harness needs to reach lamu :8020 OR any
+#                     external HTTP. default 1 (because lamu itself
+#                     lives at :8020 which is a separate process,
+#                     not in the sandbox).
+#   LAMU_GIT_SNAP     1 = if cwd is a git repo, record current HEAD +
+#                         dirty state to `.lamu-harness-snap` file so
+#                         the user can `git reset --hard` to the
+#                         recorded SHA after the session.
+#                     0 = skip.
+#                     default 1.
+#
+# Config: $HOME/local-llm/config/harnesses.yaml.
 
 set -euo pipefail
 
 ROOT="$HOME/local-llm"
 CFG="$ROOT/config/harnesses.yaml"
 LAMU_URL="${LAMU_URL:-http://localhost:8020}"
+LAMU_MODEL="${LAMU_MODEL:-}"
+LAMU_SANDBOX="${LAMU_SANDBOX:-0}"
+LAMU_SANDBOX_NET="${LAMU_SANDBOX_NET:-1}"
+LAMU_GIT_SNAP="${LAMU_GIT_SNAP:-1}"
 
 GRY="\033[90m"; GREEN="\033[32m"; YEL="\033[33m"; RED="\033[31m"; R="\033[0m"
 
@@ -112,7 +141,105 @@ if ! curl -sf "$LAMU_URL/v1/models" >/dev/null 2>&1; then
   echo -e "${YEL}warning:${R} lamu not reachable at $LAMU_URL — start it with 'just serve' first"
 fi
 
-shift || true  # drop harness name; rest of argv passes to harness
-echo -e "${GREEN}→${R} $NAME ${GRY}($FLAVOR, $EnvNote)${R}"
-echo -e "${GRY}\$${R} $CMD $*"
-exec $CMD "$@"
+# ── Per-harness MODEL injection ─────────────────────────────────────
+#
+# Each harness has its own way to pin the model. Translate LAMU_MODEL
+# (or default "lamu" alias, resolved server-side) into the harness's
+# native flag/env. Harnesses without a known model knob get the env
+# var anyway in case extensions/wrappers respect it.
+
+MODEL_ARGS=()
+SAFE_TOOLS_NOTE=""
+if [[ -n "$LAMU_MODEL" ]]; then
+  MODEL_NOTE=", model=$LAMU_MODEL"
+else
+  MODEL_NOTE=""
+fi
+
+case "$NAME" in
+  pi)
+    [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--provider lamu --model "$LAMU_MODEL")
+    # Safe-default tool allowlist for pi. Default is read-only — pi
+    # otherwise enables `bash`, `edit`, `write` automatically, which
+    # turn a prompt-injection into arbitrary file/cmd execution
+    # against the user's working directory. To escalate:
+    #     LAMU_PI_TOOLS=read,grep,find,ls,bash,edit,write just open pi
+    # To opt out of the safe-default entirely:
+    #     LAMU_PI_TOOLS=  just open pi
+    if [[ -z "${LAMU_PI_TOOLS+x}" ]]; then
+      LAMU_PI_TOOLS="read,grep,find,ls"
+    fi
+    if [[ -n "$LAMU_PI_TOOLS" ]]; then
+      MODEL_ARGS+=(--tools "$LAMU_PI_TOOLS")
+      SAFE_TOOLS_NOTE=", tools=$LAMU_PI_TOOLS"
+    fi
+    ;;
+  hermes)
+    [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(-m "$LAMU_MODEL")
+    ;;
+  claude-code)
+    [[ -n "$LAMU_MODEL" ]] && export ANTHROPIC_MODEL="$LAMU_MODEL"
+    ;;
+  crush)
+    [[ -n "$LAMU_MODEL" ]] && export ANTHROPIC_MODEL="$LAMU_MODEL"
+    ;;
+  codex)
+    [[ -n "$LAMU_MODEL" ]] && export OPENAI_MODEL="$LAMU_MODEL"
+    ;;
+  aider)
+    [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--model "openai/$LAMU_MODEL")
+    ;;
+  *)
+    if [[ -n "$LAMU_MODEL" ]]; then
+      export LAMU_MODEL OPENAI_MODEL="$LAMU_MODEL" ANTHROPIC_MODEL="$LAMU_MODEL"
+    fi
+    ;;
+esac
+
+# ── Git snapshot (rollback aid) ─────────────────────────────────────
+#
+# `lamu sessions` only captures chat sessions, not harness launches.
+# Write our own breadcrumb so the user can `git reset --hard <sha>`
+# after the session if the harness damages tracked files. The dirty
+# state isn't preserved — use `git stash` manually for that.
+
+SNAP_NOTE=""
+if [[ "$LAMU_GIT_SNAP" == "1" ]] && command -v git >/dev/null 2>&1; then
+  if SHA=$(git rev-parse --verify HEAD 2>/dev/null); then
+    BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    DIRTY=$(git status --porcelain 2>/dev/null | wc -l)
+    {
+      echo "harness=$NAME"
+      echo "model=${LAMU_MODEL:-(default)}"
+      echo "cwd=$(pwd)"
+      echo "git_branch=$BR"
+      echo "git_head=$SHA"
+      echo "dirty_paths=$DIRTY"
+      echo "launched_at=$(date -Is)"
+    } > .lamu-harness-snap
+    SNAP_NOTE=" + snap(.lamu-harness-snap)"
+  fi
+fi
+
+# Build the exec line. Sandbox wrap goes outermost so env from above
+# is inherited into the bubblewrap namespace.
+shift || true   # drop harness name; remaining argv passes to harness
+
+CMD_LINE=()
+SANDBOX_NOTE=""
+if [[ "$LAMU_SANDBOX" == "1" ]] && command -v lamu >/dev/null 2>&1; then
+  CMD_LINE=(lamu agent)
+  if [[ "$LAMU_SANDBOX_NET" == "1" ]]; then
+    CMD_LINE+=(--net)
+    SANDBOX_NOTE=" + sandbox+net"
+  else
+    SANDBOX_NOTE=" + sandbox"
+  fi
+  CMD_LINE+=(--)
+fi
+# shellcheck disable=SC2206
+CMD_LINE+=($CMD "${MODEL_ARGS[@]}" "$@")
+
+echo -e "${GREEN}→${R} $NAME ${GRY}($FLAVOR, $EnvNote${MODEL_NOTE}${SAFE_TOOLS_NOTE}${SANDBOX_NOTE}${SNAP_NOTE})${R}"
+echo -e "${GRY}\$${R} ${CMD_LINE[*]}"
+exec "${CMD_LINE[@]}"
