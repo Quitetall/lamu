@@ -208,16 +208,24 @@ if [[ "$LAMU_GIT_SNAP" == "1" ]] && command -v git >/dev/null 2>&1; then
   if SHA=$(git rev-parse --verify HEAD 2>/dev/null); then
     BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
     DIRTY=$(git status --porcelain 2>/dev/null | wc -l)
-    {
-      echo "harness=$NAME"
-      echo "model=${LAMU_MODEL:-(default)}"
-      echo "cwd=$(pwd)"
-      echo "git_branch=$BR"
-      echo "git_head=$SHA"
-      echo "dirty_paths=$DIRTY"
-      echo "launched_at=$(date -Is)"
-    } > .lamu-harness-snap
-    SNAP_NOTE=" + snap(.lamu-harness-snap)"
+    # Verify cwd is writable before redirecting — read-only cwd
+    # (e.g. /usr/share or a mounted snapshot) would silently swallow
+    # the snap with `set -e` not catching redirect failures.
+    if touch .lamu-harness-snap 2>/dev/null; then
+      {
+        echo "harness=$NAME"
+        echo "model=${LAMU_MODEL:-(default)}"
+        echo "cwd=$(pwd)"
+        echo "git_branch=$BR"
+        echo "git_head=$SHA"
+        echo "dirty_paths=$DIRTY"
+        # date -Is is GNU-only; the +"%Y-..." form works on BSD/macOS too.
+        echo "launched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+      } > .lamu-harness-snap
+      SNAP_NOTE=" + snap(.lamu-harness-snap)"
+    else
+      SNAP_NOTE=" + snap(skipped: cwd not writable)"
+    fi
   fi
 fi
 
@@ -227,18 +235,25 @@ shift || true   # drop harness name; remaining argv passes to harness
 
 CMD_LINE=()
 SANDBOX_NOTE=""
-if [[ "$LAMU_SANDBOX" == "1" ]] && command -v lamu >/dev/null 2>&1; then
-  CMD_LINE=(lamu agent)
-  if [[ "$LAMU_SANDBOX_NET" == "1" ]]; then
-    CMD_LINE+=(--net)
-    SANDBOX_NOTE=" + sandbox+net"
+if [[ "$LAMU_SANDBOX" == "1" ]]; then
+  if command -v lamu >/dev/null 2>&1; then
+    CMD_LINE=(lamu agent)
+    if [[ "$LAMU_SANDBOX_NET" == "1" ]]; then
+      CMD_LINE+=(--net)
+      SANDBOX_NOTE=" + sandbox+net"
+    else
+      SANDBOX_NOTE=" + sandbox"
+    fi
+    CMD_LINE+=(--)
   else
-    SANDBOX_NOTE=" + sandbox"
+    echo -e "${YEL}warning:${R} LAMU_SANDBOX=1 but \`lamu\` not on PATH — running unsandboxed" >&2
   fi
-  CMD_LINE+=(--)
 fi
-# shellcheck disable=SC2206
-CMD_LINE+=($CMD "${MODEL_ARGS[@]}" "$@")
+# `$CMD` from yaml may be multi-token (e.g. `cmd: "open-webui serve"`).
+# Split it ONCE into an array so each token becomes a separate argv
+# slot — avoids re-splitting any embedded subsequent expansions.
+read -ra CMD_PARTS <<< "$CMD"
+CMD_LINE+=("${CMD_PARTS[@]}" "${MODEL_ARGS[@]}" "$@")
 
 echo -e "${GREEN}→${R} $NAME ${GRY}($FLAVOR, $EnvNote${MODEL_NOTE}${SAFE_TOOLS_NOTE}${SANDBOX_NOTE}${SNAP_NOTE})${R}"
 echo -e "${GRY}\$${R} ${CMD_LINE[*]}"

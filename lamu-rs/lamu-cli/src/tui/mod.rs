@@ -590,10 +590,20 @@ fn run_loop<B: ratatui::backend::Backend>(
                                         // arg + optional sandbox). No slug →
                                         // direct exec (builtins / GitHub CLI).
                                         let mut cmd = if let Some(slug) = slug {
-                                            let script = format!(
-                                                "{}/local-llm/scripts/open-harness.sh",
-                                                std::env::var("HOME").unwrap_or_default()
-                                            );
+                                            // Resolve $HOME with a clear failure
+                                            // mode — empty HOME would produce
+                                            // `/local-llm/scripts/...` and a
+                                            // confusing "file not found".
+                                            let home = std::env::var("HOME")
+                                                .unwrap_or_else(|_| {
+                                                    eprintln!(
+                                                        "warning: $HOME unset — script path \
+                                                         resolution likely to fail; falling back \
+                                                         to /home/brianklam"
+                                                    );
+                                                    "/home/brianklam".to_string()
+                                                });
+                                            let script = format!("{}/local-llm/scripts/open-harness.sh", home);
                                             let mut c = std::process::Command::new("bash");
                                             c.arg(script).arg(slug);
                                             c
@@ -852,10 +862,20 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     run_subprocess_in_tui(terminal, move || -> Result<()> {
                                         println!("\n→ Launching {label}\n");
                                         let mut cmd = if let Some(slug) = slug {
-                                            let script = format!(
-                                                "{}/local-llm/scripts/open-harness.sh",
-                                                std::env::var("HOME").unwrap_or_default()
-                                            );
+                                            // Resolve $HOME with a clear failure
+                                            // mode — empty HOME would produce
+                                            // `/local-llm/scripts/...` and a
+                                            // confusing "file not found".
+                                            let home = std::env::var("HOME")
+                                                .unwrap_or_else(|_| {
+                                                    eprintln!(
+                                                        "warning: $HOME unset — script path \
+                                                         resolution likely to fail; falling back \
+                                                         to /home/brianklam"
+                                                    );
+                                                    "/home/brianklam".to_string()
+                                                });
+                                            let script = format!("{}/local-llm/scripts/open-harness.sh", home);
                                             let mut c = std::process::Command::new("bash");
                                             c.arg(script).arg(slug);
                                             c
