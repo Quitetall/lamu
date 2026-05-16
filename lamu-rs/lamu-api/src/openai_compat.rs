@@ -1588,6 +1588,30 @@ mod compat_tests {
         assert!(!should_flush_at_eos("partial thought", true));
     }
 
+    // Threshold-flush predicate: production code declares
+    // reasoning_done = true once pending.len() > open_tag.len() * 3
+    // without spotting `<think>`. Mirrors that gate so a future edit
+    // shifting the multiplier gets caught.
+    fn passes_threshold_flush(pending: &str, open_tag: &str) -> bool {
+        pending.len() > open_tag.len() * 3
+    }
+
+    #[test]
+    fn threshold_flush_fires_on_long_output_without_tags() {
+        let open_tag = "<think>";  // 7 chars; threshold = 21
+        // 22 chars of plain output without a `<think>` tag — must trip.
+        assert!(passes_threshold_flush("0123456789012345678901", open_tag));
+    }
+
+    #[test]
+    fn threshold_flush_holds_for_short_output() {
+        // Short outputs must NOT trip the threshold prematurely —
+        // could mistake real `<think>` prefix for non-reasoning.
+        let open_tag = "<think>";  // 7 chars; threshold = 21
+        assert!(!passes_threshold_flush("ok", open_tag));
+        assert!(!passes_threshold_flush("12345678901234567890", open_tag)); // 20 chars, just under
+    }
+
     #[test]
     fn ollama_chat_request_defaults_enable_thinking() {
         let body = r#"{
