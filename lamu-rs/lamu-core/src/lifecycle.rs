@@ -18,6 +18,13 @@
 //! (zombie `lamu start` processes piling up after Claude Code or a
 //! tmux pane closes) is annoying enough that two cheap mechanisms is
 //! worth the redundancy.
+//!
+//! **Detached intent.** `nohup(1)` sets `SIGHUP` to `SIG_IGN` — the
+//! canonical "I want this process to outlive its parent" marker.
+//! `spawn_orphan_watchdog` checks for it and disables itself when
+//! present, so `nohup lamu serve &` survives terminal close as the
+//! user expects. The watchdog only fires for unintentional orphans
+//! (parent crashed, tmux pane closed without `disown`, etc.).
 
 use std::time::Duration;
 
@@ -48,10 +55,18 @@ pub fn install_parent_death_signal() {}
 /// Polls every 5s. Cost: one syscall per interval, negligible.
 #[cfg(unix)]
 pub fn spawn_orphan_watchdog() {
+    // `nohup(1)` sets SIGHUP to SIG_IGN before exec. Treat that as the
+    // user's explicit "survive parent death" marker and skip the
+    // watchdog — otherwise `nohup lamu serve &` dies the moment the
+    // launching subshell exits.
+    if sighup_is_ignored() {
+        tracing::info!("orphan-watchdog: SIGHUP=SIG_IGN (nohup/detached) — disabled");
+        return;
+    }
     let original_ppid = nix::unistd::getppid();
     // If we were already an orphan at startup, don't pull the rug out
     // from under whatever spawned us — wait for the next genuine
-    // re-parent event. (Edge: started by `nohup` from a dying shell.)
+    // re-parent event.
     if original_ppid.as_raw() == 1 {
         tracing::info!("orphan-watchdog: ppid=1 at startup — disabled");
         return;
@@ -77,6 +92,20 @@ pub fn spawn_orphan_watchdog() {
 #[cfg(not(unix))]
 pub fn spawn_orphan_watchdog() {}
 
+/// True iff SIGHUP is currently set to SIG_IGN. `nohup(1)` is the
+/// canonical caller; some daemonization wrappers also set this.
+#[cfg(unix)]
+fn sighup_is_ignored() -> bool {
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    // sigaction(2) with new_act=NULL reads the current handler.
+    let rc = unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut act) };
+    if rc != 0 {
+        // Couldn't read disposition — fail-open (run watchdog).
+        return false;
+    }
+    act.sa_sigaction == libc::SIG_IGN
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +122,14 @@ mod tests {
 
     // Watchdog must not exit the process when ppid != 1 at startup.
     // We run it for two intervals' worth and assert we're still alive.
+    #[test]
+    fn sighup_default_disposition_not_ignored() {
+        // Cargo test inherits SIGHUP=SIG_DFL from the launching shell
+        // (unless that shell was itself nohup'd, which is unusual).
+        // Asserts the helper returns false under normal test conditions.
+        assert!(!sighup_is_ignored());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_does_not_exit_under_live_parent() {
         // We're being run by `cargo test` → parent is the test binary
