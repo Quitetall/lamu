@@ -30,8 +30,17 @@ use std::time::Duration;
 
 /// Ask the kernel to send us SIGTERM when our immediate parent dies.
 /// No-op on non-Linux.
+///
+/// Skipped under `nohup` (SIGHUP=SIG_IGN): if the user explicitly
+/// said "survive parent death", we honor that intent. Otherwise
+/// `nohup lamu serve &` from a transient shell dies the moment the
+/// shell exits, which defeats the purpose of `nohup`.
 #[cfg(target_os = "linux")]
 pub fn install_parent_death_signal() {
+    if sighup_is_ignored() {
+        tracing::info!("PDEATHSIG: SIGHUP=SIG_IGN (nohup/detached) — skipped");
+        return;
+    }
     let rc = unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0)
     };
