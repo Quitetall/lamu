@@ -214,8 +214,7 @@ models:
     notes: |
       Largest model that fits the 4090. MoE A3B = 3B active params per token,
       ~102 t/s on bee config. 35B knowledge at 3B speeds. 22.2 GB → 2.4 GB
-      headroom; no parallel CUDA work while loaded. `default`/`main`/`lamu`
-      aliases resolve here.
+      headroom; no parallel CUDA work while loaded.
   gemma-4-26b-dflash-q8:
     path: /home/brianklam/models/gemma-4-26b-dflash/gemma-4-26b-dflash-q8.gguf
     format: gguf

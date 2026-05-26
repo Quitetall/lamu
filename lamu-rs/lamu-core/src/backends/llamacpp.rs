@@ -74,11 +74,10 @@ pub fn build_llama_spawn(
     };
     let bee_dflash_active = dflash_spec.is_some();
 
-    let kv_env = std::env::var("LAMU_KV");
-    let kv_type = match kv_env.as_deref() {
-        Ok("q8_0") | Ok("q4_0") | Ok("q4_1") | Ok("q5_0") | Ok("q5_1")
-            | Ok("f16") | Ok("bf16") | Ok("f32")
-            | Ok("turbo2") | Ok("turbo3") | Ok("turbo3_tcq") | Ok("turbo4") => kv_env.unwrap(),
+    let kv_type = match std::env::var("LAMU_KV").as_deref() {
+        Ok(v @ ("q8_0" | "q4_0" | "q4_1" | "q5_0" | "q5_1"
+            | "f16" | "bf16" | "f32"
+            | "turbo2" | "turbo3" | "turbo3_tcq" | "turbo4")) => v.to_string(),
         Ok(other) => {
             return Err(Error::Backend(format!(
                 "LAMU_KV='{}' invalid — expected one of: q8_0, q4_0, q4_1, q5_0, q5_1, f16, bf16, f32, turbo2, turbo3, turbo3_tcq, turbo4",
