@@ -94,16 +94,26 @@ pub fn spawn_orphan_watchdog() {}
 
 /// True iff SIGHUP is currently set to SIG_IGN. `nohup(1)` is the
 /// canonical caller; some daemonization wrappers also set this.
+///
+/// On Linux libc, `sigaction.sa_sigaction` is `size_t` and `SIG_IGN`
+/// is `1: size_t`, so the `==` comparison is integer equality. The
+/// `as usize` cast keeps it explicit + portable to other unices
+/// where the field type may differ.
 #[cfg(unix)]
 fn sighup_is_ignored() -> bool {
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
     // sigaction(2) with new_act=NULL reads the current handler.
     let rc = unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut act) };
     if rc != 0 {
-        // Couldn't read disposition — fail-open (run watchdog).
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            "orphan-watchdog: sigaction(SIGHUP) read failed ({}): {} — \
+             running watchdog (may kill nohup'd processes)",
+            rc, err
+        );
         return false;
     }
-    act.sa_sigaction == libc::SIG_IGN
+    (act.sa_sigaction as usize) == (libc::SIG_IGN as usize)
 }
 
 #[cfg(test)]
