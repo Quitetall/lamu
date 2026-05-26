@@ -105,14 +105,9 @@ impl LamuMcpServer {
     }
 
     pub async fn run(self) -> Result<()> {
-        // Ask the kernel to send us SIGTERM if our parent process dies
-        // (e.g. the Claude Code harness crashes without closing stdin).
-        // Without this, an orphaned `lamu start` keeps running indefinitely
-        // because stdin never reaches EOF when the parent dies abruptly.
-        lamu_core::lifecycle::install_parent_death_signal();
-        // PDEATHSIG has been observed to silently fail in some setups
-        // (orphans surviving for hours). Watchdog catches reparent-to-init.
-        lamu_core::lifecycle::spawn_orphan_watchdog();
+        // Orphan cleanup runs in lamu-cli main() — lamu-mcp is a
+        // library, always invoked via `lamu start`. See
+        // `lamu_core::lifecycle` for the PDEATHSIG + watchdog rationale.
 
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();

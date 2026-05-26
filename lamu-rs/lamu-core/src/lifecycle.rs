@@ -113,14 +113,4 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // If ppid is already 1 at startup, watchdog must disable itself
-    // (otherwise we'd exit immediately every time we ran under init).
-    // Can't actually set ppid=1, so this test just documents the
-    // intent — the behavior is covered by inspection.
-    #[test]
-    fn watchdog_documents_init_disable() {
-        // No-op test; behavior asserted by `if original_ppid == 1 { return }`
-        // in spawn_orphan_watchdog. Compiles only if function exists.
-        let _ = spawn_orphan_watchdog;
-    }
 }
