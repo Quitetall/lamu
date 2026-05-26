@@ -148,6 +148,12 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Orphan cleanup: PDEATHSIG signals on parent death; watchdog
+    // catches reparent-to-init when PDEATHSIG silently fails (observed
+    // with `lamu start` zombies surviving terminal close).
+    lamu_core::lifecycle::install_parent_death_signal();
+    lamu_core::lifecycle::spawn_orphan_watchdog();
+
     load_api_keys_env();
 
     let cli = Cli::parse();

@@ -18,5 +18,6 @@ pub mod observability;
 pub mod queue;
 pub mod sandbox;
 pub mod supervisor;
+pub mod lifecycle;
 
 pub use error::{Error, Result};

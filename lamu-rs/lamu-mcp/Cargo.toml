@@ -27,7 +27,6 @@ serde_yaml = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

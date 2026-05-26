@@ -109,7 +109,10 @@ impl LamuMcpServer {
         // (e.g. the Claude Code harness crashes without closing stdin).
         // Without this, an orphaned `lamu start` keeps running indefinitely
         // because stdin never reaches EOF when the parent dies abruptly.
-        install_parent_death_signal();
+        lamu_core::lifecycle::install_parent_death_signal();
+        // PDEATHSIG has been observed to silently fail in some setups
+        // (orphans surviving for hours). Watchdog catches reparent-to-init.
+        lamu_core::lifecycle::spawn_orphan_watchdog();
 
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
@@ -260,35 +263,6 @@ impl LamuMcpServer {
     }
 
 }
-
-/// Linux-specific: ask the kernel to deliver SIGTERM to us if our parent
-/// process dies. Prevents orphaned `lamu start` daemons when the Claude
-/// Code (or any) parent harness crashes without closing stdin.
-///
-/// On non-Linux Unix and Windows this is a no-op; EOF-on-stdin handling
-/// + tokio signal handlers cover those platforms (less reliably for
-/// abrupt parent death, but better than nothing).
-#[cfg(target_os = "linux")]
-fn install_parent_death_signal() {
-    // PR_SET_PDEATHSIG, second arg = signal number (SIGTERM = 15).
-    // The fifth arg is unused; pass 0. The cast to c_ulong matches
-    // `nix::sys::prctl` but we use `libc` directly since `nix` doesn't
-    // expose PDEATHSIG on all targets.
-    let rc = unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0)
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!(
-            "PR_SET_PDEATHSIG failed (rc={}, errno={}); orphan-on-parent-death \
-             cleanup is degraded — kill stale `lamu start` daemons manually",
-            rc, err
-        );
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn install_parent_death_signal() {}
 
 fn initialize_response(id: Option<Value>) -> Value {
     json!({
