@@ -121,6 +121,53 @@ pub fn default_seed() -> Vec<CloudModel> {
             base_url: Some("https://api.deepseek.com".into()),
             chat_path: None,
         },
+        // Xiaomi MiMo V2.5 — OpenAI-compat endpoint at
+        // https://token-plan-sgp.xiaomimimo.com/v1. Anthropic-compat
+        // available at /anthropic on the same host.
+        CloudModel {
+            name: "mimo-v2.5-pro".into(),
+            provider: "mimo".into(),
+            model_id: Some("MiMo-V2.5-Pro".into()),
+            context_max: 256_000,
+            notes: "Xiaomi MiMo V2.5 Pro — flagship reasoning.".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MIMO_API_KEY".into()),
+            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            chat_path: None,
+        },
+        CloudModel {
+            name: "mimo-v2.5".into(),
+            provider: "mimo".into(),
+            model_id: Some("MiMo-V2.5".into()),
+            context_max: 256_000,
+            notes: "Xiaomi MiMo V2.5 — workhorse chat.".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MIMO_API_KEY".into()),
+            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            chat_path: None,
+        },
+        CloudModel {
+            name: "mimo-v2-pro".into(),
+            provider: "mimo".into(),
+            model_id: Some("MiMo-V2-Pro".into()),
+            context_max: 256_000,
+            notes: "Xiaomi MiMo V2 Pro — prior gen flagship.".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MIMO_API_KEY".into()),
+            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            chat_path: None,
+        },
+        CloudModel {
+            name: "mimo-v2-omni".into(),
+            provider: "mimo".into(),
+            model_id: Some("MiMo-V2-Omni".into()),
+            context_max: 256_000,
+            notes: "Xiaomi MiMo V2 Omni — multimodal.".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MIMO_API_KEY".into()),
+            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            chat_path: None,
+        },
     ]
 }
 
@@ -151,13 +198,18 @@ pub fn provider_template(provider: &str) -> Option<CloudModel> {
         "openrouter" => Some(make("openrouter", "OPENROUTER_API_KEY", 128_000, "OpenRouter aggregator")),
         "google" => Some(make("google", "GOOGLE_API_KEY", 1_000_000, "Google Gemini")),
         "xai" => Some(make("xai", "XAI_API_KEY", 256_000, "xAI Grok")),
+        "mimo" => {
+            let mut m = make("mimo", "MIMO_API_KEY", 256_000, "Xiaomi MiMo");
+            m.base_url = Some("https://token-plan-sgp.xiaomimimo.com/v1".into());
+            Some(m)
+        }
         _ => None,
     }
 }
 
 pub const KNOWN_PROVIDERS: &[&str] = &[
     "anthropic", "openai", "zhipu", "moonshot", "alibaba",
-    "deepseek", "mistral", "openrouter", "google", "xai",
+    "deepseek", "mistral", "openrouter", "google", "xai", "mimo",
 ];
 
 /// Run an interactive add-cloud-model wizard on plain stdin/stdout.
