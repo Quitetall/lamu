@@ -919,15 +919,20 @@ async fn anthropic_messages(
         anthropic_message_to_openai(&m.role, &m.content, &mut messages);
     }
 
+    // Translate tools/tool_choice up front so BOTH the streaming and
+    // non-streaming paths forward them. Previously this ran AFTER the
+    // stream branch returned, so streaming /v1/messages dropped tools
+    // entirely — fatal for Claude Code, which streams by default.
+    let oai_tools = req.tools.as_ref().map(|t| anthropic_tools_to_openai(t));
+    let oai_tool_choice = req.tool_choice.as_ref().map(anthropic_tool_choice_to_openai);
+
     if req.stream {
         return stream_response_anthropic(state, messages, req.model.clone(),
                                          req.max_tokens, req.temperature,
                                          req.top_k, req.top_p,
-                                         req.enable_thinking).await;
+                                         req.enable_thinking,
+                                         oai_tools, oai_tool_choice).await;
     }
-
-    let oai_tools = req.tools.as_ref().map(|t| anthropic_tools_to_openai(t));
-    let oai_tool_choice = req.tool_choice.as_ref().map(anthropic_tool_choice_to_openai);
 
     let oai_req = ChatRequest {
         model: req.model.clone(),
@@ -1054,6 +1059,16 @@ async fn anthropic_messages(
     (StatusCode::OK, Json(anthro)).into_response()
 }
 
+/// Accumulates one streamed OpenAI tool_call across SSE chunks. OpenAI
+/// delivers a tool call incrementally: the first chunk carries `id` +
+/// `function.name`, later chunks append `function.arguments` fragments.
+#[derive(Default)]
+struct ToolAcc {
+    id: String,
+    name: String,
+    args: String,
+}
+
 // Anthropic streaming: bridge OpenAI SSE → Anthropic event-typed SSE.
 // Re-uses chat_completions routing/lock acquisition by calling backend
 // directly via the routing decision pulled from state.
@@ -1066,6 +1081,8 @@ async fn stream_response_anthropic(
     top_k: Option<u32>,
     top_p: Option<f32>,
     enable_thinking: Option<bool>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<Value>,
 ) -> Response {
     let (port, model_name, _marker) = match resolve_and_ensure_loaded(
         &state,
@@ -1086,6 +1103,14 @@ async fn stream_response_anthropic(
     });
     if let Some(et) = enable_thinking {
         payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
+    }
+    // Forward tool schemas + choice so the backend can emit tool calls
+    // on the streaming path (see anthropic_messages for the why).
+    if let Some(t) = &tools {
+        payload["tools"] = json!(t);
+    }
+    if let Some(tc) = &tool_choice {
+        payload["tool_choice"] = tc.clone();
     }
 
     let msg_id = format!("msg_{}", random_hex(12));
@@ -1131,54 +1156,144 @@ async fn stream_response_anthropic(
         let mut byte_stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut out_tokens: u64 = 0;
+        // Tool calls accumulated by their OpenAI delta index. BTreeMap so
+        // the emitted tool_use blocks keep the backend's call order.
+        let mut tool_acc: std::collections::BTreeMap<usize, ToolAcc> = std::collections::BTreeMap::new();
+        // Last finish_reason seen in the stream — drives the empty-backend
+        // gate at close. Empty = stream closed without one.
+        let mut finish_reason = String::new();
 
         use futures_util::stream::StreamExt;
-        while let Some(chunk_res) = byte_stream.next().await {
-            let Ok(bytes) = chunk_res else { break };
+        'read: while let Some(chunk_res) = byte_stream.next().await {
+            let Ok(bytes) = chunk_res else { break 'read };
             buf.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(nl) = buf.find('\n') {
                 let line: String = buf.drain(..=nl).collect();
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("data: ") else { continue };
-                if rest == "[DONE]" {
-                    let cb_stop = json!({"type":"content_block_stop","index":0});
-                    yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
-
-                    let m_delta = json!({
-                        "type": "message_delta",
-                        "delta": {"stop_reason":"end_turn","stop_sequence": serde_json::Value::Null},
-                        "usage": {"output_tokens": out_tokens}
-                    });
-                    yield Ok(Event::default().event("message_delta").data(m_delta.to_string()));
-
-                    let m_stop = json!({"type":"message_stop"});
-                    yield Ok(Event::default().event("message_stop").data(m_stop.to_string()));
-                    return;
-                }
+                if rest == "[DONE]" { break 'read; }
                 let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
-                let Some(token) = val.get("choices").and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                else { continue };
-                if token.is_empty() { continue; }
-                out_tokens += 1;
-                let delta = json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type":"text_delta","text": token}
-                });
-                yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                let choice = val.get("choices").and_then(|c| c.get(0));
+                if let Some(fr) = choice.and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()) {
+                    finish_reason = fr.to_string();
+                }
+                let delta = choice.and_then(|c| c.get("delta"));
+
+                // Text token → text_delta on the index-0 text block.
+                if let Some(token) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+                    if !token.is_empty() {
+                        out_tokens += 1;
+                        let d = json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type":"text_delta","text": token}
+                        });
+                        yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+                    }
+                }
+
+                // Tool-call deltas → accumulate by index; emitted as Anthropic
+                // tool_use blocks at close once fully assembled.
+                if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let slot = tool_acc.entry(idx).or_default();
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            if !id.is_empty() { slot.id = id.to_string(); }
+                        }
+                        if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                            if !name.is_empty() { slot.name = name.to_string(); }
+                        }
+                        if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                            slot.args.push_str(a);
+                        }
+                    }
+                }
             }
         }
 
-        // Stream ended without [DONE]; emit close events anyway.
+        // ── Close ────────────────────────────────────────────────────
+        // Empty-backend gate (mirrors the non-streaming 502): zero text,
+        // zero tool calls, and no legitimate finish reason ⇒ the backend
+        // silently failed. Emit an Anthropic `error` event instead of
+        // reporting a clean (but empty) completion.
+        let legit_finish = matches!(finish_reason.as_str(), "stop" | "length" | "tool_calls" | "content_filter");
+        if out_tokens == 0 && tool_acc.is_empty() && !legit_finish {
+            // Close the index-0 text block (opened pre-loop) before the
+            // error so block-lifecycle-tracking clients see valid SSE.
+            let cb_stop = json!({"type":"content_block_stop","index":0});
+            yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
+            let err = json!({
+                "type": "error",
+                "error": {
+                    "type": "backend_returned_empty",
+                    "message": "backend produced no content and no legitimate finish reason"
+                }
+            });
+            yield Ok(Event::default().event("error").data(err.to_string()));
+            let m_stop = json!({"type":"message_stop"});
+            yield Ok(Event::default().event("message_stop").data(m_stop.to_string()));
+            return;
+        }
+
+        // Close the index-0 text block.
         let cb_stop = json!({"type":"content_block_stop","index":0});
         yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
+
+        // Emit one tool_use content block per accumulated call (start +
+        // a single input_json_delta carrying the full args + stop).
+        // stop_reason tracks blocks ACTUALLY emitted, so a malformed call
+        // (empty name) that we skip doesn't yield a phantom tool_use verdict.
+        let mut emitted_tools = false;
+        let mut next_index = 1;
+        for (_oai_idx, acc) in tool_acc {
+            if acc.name.is_empty() {
+                tracing::warn!("anthropic stream: dropping tool_call with empty function name");
+                continue;
+            }
+            // Anthropic requires a non-empty tool_use id; synthesize one if
+            // the backend never sent it (some OpenAI-compat servers omit it).
+            let id = if acc.id.is_empty() {
+                format!("toolu_{}", random_hex(12))
+            } else {
+                acc.id.clone()
+            };
+            let cbs = json!({
+                "type": "content_block_start",
+                "index": next_index,
+                "content_block": {"type":"tool_use","id": id, "name": acc.name, "input": {}}
+            });
+            yield Ok(Event::default().event("content_block_start").data(cbs.to_string()));
+            // Forward the assembled args as a single input_json_delta. Empty
+            // → "{}" (valid no-arg call). Non-empty but unparseable → forward
+            // RAW (don't substitute "{}", which would silently erase a
+            // truncated-but-meaningful call) and warn so operators can spot
+            // a misbehaving backend.
+            let partial_json = if acc.args.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                if serde_json::from_str::<Value>(&acc.args).is_err() {
+                    tracing::warn!(args = %acc.args, "anthropic stream: tool_call args are not valid JSON; forwarding raw");
+                }
+                acc.args.clone()
+            };
+            let cbd = json!({
+                "type": "content_block_delta",
+                "index": next_index,
+                "delta": {"type":"input_json_delta","partial_json": partial_json}
+            });
+            yield Ok(Event::default().event("content_block_delta").data(cbd.to_string()));
+            let cbstop = json!({"type":"content_block_stop","index": next_index});
+            yield Ok(Event::default().event("content_block_stop").data(cbstop.to_string()));
+            next_index += 1;
+            emitted_tools = true;
+        }
+
+        let stop_reason = if emitted_tools { "tool_use" } else { "end_turn" };
         let m_delta = json!({
-            "type":"message_delta",
-            "delta":{"stop_reason":"end_turn","stop_sequence": serde_json::Value::Null},
-            "usage":{"output_tokens": out_tokens}
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null},
+            "usage": {"output_tokens": out_tokens}
         });
         yield Ok(Event::default().event("message_delta").data(m_delta.to_string()));
         let m_stop = json!({"type":"message_stop"});
