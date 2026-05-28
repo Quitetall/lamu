@@ -117,3 +117,18 @@ harnesses:
     flavor: ollama
     # `open-webui serve --port 7070` is one pattern; tweak per install.
     cmd: open-webui serve
+
+  opencode:
+    # opencode reads ~/.config/opencode/opencode.jsonc for providers +
+    # model defaults — does NOT honor OPENAI_BASE_URL. Configured to
+    # default model `mimo/mimo-v2.5-pro` via that file. To switch
+    # backends pass `--model lamu/lamu` etc.
+    flavor: openai
+    cmd: opencode
+
+  opencode-lamu:
+    # Same opencode but pinned to the local lamu 27B (override default).
+    flavor: openai
+    cmd: opencode
+    extra_env:
+      OPENCODE_MODEL: lamu/lamu

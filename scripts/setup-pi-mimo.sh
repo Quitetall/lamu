@@ -80,10 +80,26 @@ mv "$TMP" "$PI_CFG"
 
 echo -e "${GREEN}✓${R} mimo provider registered in $PI_CFG"
 echo -e "${GRY}registered:${R} $(echo "$MODELS_JSON" | jq -r '.data | length') models from MiMo registry"
-echo -e "${GRY}use it:${R} pi --provider mimo --model mimo-v2.5-pro \"hello\""
-echo -e "${GRY}or via lamu:${R} just open pi-mimo"
-echo
-echo -e "${YEL}note:${R} this does NOT flip pi's default provider away from lamu."
-echo "      To make MiMo the bare-invocation default, edit $HOME/.pi/agent/settings.json:"
-echo '        "defaultProvider": "mimo"'
-echo '        "defaultModel": "mimo-v2.5-pro"'
+
+# Optional: flip pi's default provider + model so bare `pi "..."`
+# routes through MiMo without --provider flag. Opt-in to avoid
+# surprising users who run setup-pi-mimo.sh expecting an additive
+# registration. Set LAMU_PI_DEFAULT=mimo to enable.
+if [[ "${LAMU_PI_DEFAULT:-}" == "mimo" ]]; then
+  SETTINGS="$HOME/.pi/agent/settings.json"
+  if [[ ! -f "$SETTINGS" ]]; then
+    echo '{}' > "$SETTINGS"
+  fi
+  TMP=$(mktemp)
+  jq '.defaultProvider = "mimo" | .defaultModel = "mimo-v2.5-pro"' "$SETTINGS" > "$TMP"
+  mv "$TMP" "$SETTINGS"
+  echo -e "${GREEN}✓${R} pi defaultProvider=mimo, defaultModel=mimo-v2.5-pro in $SETTINGS"
+  echo -e "${GRY}use it:${R} pi \"hello\"   (bare invocation, no flags)"
+else
+  echo -e "${GRY}use it:${R} pi --provider mimo --model mimo-v2.5-pro \"hello\""
+  echo -e "${GRY}or via lamu:${R} just open pi-mimo"
+  echo
+  echo -e "${YEL}note:${R} default provider NOT flipped. To make MiMo bare-invocation default:"
+  echo "        LAMU_PI_DEFAULT=mimo bash scripts/setup-pi-mimo.sh"
+  echo "      or edit $HOME/.pi/agent/settings.json manually."
+fi
