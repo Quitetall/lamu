@@ -194,19 +194,32 @@ case "$NAME" in
       SAFE_TOOLS_NOTE=", tools=$LAMU_PI_TOOLS"
     fi
     ;;
-  hermes)
+  pi-mimo)
+    # MiMo route — pi reads ~/.pi/agent/models.json for providers.
+    # Run scripts/setup-pi-mimo.sh once to register the `mimo`
+    # provider entry there. Override model via LAMU_MODEL.
+    MODEL_ARGS+=(--provider mimo --model "${LAMU_MODEL:-mimo-v2.5-pro}")
+    if [[ -z "${LAMU_PI_TOOLS+x}" ]]; then
+      LAMU_PI_TOOLS="read,grep,find,ls"
+    fi
+    if [[ -n "$LAMU_PI_TOOLS" ]]; then
+      MODEL_ARGS+=(--tools "$LAMU_PI_TOOLS")
+      SAFE_TOOLS_NOTE=", tools=$LAMU_PI_TOOLS"
+    fi
+    ;;
+  hermes|hermes-mimo)
     [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(-m "$LAMU_MODEL")
     ;;
-  claude-code)
+  claude-code|claude-code-mimo)
     [[ -n "$LAMU_MODEL" ]] && export ANTHROPIC_MODEL="$LAMU_MODEL"
     ;;
-  crush)
+  crush|crush-mimo)
     [[ -n "$LAMU_MODEL" ]] && export ANTHROPIC_MODEL="$LAMU_MODEL"
     ;;
-  codex)
+  codex|codex-mimo)
     [[ -n "$LAMU_MODEL" ]] && export OPENAI_MODEL="$LAMU_MODEL"
     ;;
-  aider)
+  aider|aider-mimo)
     [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--model "openai/$LAMU_MODEL")
     ;;
   *)

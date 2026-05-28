@@ -34,9 +34,27 @@ harnesses:
     flavor: anthropic
     cmd: crush
 
+  crush-mimo:
+    # crush via MiMo's Anthropic-compat mirror.
+    flavor: anthropic
+    cmd: crush
+    extra_env:
+      ANTHROPIC_BASE_URL: https://api.xiaomimimo.com/anthropic
+      ANTHROPIC_API_KEY: $MIMO_API_KEY
+      ANTHROPIC_MODEL: mimo-v2.5-pro
+
   codex:
     flavor: openai
     cmd: codex
+
+  codex-mimo:
+    # codex via MiMo's OpenAI-compat endpoint.
+    flavor: openai
+    cmd: codex
+    extra_env:
+      OPENAI_BASE_URL: https://api.xiaomimimo.com/v1
+      OPENAI_API_KEY: $MIMO_API_KEY
+      OPENAI_MODEL: mimo-v2.5-pro
 
   cursor:
     flavor: openai
@@ -50,6 +68,16 @@ harnesses:
     extra_env:
       AIDER_MODEL: openai/lamu
 
+  aider-mimo:
+    # aider via MiMo's OpenAI-compat endpoint. AIDER_MODEL must use
+    # the openai/<id> prefix even though we override the base URL.
+    flavor: openai
+    cmd: aider
+    extra_env:
+      OPENAI_API_BASE: https://api.xiaomimimo.com/v1
+      OPENAI_API_KEY: $MIMO_API_KEY
+      AIDER_MODEL: openai/mimo-v2.5-pro
+
   continue:
     flavor: openai
     # ~/.continue/config.json must be edited once to point at lamu.
@@ -59,10 +87,27 @@ harnesses:
     flavor: openai
     cmd: pi
 
+  pi-mimo:
+    # pi reads ~/.pi/agent/models.json — does NOT honor OPENAI_BASE_URL.
+    # Requires the `mimo` provider entry registered in that file. Run
+    # ./scripts/setup-pi-mimo.sh once to install, then `just open pi-mimo`
+    # routes via MiMo with `--provider mimo --model mimo-v2.5-pro`.
+    flavor: openai
+    cmd: pi
+
   hermes:
     flavor: anthropic
     # ECC operator. Adjust to the right launch verb on your install.
     cmd: hermes
+
+  hermes-mimo:
+    # hermes via MiMo's Anthropic-compat mirror.
+    flavor: anthropic
+    cmd: hermes
+    extra_env:
+      ANTHROPIC_BASE_URL: https://api.xiaomimimo.com/anthropic
+      ANTHROPIC_API_KEY: $MIMO_API_KEY
+      ANTHROPIC_MODEL: mimo-v2.5-pro
 
   anything-llm:
     flavor: ollama
