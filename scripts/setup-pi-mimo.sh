@@ -5,7 +5,7 @@
 # ~/.pi/agent/models.json — a JSON registry of OpenAI-compatible
 # providers. This script merges a `mimo` provider entry into that file
 # so `pi --provider mimo --model mimo-v2.5-pro` routes through
-# Xiaomi's OpenAI-compat endpoint at api.xiaomimimo.com/v1.
+# Xiaomi's OpenAI-compat endpoint at token-plan-sgp.xiaomimimo.com/v1.
 #
 # Idempotent: re-running updates the mimo entry without touching others.
 #
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-MIMO_BASE="https://api.xiaomimimo.com/v1"
+MIMO_BASE="https://token-plan-sgp.xiaomimimo.com/v1"
 PI_CFG="$HOME/.pi/agent/models.json"
 
 GRY="\033[90m"; GREEN="\033[32m"; YEL="\033[33m"; RED="\033[31m"; R="\033[0m"
