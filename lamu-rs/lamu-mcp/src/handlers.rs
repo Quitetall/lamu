@@ -106,24 +106,24 @@ impl LamuMcpServer {
             let decision = st.router.route(&st.scheduler, model, caps_opt, Some(st.health.all()));
 
             if decision.model_name.is_empty() {
-                return format!("No model available: {}", decision.reason);
+                return format!("error: no model available: {}", decision.reason);
             }
             if !decision.loaded {
                 return format!(
-                    "Model '{}' not loaded. Would need to load (evicting: {:?}). \
+                    "error: model '{}' not loaded. Would need to load (evicting: {:?}). \
                      Use load_model first or query a loaded model.",
                     decision.model_name, decision.would_evict
                 );
             }
 
             let Some(_loaded) = st.scheduler.get_loaded(&decision.model_name) else {
-                return "internal: lost loaded model".into();
+                return "error: internal: lost loaded model".into();
             };
             let entry = st.entries.get(&decision.model_name).cloned();
             let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
             let Some(backend_arc) = st.backends.get(&decision.model_name).cloned() else {
                 return format!(
-                    "internal: model '{}' marked loaded but missing from backends map",
+                    "error: internal: model '{}' marked loaded but missing from backends map",
                     decision.model_name
                 );
             };
@@ -198,7 +198,7 @@ impl LamuMcpServer {
                             "error": format!("{e}"),
                         }),
                     );
-                    return format!("Generation error: {}", e);
+                    return format!("error: generation failed: {}", e);
                 }
             }
         };
@@ -732,10 +732,10 @@ impl LamuMcpServer {
         let mut st = self.state.lock();
         let entries = match scan_directory(&st.models_dir) {
             Ok(e) => e,
-            Err(e) => return format!("scan error: {}", e),
+            Err(e) => return format!("error: scan: {}", e),
         };
         if let Err(e) = write_registry(&entries, &st.registry_path) {
-            return format!("write error: {}", e);
+            return format!("error: write registry: {}", e);
         }
         st.entries = entries.iter().map(|e| (e.name.clone(), e.clone())).collect();
         st.router.update_registry(entries.clone());

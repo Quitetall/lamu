@@ -277,7 +277,10 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             Err(e) => return format!("error: parse: {e}"),
         };
         if let Some(err) = v.get("error") {
-            return format!("anthropic error: {}", err);
+            // Prefix "error:" so tools_call's isError flag fires AND the
+            // ensemble/critic gates (which test `starts_with("error:")`)
+            // don't feed an API-error blob into merge_unique_findings.
+            return format!("error: anthropic API: {}", err);
         }
         // content is an array of {type: "text"|"thinking", text|thinking: "..."}
         let mut out = String::new();
@@ -331,7 +334,9 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             Err(e) => return format!("error: parse: {e}"),
         };
         if let Some(err) = v.get("error") {
-            return format!("provider error: {}", err);
+            // See anthropic branch above — "error:" prefix is load-bearing
+            // for the isError flag and the review-pipeline error gates.
+            return format!("error: provider API: {}", err);
         }
         if let Some(usage) = v.get("usage") {
             tracing::info!(target: "lamu_bench", "cloud_query usage model={} {}", model_name, usage);
@@ -592,13 +597,14 @@ pub(crate) fn handle_recall_conversation(args: Value) -> String {
     out
 }
 
-// ── DeepSeek V4 Pro reviewer (project policy) ───────────────────────
+// ── MiMo V2.5 Pro reviewer (project policy) ─────────────────────────
 //
-// Every commit goes through this. The system prompt below tells V4 Pro
-// to focus on issues that matter — security, correctness, edge cases,
-// architecture — and to call out problems even when none exist. The
-// model's reasoning_content is included so the human can see HOW the
-// review was reached, not just the conclusion.
+// Every commit goes through this. The system prompt below tells the
+// reviewer to focus on issues that matter — security, correctness,
+// edge cases, architecture — and to call out problems even when none
+// exist. Reviews run with include_reasoning:false today (just the
+// verdict + findings); flip the per-call flag if the human wants the
+// model's reasoning_content surfaced too.
 
 /// Quality/cost preset for review_commit + review_diff.
 ///
@@ -870,7 +876,7 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     //   - When draft has findings, run verify_findings_via_flash to
     //     drop those matching a known-FP pattern. Cuts residual FPs.
     //   - When draft says PASS, run pass_double_check_via_flash to
-    //     scan the diff a second time for issues V4 Pro might have
+    //     scan the diff a second time for issues the reviewer might have
     //     skipped. Cuts false negatives (silent merge of broken code).
     // V6 N: skip Flash 2nd-pass on trivial diffs. The double-check
     // primarily catches issues in substantive changes; small commits
@@ -907,10 +913,10 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         review
     };
 
-    format!("=== Review of {} (DeepSeek V4 Pro) ===\n\n{}", commit, review)
+    format!("=== Review of {} (MiMo V2.5 Pro) ===\n\n{}", commit, review)
 }
 
-/// Self-reflection: feed the V4 Pro draft + central FP-list to a
+/// Self-reflection: feed the reviewer draft + central FP-list to a
 /// cheap Flash call asking it to drop findings that match a known
 /// false-positive pattern. Returns either a filtered version of the
 /// draft, or the draft unchanged if Flash refuses / errors / the
@@ -1118,7 +1124,7 @@ async fn two_stage_review(prompt: &str, system: &str) -> String {
     handle_cloud_query(stage2_args).await
 }
 
-/// V5 D: when V4 Pro returns PASS, run a quick Flash pass that
+/// V5 D: when the reviewer returns PASS, run a quick Flash pass that
 /// re-reads the diff with the central FP-list as system prompt and
 /// asks "did the reviewer miss anything obvious?". Returns the
 /// original PASS draft unchanged if Flash also says PASS; otherwise
@@ -1152,7 +1158,7 @@ async fn pass_double_check_via_flash(draft: &str, diff: &str) -> String {
     }
     // Flash found something — append to draft, upgrade verdict.
     format!(
-        "{}\n\n---\n\n## Second-pass findings (V5 D — Flash, after V4 Pro PASS)\n\n{}",
+        "{}\n\n---\n\n## Second-pass findings (V5 D — Flash, after reviewer PASS)\n\n{}",
         draft, second
     )
 }
@@ -1258,7 +1264,7 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
         review
     };
 
-    format!("=== Diff review (DeepSeek V4 Pro) ===\n\n{}", review)
+    format!("=== Diff review (MiMo V2.5 Pro) ===\n\n{}", review)
 }
 
 #[cfg(test)]

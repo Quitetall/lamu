@@ -2,7 +2,7 @@
 //! review_commit, review_diff, parallel_query).
 //!
 //! Step 4 ships the **Central** tier only: a bundled `&'static str`
-//! review policy + V4 Pro false-positive list, prepended to the
+//! review policy + reviewer false-positive list, prepended to the
 //! reviewer's system prompt. Steps 5–7 add the Plan tier (file-driven,
 //! opt-in) and Tactical tier (caller-supplied).
 //!
@@ -96,7 +96,7 @@ fn resolve_central() -> &'static str {
 
 /// V5 G: per-repo FP feedback footer. Mines `FP: …` notes from prior
 /// commit messages (the audit trail the project already keeps when
-/// skipping V4 Pro false positives), formats as a "documented FP
+/// skipping reviewer false positives), formats as a "documented FP
 /// patterns from this repo's history" list. Cached per-process per-
 /// repo so the cache prefix stays stable.
 pub(crate) fn fp_feedback_footer(repo: &Path) -> String {
