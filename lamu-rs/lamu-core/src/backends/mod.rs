@@ -88,30 +88,32 @@ pub struct ChatMessage {
 }
 
 /// Harden a spawned backend child so it can NEVER outlive lamu and leak
-/// its VRAM. Two mechanisms, applied to every backend spawn:
+/// its VRAM — WITHOUT killing it when the owning handle is merely dropped.
 ///
-/// 1. `kill_on_drop(true)` — when the owning `Box<dyn Backend>` (and its
-///    tokio `Child`) drops, the runtime SIGKILLs the process. Covers
-///    normal teardown (ServerState dropping as `lamu start`'s main
-///    returns after a graceful SIGTERM/EOF).
+/// Mechanism: `PR_SET_PDEATHSIG(SIGKILL)` via `pre_exec`. The kernel
+/// SIGKILLs the child the instant lamu (its parent) dies by ANY means —
+/// graceful SIGTERM/EOF, a hard crash, `SIGKILL`, or the orphan-
+/// watchdog's `std::process::exit(0)` (none of which need to run
+/// destructors). That closes the VRAM-leak-on-lamu-death hole.
 ///
-/// 2. `PR_SET_PDEATHSIG(SIGKILL)` via `pre_exec` — the kernel SIGKILLs
-///    the child the instant lamu dies by ANY means that does NOT run
-///    destructors: a hard crash, `SIGKILL`, or the orphan-watchdog's
-///    `std::process::exit(0)`. Without this, those paths orphan the
-///    llama-server and permanently leak ~20 GB of VRAM.
+/// We deliberately DO NOT set `kill_on_drop(true)`: lamu-api (`lamu
+/// serve`) intentionally drops the `Box<dyn Backend>` right after load
+/// and then proxies to the still-running llama-server by its port (see
+/// loader.rs). kill_on_drop would SIGKILL that server on the drop,
+/// leaving a phantom "loaded" entry pointing at a dead port. PDEATHSIG
+/// is independent of the handle — it's a property of the child process,
+/// so dropping the handle never clears it; the child still dies with
+/// lamu. lamu-mcp's explicit unload/shutdown-drain handles in-session
+/// teardown, and PDEATHSIG backstops every abnormal exit.
 ///
 /// This is UNCONDITIONAL — unlike lamu's own PDEATHSIG
 /// (lamu-core/src/lifecycle.rs), which respects a `nohup` SIGHUP=SIG_IGN
-/// "survive my parent" marker. A backend must never survive its lamu: an
-/// unmanaged llama-server is pure leak, so we kill it regardless of how
-/// lamu is launched.
+/// "survive my parent" marker. A backend must never survive its lamu.
 ///
-/// Non-Linux (incl. macOS): only `kill_on_drop` applies — there is no
-/// portable `PR_SET_PDEATHSIG` equivalent. lamu's backends are
-/// CUDA/Linux-only in practice, so the gap is theoretical.
+/// Non-Linux (incl. macOS): no-op — there is no portable
+/// `PR_SET_PDEATHSIG` equivalent. lamu's backends are CUDA/Linux-only in
+/// practice, so the gap is theoretical.
 pub(crate) fn harden_child_command(cmd: &mut tokio::process::Command) {
-    cmd.kill_on_drop(true);
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `pre_exec` runs in the forked child between fork and
@@ -136,6 +138,9 @@ pub(crate) fn harden_child_command(cmd: &mut tokio::process::Command) {
             });
         }
     }
+    // Reference cmd on non-Linux so the param isn't flagged unused.
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
 }
 
 /// Graceful child shutdown: SIGTERM, wait up to 10s for the child to
