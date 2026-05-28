@@ -15,6 +15,21 @@ harnesses:
     # ANTHROPIC_MODEL is best left unset so the harness's own pick goes
     # through; lamu's router resolves "lamu"/"default"/null → main entry.
 
+  claude-code-mimo:
+    # Same `claude` binary but routed through Xiaomi MiMo's
+    # Anthropic-compat endpoint instead of through lamu serve. Saves
+    # Opus tokens on routine code by using mimo-v2.5-pro for the
+    # implementation work; reserve Opus for plan + review.
+    #
+    # Requires MIMO_API_KEY in ~/.config/lamu/api-keys.env.
+    # extra_env values starting with `$` are expanded by open-harness.sh.
+    flavor: anthropic
+    cmd: claude
+    extra_env:
+      ANTHROPIC_BASE_URL: https://api.xiaomimimo.com/anthropic
+      ANTHROPIC_API_KEY: $MIMO_API_KEY
+      ANTHROPIC_MODEL: mimo-v2.5-pro
+
   crush:
     flavor: anthropic
     cmd: crush

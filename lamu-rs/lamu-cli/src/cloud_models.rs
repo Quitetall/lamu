@@ -168,6 +168,32 @@ pub fn default_seed() -> Vec<CloudModel> {
             base_url: Some("https://api.xiaomimimo.com/v1".into()),
             chat_path: None,
         },
+        // Anthropic-shaped MiMo mirror — same model, /anthropic
+        // endpoint. Useful for routing claude-code (and any other
+        // Claude-shaped harness) through MiMo via ANTHROPIC_BASE_URL
+        // without the Anthropic SDK noticing the difference.
+        CloudModel {
+            name: "mimo-v2.5-pro-anthropic".into(),
+            provider: "anthropic".into(),
+            model_id: Some("mimo-v2.5-pro".into()),
+            context_max: 256_000,
+            notes: "Xiaomi MiMo V2.5 Pro via Anthropic-compat endpoint.".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MIMO_API_KEY".into()),
+            base_url: Some("https://api.xiaomimimo.com/anthropic".into()),
+            chat_path: None,
+        },
+        CloudModel {
+            name: "mimo-v2.5-anthropic".into(),
+            provider: "anthropic".into(),
+            model_id: Some("mimo-v2.5".into()),
+            context_max: 256_000,
+            notes: "Xiaomi MiMo V2.5 via Anthropic-compat endpoint.".into(),
+            quota: QuotaState::Available,
+            api_key_env: Some("MIMO_API_KEY".into()),
+            base_url: Some("https://api.xiaomimimo.com/anthropic".into()),
+            chat_path: None,
+        },
     ]
 }
 

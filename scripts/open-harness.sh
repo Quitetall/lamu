@@ -39,6 +39,18 @@ set -euo pipefail
 ROOT="$HOME/local-llm"
 CFG="$ROOT/config/harnesses.yaml"
 LAMU_URL="${LAMU_URL:-http://localhost:8020}"
+
+# Make API keys (MIMO_API_KEY, DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, …)
+# available to harnesses + to per-harness env redirects below. lamu's
+# own load_api_keys_env handles its main()/serve paths; harness launches
+# go through a separate shell, so we source the same file here.
+KEYS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/lamu/api-keys.env"
+if [[ -f "$KEYS_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$KEYS_FILE"
+  set +a
+fi
 LAMU_MODEL="${LAMU_MODEL:-}"
 LAMU_SANDBOX="${LAMU_SANDBOX:-0}"
 LAMU_SANDBOX_NET="${LAMU_SANDBOX_NET:-1}"
@@ -133,7 +145,15 @@ esac
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
-  export "$line"
+  # Expand `$VAR` references in the value so that harness entries
+  # can reference shell env (e.g. ANTHROPIC_AUTH_TOKEN: $MIMO_API_KEY
+  # in harnesses.yaml). Without this the literal "$MIMO_API_KEY"
+  # string would be exported, breaking auth.
+  key="${line%%=*}"
+  raw_val="${line#*=}"
+  # shellcheck disable=SC2086,SC2090
+  eval "expanded_val=\"$raw_val\""
+  export "$key=$expanded_val"
 done <<< "$EXTRA"
 
 # Pre-check lamu is reachable.
