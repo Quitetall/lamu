@@ -218,10 +218,25 @@ impl LamuMcpServer {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
 
+        // Routing-mode gate: 'local-only' refuses cloud-LLM tools — the
+        // mirror of handle_query's 'cloud-only' refusal for local
+        // queries. Cloud tools are HandlerKind::Free and never receive
+        // `&self`, so they can't consult routing_mode themselves; the
+        // dispatcher (which DOES hold &self) enforces it via the tool's
+        // own `cloud` flag. Scope the lock so the guard drops before any
+        // handler `.await` — holding routing_mode across a handler could
+        // deadlock set_routing_mode.
+        let local_only = self.routing_mode.lock().await.as_str() == "local-only";
+
         // Phase 2.1: dispatcher reads from `tools::TOOLS`. Adding a new
         // tool means one entry in tools.rs; the dispatcher and the
         // tools/list response both pick it up automatically.
         let result = match crate::tools::find(tool_name) {
+            Some(t) if local_only && t.cloud => format!(
+                "error: routing mode is 'local-only' — cloud tool '{}' refused. \
+                 Call set_routing_mode(mode='auto') to re-enable.",
+                tool_name
+            ),
             Some(t) => match &t.handler {
                 crate::tools::HandlerKind::Stateful(f) => f(self, args).await,
                 crate::tools::HandlerKind::Free(f) => f(args).await,

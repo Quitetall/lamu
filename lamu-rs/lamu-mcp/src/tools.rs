@@ -35,6 +35,15 @@ pub struct ToolDef {
     /// Schema is computed lazily so the const table holds plain fn ptrs.
     pub schema_fn: fn() -> Value,
     pub handler: HandlerKind,
+    /// True for cloud-LLM tools that routing mode 'local-only' refuses.
+    /// The field is required, so adding a tool forces a cloud/local
+    /// decision at the call site — a new cloud tool can't silently
+    /// bypass the local-only gate (the prior hand-curated match could
+    /// drift). NOTE: `parallel_query` is `false` despite reaching cloud:
+    /// it mixes local + cloud tasks and self-enforces local-only
+    /// per-task in handle_parallel_query, so a blanket dispatcher
+    /// refusal would wrongly kill its local tasks too.
+    pub cloud: bool,
 }
 
 impl ToolDef {
@@ -378,126 +387,147 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Send prompt to local LLM. Routes by capabilities or explicit model. Queued per-model (FIFO default) so concurrent agents don't collide. Fast, free, uncensored.",
         schema_fn: schema_query,
         handler: HandlerKind::Stateful(dispatch_query),
+        cloud: false,
     },
     ToolDef {
         name: "plan_query",
         description: "Dry-run: see which model WOULD handle a request without generating.",
         schema_fn: schema_plan_query,
         handler: HandlerKind::Stateful(dispatch_plan_query),
+        cloud: false,
     },
     ToolDef {
         name: "list_models",
         description: "List all known models with load status and capabilities.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_list_models),
+        cloud: false,
     },
     ToolDef {
         name: "load_model",
         description: "Explicitly load a model onto GPU.",
         schema_fn: schema_named_only,
         handler: HandlerKind::Stateful(dispatch_load_model),
+        cloud: false,
     },
     ToolDef {
         name: "unload_model",
         description: "Unload a model from GPU.",
         schema_fn: schema_named_only,
         handler: HandlerKind::Stateful(dispatch_unload_model),
+        cloud: false,
     },
     ToolDef {
         name: "vram_status",
         description: "Show current VRAM allocation.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_vram_status),
+        cloud: false,
     },
     ToolDef {
         name: "scan_models",
         description: "Re-scan disk for new models.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_scan),
+        cloud: false,
     },
     ToolDef {
         name: "queue_status",
         description: "Show per-model queue depth and scheduling strategy.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_queue_status),
+        cloud: false,
     },
     ToolDef {
         name: "cloud_query",
         description: "Send prompt to a cloud model (DeepSeek V4, Claude, GLM, Kimi, Qwen-Max, etc.). Use this for tasks that need stronger reasoning than local, OR cheaper inference than the calling agent (e.g. Claude Code → DeepSeek V4 Flash for code generation at ~$0.07/M input, currently 75% off). Auto-routes via OpenAI/Anthropic format detection.",
         schema_fn: schema_cloud_query,
         handler: HandlerKind::Free(dispatch_cloud_query),
+        cloud: true,
     },
     ToolDef {
         name: "list_cloud_models",
         description: "List configured cloud models from ~/.config/lamu/cloud-models.yaml. Returns name, provider, context window, and whether the API key env var is set.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Free(dispatch_list_cloud_models),
+        cloud: false,
     },
     ToolDef {
         name: "review_commit",
         description: "PRIMARY REVIEW TOOL — auto-routes to MiMo V2.5 Pro (the project policy reviewer). Takes a commit SHA (or 'HEAD' for the most recent), runs `git show` to get the full diff + commit message, and returns a deep code review covering security, correctness, edge cases, idiom, and architectural fit. NO CODE SHOULD BE CONSIDERED DONE WITHOUT GOING THROUGH THIS TOOL. Use it after every commit you make.\n\nQUALITY/COST PRESETS — `preset` arg controls the review intensity:\n  - 'max' (default, ~$0.005/review hot cache): single Pro pass + critic-role parallel pass + multi-model ensemble (uses claude-opus-4-7 if ANTHROPIC_API_KEY is set, else falls back to deepseek-v4-flash). 5-7 findings, cross-provider diversity. Use for every-commit reviews + pre-merge gating.\n  - 'fast' (~$0.004/review hot cache): single Pro pass only. 0-2 findings. Use when cost is dominant and false negatives are tolerable.\nPer-call arg overrides $LAMU_PRESET env. Individual env knobs (LAMU_CRITIC_PASS, LAMU_ENSEMBLE_REVIEW, LAMU_TEST_PREFLIGHT, LAMU_TWO_STAGE_REVIEW) override the preset's defaults.\n\nMANDATORY: Before applying ANY fix from a review, verify each finding is real, not a hallucination. MiMo V2.5 Pro has ~30% false-positive rate. Open the cited file:line, read the code, confirm the bug exists. Common hallucinations: serde_json indexing claimed to panic (returns Null instead), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (actually 32-bit per spec), env-var race across cargo test binaries (env is process-local). Skip findings that don't reproduce. Note skipped false positives in the follow-up commit message.",
         schema_fn: schema_review_commit,
         handler: HandlerKind::Free(dispatch_review_commit),
+        cloud: true,
     },
     ToolDef {
         name: "review_diff",
         description: "Review an arbitrary diff via MiMo V2.5 Pro. Same reviewer policy as review_commit but accepts the diff text directly — useful when reviewing uncommitted changes or a chunk of pasted code.\n\nQUALITY/COST PRESETS — `preset: 'fast' | 'max'` arg, default 'max'. Same semantics as review_commit (max = Pro + critic + ensemble, ANTHROPIC_API_KEY enables cross-provider second reviewer; fast = single Pro pass). Per-call arg overrides $LAMU_PRESET env.\n\nMANDATORY: Before applying ANY fix, verify each finding is real (~30% false-positive rate). Open the cited code, confirm the bug exists. Skip findings that don't reproduce. Common hallucinations: serde_json indexing claimed to panic (returns Null in reality), bwrap claimed to expose paths it doesn't bind (empty namespace by default), GGUF type-5/6 claimed 64-bit (32-bit per spec), env-var race across cargo test binaries (env is process-local).",
         schema_fn: schema_review_diff,
         handler: HandlerKind::Free(dispatch_review_diff),
+        cloud: true,
     },
     ToolDef {
         name: "set_routing_mode",
         description: "Control which backends are usable. Modes: 'auto' (default — use local for matching capabilities, cloud for the rest), 'local-only' (refuse cloud requests), 'cloud-only' (kill local llama-server and free VRAM, route everything to cloud). Useful when you want to free GPU for other work but keep DeepSeek/Claude on tap.",
         schema_fn: schema_set_routing_mode,
         handler: HandlerKind::Stateful(dispatch_set_routing_mode),
+        cloud: false,
     },
     ToolDef {
         name: "routing_status",
         description: "Report current routing mode + which backends are reachable.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_routing_status),
+        cloud: false,
     },
     ToolDef {
         name: "warmup",
         description: "Prime the cloud reviewer's prompt cache by sending a 1-token completion with the future review_commit's central+plan prefix. Subsequent calls in the session hit cache from byte 0 instead of paying full prefix-prefill on the first call. Cost: ~$0.0001 per warmup. Pass the same `plan_file` you'll use later.",
         schema_fn: schema_warmup,
         handler: HandlerKind::Free(dispatch_warmup),
+        cloud: true,
     },
     ToolDef {
         name: "search_repo",
         description: "Find code in the repository. Modes: 'auto' (ripgrep first, semantic fallback when OPENAI_API_KEY is set), 'ripgrep' (instant grep), 'semantic' (cosine-sim against the embedding index — `index_repo` builds it). Returns up to k hits with file:line + snippet. Useful for the orchestrator to populate the Tactical-tier `context` arg of cloud_query / review_commit.",
         schema_fn: schema_search_repo,
         handler: HandlerKind::Free(dispatch_search_repo),
+        cloud: false,
     },
     ToolDef {
         name: "index_repo",
         description: "Build / refresh the semantic-search index at ~/.local/share/lamu/embeddings.db. Walks `git ls-files`, chunks each text file at ~1KB boundaries, embeds via OpenAI text-embedding-3-small (~$0.02/M tokens). Skips files whose mtime is unchanged from the previous index unless `force: true`.",
         schema_fn: schema_index_repo,
         handler: HandlerKind::Free(dispatch_index_repo),
+        cloud: false,
     },
     ToolDef {
         name: "recall_conversation",
         description: "Read recorded turns from a conversation logged via cloud_query's `conversation_id` arg. Returns oldest-first, optionally capped at `limit` most-recent turns. Storage: ~/.local/share/lamu/conversations.db (SQLite). Use this to inspect what was said in a prior session, or to replay a conversation thread into a fresh cloud_query via the `context` arg.",
         schema_fn: schema_recall_conversation,
         handler: HandlerKind::Free(dispatch_recall_conversation),
+        cloud: false,
     },
     ToolDef {
         name: "train_from_conversations",
         description: "Fine-tune a local model on the user's recent conversation history. EXPENSIVE: 30 min – 4 h depending on dataset size; locks the GPU exclusively for the run. First call without `confirm: true` returns the dataset estimate (conversation count + turn count) so the caller can decide. With `confirm: true`, shells out to the `blut` binary (BLUT — Brian Lam's Universal Trainer) in detached background mode and returns immediately — check `blut jobs` for the resulting job id. The MCP server does NOT depend on blut; the binary must be installed separately (cargo install --path lamu-rs/blut) or located via $BLUT_BIN. ($LAMU_TRAIN_BIN remains accepted as a back-compat alias.)",
         schema_fn: schema_train_from_conversations,
         handler: HandlerKind::Free(dispatch_train_from_conversations),
+        cloud: false,
     },
     ToolDef {
         name: "write_file",
         description: "Write a file with rollback journaling (Phase 6.1). Records the file's pre-state under session_id; `lamu rollback <session>` restores. Path is required relative to lamu-mcp's cwd; absolute paths and '..' segments are refused so the call cannot escape the working directory. session_id must match [A-Za-z0-9_-.]+ — anything else is rejected up front.",
         schema_fn: schema_write_file,
         handler: HandlerKind::Free(dispatch_write_file),
+        cloud: false,
     },
     ToolDef {
         name: "parallel_query",
         description: "Fan out N prompts at once (agent swarm). Provider-aware concurrency: DeepSeek/OpenAI/Anthropic run in parallel up to per-provider caps, untested providers and ALL local models default to sequential (concurrency=1) until proven safe. Tasks are grouped by model so each model gets its own semaphore. Returns results in the original task order, with per-task elapsed time. Use this for batch reviews, parallel code generation, multi-perspective brainstorming.",
         schema_fn: schema_parallel_query,
         handler: HandlerKind::Stateful(dispatch_parallel_query),
+        cloud: false, // mixes local+cloud; self-enforces local-only per-task
     },
 ];
 
@@ -546,6 +576,25 @@ mod tests {
         // critical-tools test below pins the named entries that
         // external callers (Claude Code, ultrareview, etc.) depend on.
         assert!(TOOLS.len() >= 20, "catalog shrunk below 20: {}", TOOLS.len());
+    }
+
+    #[test]
+    fn cloud_flag_matches_routing_policy() {
+        // The four cloud-LLM tools must be gated under local-only.
+        for name in ["cloud_query", "review_commit", "review_diff", "warmup"] {
+            assert!(find(name).unwrap().cloud, "{name} must have cloud:true (local-only gate)");
+        }
+        // Local / read-only / RAG / mixed tools must NOT be blanket-gated
+        // (parallel_query self-enforces per-task; search/index degrade).
+        for name in [
+            "query", "plan_query", "list_models", "load_model", "unload_model",
+            "vram_status", "scan_models", "queue_status", "list_cloud_models",
+            "set_routing_mode", "routing_status", "search_repo", "index_repo",
+            "recall_conversation", "train_from_conversations", "write_file",
+            "parallel_query",
+        ] {
+            assert!(!find(name).unwrap().cloud, "{name} must have cloud:false");
+        }
     }
 
     #[test]

@@ -154,6 +154,63 @@ async fn parallel_query_rejects_empty_tasks_array() {
     assert!(text.contains("non-empty array"), "got: {text}");
 }
 
+// Routing-mode enforcement. These exercise the dispatcher gate
+// (local-only) + the load_model guard (cloud-only). They're hermetic:
+// both gates fire BEFORE any registry / cloud-models.yaml lookup, so
+// the result doesn't depend on the test machine's config.
+
+#[tokio::test]
+async fn local_only_refuses_cloud_query() {
+    let srv = fresh_server();
+    // Flip to local-only.
+    let set = call_tool(&srv, "set_routing_mode", json!({"mode": "local-only"})).await;
+    assert_eq!(set["result"]["isError"], false);
+    // cloud_query must now be refused by the dispatcher gate.
+    let resp = call_tool(&srv, "cloud_query", json!({"prompt": "hi"})).await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("local-only"), "got: {text}");
+    assert!(text.contains("cloud tool 'cloud_query'"), "got: {text}");
+}
+
+#[tokio::test]
+async fn local_only_still_allows_local_tools() {
+    let srv = fresh_server();
+    call_tool(&srv, "set_routing_mode", json!({"mode": "local-only"})).await;
+    // A local/read-only tool (list_models) must remain reachable.
+    let resp = call_tool(&srv, "list_models", json!({})).await;
+    assert_eq!(resp["result"]["isError"], false, "local tool wrongly gated");
+}
+
+#[tokio::test]
+async fn cloud_only_refuses_load_model() {
+    let srv = fresh_server();
+    let set = call_tool(&srv, "set_routing_mode", json!({"mode": "cloud-only"})).await;
+    assert_eq!(set["result"]["isError"], false);
+    // load_model would re-allocate the VRAM cloud-only just freed.
+    let resp = call_tool(&srv, "load_model", json!({"name": "anything"})).await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("cloud-only"), "got: {text}");
+    assert!(text.contains("load_model refused"), "got: {text}");
+}
+
+#[tokio::test]
+async fn auto_mode_does_not_gate_cloud_query() {
+    let srv = fresh_server();
+    // Default mode is auto — cloud_query should pass the gate and fail
+    // later at the model lookup, NOT at the routing gate.
+    let resp = call_tool(
+        &srv,
+        "cloud_query",
+        json!({"prompt": "hi", "model": "nope-not-a-real-model"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("not in cloud-models.yaml"), "gate fired in auto mode: {text}");
+}
+
 #[tokio::test]
 async fn list_cloud_models_round_trip() {
     let srv = fresh_server();

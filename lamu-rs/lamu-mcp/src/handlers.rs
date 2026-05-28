@@ -304,6 +304,17 @@ impl LamuMcpServer {
             None => return "error: missing 'name' argument".into(),
         };
 
+        // Routing-mode gate: refuse under 'cloud-only'. set_routing_mode
+        // ('cloud-only') drains backends + frees VRAM precisely so the
+        // GPU is available for other work; letting load_model re-spawn a
+        // llama-server here would silently re-allocate that VRAM and
+        // defeat the documented "free GPU" guarantee. handle_query
+        // already refuses local queries under cloud-only — this closes
+        // the load path too.
+        if self.routing_mode.lock().await.as_str() == "cloud-only" {
+            return "error: routing mode is 'cloud-only' — load_model refused (would re-allocate the VRAM you freed). Call set_routing_mode(mode='auto') first.".into();
+        }
+
         // Atomic plan-and-reserve: hold the state lock across (a) entry
         // lookup, (b) plan_load, (c) mark_loading. Without this,
         // concurrent load_model calls could both pass the is_loaded check
@@ -622,6 +633,12 @@ impl LamuMcpServer {
         let default_system = args["default_system"].as_str().unwrap_or("").to_string();
         let user_max = args["max_concurrency"].as_u64().map(|n| n as usize);
 
+        // Routing-mode gate: under 'local-only' refuse the cloud tasks in
+        // the batch (but keep running local ones). parallel_query calls
+        // handle_cloud_query directly, bypassing the dispatcher's
+        // is_cloud_tool gate, so it must enforce local-only itself.
+        let local_only = self.routing_mode.lock().await.as_str() == "local-only";
+
         let cloud = crate::cloud::load_cloud_models();
 
         // Build per-(model) semaphores. Same-model tasks share one
@@ -650,6 +667,13 @@ impl LamuMcpServer {
                 .map(Value::Bool);
 
             let is_cloud = cloud.iter().any(|m| m.name == model);
+            if is_cloud && local_only {
+                prepared.push(Err(format!(
+                    "task[{}]: cloud model '{}' refused — routing mode is 'local-only'",
+                    idx, model
+                )));
+                continue;
+            }
             let cap = if is_cloud {
                 let provider_cap = crate::cloud::provider_concurrency(&model, &cloud);
                 user_max.map(|u| u.min(provider_cap)).unwrap_or(provider_cap)
