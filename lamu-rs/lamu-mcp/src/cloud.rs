@@ -43,6 +43,7 @@ pub(crate) fn provider_concurrency(model_name: &str, cloud: &[CloudModel]) -> us
 
     match provider {
         "deepseek" => 8,
+        "mimo" => 8,
         "anthropic" => 4,
         "openai" => 4,
         // Less tested — start at 1 until proven. Bump via env var.
@@ -77,7 +78,7 @@ pub(crate) fn handle_list_cloud_models() -> String {
 pub(crate) async fn handle_cloud_query(args: Value) -> String {
     let prompt = args["prompt"].as_str().unwrap_or("");
     if prompt.is_empty() { return "error: prompt is required".into(); }
-    let model_name = args["model"].as_str().unwrap_or("deepseek-v4-flash");
+    let model_name = args["model"].as_str().unwrap_or("mimo-v2.5");
     let raw_system = args["system"].as_str().unwrap_or("");
 
     // Phase 6 step 6: context layer for cloud_query. Defaults match
@@ -499,7 +500,7 @@ pub(crate) async fn handle_warmup(args: Value) -> String {
     );
 
     let warmup_args = json!({
-        "model": "deepseek-v4-pro",
+        "model": "mimo-v2.5-pro",
         "prompt": "ACK only — warmup",
         "system": system,
         "max_tokens": 1,
@@ -855,7 +856,7 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         two_stage_review(&prompt, &system).await
     } else {
         let review_args = json!({
-            "model": "deepseek-v4-pro",
+            "model": "mimo-v2.5-pro",
             "prompt": prompt,
             "system": system,
             "max_tokens": 8192,
@@ -935,7 +936,7 @@ async fn critic_pass(prompt: &str, system: &str) -> String {
         prompt
     );
     let args = json!({
-        "model": "deepseek-v4-flash",
+        "model": "mimo-v2.5",
         "prompt": critic_prompt,
         "system": critic_system,
         "max_tokens": 1024,
@@ -966,7 +967,7 @@ async fn critic_pass(prompt: &str, system: &str) -> String {
 /// Opt-in via LAMU_ENSEMBLE_REVIEW=1. Cost: ~+$0.0004 per review.
 async fn ensemble_review(prompt: &str, system: &str) -> String {
     let pro_args = json!({
-        "model": "deepseek-v4-pro",
+        "model": "mimo-v2.5-pro",
         "prompt": prompt, "system": system,
         "max_tokens": 8192, "temperature": 0.2,
         "include_reasoning": false,
@@ -1079,7 +1080,7 @@ async fn two_stage_review(prompt: &str, system: &str) -> String {
         prompt
     );
     let stage1_args = json!({
-        "model": "deepseek-v4-flash",
+        "model": "mimo-v2.5",
         "prompt": stage1_prompt,
         "system": system,
         "max_tokens": 1024,
@@ -1107,7 +1108,7 @@ async fn two_stage_review(prompt: &str, system: &str) -> String {
         )
     };
     let stage2_args = json!({
-        "model": "deepseek-v4-pro",
+        "model": "mimo-v2.5-pro",
         "prompt": stage2_prompt,
         "system": system,
         "max_tokens": 8192,
@@ -1137,7 +1138,7 @@ async fn pass_double_check_via_flash(draft: &str, diff: &str) -> String {
         diff
     );
     let args = json!({
-        "model": "deepseek-v4-flash",
+        "model": "mimo-v2.5",
         "prompt": prompt,
         "system": system,
         "max_tokens": 2048,
@@ -1182,7 +1183,7 @@ async fn verify_findings_via_flash(draft: &str) -> String {
         draft
     );
     let args = json!({
-        "model": "deepseek-v4-flash",
+        "model": "mimo-v2.5",
         "prompt": prompt,
         "system": system,
         "max_tokens": 4096,
@@ -1236,7 +1237,7 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
         two_stage_review(&prompt, &system).await
     } else {
         let review_args = json!({
-            "model": "deepseek-v4-pro",
+            "model": "mimo-v2.5-pro",
             "prompt": prompt,
             "system": system,
             "max_tokens": 8192,

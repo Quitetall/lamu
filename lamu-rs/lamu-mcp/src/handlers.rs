@@ -618,7 +618,7 @@ impl LamuMcpServer {
             _ => return "error: 'tasks' must be a non-empty array".into(),
         };
         let default_model = args["default_model"].as_str()
-            .unwrap_or("deepseek-v4-flash").to_string();
+            .unwrap_or("mimo-v2.5").to_string();
         let default_system = args["default_system"].as_str().unwrap_or("").to_string();
         let user_max = args["max_concurrency"].as_u64().map(|n| n as usize);
 

@@ -100,7 +100,7 @@ fn schema_cloud_query() -> Value {
         "type": "object",
         "properties": {
             "prompt": {"type": "string", "description": "User prompt"},
-            "model": {"type": "string", "description": "Cloud model name from cloud-models.yaml (e.g. 'deepseek-v4-flash', 'claude-haiku-4-5'). Defaults to 'deepseek-v4-flash'.", "default": "deepseek-v4-flash"},
+            "model": {"type": "string", "description": "Cloud model name from cloud-models.yaml (e.g. 'mimo-v2.5', 'mimo-v2.5-pro', 'deepseek-v4-flash', 'claude-haiku-4-5'). Defaults to 'mimo-v2.5'.", "default": "mimo-v2.5"},
             "system": {"type": "string", "description": "System prompt", "default": ""},
             "max_tokens": {"type": "integer", "default": 8192},
             "temperature": {"type": "number", "default": 0.3},
@@ -264,7 +264,7 @@ fn schema_parallel_query() -> Value {
                     "required": ["prompt"]
                 }
             },
-            "default_model": {"type": "string", "default": "deepseek-v4-flash"},
+            "default_model": {"type": "string", "default": "mimo-v2.5"},
             "default_system": {"type": "string", "default": ""},
             "max_concurrency": {"type": "integer", "description": "Optional cap that overrides per-provider defaults (downwards only — never raises an unproven provider above 1)."}
         },
