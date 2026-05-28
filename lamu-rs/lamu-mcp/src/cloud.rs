@@ -887,8 +887,7 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
         if trivial {
             tracing::debug!("v6 N: skipping Flash 2nd-pass on trivial diff");
             review
-        } else if review.contains("\nPASS\n") || review.contains("\nPASS.")
-            || review.starts_with("PASS\n") || review.starts_with("PASS.") {
+        } else if is_clean_pass(&review) {
             // PASS path — scan for false negatives
             let diff = git_show_diff_or_empty(commit, std::path::Path::new(repo));
             pass_double_check_via_flash(&review, &diff).await
@@ -1163,6 +1162,59 @@ async fn pass_double_check_via_flash(draft: &str, diff: &str) -> String {
     )
 }
 
+/// True when the review's verdict is a clean PASS — no findings to
+/// filter. Routes the Flash second pass: clean PASS → scan for false
+/// NEGATIVES (pass_double_check_via_flash); anything else (PASS WITH
+/// NITS / NEEDS CHANGES / REJECT) → FP-drop filter (verify_findings).
+///
+/// Robust to the documented verdict vocabulary + a "Verdict:" label and
+/// markdown "**PASS**" bold, unlike the prior exact "\nPASS\n" substring
+/// check which misrouted "PASS WITH NITS" into the false-negative branch.
+fn is_clean_pass(review: &str) -> bool {
+    review.lines().any(|line| {
+        let v = line.trim();
+        let v = v.strip_prefix("Verdict:").map(str::trim).unwrap_or(v);
+        let v = v.trim_matches('*').trim(); // strip markdown bold **PASS**
+        match v.strip_prefix("PASS") {
+            // "PASS" / "PASS." / "PASS — …" / "PASS: …" → clean.
+            // "PASS WITH NITS" → rest is " WITH …" → not clean.
+            // "PASSED" → rest "ED" → not clean.
+            Some(rest) => {
+                let r = rest.trim_start();
+                r.is_empty()
+                    || r.starts_with('.')
+                    || r.starts_with(':')
+                    || r.starts_with('—')
+                    || r.starts_with('-')
+            }
+            None => false,
+        }
+    })
+}
+
+/// Text-only trivial-diff heuristic for review_diff, which (unlike
+/// review_commit) has no commit SHA to run `git show --shortstat`
+/// against. Counts changed files via `diff --git` headers and added
+/// lines (`+` excluding the `+++` file header). Same thresholds as
+/// is_trivial_diff — small diffs skip the Flash second pass since the
+/// double-check mostly catches issues in substantive changes. A raw
+/// pasted chunk without `diff --git` headers has files=0, so only the
+/// added-line gate applies.
+fn is_trivial_diff_text(diff: &str) -> bool {
+    const MAX_LINES: usize = 50;
+    const MAX_FILES: usize = 3;
+    let mut added = 0usize;
+    let mut files = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            files += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        }
+    }
+    added <= MAX_LINES && files <= MAX_FILES
+}
+
 fn git_show_diff_or_empty(commit: &str, repo: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
         .current_dir(repo)
@@ -1251,6 +1303,22 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
             "include_reasoning": false,
         });
         handle_cloud_query(review_args).await
+    };
+
+    // Verify-before-fix self-reflection — same two-direction pass as
+    // review_commit (audit: review_diff previously had NO FP filter
+    // despite tools.rs advertising "same reviewer policy"). review_diff
+    // carries the diff text directly, so both directions work: a clean
+    // PASS scans for false negatives, findings get the FP-drop filter.
+    // Skip on trivial diffs (matches review_commit's cost optimization).
+    let review = if !review.starts_with("error:") && !is_trivial_diff_text(&diff) {
+        if is_clean_pass(&review) {
+            pass_double_check_via_flash(&review, &diff).await
+        } else {
+            verify_findings_via_flash(&review).await
+        }
+    } else {
+        review
     };
 
     let review = if preset.critic_pass_on() && !review.starts_with("error:") {
@@ -1364,6 +1432,44 @@ mod tests {
         assert!(out.len() < s.len());
         assert!(out.contains("truncated"));
         assert!(out.contains("900 more bytes"));
+    }
+
+    #[test]
+    fn is_clean_pass_recognizes_clean_verdicts() {
+        assert!(is_clean_pass("PASS\n\nRecommend: ship"));
+        assert!(is_clean_pass("**PASS**"));
+        assert!(is_clean_pass("Verdict: PASS — looks good"));
+        assert!(is_clean_pass("Verdict: PASS"));
+        assert!(is_clean_pass("preamble line\nPASS.\nRecommend: ship"));
+        assert!(is_clean_pass("PASS: clean, nothing to flag"));
+    }
+
+    #[test]
+    fn is_clean_pass_rejects_findings_and_non_pass() {
+        // Has nits/findings — must route to the FP-drop filter, not the
+        // false-negative double-check.
+        assert!(!is_clean_pass("PASS WITH NITS\n\n1. STYLE foo"));
+        assert!(!is_clean_pass("**PASS WITH NITS**"));
+        assert!(!is_clean_pass("Verdict: PASS WITH NITS"));
+        assert!(!is_clean_pass("NEEDS CHANGES\n\n1. BUG bar"));
+        assert!(!is_clean_pass("REJECT"));
+        assert!(!is_clean_pass("PASSED the build"));
+        assert!(!is_clean_pass("no verdict at all"));
+    }
+
+    #[test]
+    fn is_trivial_diff_text_thresholds() {
+        // Small raw chunk (no diff --git headers) → trivial.
+        assert!(is_trivial_diff_text("+one added line\n-one removed"));
+        // > 50 added lines → not trivial.
+        let big: String = (0..60).map(|i| format!("+line {i}\n")).collect();
+        assert!(!is_trivial_diff_text(&big));
+        // 4 changed files → not trivial (even if few lines).
+        let many_files = "diff --git a/1 b/1\n+x\ndiff --git a/2 b/2\n+x\n\
+                          diff --git a/3 b/3\n+x\ndiff --git a/4 b/4\n+x\n";
+        assert!(!is_trivial_diff_text(many_files));
+        // +++ header is NOT counted as an added line.
+        assert!(is_trivial_diff_text("diff --git a/f b/f\n+++ b/f\n+just one"));
     }
 
     #[test]
