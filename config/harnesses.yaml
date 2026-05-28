@@ -132,3 +132,23 @@ harnesses:
     cmd: opencode
     extra_env:
       OPENCODE_MODEL: lamu/lamu
+
+  omp:
+    # Oh My Pi (the bun-native fork of pi). Reads ~/.omp/agent/models.json
+    # for provider overrides and XIAOMI_API_KEY for xiaomi auth. Bundled
+    # baseUrl points at api.xiaomimimo.com (canonical); override to the
+    # tp- token-plan host via ~/.omp/agent/models.json.
+    #
+    # Setup: run scripts/setup-omp-mimo.sh once. Requires bun >= 1.3.14.
+    flavor: openai
+    cmd: omp
+    extra_env:
+      XIAOMI_API_KEY: $MIMO_API_KEY
+
+  omp-mimo:
+    # Explicit MiMo variant — pins --model xiaomi/mimo-v2.5-pro via env.
+    flavor: openai
+    cmd: omp
+    extra_env:
+      XIAOMI_API_KEY: $MIMO_API_KEY
+      PI_MODEL: xiaomi/mimo-v2.5-pro
