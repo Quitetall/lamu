@@ -127,11 +127,26 @@ fn firejail_args(opts: &SandboxOpts, cmd_argv: &[String]) -> Vec<String> {
         "--noprofile".into(),
         "--private-tmp".into(),
         format!("--private={}", opts.workdir.display()),
+        // Allowlist /etc instead of relying solely on per-secret
+        // blacklists: firejail builds a FRESH /etc containing only these
+        // entries, so everything else on the host /etc — /etc/shadow,
+        // /etc/sudoers, other users' configs, etc. — is simply absent.
+        // This closes the prior denylist's gap (where /etc/passwd, /var,
+        // and arbitrary host files outside the blacklist stayed readable)
+        // and mirrors bwrap's allowlist posture as closely as firejail
+        // allows. The list covers TLS + name resolution + the minimal
+        // identity files most tools expect.
+        "--private-etc=ssl,ca-certificates,resolv.conf,hosts,nsswitch.conf,passwd,group,localtime,timezone,services,protocols,gitconfig".into(),
+        // Minimal /dev; hide removable/mounted volumes.
+        "--private-dev".into(),
+        "--disable-mnt".into(),
         "--no3d".into(),
         "--nogroups".into(),
         "--nonewprivs".into(),
         "--noroot".into(),
         "--seccomp".into(),
+        // Defense-in-depth: keep the high-value secrets explicitly blocked
+        // even though --private-etc / --private already hide most of them.
         "--blacklist=/root".into(),
         "--blacklist=/etc/sudoers".into(),
         "--blacklist=/etc/shadow".into(),
@@ -152,6 +167,13 @@ fn firejail_args(opts: &SandboxOpts, cmd_argv: &[String]) -> Vec<String> {
 
 pub fn run(opts: &SandboxOpts, cmd_argv: &[String]) -> Result<std::process::ExitStatus> {
     let backend = detect_backend();
+    if backend == SandboxBackend::Firejail {
+        eprintln!(
+            "[sandbox] WARNING: bubblewrap not found — falling back to firejail, \
+             a weaker sandbox. Install the `bubblewrap` package via your system \
+             package manager for the stronger empty-namespace allowlist."
+        );
+    }
     let (prog, args) = build_launch(backend.clone(), opts, cmd_argv)?;
     eprintln!("[sandbox: {:?}] running {:?}", backend, cmd_argv);
     let status = Command::new(&prog).args(&args).status()
@@ -192,5 +214,17 @@ mod tests {
         assert!(args.iter().any(|a| a.contains(".ssh")));
         assert!(args.iter().any(|a| a.contains("sudoers")));
         assert!(args.iter().any(|a| a == "--net=none"));
+    }
+
+    #[test]
+    fn firejail_args_allowlist_etc_and_hide_mounts() {
+        // The allowlist (--private-etc) is the load-bearing upgrade: it
+        // hides everything in host /etc not explicitly listed, instead of
+        // leaning on per-secret blacklists.
+        let opts = SandboxOpts::new(PathBuf::from("/tmp/proj"));
+        let args = firejail_args(&opts, &["echo".into()]);
+        assert!(args.iter().any(|a| a.starts_with("--private-etc=")), "missing --private-etc allowlist");
+        assert!(args.iter().any(|a| a == "--private-dev"));
+        assert!(args.iter().any(|a| a == "--disable-mnt"));
     }
 }

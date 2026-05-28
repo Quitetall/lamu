@@ -290,12 +290,73 @@ fn cmd_rollback(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn git_repo_root(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+}
+
 fn cmd_agent(allow_net: bool, cmd: Vec<String>) -> Result<()> {
     if cmd.is_empty() {
         anyhow::bail!("usage: lamu agent [--net] -- <command...>");
     }
+
     let cwd = std::env::current_dir()?;
-    let mut opts = sandbox::launcher::SandboxOpts::new(cwd);
+
+    // Opt-in filesystem isolation: LAMU_AGENT_WORKTREE=1 runs the agent in
+    // a dedicated git worktree (branch agent/<id>) instead of binding the
+    // live cwd, so concurrent `lamu agent` runs don't collide on the same
+    // working tree. OFF by default — most callers want edits to land in
+    // the cwd they launched from; auto-creating a worktree would silently
+    // redirect their writes. The bubblewrap namespace (pid/net/user) is
+    // isolated regardless; this adds *filesystem* isolation when asked.
+    // create_worktree failure propagates BEFORE the snapshot below, so a
+    // failed run never leaves an orphaned snapshot.
+    let worktree = if std::env::var("LAMU_AGENT_WORKTREE").as_deref() == Ok("1") {
+        match git_repo_root(&cwd) {
+            Some(repo) => {
+                let session = sandbox::new_session_id();
+                let wt = sandbox::preserve::create_worktree(&session, &repo)?;
+                eprintln!(
+                    "[sandbox] agent worktree: {} (branch agent/{session})\n\
+                     [sandbox]   merge your changes back with `git worktree`/`git cherry-pick`, \
+                     then `git worktree remove` to clean up.",
+                    wt.display()
+                );
+                Some(wt)
+            }
+            None => {
+                eprintln!("[sandbox] LAMU_AGENT_WORKTREE=1 but cwd is not a git repo — using cwd");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Rollback coverage: capture a git snapshot so `lamu undo` / `lamu
+    // agents` cover sandboxed agent runs (previously only the chat-TUI
+    // path did). Only needed when the agent writes into the live cwd — in
+    // worktree mode the changes live on an isolated branch, rolled back
+    // with `git worktree remove`. Best-effort: failure must not block.
+    let workdir = match worktree {
+        Some(wt) => wt,
+        None => {
+            match sandbox::snap::Snapshot::capture("agent") {
+                Ok(s) => eprintln!("[sandbox] snapshot {} captured — `lamu undo` to restore", s.session_id),
+                Err(e) => eprintln!("[sandbox] warning: snapshot capture failed: {e}"),
+            }
+            cwd
+        }
+    };
+
+    let mut opts = sandbox::launcher::SandboxOpts::new(workdir);
     if allow_net { opts = opts.with_net(); }
     let status = sandbox::launcher::run(&opts, &cmd)?;
     if !status.success() {
