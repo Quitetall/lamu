@@ -529,6 +529,11 @@ async fn stream_response(
         let mut pending = String::new();
         let mut in_reasoning = false;
         let mut reasoning_done = false;
+        // Empty-backend gate state: did the backend yield ANY non-empty
+        // token, and what finish_reason (if any) did it report? Mirrors
+        // the non-streaming 502 backend_returned_empty gate.
+        let mut any_content = false;
+        let mut finish_reason = String::new();
 
         use futures_util::stream::StreamExt;
         while let Some(chunk_res) = byte_stream.next().await {
@@ -553,6 +558,12 @@ async fn stream_response(
                         let chunk = make_chunk(&completion_id, created, &model_name, &pending);
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
+                    if streaming_backend_empty(any_content, &finish_reason) {
+                        let err = json!({"error": {"type":"backend_returned_empty","message":"backend produced no content and no legitimate finish reason"}});
+                        yield Ok(Event::default().data(err.to_string()));
+                        yield Ok(Event::default().data("[DONE]"));
+                        return;
+                    }
                     let done_chunk = json!({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -565,12 +576,16 @@ async fn stream_response(
                     return;
                 }
                 let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
+                if let Some(fr) = finish_reason_of(&val) {
+                    finish_reason = fr.to_string();
+                }
                 let Some(token) = val.get("choices").and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
                     .and_then(|d| d.get("content"))
                     .and_then(|c| c.as_str())
                 else { continue };
                 if token.is_empty() { continue; }
+                any_content = true;
 
                 pending.push_str(token);
 
@@ -620,6 +635,12 @@ async fn stream_response(
             let chunk = make_chunk(&completion_id, created, &model_name, &pending);
             yield Ok(Event::default().data(chunk.to_string()));
         }
+        if streaming_backend_empty(any_content, &finish_reason) {
+            let err = json!({"error": {"type":"backend_returned_empty","message":"backend produced no content and no legitimate finish reason"}});
+            yield Ok(Event::default().data(err.to_string()));
+            yield Ok(Event::default().data("[DONE]"));
+            return;
+        }
         let done_chunk = json!({
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -632,6 +653,29 @@ async fn stream_response(
     };
 
     Sse::new(Box::pin(s))
+}
+
+/// Extract `choices[0].finish_reason` as a borrowed str when present and
+/// non-null. All three streaming bridges read the same OpenAI-format
+/// upstream (lamu's llama-server at :PORT/v1/chat/completions — the
+/// Ollama/Anthropic shapes are client-facing only), so the extraction is
+/// shared to keep the three gate paths from drifting.
+fn finish_reason_of(val: &Value) -> Option<&str> {
+    val.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+}
+
+/// Empty-backend gate for the streaming paths. True when the backend
+/// yielded no usable output (`any_output == false`) AND reported no
+/// legitimate finish reason — i.e. it silently failed (crashed or
+/// dropped the socket) rather than producing a legitimately-empty
+/// completion. Mirrors the non-streaming 502 `backend_returned_empty`
+/// gate's finish-reason allowlist so all four surfaces agree.
+fn streaming_backend_empty(any_output: bool, finish_reason: &str) -> bool {
+    !any_output
+        && !matches!(finish_reason, "stop" | "length" | "tool_calls" | "content_filter")
 }
 
 fn make_chunk(id: &str, created: u64, model: &str, content: &str) -> Value {
@@ -1174,7 +1218,7 @@ async fn stream_response_anthropic(
                 if rest == "[DONE]" { break 'read; }
                 let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
                 let choice = val.get("choices").and_then(|c| c.get(0));
-                if let Some(fr) = choice.and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()) {
+                if let Some(fr) = finish_reason_of(&val) {
                     finish_reason = fr.to_string();
                 }
                 let delta = choice.and_then(|c| c.get("delta"));
@@ -1217,8 +1261,7 @@ async fn stream_response_anthropic(
         // zero tool calls, and no legitimate finish reason ⇒ the backend
         // silently failed. Emit an Anthropic `error` event instead of
         // reporting a clean (but empty) completion.
-        let legit_finish = matches!(finish_reason.as_str(), "stop" | "length" | "tool_calls" | "content_filter");
-        if out_tokens == 0 && tool_acc.is_empty() && !legit_finish {
+        if streaming_backend_empty(out_tokens > 0 || !tool_acc.is_empty(), &finish_reason) {
             // Close the index-0 text block (opened pre-loop) before the
             // error so block-lifecycle-tracking clients see valid SSE.
             let cb_stop = json!({"type":"content_block_stop","index":0});
@@ -1509,32 +1552,22 @@ async fn stream_response_ollama(
         let mut byte_stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut out_tokens: u64 = 0;
+        // Empty-backend gate state (mirrors the non-streaming 502).
+        let mut finish_reason = String::new();
 
         use futures_util::stream::StreamExt;
-        while let Some(chunk_res) = byte_stream.next().await {
-            let Ok(bytes) = chunk_res else { break };
+        'read: while let Some(chunk_res) = byte_stream.next().await {
+            let Ok(bytes) = chunk_res else { break 'read };
             buf.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(nl) = buf.find('\n') {
                 let line: String = buf.drain(..=nl).collect();
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("data: ") else { continue };
-                if rest == "[DONE]" {
-                    let final_obj = json!({
-                        "model": model_name,
-                        "created_at": rfc3339_now(),
-                        "message": {"role":"assistant","content":""},
-                        "done_reason":"stop",
-                        "done": true,
-                        "total_duration": 0,
-                        "load_duration": 0,
-                        "prompt_eval_count": 0,
-                        "eval_count": out_tokens,
-                        "eval_duration": 0,
-                    });
-                    yield Ok(format!("{}\n", final_obj).into_bytes());
-                    return;
-                }
+                if rest == "[DONE]" { break 'read; }
                 let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
+                if let Some(fr) = finish_reason_of(&val) {
+                    finish_reason = fr.to_string();
+                }
                 let Some(token) = val.get("choices").and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
                     .and_then(|d| d.get("content"))
@@ -1551,6 +1584,34 @@ async fn stream_response_ollama(
                 yield Ok(format!("{}\n", chunk).into_bytes());
             }
         }
+
+        // Single close path for both [DONE] and bare socket close (the
+        // latter previously emitted NOTHING — clients hung waiting for a
+        // done marker). Empty-backend gate: zero tokens + no legitimate
+        // finish reason ⇒ emit an error line instead of a clean done.
+        if streaming_backend_empty(out_tokens > 0, &finish_reason) {
+            let err = json!({
+                "model": model_name,
+                "created_at": rfc3339_now(),
+                "error": "backend_returned_empty: backend produced no content and no legitimate finish reason",
+                "done": true,
+            });
+            yield Ok(format!("{}\n", err).into_bytes());
+            return;
+        }
+        let final_obj = json!({
+            "model": model_name,
+            "created_at": rfc3339_now(),
+            "message": {"role":"assistant","content":""},
+            "done_reason":"stop",
+            "done": true,
+            "total_duration": 0,
+            "load_duration": 0,
+            "prompt_eval_count": 0,
+            "eval_count": out_tokens,
+            "eval_duration": 0,
+        });
+        yield Ok(format!("{}\n", final_obj).into_bytes());
     };
 
     let stream_body = axum::body::Body::from_stream(body_stream);
@@ -1735,6 +1796,24 @@ mod compat_tests {
         }"#;
         let req: OllamaChatRequest = serde_json::from_str(body).expect("parse");
         assert_eq!(req.enable_thinking, None);
+    }
+
+    // ── streaming empty-backend gate ────────────────────────────────
+
+    #[test]
+    fn streaming_gate_fires_only_on_silent_failure() {
+        // Silent failure: no output AND no legitimate finish reason.
+        assert!(streaming_backend_empty(false, ""));
+        assert!(streaming_backend_empty(false, "error"));
+        assert!(streaming_backend_empty(false, "null"));
+        // Legitimately-empty completion (model chose to stop) → NOT a gate.
+        assert!(!streaming_backend_empty(false, "stop"));
+        assert!(!streaming_backend_empty(false, "length"));
+        assert!(!streaming_backend_empty(false, "tool_calls"));
+        assert!(!streaming_backend_empty(false, "content_filter"));
+        // Any output → never a gate, regardless of finish reason.
+        assert!(!streaming_backend_empty(true, ""));
+        assert!(!streaming_backend_empty(true, "stop"));
     }
 
     // ── Anthropic tool translator ───────────────────────────────────
