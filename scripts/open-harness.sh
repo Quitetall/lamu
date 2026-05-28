@@ -178,7 +178,12 @@ fi
 
 case "$NAME" in
   pi)
-    [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--provider lamu --model "$LAMU_MODEL")
+    # Force the lamu provider so bare `just open pi` hits LOCAL lamu, not
+    # whatever defaultProvider ~/.pi/agent/settings.json carries (which
+    # setup-pi-mimo.sh may have flipped to MiMo cloud). pi forwards the
+    # `lamu` model id to lamu serve, whose router resolves it → main
+    # entry. Override the model via LAMU_MODEL.
+    MODEL_ARGS+=(--provider lamu --model "${LAMU_MODEL:-lamu}")
     # Safe-default tool allowlist for pi. Default is read-only — pi
     # otherwise enables `bash`, `edit`, `write` automatically, which
     # turn a prompt-injection into arbitrary file/cmd execution
@@ -219,8 +224,31 @@ case "$NAME" in
   codex|codex-mimo)
     [[ -n "$LAMU_MODEL" ]] && export OPENAI_MODEL="$LAMU_MODEL"
     ;;
-  aider|aider-mimo)
+  aider)
+    # aider keys its OpenAI endpoint off OPENAI_API_BASE, NOT the newer
+    # OPENAI_BASE_URL the openai flavor exports — so set it here (scoped
+    # to aider, not every openai-flavor harness). aider-mimo's extra_env
+    # already sets OPENAI_API_BASE to the MiMo host, so it's handled
+    # separately below and we must NOT clobber it here.
+    export OPENAI_API_BASE="$LAMU_URL/v1"
     [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--model "openai/$LAMU_MODEL")
+    ;;
+  aider-mimo)
+    # OPENAI_API_BASE already pointed at the MiMo host via extra_env.
+    [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--model "openai/$LAMU_MODEL")
+    ;;
+  omp)
+    # Oh My Pi reads ~/.omp/agent/{models.json,config.yml}: the xiaomi
+    # provider baseUrl is set by scripts/setup-omp-mimo.sh, and the
+    # default model lives in config.yml (modelRoles.default). omp has no
+    # OPENAI_BASE_URL / PI_MODEL knob — pin a model only via --model when
+    # the caller asks (LAMU_MODEL), else fall through to config.yml.
+    [[ -n "$LAMU_MODEL" ]] && MODEL_ARGS+=(--model "$LAMU_MODEL")
+    ;;
+  omp-mimo)
+    # Explicit MiMo route. omp is pinned via its --model flag (the prior
+    # PI_MODEL env was a no-op — omp never reads it). LAMU_MODEL overrides.
+    MODEL_ARGS+=(--model "${LAMU_MODEL:-xiaomi/mimo-v2.5-pro}")
     ;;
   *)
     if [[ -n "$LAMU_MODEL" ]]; then

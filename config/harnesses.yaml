@@ -146,9 +146,10 @@ harnesses:
       XIAOMI_API_KEY: $MIMO_API_KEY
 
   omp-mimo:
-    # Explicit MiMo variant — pins --model xiaomi/mimo-v2.5-pro via env.
+    # Explicit MiMo variant. The model is pinned by open-harness.sh's
+    # `omp-mimo)` case via omp's `--model xiaomi/mimo-v2.5-pro` flag —
+    # omp has no PI_MODEL env (the old one here was a silent no-op).
     flavor: openai
     cmd: omp
     extra_env:
       XIAOMI_API_KEY: $MIMO_API_KEY
-      PI_MODEL: xiaomi/mimo-v2.5-pro
