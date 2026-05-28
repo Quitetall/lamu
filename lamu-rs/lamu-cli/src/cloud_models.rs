@@ -122,7 +122,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             chat_path: None,
         },
         // Xiaomi MiMo V2.5 — OpenAI-compat endpoint at
-        // https://token-plan-sgp.xiaomimimo.com/v1. Anthropic-compat
+        // https://api.xiaomimimo.com/v1. Anthropic-compat
         // available at /anthropic on the same host.
         CloudModel {
             name: "mimo-v2.5-pro".into(),
@@ -132,7 +132,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Xiaomi MiMo V2.5 Pro — flagship reasoning.".into(),
             quota: QuotaState::Available,
             api_key_env: Some("MIMO_API_KEY".into()),
-            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            base_url: Some("https://api.xiaomimimo.com/v1".into()),
             chat_path: None,
         },
         CloudModel {
@@ -143,7 +143,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Xiaomi MiMo V2.5 — workhorse chat.".into(),
             quota: QuotaState::Available,
             api_key_env: Some("MIMO_API_KEY".into()),
-            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            base_url: Some("https://api.xiaomimimo.com/v1".into()),
             chat_path: None,
         },
         CloudModel {
@@ -154,7 +154,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Xiaomi MiMo V2 Pro — prior gen flagship.".into(),
             quota: QuotaState::Available,
             api_key_env: Some("MIMO_API_KEY".into()),
-            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            base_url: Some("https://api.xiaomimimo.com/v1".into()),
             chat_path: None,
         },
         CloudModel {
@@ -165,7 +165,7 @@ pub fn default_seed() -> Vec<CloudModel> {
             notes: "Xiaomi MiMo V2 Omni — multimodal.".into(),
             quota: QuotaState::Available,
             api_key_env: Some("MIMO_API_KEY".into()),
-            base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".into()),
+            base_url: Some("https://api.xiaomimimo.com/v1".into()),
             chat_path: None,
         },
     ]
@@ -200,7 +200,7 @@ pub fn provider_template(provider: &str) -> Option<CloudModel> {
         "xai" => Some(make("xai", "XAI_API_KEY", 256_000, "xAI Grok")),
         "mimo" => {
             let mut m = make("mimo", "MIMO_API_KEY", 256_000, "Xiaomi MiMo");
-            m.base_url = Some("https://token-plan-sgp.xiaomimimo.com/v1".into());
+            m.base_url = Some("https://api.xiaomimimo.com/v1".into());
             Some(m)
         }
         _ => None,
