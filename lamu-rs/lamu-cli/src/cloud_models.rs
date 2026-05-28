@@ -127,7 +127,7 @@ pub fn default_seed() -> Vec<CloudModel> {
         CloudModel {
             name: "mimo-v2.5-pro".into(),
             provider: "mimo".into(),
-            model_id: Some("MiMo-V2.5-Pro".into()),
+            model_id: Some("mimo-v2.5-pro".into()),
             context_max: 256_000,
             notes: "Xiaomi MiMo V2.5 Pro — flagship reasoning.".into(),
             quota: QuotaState::Available,
@@ -138,7 +138,7 @@ pub fn default_seed() -> Vec<CloudModel> {
         CloudModel {
             name: "mimo-v2.5".into(),
             provider: "mimo".into(),
-            model_id: Some("MiMo-V2.5".into()),
+            model_id: Some("mimo-v2.5".into()),
             context_max: 256_000,
             notes: "Xiaomi MiMo V2.5 — workhorse chat.".into(),
             quota: QuotaState::Available,
@@ -149,7 +149,7 @@ pub fn default_seed() -> Vec<CloudModel> {
         CloudModel {
             name: "mimo-v2-pro".into(),
             provider: "mimo".into(),
-            model_id: Some("MiMo-V2-Pro".into()),
+            model_id: Some("mimo-v2-pro".into()),
             context_max: 256_000,
             notes: "Xiaomi MiMo V2 Pro — prior gen flagship.".into(),
             quota: QuotaState::Available,
@@ -160,7 +160,7 @@ pub fn default_seed() -> Vec<CloudModel> {
         CloudModel {
             name: "mimo-v2-omni".into(),
             provider: "mimo".into(),
-            model_id: Some("MiMo-V2-Omni".into()),
+            model_id: Some("mimo-v2-omni".into()),
             context_max: 256_000,
             notes: "Xiaomi MiMo V2 Omni — multimodal.".into(),
             quota: QuotaState::Available,
