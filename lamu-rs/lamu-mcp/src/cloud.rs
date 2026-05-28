@@ -51,6 +51,28 @@ pub(crate) fn provider_concurrency(model_name: &str, cloud: &[CloudModel]) -> us
     }
 }
 
+/// Process-global per-provider concurrency semaphore. Created once per
+/// provider on first use; the `cap` arg only takes effect on creation.
+///
+/// Lives here (not on LamuMcpServer) so it gates EVERY cloud request —
+/// standalone `cloud_query`, the reviewer pipeline, AND `parallel_query`
+/// tasks (which call handle_cloud_query) — with one shared limit. The
+/// audit found parallel_query's per-invocation semaphores let N
+/// concurrent callers each get a full "8 each", and standalone
+/// cloud_query had no gate at all; a single global semaphore per provider
+/// closes both holes.
+fn cloud_provider_sem(provider: &str, cap: usize) -> std::sync::Arc<tokio::sync::Semaphore> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Semaphore;
+    static SEMS: OnceLock<Mutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
+    let map = SEMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(provider.to_string())
+        .or_insert_with(|| Arc::new(Semaphore::new(cap.max(1))))
+        .clone()
+}
+
 // ── list_cloud_models ────────────────────────────────────────────────
 
 pub(crate) fn handle_list_cloud_models() -> String {
@@ -203,6 +225,20 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     // contain "anthropic" (e.g. a proxy domain) — every cloud-models.yaml
     // entry already declares its provider, so trust that.
     let is_anthropic = entry.provider == "anthropic";
+
+    // Global per-provider concurrency gate. Held for the whole request so
+    // the in-flight count across ALL cloud paths can't exceed the
+    // provider's cap (parallel_query's per-call sems were per-invocation;
+    // standalone cloud_query had none). handle_cloud_query never recurses,
+    // so this can't self-deadlock even at cap=1.
+    let provider_cap = provider_concurrency(model_name, &models);
+    let _permit = {
+        let sem = cloud_provider_sem(&entry.provider, provider_cap);
+        match sem.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return "error: cloud concurrency semaphore closed".into(),
+        }
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
