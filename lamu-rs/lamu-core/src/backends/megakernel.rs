@@ -72,6 +72,7 @@ impl Backend for MegakernelBackend {
             .env("CUDA_VISIBLE_DEVICES", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        crate::backends::harden_child_command(&mut cmd);
 
         let child = cmd.spawn()
             .map_err(|e| Error::Backend(format!("spawn failed: {}", e)))?;

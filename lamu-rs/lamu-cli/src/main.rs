@@ -416,9 +416,18 @@ async fn cmd_start() -> Result<()> {
                     let model_id = model_id.to_lowercase();
                     for entry in &entries_vec {
                         if entry.name.contains(&model_id) || model_id.contains(entry.name.as_str()) {
-                            let pids = scheduler.query_gpu_pids();
-                            let vram = pids.iter().map(|(_, m)| *m).max().unwrap_or(entry.vram_mb);
-                            scheduler.register_loaded(entry.clone(), None, port, vram);
+                            // Use the registry's declared footprint for THIS
+                            // model. The llama-server was started outside this
+                            // lamu process, so we don't have its PID to attribute
+                            // a specific GPU process to it. The prior
+                            // `query_gpu_pids().max()` stamped every
+                            // auto-registered model with the single largest GPU
+                            // process globally — double-counting when both ports
+                            // are live, and mis-estimating eviction freed-math.
+                            // available_mb() still clamps the aggregate to NVML
+                            // truth, so the declared per-model size is the honest
+                            // estimate for budget + eviction.
+                            scheduler.register_loaded(entry.clone(), None, port, entry.vram_mb);
                             break;
                         }
                     }

@@ -326,6 +326,7 @@ impl Backend for LlamaCppBackend {
             cmd.env(k, v);
         }
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        crate::backends::harden_child_command(&mut cmd);
 
         let child = cmd.spawn()
             .map_err(|e| Error::Backend(format!("spawn failed: {}", e)))?;

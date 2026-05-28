@@ -194,7 +194,39 @@ impl LamuMcpServer {
             }
         }
 
+        // Graceful teardown on a clean shutdown (SIGTERM / SIGINT / stdin
+        // EOF — the loop `break`s above). Without this, the loaded
+        // llama-server children were only reaped by Child-drop, which on
+        // some exit paths never ran → leaked VRAM. We now SIGTERM each
+        // backend (KV/log flush) before exit. The orphan-watchdog's
+        // exit(0) path can't reach here — that's covered by the
+        // children's PR_SET_PDEATHSIG — and kill_on_drop is the final
+        // backstop if this drain is skipped or times out.
+        self.drain_backends_on_shutdown().await;
+
         Ok(())
+    }
+
+    /// Best-effort graceful unload of every loaded backend at shutdown.
+    /// Bounded per-backend so a wedged child can't hang the exit; the
+    /// child's kill_on_drop + PDEATHSIG guarantee it dies regardless.
+    async fn drain_backends_on_shutdown(&self) {
+        let handles: Vec<(String, BackendHandle)> = {
+            let mut st = self.state.lock();
+            st.backends.drain().collect()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        tracing::info!("shutdown: draining {} backend(s)", handles.len());
+        for (name, backend_arc) in handles {
+            let mut b = backend_arc.lock().await;
+            match tokio::time::timeout(std::time::Duration::from_secs(10), b.unload()).await {
+                Ok(Ok(_)) => tracing::info!("shutdown: unloaded {}", name),
+                Ok(Err(e)) => warn!("shutdown: unload({}) errored: {}", name, e),
+                Err(_) => warn!("shutdown: unload({}) timed out — kill_on_drop/PDEATHSIG will reap", name),
+            }
+        }
     }
 
     /// Dispatch one JSON-RPC request. The stdio loop in `run()` calls

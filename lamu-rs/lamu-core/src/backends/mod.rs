@@ -87,6 +87,57 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Harden a spawned backend child so it can NEVER outlive lamu and leak
+/// its VRAM. Two mechanisms, applied to every backend spawn:
+///
+/// 1. `kill_on_drop(true)` — when the owning `Box<dyn Backend>` (and its
+///    tokio `Child`) drops, the runtime SIGKILLs the process. Covers
+///    normal teardown (ServerState dropping as `lamu start`'s main
+///    returns after a graceful SIGTERM/EOF).
+///
+/// 2. `PR_SET_PDEATHSIG(SIGKILL)` via `pre_exec` — the kernel SIGKILLs
+///    the child the instant lamu dies by ANY means that does NOT run
+///    destructors: a hard crash, `SIGKILL`, or the orphan-watchdog's
+///    `std::process::exit(0)`. Without this, those paths orphan the
+///    llama-server and permanently leak ~20 GB of VRAM.
+///
+/// This is UNCONDITIONAL — unlike lamu's own PDEATHSIG
+/// (lamu-core/src/lifecycle.rs), which respects a `nohup` SIGHUP=SIG_IGN
+/// "survive my parent" marker. A backend must never survive its lamu: an
+/// unmanaged llama-server is pure leak, so we kill it regardless of how
+/// lamu is launched.
+///
+/// Non-Linux (incl. macOS): only `kill_on_drop` applies — there is no
+/// portable `PR_SET_PDEATHSIG` equivalent. lamu's backends are
+/// CUDA/Linux-only in practice, so the gap is theoretical.
+pub(crate) fn harden_child_command(cmd: &mut tokio::process::Command) {
+    cmd.kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `pre_exec` runs in the forked child between fork and
+        // exec, where only async-signal-safe calls are permitted. We use
+        // only `prctl` and `getppid`, both async-signal-safe. The
+        // `getppid() == 1` re-check closes the classic fork-vs-parent-
+        // death race: if lamu already died before this ran, the
+        // PDEATHSIG would be relative to init (pid 1) and never fire, so
+        // we fail the exec instead of spawning an immortal orphan.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() == 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "lamu (parent) died before PDEATHSIG armed",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 /// Graceful child shutdown: SIGTERM, wait up to 10s for the child to
 /// exit cleanly, fall back to SIGKILL if it ignores TERM. Used by every
 /// `Backend::unload` impl so server-side flushes (KV cache, log files,
