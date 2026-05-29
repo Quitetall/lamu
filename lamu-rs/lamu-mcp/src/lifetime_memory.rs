@@ -762,6 +762,10 @@ fn yaml_scalar(s: &str) -> String {
         || s.contains(':')
         || s.contains('#')
         || s.starts_with(['"', '\'', '[', '{', '*', '&', '!', '|', '>', '@', '`'])
+        // Numeric-looking bare scalars (e.g. a kind of "123" or "3.14")
+        // would be read as a YAML number, not a string — quote them too.
+        || s.parse::<i64>().is_ok()
+        || s.parse::<f64>().is_ok()
         || matches!(
             s.to_ascii_lowercase().as_str(),
             "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
@@ -1381,6 +1385,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         assert_eq!(yaml_scalar("#tag"), "\"#tag\"");
         // Empty gets quoted (empty bare scalar is null in YAML).
         assert_eq!(yaml_scalar(""), "\"\"");
+        // Numeric-looking values get quoted so they stay strings.
+        assert_eq!(yaml_scalar("123"), "\"123\"");
+        assert_eq!(yaml_scalar("3.14"), "\"3.14\"");
         // Newlines collapsed to a space before the quote decision.
         assert_eq!(yaml_scalar("line\nbreak"), "line break");
     }
