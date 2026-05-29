@@ -383,10 +383,17 @@ pub async fn consolidate(conversation_id: &str) -> Result<usize> {
     }
 
     let facts = parse_extracted_facts(&resp);
+    // Best-effort: a per-fact embed/insert hiccup (network/rate-limit on
+    // the Nth fact) must NOT abort the rest or hide the facts already
+    // stored. Log-and-continue, return the count actually persisted, so a
+    // transient failure on one fact doesn't both lose the others and make
+    // the caller think nothing was stored.
     let mut stored = 0usize;
     for fact in facts {
-        remember(&fact, "fact", conversation_id).await?;
-        stored += 1;
+        match remember(&fact, "fact", conversation_id).await {
+            Ok(_) => stored += 1,
+            Err(e) => tracing::warn!("consolidate({conversation_id}): store fact failed: {e}"),
+        }
     }
     Ok(stored)
 }
@@ -570,7 +577,9 @@ mod tests {
     #[test]
     fn validate_conversation_id_allowlist() {
         assert!(validate_conversation_id("sess-1_2.3").is_ok());
+        assert!(validate_conversation_id("a.b").is_ok()); // non-leading dot allowed
         assert!(validate_conversation_id("").is_err());
+        assert!(validate_conversation_id(".").is_err()); // bare dot → leading-dot reject
         assert!(validate_conversation_id(".hidden").is_err());
         assert!(validate_conversation_id("a..b").is_err());
         assert!(validate_conversation_id("a/b").is_err());
