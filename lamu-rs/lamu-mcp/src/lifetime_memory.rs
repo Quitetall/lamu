@@ -82,14 +82,17 @@ fn open_memory_db(path: &Path) -> Result<Connection> {
 static MEMORY_DB: OnceLock<Arc<Mutex<Connection>>> = OnceLock::new();
 
 fn memory_db() -> Result<Arc<Mutex<Connection>>> {
+    // Fast path: already initialized.
     if let Some(d) = MEMORY_DB.get() {
         return Ok(d.clone());
     }
+    // Open outside the OnceLock so a failed open doesn't poison the
+    // cell, then publish via get_or_init — under a race the loser's
+    // connection is dropped (not leaked) and everyone shares the winner.
     let path = memory_db_path()?;
     let conn = open_memory_db(&path)?;
-    let arc = Arc::new(Mutex::new(conn));
-    let _ = MEMORY_DB.set(arc.clone());
-    Ok(arc)
+    let arc = MEMORY_DB.get_or_init(|| Arc::new(Mutex::new(conn)));
+    Ok(arc.clone())
 }
 
 fn now_secs() -> i64 {
@@ -225,28 +228,32 @@ pub async fn recall_memory(query: &str, k: usize) -> Result<Vec<MemoryHit>> {
     match openai_key() {
         Some(key) => {
             let qvec = embed_one(query, &key).await?;
-            let conn = arc.lock();
-            let mut stmt = conn
-                .prepare("SELECT id, text, kind, source, ts, embedding FROM memories")?;
-            let mapped = stmt.query_map([], |r| {
-                let id: i64 = r.get(0)?;
-                let text: String = r.get(1)?;
-                let kind: String = r.get(2)?;
-                let source: Option<String> = r.get(3)?;
-                let ts: i64 = r.get(4)?;
-                let emb: Option<Vec<u8>> = r.get(5)?;
-                Ok((id, text, kind, source, ts, emb))
-            })?;
-            let mut rows: Vec<MemoryRow> = Vec::new();
-            for row in mapped {
-                let (id, text, kind, source, ts, emb) = row?;
-                // Skip embedding-less rows in the ranked path.
-                if let Some(blob) = emb {
-                    rows.push((id, text, kind, source, ts, blob_to_vec(&blob)));
+            // Collect rows into a Vec, then release the lock BEFORE
+            // ranking — never hold the mutex across the cosine pass, so
+            // concurrent remember/recall don't serialize behind it.
+            // `embedding IS NOT NULL` skips embedding-less rows in SQL
+            // (the ranked path can't use them anyway).
+            let rows: Vec<MemoryRow> = {
+                let conn = arc.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT id, text, kind, source, ts, embedding FROM memories \
+                     WHERE embedding IS NOT NULL",
+                )?;
+                let mapped = stmt.query_map([], |r| {
+                    let id: i64 = r.get(0)?;
+                    let text: String = r.get(1)?;
+                    let kind: String = r.get(2)?;
+                    let source: Option<String> = r.get(3)?;
+                    let ts: i64 = r.get(4)?;
+                    let emb: Vec<u8> = r.get(5)?;
+                    Ok((id, text, kind, source, ts, blob_to_vec(&emb)))
+                })?;
+                let mut rows = Vec::new();
+                for row in mapped {
+                    rows.push(row?);
                 }
-            }
-            drop(stmt);
-            drop(conn);
+                rows
+            };
             Ok(rank_memories(&qvec, rows, k))
         }
         None => {
@@ -316,9 +323,40 @@ pub(crate) fn parse_extracted_facts(raw: &str) -> Vec<String> {
     facts
 }
 
+/// Same caller-supplied-id allowlist `write_file` / `memory.rs` enforce
+/// — fail fast with a clear message rather than relying on the inner
+/// `recall` validation, so the error surfaces at the tool boundary.
+fn validate_conversation_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(anyhow!("conversation_id is empty"));
+    }
+    if id.starts_with('.') {
+        return Err(anyhow!("conversation_id cannot start with '.': {id}"));
+    }
+    if id.contains("..") {
+        return Err(anyhow!("conversation_id contains '..': {id}"));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "conversation_id contains forbidden character — allowed: [A-Za-z0-9_-.]: {id}"
+        ));
+    }
+    Ok(())
+}
+
 /// Extract durable facts from a conversation via MiMo and store each as
 /// a fact memory keyed by the conversation id. Returns the count stored.
+///
+/// `recall(id, 0)` uses `limit = 0` to mean "no cap" (full transcript).
+/// NOTE: the transcript is sent to MiMo with the spec-mandated
+/// `max_tokens: 1024` for the *output*; an extremely long input
+/// conversation could exceed the model's context window. Input
+/// truncation is a deliberate follow-up (see commit message).
 pub async fn consolidate(conversation_id: &str) -> Result<usize> {
+    validate_conversation_id(conversation_id)?;
     let mem = crate::memory::shared()?;
     let turns = mem.recall(conversation_id, 0)?;
     if turns.is_empty() {
@@ -383,7 +421,9 @@ pub(crate) async fn handle_recall_memory(args: serde_json::Value) -> String {
     if query.is_empty() {
         return "error: query is required".to_string();
     }
-    let k = args["k"].as_u64().unwrap_or(8) as usize;
+    // Cap k so a pathological request can't ask for an unbounded result
+    // set (the underlying scan is already bounded; this bounds output).
+    let k = (args["k"].as_u64().unwrap_or(8) as usize).min(100);
     match recall_memory(query, k).await {
         Ok(hits) if hits.is_empty() => "(no memories matched)".to_string(),
         Ok(hits) => {
@@ -525,6 +565,16 @@ mod tests {
         let raw = "fact one\n\n   \nfact two\n";
         let facts = parse_extracted_facts(raw);
         assert_eq!(facts, vec!["fact one".to_string(), "fact two".to_string()]);
+    }
+
+    #[test]
+    fn validate_conversation_id_allowlist() {
+        assert!(validate_conversation_id("sess-1_2.3").is_ok());
+        assert!(validate_conversation_id("").is_err());
+        assert!(validate_conversation_id(".hidden").is_err());
+        assert!(validate_conversation_id("a..b").is_err());
+        assert!(validate_conversation_id("a/b").is_err());
+        assert!(validate_conversation_id("a b").is_err());
     }
 
     #[test]
