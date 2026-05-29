@@ -159,7 +159,7 @@ pub fn safe_write(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<()> {
             );
         }
     }
-    let before = read_blob(path);
+    let before = read_blob(path)?; // aborts if the target exists but is unreadable (#27)
     journal.append(&JournalEntry::Write {
         path: path.to_path_buf(),
         before,
@@ -208,17 +208,62 @@ fn write_no_follow(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn safe_delete(journal: &Journal, path: &Path) -> Result<()> {
-    let before = read_blob(path);
+    // symlink_metadata does NOT follow the leaf, so we classify the path
+    // itself, never its target.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), // idempotent
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    let ft = meta.file_type();
+
+    if ft.is_symlink() {
+        // Unlink the LINK only — never deref it. The old code's read_blob
+        // followed the symlink and copied the TARGET's bytes into the
+        // journal (info-leak), and rollback would then materialize a
+        // regular file with that content at the link's path (type change).
+        // The journal has no Symlink entry, so a deleted symlink is not
+        // restorable; record before: None. (#18)
+        journal.append(&JournalEntry::Delete {
+            path: path.to_path_buf(),
+            before: None,
+            ts: now_secs(),
+        })?;
+        std::fs::remove_file(path)?; // remove_file on a symlink unlinks the link
+        return Ok(());
+    }
+
+    if ft.is_dir() {
+        // Journal each contained FILE as a restorable Delete (rollback's
+        // create_dir_all recreates parent dirs), THEN wipe the tree. The
+        // old code journaled before: None for the whole directory, so
+        // remove_dir_all destroyed the subtree unrecoverably. Empty
+        // sub-directories are not separately restored — files + their
+        // paths are. (#17) If any file can't be read (read_blob errs), the
+        // whole delete aborts BEFORE remove_dir_all — we never wipe a tree
+        // we couldn't fully journal.
+        let mut files = Vec::new();
+        collect_files_no_follow(path, &mut files)?;
+        for f in &files {
+            let before = read_blob(f)?;
+            journal.append(&JournalEntry::Delete {
+                path: f.clone(),
+                before,
+                ts: now_secs(),
+            })?;
+        }
+        std::fs::remove_dir_all(path)?;
+        return Ok(());
+    }
+
+    // Regular file.
+    let before = read_blob(path)?;
     journal.append(&JournalEntry::Delete {
         path: path.to_path_buf(),
         before,
         ts: now_secs(),
     })?;
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    std::fs::remove_file(path)?;
     Ok(())
 }
 
@@ -292,9 +337,46 @@ pub fn rollback_one(entry: &JournalEntry) -> Result<()> {
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-fn read_blob(path: &Path) -> Option<EncodedBlob> {
-    if !path.exists() || path.is_dir() { return None; }
-    std::fs::read(path).ok().map(|b| EncodedBlob::from_bytes(&b))
+/// Capture a leaf's bytes for the journal. Returns:
+/// - `Ok(None)` when the path doesn't exist, is a directory, or is a
+///   symlink (none of which carry restorable leaf bytes), OR
+/// - `Ok(Some(blob))` for a readable regular file, OR
+/// - `Err(..)` when the path IS a regular file but reading it fails
+///   (EACCES/EIO). The old `std::fs::read(path).ok()` collapsed that last
+///   case to `None`, so `safe_write` journaled `before: None` and a later
+///   rollback DELETED the (unreadable but existing) file. Propagating the
+///   error makes the caller abort instead. (#27)
+fn read_blob(path: &Path) -> Result<Option<EncodedBlob>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    if meta.is_dir() || meta.file_type().is_symlink() {
+        return Ok(None);
+    }
+    match std::fs::read(path) {
+        Ok(b) => Ok(Some(EncodedBlob::from_bytes(&b))),
+        Err(e) => Err(e).with_context(|| format!("read {} for journal", path.display())),
+    }
+}
+
+/// Recursively collect every non-directory leaf (files AND symlinks) under
+/// `dir`, WITHOUT following symlinks (`DirEntry::file_type` reads the entry
+/// type, not the target). Used by `safe_delete` to journal each file before
+/// wiping a tree.
+fn collect_files_no_follow(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let p = entry.path();
+        if ft.is_dir() {
+            collect_files_no_follow(&p, out)?;
+        } else {
+            out.push(p);
+        }
+    }
+    Ok(())
 }
 
 fn now_secs() -> u64 {
@@ -465,6 +547,58 @@ mod tests {
             super::rollback_one(e).unwrap();
         }
         assert_eq!(std::fs::read(&target).unwrap(), b"keepme");
+    }
+
+    #[test]
+    fn safe_delete_dir_recurses_and_rollback_restores_files() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("tree");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(dir.join("sub/b.txt"), b"bravo").unwrap();
+
+        let j = Journal {
+            session_id: "test-delete-dir".into(),
+            path: tmp.path().join("journal.jsonl"),
+        };
+        safe_delete(&j, &dir).unwrap();
+        assert!(!dir.exists(), "tree wiped");
+
+        for e in j.read_all().unwrap().iter().rev() {
+            super::rollback_one(e).unwrap();
+        }
+        // Files (and their parent dirs) restored — the old before:None on
+        // the whole dir made this unrecoverable.
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dir.join("sub/b.txt")).unwrap(), b"bravo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_delete_symlink_unlinks_link_not_target() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("secret.txt");
+        std::fs::write(&target, b"do-not-touch").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let j = Journal {
+            session_id: "test-delete-symlink".into(),
+            path: tmp.path().join("journal.jsonl"),
+        };
+        safe_delete(&j, &link).unwrap();
+
+        assert!(!link.exists(), "link removed");
+        // The TARGET and its bytes are untouched (no deref-and-delete).
+        assert_eq!(std::fs::read(&target).unwrap(), b"do-not-touch");
+        // The journal recorded before: None for the link — no target bytes
+        // leaked into it.
+        let entries = j.read_all().unwrap();
+        let leaked = entries.iter().any(|e| matches!(
+            e,
+            JournalEntry::Delete { before: Some(b), .. } if b.to_bytes().ok() == Some(b"do-not-touch".to_vec())
+        ));
+        assert!(!leaked, "target bytes must not be journaled");
     }
 
     #[test]
