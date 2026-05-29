@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::rag::{blob_to_vec, embed_one, openai_key, vec_to_blob};
-use crate::vector_index::{BruteForceCosine, VectorIndex};
+use crate::vector_index::{vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memories (
@@ -182,27 +182,74 @@ pub async fn remember(text: &str, kind: &str, source: &str) -> Result<i64> {
 ///
 /// `rows` carries only rows that HAVE an embedding (the caller filters
 /// out NULL-embedding rows before building this list).
+/// Build the selected [`VectorIndex`] backend from payload rows and return
+/// the top-`k` scored payloads. Brute is the unchanged default; TurboVec is
+/// reachable only with the `turbovec` feature compiled in AND
+/// `LAMU_VECTOR_BACKEND=turbovec` at runtime (see [`vector_backend`]). Both
+/// branches add the same rows + run the same `.search`, so `rank_memories`'
+/// `MemoryHit` mapping is backend-agnostic.
+fn rank_rows(
+    rows: Vec<(Vec<f32>, MemoryPayload)>,
+    query_emb: &[f32],
+    k: usize,
+) -> Vec<Scored<MemoryPayload>> {
+    fn fill<I: VectorIndex<MemoryPayload>>(
+        mut index: I,
+        rows: Vec<(Vec<f32>, MemoryPayload)>,
+        query_emb: &[f32],
+        k: usize,
+    ) -> Vec<Scored<MemoryPayload>> {
+        for (emb, payload) in rows {
+            index.add(emb, payload);
+        }
+        index.search(query_emb, k)
+    }
+    match vector_backend() {
+        VectorBackend::Brute => {
+            fill(BruteForceCosine::with_capacity(rows.len()), rows, query_emb, k)
+        }
+        VectorBackend::TurboVec => {
+            #[cfg(feature = "turbovec")]
+            {
+                fill(
+                    crate::vector_index::TurboVecIndex::with_capacity(rows.len()),
+                    rows,
+                    query_emb,
+                    k,
+                )
+            }
+            #[cfg(not(feature = "turbovec"))]
+            {
+                fill(BruteForceCosine::with_capacity(rows.len()), rows, query_emb, k)
+            }
+        }
+    }
+}
+
 pub(crate) fn rank_memories(
     query_emb: &[f32],
     rows: Vec<MemoryRow>,
     k: usize,
 ) -> Vec<MemoryHit> {
-    // SEAM: same brute-force cosine index rag.rs uses for repo search.
-    let mut index: BruteForceCosine<MemoryPayload> = BruteForceCosine::with_capacity(rows.len());
-    for (id, text, kind, source, ts, emb) in rows {
-        index.add(
-            emb,
-            MemoryPayload {
-                id,
-                text,
-                kind,
-                source,
-                ts,
-            },
-        );
-    }
-    index
-        .search(query_emb, k)
+    // SEAM: same vector-index seam rag.rs uses for repo search. Build the
+    // payload rows once, then let the selector pick the backend; the
+    // result-mapping below is identical for both branches.
+    let payload_rows: Vec<(Vec<f32>, MemoryPayload)> = rows
+        .into_iter()
+        .map(|(id, text, kind, source, ts, emb)| {
+            (
+                emb,
+                MemoryPayload {
+                    id,
+                    text,
+                    kind,
+                    source,
+                    ts,
+                },
+            )
+        })
+        .collect();
+    rank_rows(payload_rows, query_emb, k)
         .into_iter()
         .map(|hit| MemoryHit {
             id: hit.payload.id,

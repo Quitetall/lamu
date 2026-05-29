@@ -24,7 +24,7 @@
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use crate::vector_index::{BruteForceCosine, VectorIndex};
+use crate::vector_index::{vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -335,6 +335,45 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
     Ok(to_embed.len())
 }
 
+/// Build the selected [`VectorIndex`] backend from already-loaded rows and
+/// return the top-`k` scored payloads. The Brute branch is the unchanged
+/// default path; the TurboVec branch is reachable only with the `turbovec`
+/// feature compiled in AND `LAMU_VECTOR_BACKEND=turbovec` at runtime (see
+/// [`vector_backend`]). Both branches add the same rows + run the same
+/// `.search`, so the caller's result-mapping is backend-agnostic.
+fn search_rows(
+    rows: Vec<(Vec<f32>, (String, String))>,
+    qvec: &[f32],
+    k: usize,
+) -> Vec<Scored<(String, String)>> {
+    fn fill<I: VectorIndex<(String, String)>>(
+        mut index: I,
+        rows: Vec<(Vec<f32>, (String, String))>,
+        qvec: &[f32],
+        k: usize,
+    ) -> Vec<Scored<(String, String)>> {
+        for (emb, payload) in rows {
+            index.add(emb, payload);
+        }
+        index.search(qvec, k)
+    }
+    match vector_backend() {
+        VectorBackend::Brute => fill(BruteForceCosine::new(), rows, qvec, k),
+        VectorBackend::TurboVec => {
+            #[cfg(feature = "turbovec")]
+            {
+                fill(crate::vector_index::TurboVecIndex::new(), rows, qvec, k)
+            }
+            // `vector_backend()` never returns TurboVec without the feature,
+            // but keep the arm total if that ever changes.
+            #[cfg(not(feature = "turbovec"))]
+            {
+                fill(BruteForceCosine::new(), rows, qvec, k)
+            }
+        }
+    }
+}
+
 pub async fn semantic_search(query: &str, k: usize) -> Result<Vec<SearchHit>> {
     let key = openai_key().ok_or_else(|| {
         anyhow!("OPENAI_API_KEY unset — semantic search requires it.")
@@ -352,13 +391,15 @@ pub async fn semantic_search(query: &str, k: usize) -> Result<Vec<SearchHit>> {
     })?;
     // SEAM: swap BruteForceCosine for an ANN/quantized index when the
     // corpus outgrows brute-force (see crate::vector_index for the why).
-    let mut index: BruteForceCosine<(String, String)> = BruteForceCosine::new();
+    // Load the rows once, then build whichever backend the selector picks;
+    // the result-mapping below is identical for both branches.
+    let mut loaded: Vec<(Vec<f32>, (String, String))> = Vec::new();
     for row in rows {
         let (path, content, emb_blob) = row?;
-        index.add(blob_to_vec(&emb_blob), (path, content));
+        loaded.push((blob_to_vec(&emb_blob), (path, content)));
     }
-    Ok(index
-        .search(&qvec, k)
+    let hits = search_rows(loaded, &qvec, k);
+    Ok(hits
         .into_iter()
         .map(|hit| {
             let (path, content) = hit.payload;
