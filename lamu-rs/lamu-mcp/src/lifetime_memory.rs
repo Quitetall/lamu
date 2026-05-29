@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::rag::{blob_to_vec, embed_one, openai_key, vec_to_blob};
-use crate::vector_index::{vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
+use crate::vector_index::{cosine, vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memories (
@@ -445,6 +445,96 @@ pub async fn consolidate(conversation_id: &str) -> Result<usize> {
     Ok(stored)
 }
 
+// ── Autocapture (single-exchange extraction + novelty dedup) ────────
+
+/// Cosine-similarity threshold at/above which a candidate fact is
+/// considered a duplicate of an existing memory and skipped. Chosen high
+/// (0.92) so only near-identical restatements are dropped — distinct but
+/// related facts still land.
+const NOVELTY_THRESHOLD: f32 = 0.92;
+
+/// Extract durable facts from a SINGLE user/assistant exchange via MiMo.
+///
+/// This is `consolidate()`'s extraction step applied to one turn-pair
+/// instead of a whole conversation: build a compact transcript, send it
+/// to MiMo with the shared [`EXTRACTION_PROMPT`], and parse the reply
+/// with [`parse_extracted_facts`]. Deliberately OMITS `conversation_id`
+/// from the cloud args so the recall-and-prepend branch never engages —
+/// it stays a stateless one-shot and cannot recurse into autocapture.
+pub async fn extract_from_exchange(user: &str, assistant: &str) -> Result<Vec<String>> {
+    let transcript = format!("User: {user}\n\nAssistant: {assistant}");
+    let args = serde_json::json!({
+        "model": "mimo-v2.5",
+        "system": EXTRACTION_PROMPT,
+        "prompt": transcript,
+        "max_tokens": 512,
+        "temperature": 0.2,
+        "include_reasoning": false,
+    });
+    let resp = crate::cloud::handle_cloud_query(args).await;
+    if resp.starts_with("error:") {
+        return Err(anyhow!("fact extraction failed: {resp}"));
+    }
+    Ok(parse_extracted_facts(&resp))
+}
+
+/// PURE novelty test: a candidate embedding is novel iff its MAX cosine
+/// similarity against every `existing` embedding is strictly below
+/// `threshold`. Empty `existing` → always novel (true). Reuses
+/// [`crate::vector_index::cosine`] (no re-implementation). Unit-testable.
+pub(crate) fn is_novel(new_emb: &[f32], existing: &[Vec<f32>], threshold: f32) -> bool {
+    !existing
+        .iter()
+        .any(|e| cosine(new_emb, e) >= threshold)
+}
+
+/// Store `text` as a memory only if it is NOVEL relative to what is
+/// already remembered, returning the new rowid on insert or `None` when
+/// it was skipped as a near-duplicate.
+///
+/// - Without an `OPENAI_API_KEY`: dedup is impossible (no embeddings), so
+///   fall back to an unconditional [`remember`] and return `Ok(Some(id))`.
+/// - With a key: embed `text`, load every embedding-bearing row (same
+///   SELECT + `blob_to_vec` the recall path uses), and if
+///   [`is_novel`] is false return `Ok(None)`. Otherwise insert the row
+///   WITH its embedding and return `Ok(Some(id))`.
+pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<Option<i64>> {
+    let key = match openai_key() {
+        // No key → can't embed/dedup; store unconditionally.
+        None => return remember(text, kind, source).await.map(Some),
+        Some(k) => k,
+    };
+
+    let emb = embed_one(text, &key).await?;
+    let arc = memory_db()?;
+    // Load existing embeddings under the lock, then release BEFORE the
+    // cosine pass — same discipline as recall_memory: never hold the
+    // mutex across ranking. Same SELECT + blob_to_vec the recall path uses.
+    let existing: Vec<Vec<f32>> = {
+        let conn = arc.lock();
+        let mut stmt = conn.prepare(
+            "SELECT embedding FROM memories WHERE embedding IS NOT NULL",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            let blob: Vec<u8> = r.get(0)?;
+            Ok(blob_to_vec(&blob))
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        rows
+    };
+
+    if !is_novel(&emb, &existing, NOVELTY_THRESHOLD) {
+        return Ok(None);
+    }
+
+    let conn = arc.lock();
+    let id = insert_memory(&conn, text, Some(&emb), kind, source, now_secs())?;
+    Ok(Some(id))
+}
+
 // ── MCP tool handlers ──────────────────────────────────────────────
 
 /// `remember` tool handler. Local store, embedding optional.
@@ -631,6 +721,38 @@ mod tests {
         assert!(validate_conversation_id("a..b").is_err());
         assert!(validate_conversation_id("a/b").is_err());
         assert!(validate_conversation_id("a b").is_err());
+    }
+
+    #[test]
+    fn is_novel_empty_existing_is_always_novel() {
+        // Nothing to compare against → novel regardless of the candidate.
+        assert!(is_novel(&[1.0, 0.0, 0.0], &[], NOVELTY_THRESHOLD));
+    }
+
+    #[test]
+    fn is_novel_near_duplicate_is_not_novel() {
+        let existing = vec![vec![1.0, 0.0, 0.0]];
+        // cosine([1,0,0],[1,0,0]) == 1.0 >= 0.92 → duplicate.
+        assert!(!is_novel(&[1.0, 0.0, 0.0], &existing, NOVELTY_THRESHOLD));
+        // A vector only slightly off-axis: cosine ≈ 0.9999 >= 0.92 → dup.
+        assert!(!is_novel(&[0.999, 0.01, 0.0], &existing, NOVELTY_THRESHOLD));
+    }
+
+    #[test]
+    fn is_novel_dissimilar_is_novel() {
+        let existing = vec![vec![1.0, 0.0, 0.0]];
+        // Orthogonal → cosine 0.0 < 0.92 → novel.
+        assert!(is_novel(&[0.0, 1.0, 0.0], &existing, NOVELTY_THRESHOLD));
+    }
+
+    #[test]
+    fn is_novel_max_over_many_existing() {
+        // Novel against several dissimilar rows, but NOT novel once a
+        // near-duplicate is present — the MAX similarity is what gates.
+        let dissimilar = vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
+        assert!(is_novel(&[1.0, 0.0, 0.0], &dissimilar, NOVELTY_THRESHOLD));
+        let with_dup = vec![vec![0.0, 1.0, 0.0], vec![1.0, 0.0, 0.0]];
+        assert!(!is_novel(&[1.0, 0.0, 0.0], &with_dup, NOVELTY_THRESHOLD));
     }
 
     #[test]

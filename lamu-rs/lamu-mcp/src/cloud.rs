@@ -97,6 +97,25 @@ pub(crate) fn handle_list_cloud_models() -> String {
 
 // ── cloud_query ──────────────────────────────────────────────────────
 
+/// Pure parse of the `LAMU_AUTOCAPTURE` env value: true ONLY for "1" or
+/// "true" (case-insensitive), false for everything else (including
+/// unset → `None`). Split out so it is unit-testable without touching
+/// the process environment.
+fn autocapture_flag(val: Option<&str>) -> bool {
+    matches!(
+        val.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Whether memory autocapture is enabled. DEFAULT FALSE: only "1"/"true"
+/// (case-insensitive) in `LAMU_AUTOCAPTURE` turns it on. When unset the
+/// autocapture spawn below is unreachable — zero extra MiMo/embedding
+/// calls, zero added latency, zero behavior change.
+fn autocapture_enabled() -> bool {
+    autocapture_flag(std::env::var("LAMU_AUTOCAPTURE").ok().as_deref())
+}
+
 pub(crate) async fn handle_cloud_query(args: Value) -> String {
     let prompt = args["prompt"].as_str().unwrap_or("");
     if prompt.is_empty() { return "error: prompt is required".into(); }
@@ -405,7 +424,70 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         }
     }
 
+    // OPT-IN memory autocapture (default OFF). When LAMU_AUTOCAPTURE is
+    // unset this whole block is unreachable — zero extra cost, zero
+    // latency, zero behavior change. Gated additionally on a real
+    // conversation turn (`conv_id` non-empty — which excludes every
+    // internal warmup/review caller, none of which set conversation_id)
+    // and on a non-error reply. The work runs in a DETACHED task that
+    // captures only owned data, so `result` is returned IMMEDIATELY below
+    // and the user's reply is never blocked or delayed; facts land
+    // shortly AFTER the reply (eventual consistency, by design).
+    if autocapture_enabled() && !conv_id.is_empty() && !result.starts_with("error:") {
+        let user = prompt.to_string();
+        let assistant = result.clone();
+        let conv = conv_id.to_string();
+        spawn_autocapture(user, assistant, conv);
+    }
+
     result
+}
+
+/// Run the autocapture pipeline (extract durable facts from this
+/// exchange, store the novel ones) detached and best-effort, so the
+/// caller's `result` is returned without waiting.
+///
+/// `handle_cloud_query`'s own future is NOT `Send` (its unreachable-here
+/// `recall_ranked` branch holds a `Connection` guard across an `.await`),
+/// so it can't be `tokio::spawn`ed directly. We instead construct the
+/// future INSIDE a fresh thread that owns a current-thread runtime —
+/// only owned `String`s cross the thread boundary, never a non-`Send`
+/// future. The thread is detached; we don't join it.
+fn spawn_autocapture(user: String, assistant: String, conv: String) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::debug!("autocapture({conv}): runtime build failed: {e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            match crate::lifetime_memory::extract_from_exchange(&user, &assistant).await {
+                Ok(facts) => {
+                    let mut stored = 0usize;
+                    for f in &facts {
+                        match crate::lifetime_memory::remember_if_novel(f, "fact", &conv).await {
+                            Ok(Some(_)) => stored += 1,
+                            Ok(None) => {} // skipped as a near-duplicate
+                            Err(e) => {
+                                tracing::debug!("autocapture({conv}): store fact failed: {e}")
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        "autocapture({conv}): extracted {} fact(s), stored {} novel",
+                        facts.len(),
+                        stored
+                    );
+                }
+                Err(e) => tracing::debug!("autocapture({conv}): extraction failed: {e}"),
+            }
+        });
+    });
 }
 
 /// V5 improvement H: dedupe overlapping content between auto_context
@@ -1387,6 +1469,37 @@ mod tests {
             api_key_env: None,
             base_url: None,
             chat_path: None,
+        }
+    }
+
+    #[test]
+    fn autocapture_flag_pure_truth_table() {
+        // ON only for "1"/"true" (case-insensitive, trimmed).
+        assert!(autocapture_flag(Some("1")));
+        assert!(autocapture_flag(Some("true")));
+        assert!(autocapture_flag(Some("TRUE")));
+        assert!(autocapture_flag(Some("True")));
+        assert!(autocapture_flag(Some("  true  ")));
+        // OFF for unset and any other value.
+        assert!(!autocapture_flag(None));
+        assert!(!autocapture_flag(Some("")));
+        assert!(!autocapture_flag(Some("0")));
+        assert!(!autocapture_flag(Some("false")));
+        assert!(!autocapture_flag(Some("yes")));
+        assert!(!autocapture_flag(Some("2")));
+    }
+
+    #[test]
+    fn autocapture_enabled_default_off_when_unset() {
+        // Rust 2024 makes std::env::set_var unsafe (env mutation races
+        // with concurrent test threads), so we don't mutate the env here.
+        // The ON/value branches are exhaustively covered by the pure
+        // `autocapture_flag` truth-table test above. This asserts the
+        // load-bearing default: the test harness runs WITHOUT
+        // LAMU_AUTOCAPTURE set, so the real env-reading wrapper reports
+        // OFF — proving the autocapture spawn is unreachable by default.
+        if std::env::var("LAMU_AUTOCAPTURE").is_err() {
+            assert!(!autocapture_enabled(), "unset env → autocapture OFF");
         }
     }
 
