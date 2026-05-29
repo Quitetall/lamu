@@ -436,14 +436,12 @@ impl LamuMcpServer {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
-        // Pick port
+        // pick_backend_port skips ports held by Loaded/Loading models;
+        // port-0 (this in-flight entry, just mark_loading'd) is ignored.
+        // See commit c219449 for the is_empty() collision it replaces.
         let port: u16 = {
             let st = self.state.lock();
-            if st.scheduler.loaded_models().is_empty() {
-                lamu_core::config::PORT_MAIN
-            } else {
-                lamu_core::config::PORT_SIDECAR
-            }
+            lamu_core::loader::pick_backend_port(&st.scheduler, None)
         };
 
         // Construct the right Backend for this entry. The Backend impl
