@@ -106,6 +106,15 @@ impl Backend for MegakernelBackend {
 
         for _ in 0..45 {
             sleep(Duration::from_secs(1)).await;
+            // Bail early if the child exited during startup instead of
+            // polling for the full timeout while holding the spawn gate. (#16)
+            if let Some(p) = self.proc.as_mut() {
+                if let Ok(Some(status)) = p.try_wait() {
+                    return Err(Error::Backend(format!(
+                        "megakernel server exited during startup (port {port}, {status})"
+                    )));
+                }
+            }
             if self.is_healthy().await {
                 return Ok(pid);
             }

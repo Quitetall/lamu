@@ -121,6 +121,15 @@ impl Backend for DflashBackend {
         // Health: /v1/models (no /health endpoint on dflash server)
         for _ in 0..60 {
             sleep(Duration::from_secs(2)).await;
+            // Bail early if the child exited during startup instead of
+            // polling for the full timeout while holding the spawn gate. (#16)
+            if let Some(p) = self.proc.as_mut() {
+                if let Ok(Some(status)) = p.try_wait() {
+                    return Err(Error::Backend(format!(
+                        "dflash server exited during startup (port {port}, {status})"
+                    )));
+                }
+            }
             if self.is_healthy().await {
                 return Ok(pid);
             }

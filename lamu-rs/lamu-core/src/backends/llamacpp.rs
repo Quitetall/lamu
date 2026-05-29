@@ -337,6 +337,17 @@ impl Backend for LlamaCppBackend {
         // Health poll
         for _ in 0..60 {
             sleep(Duration::from_secs(1)).await;
+            // Detect a child that exited during startup (CUDA OOM, bad
+            // args, port already bound, missing .so) — otherwise the loop
+            // can't tell "crashed" from "still warming up" and runs the
+            // full timeout while holding the global spawn gate. (#16)
+            if let Some(p) = self.proc.as_mut() {
+                if let Ok(Some(status)) = p.try_wait() {
+                    return Err(Error::Backend(format!(
+                        "llama-server exited during startup (port {port}, {status})"
+                    )));
+                }
+            }
             if self.is_healthy().await {
                 // Warmup: one-token completion so cuBLAS / cuDNN
                 // handles + kv slot are JIT-compiled before the user's
