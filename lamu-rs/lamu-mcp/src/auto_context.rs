@@ -34,45 +34,101 @@ const CALLERS_PER_SYMBOL_MAX: usize = 10;
 /// Bounded: 60s timeout. If tests pass / cargo absent / timeout, no
 /// section is appended (empty string returned).
 pub fn run_test_preflight(repo: &Path) -> String {
+    use std::io::Read;
     use std::process::Stdio;
     use std::time::Duration;
-    let out = std::process::Command::new("cargo")
-        .current_dir(repo)
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.current_dir(repo)
         .args(["test", "--workspace", "--quiet", "--no-fail-fast"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match out {
+        .stderr(Stdio::piped());
+    // Own process group so a timeout can SIGKILL the whole cargo→rustc→
+    // test-binary tree at once, not just the cargo parent (#25).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return String::new(),
     };
-    // Use std::sync wait with manual timeout; cargo test in a small
-    // workspace usually finishes in <30s. We bound at 60s.
+
+    // Drain stdout+stderr on dedicated threads. cargo's build + failing-test
+    // output easily exceeds the 64KB pipe buffer; with the old try_wait-only
+    // loop (no drain) the child blocked on write, try_wait never reported
+    // exit, the 60s timeout fired, and we returned a FALSE "no failures" in
+    // exactly the high-failure case the preflight exists to catch (#8).
+    let mut out_pipe = child.stdout.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+    let mut err_pipe = child.stderr.take();
+    let err_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
-    while child.try_wait().ok().flatten().is_none() {
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
         if start.elapsed() > timeout {
+            timed_out = true;
+            #[cfg(unix)]
+            // SAFETY: kill(2) with a negative pid signals the process group;
+            // child.id() is our just-spawned group leader (process_group(0)).
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            // NOTE: non-Unix kills only the direct cargo child; rustc/test
+            // grandchildren may outlive the timeout. Unix isn't affected
+            // (process-group SIGKILL above). lamu targets Linux in practice.
+            #[cfg(not(unix))]
             let _ = child.kill();
-            return String::new();
+            let _ = child.wait(); // reap cargo so it isn't left a zombie (#25)
+            break None;
         }
         std::thread::sleep(Duration::from_millis(200));
-    }
-    let status = child.try_wait().ok().flatten();
-    let stdout = match child.wait_with_output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return String::new(),
     };
+
+    // Join readers — pipes hit EOF once the child (and its group) exit.
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+
+    if timed_out {
+        return String::new();
+    }
     if matches!(status, Some(s) if s.success()) {
         return String::new(); // tests passed → no signal
     }
-    // Failures present — extract concise summary lines.
-    let summary: Vec<&str> = stdout
+    // Failures present — extract concise summary lines. Scan BOTH streams:
+    // test-result lines + panics land on stdout, but a build failure (which
+    // also fails `cargo test`) prints `error[E…]`/`error:` to stderr — those
+    // were invisible before and are the whole reason a test run aborted.
+    let combined = format!("{stdout}\n{stderr}");
+    let summary: Vec<&str> = combined
         .lines()
         .filter(|l| {
             l.contains("FAILED")
                 || l.contains("test result: FAILED")
                 || l.contains("panicked at")
                 || l.starts_with("---- ")
+                || l.starts_with("error[")
+                || l.starts_with("error: ")
         })
         .take(50)
         .collect();

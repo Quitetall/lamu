@@ -27,6 +27,10 @@ serde_yaml = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
+# Process-group kill for the cargo-test preflight timeout path (kill the
+# whole rustc/test child tree, not just the cargo parent). Used only under
+# cfg(unix); harmless elsewhere.
+libc = "0.2"
 # OPT-IN compressed vector index backend. Off by default — the default
 # build never pulls this dep (verify: `cargo tree -p lamu-mcp` lists no
 # turbovec). NOTE (Linux): turbovec links a system OpenBLAS via

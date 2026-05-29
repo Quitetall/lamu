@@ -1817,6 +1817,7 @@ dependencies = [
  "humantime",
  "lamu-core",
  "lamu-providers",
+ "libc",
  "parking_lot",
  "reqwest",
  "rusqlite",
