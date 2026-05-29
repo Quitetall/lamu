@@ -684,14 +684,17 @@ impl LamuMcpServer {
 
         let mut prepared = Vec::with_capacity(tasks_arr.len());
         for (idx, t) in tasks_arr.iter().enumerate() {
+            // Compute task_id FIRST so the pre-flight Err variants can carry
+            // the real idx + id (the futs map used to hardcode 0/"error",
+            // collapsing every failed task to the front on sort — #12).
+            let task_id = t["id"].as_str().map(String::from)
+                .unwrap_or_else(|| format!("task{}", idx));
             let prompt = t["prompt"].as_str().unwrap_or("").to_string();
             if prompt.is_empty() {
-                prepared.push(Err(format!("task[{}]: empty prompt", idx)));
+                prepared.push(Err((idx, task_id, "empty prompt".to_string())));
                 continue;
             }
             let model = t["model"].as_str().unwrap_or(&default_model).to_string();
-            let task_id = t["id"].as_str().map(String::from)
-                .unwrap_or_else(|| format!("task{}", idx));
             let system = t["system"].as_str().unwrap_or(&default_system).to_string();
             let max_tokens = t["max_tokens"].as_u64().unwrap_or(8192);
             let temperature = t["temperature"].as_f64().unwrap_or(0.3);
@@ -705,18 +708,24 @@ impl LamuMcpServer {
 
             let is_cloud = cloud.iter().any(|m| m.name == model);
             if is_cloud && local_only {
-                prepared.push(Err(format!(
-                    "task[{}]: cloud model '{}' refused — routing mode is 'local-only'",
-                    idx, model
+                prepared.push(Err((
+                    idx,
+                    task_id,
+                    format!("cloud model '{}' refused — routing mode is 'local-only'", model),
                 )));
                 continue;
             }
-            let cap = if is_cloud {
+            // Never 0: a zero-permit Semaphore (user passes max_concurrency:0
+            // → 0.min(provider_cap)) makes acquire().await never resolve and
+            // hangs the whole join_all batch (#23). Parenthesised so .max(1)
+            // applies to the whole if-expression, not just the else arm.
+            let cap = (if is_cloud {
                 let provider_cap = crate::cloud::provider_concurrency(&model, &cloud);
                 user_max.map(|u| u.min(provider_cap)).unwrap_or(provider_cap)
             } else {
                 1 // local: always sequential per project policy
-            };
+            })
+            .max(1);
             let sem_key = if is_cloud { model.clone() } else { format!("local:{}", model) };
             let sem = sems.entry(sem_key)
                 .or_insert_with(|| Arc::new(Semaphore::new(cap)))
@@ -742,7 +751,9 @@ impl LamuMcpServer {
         let t0 = std::time::Instant::now();
         let futs = prepared.into_iter().map(|p| async move {
             match p {
-                Err(msg) => (0usize, "error".to_string(), "(unknown)".to_string(), false, msg, 0.0),
+                Err((idx, id, msg)) => {
+                    (idx, id, "(refused)".to_string(), false, format!("error: {msg}"), 0.0)
+                }
                 Ok((idx, id, model, is_cloud, sem, args)) => {
                     let t_start = std::time::Instant::now();
                     let _permit = match sem.acquire().await {
