@@ -15,3 +15,4 @@ pub mod rag;
 pub mod server;
 pub mod tools;
 pub mod train_tool;
+pub mod vector_index;

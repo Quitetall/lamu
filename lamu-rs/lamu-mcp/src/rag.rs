@@ -24,6 +24,7 @@
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
+use crate::vector_index::{BruteForceCosine, VectorIndex};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -247,24 +248,6 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     out
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
-}
-
 /// Walk `git ls-files` from `repo`, chunk each text file, and embed
 /// the chunks. Existing chunks for unchanged files (matching mtime)
 /// are skipped. Returns count of chunks indexed.
@@ -363,28 +346,29 @@ pub async fn semantic_search(query: &str, k: usize) -> Result<Vec<SearchHit>> {
         conn.prepare("SELECT path, chunk_idx, content, embedding FROM chunks")?;
     let rows = stmt.query_map([], |r| {
         let path: String = r.get(0)?;
-        let idx: i64 = r.get(1)?;
-        let content: String = r.get(2)?;
+        let content: String = r.get(2)?; // chunk_idx (col 1) not needed in SearchHit
         let emb_blob: Vec<u8> = r.get(3)?;
-        Ok((path, idx, content, emb_blob))
+        Ok((path, content, emb_blob))
     })?;
-    let mut scored: Vec<(f32, String, i64, String)> = Vec::new();
+    // SEAM: swap BruteForceCosine for an ANN/quantized index when the
+    // corpus outgrows brute-force (see crate::vector_index for the why).
+    let mut index: BruteForceCosine<(String, String)> = BruteForceCosine::new();
     for row in rows {
-        let (path, idx, content, emb_blob) = row?;
-        let emb = blob_to_vec(&emb_blob);
-        let score = cosine(&qvec, &emb);
-        scored.push((score, path, idx, content));
+        let (path, content, emb_blob) = row?;
+        index.add(blob_to_vec(&emb_blob), (path, content));
     }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(scored
+    Ok(index
+        .search(&qvec, k)
         .into_iter()
-        .take(k)
-        .map(|(score, path, _idx, content)| SearchHit {
-            path,
-            line: None,
-            snippet: truncate_utf8(&content, 400),
-            score: Some(score),
-            source: "semantic",
+        .map(|hit| {
+            let (path, content) = hit.payload;
+            SearchHit {
+                path,
+                line: None,
+                snippet: truncate_utf8(&content, 400),
+                score: Some(hit.score),
+                source: "semantic",
+            }
         })
         .collect())
 }
@@ -472,27 +456,7 @@ fn truncate_utf8(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cosine_orthogonal_is_zero() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        assert_eq!(cosine(&a, &b), 0.0);
-    }
-
-    #[test]
-    fn cosine_identical_is_one() {
-        let a = vec![0.5, 0.5, 0.5];
-        let b = vec![0.5, 0.5, 0.5];
-        let c = cosine(&a, &b);
-        assert!((c - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_handles_zero_vector() {
-        let a = vec![0.0, 0.0, 0.0];
-        let b = vec![1.0, 1.0, 1.0];
-        assert_eq!(cosine(&a, &b), 0.0);
-    }
+    // cosine() + its unit tests moved to crate::vector_index (the seam).
 
     #[test]
     fn vec_blob_round_trip() {
