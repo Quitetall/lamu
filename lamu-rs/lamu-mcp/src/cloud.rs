@@ -296,7 +296,12 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     };
 
     let result: String = if is_anthropic {
-        let url = format!("{}/v1/messages", base);
+        // Honor entry.chat_path (proxy/gateway suffix) via the shared
+        // CloudModel::chat_url — the hand-built format! dropped it, so a
+        // model with a custom chat_path 404'd from MCP while working via
+        // the CLI (which already uses chat_url). base is Some here (guarded
+        // above), so the fallback arg is never used. (#10)
+        let url = entry.chat_url(&base);
         let mut payload = json!({
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
@@ -333,6 +338,11 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
                     "type": "enabled",
                     "budget_tokens": budget,
                 });
+                // Anthropic requires temperature == 1 whenever extended
+                // thinking is engaged; any other value (default 0.3) is a
+                // hard 400. This was the silent failure that knocked the
+                // ensemble's anthropic second-reviewer offline. (#11)
+                payload["temperature"] = json!(1);
             } else {
                 warn!(
                     "cloud_query: thinking_enabled=true but max_tokens={} ≤ 1024 (Anthropic min budget); thinking block omitted",
@@ -356,6 +366,11 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             Ok(r) => r,
             Err(e) => return format!("error: post {url}: {e}"),
         };
+        // reqwest does NOT error on 4xx/5xx. Capture the status before
+        // consuming the body so a non-2xx whose body lacks an {error:…}
+        // key (e.g. a proxy's {"detail":…}/{"message":…}) isn't silently
+        // returned as a clean empty reply and persisted to memory. (#29)
+        let status = resp.status();
         let v: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => return format!("error: parse: {e}"),
@@ -365,6 +380,10 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             // ensemble/critic gates (which test `starts_with("error:")`)
             // don't feed an API-error blob into merge_unique_findings.
             return format!("error: anthropic API: {}", err);
+        }
+        if !status.is_success() {
+            let body: String = v.to_string().chars().take(300).collect();
+            return format!("error: anthropic HTTP {}: {}", status.as_u16(), body);
         }
         // content is an array of {type: "text"|"thinking", text|thinking: "..."}
         let mut out = String::new();
@@ -384,7 +403,7 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             out
         }
     } else {
-        let url = format!("{}/chat/completions", base);
+        let url = entry.chat_url(&base); // honor chat_path; see #10 above
         let mut messages: Vec<Value> = Vec::new();
         if !system.is_empty() {
             messages.push(json!({"role": "system", "content": system}));
@@ -413,6 +432,10 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             Ok(r) => r,
             Err(e) => return format!("error: post {url}: {e}"),
         };
+        // See anthropic branch — reqwest doesn't error on 4xx/5xx, so check
+        // the status so a non-2xx with a non-{error:…} body isn't returned
+        // as a clean empty reply. (#29)
+        let status = resp.status();
         let v: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => return format!("error: parse: {e}"),
@@ -421,6 +444,10 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
             // See anthropic branch above — "error:" prefix is load-bearing
             // for the isError flag and the review-pipeline error gates.
             return format!("error: provider API: {}", err);
+        }
+        if !status.is_success() {
+            let body: String = v.to_string().chars().take(300).collect();
+            return format!("error: provider HTTP {}: {}", status.as_u16(), body);
         }
         if let Some(usage) = v.get("usage") {
             tracing::info!(target: "lamu_bench", "cloud_query usage model={} {}", model_name, usage);
@@ -476,12 +503,16 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
 /// exchange, store the novel ones) detached and best-effort, so the
 /// caller's `result` is returned without waiting.
 ///
-/// `handle_cloud_query`'s own future is NOT `Send` (its unreachable-here
-/// `recall_ranked` branch holds a `Connection` guard across an `.await`),
-/// so it can't be `tokio::spawn`ed directly. We instead construct the
-/// future INSIDE a fresh thread that owns a current-thread runtime —
-/// only owned `String`s cross the thread boundary, never a non-`Send`
-/// future. The thread is detached; we don't join it.
+/// Runs on a dedicated detached thread with its own current-thread runtime
+/// (rather than `tokio::spawn`) so the blocking SQLite + embedding work is
+/// isolated from the caller's async worker pool. Only owned `String`s cross
+/// the thread boundary; the thread is detached and never joined.
+///
+/// NOTE: the autocapture future IS `Send` — a previous version of this
+/// comment claimed `recall_ranked` holds a `Connection` guard across an
+/// `.await`, which is false (`remember_if_novel`/`recall` drop every guard
+/// before awaiting). The dedicated thread is for blocking-work isolation,
+/// not a Send workaround.
 fn spawn_autocapture(user: String, assistant: String, conv: String) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
