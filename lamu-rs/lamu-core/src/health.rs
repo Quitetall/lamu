@@ -48,6 +48,7 @@ impl BackendHealth {
         self.consecutive_errors = 0;
         self.state = HealthState::Healthy;
         self.last_error = None;
+        self.restart_attempts = 0; // recovered → reset the restart counter (#20)
     }
 
     pub fn record_error(&mut self, msg: impl Into<String>) {

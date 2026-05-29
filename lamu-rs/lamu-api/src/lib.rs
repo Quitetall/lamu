@@ -187,7 +187,8 @@ fn is_process_alive(_pid: i32) -> bool { false }
 /// fatal.
 fn spawn_main_preload(state: openai_compat::AppState) {
     let main_name = state.entries.values()
-        .find(|e| e.main)
+        .filter(|e| e.main)
+        .min_by(|a, b| a.name.cmp(&b.name)) // deterministic when >1 main (#22)
         .map(|e| e.name.clone());
     let Some(name) = main_name else {
         tracing::info!("preload: no `main: true` entry in registry, skipping");

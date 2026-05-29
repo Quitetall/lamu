@@ -659,7 +659,11 @@ fn draw_launchers(f: &mut ratatui::Frame, state: &AppState) {
     // Detail pane: install hint for selected harness.
     let mut detail_lines: Vec<Line> = Vec::new();
     if let Some(h) = state.selected_harness() {
-        let idx = state.launcher_state.selected().unwrap_or(0);
+        // harness_installed is ORIGINAL-indexed (built from HARNESSES); the
+        // launcher list is a sorted VIEW, so launcher_state.selected() (a
+        // view index) read the wrong row's install status once any harness
+        // was favorited/installed. Map view→original. (#24)
+        let idx = state.selected_harness_orig_idx().unwrap_or(0);
         let installed = *state.harness_installed.get(idx).unwrap_or(&false);
         if installed {
             detail_lines.push(Line::from(format!("[Enter] launches: {}", h.launch_argv.join(" "))));

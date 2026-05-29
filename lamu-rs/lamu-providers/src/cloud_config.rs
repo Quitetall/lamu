@@ -76,18 +76,25 @@ impl CloudModel {
             .unwrap_or_else(|| format!("{}/{}", self.provider, self.name))
     }
 
-    /// True iff `api_key_env` is unset OR the named env var is present.
+    /// True iff `api_key_env` is `None` (no key required) OR the named env
+    /// var is present and non-empty after trimming. An exported-but-empty
+    /// or whitespace-only var (`export VAR=`) counts as MISSING — otherwise
+    /// the row renders valid and the key flows in as `""`, producing a
+    /// confusing 401 instead of a clear missing-key message. (#32)
     pub fn key_present(&self) -> bool {
         match &self.api_key_env {
             None => true,
-            Some(var) => std::env::var(var).is_ok(),
+            Some(var) => std::env::var(var).map(|v| !v.trim().is_empty()).unwrap_or(false),
         }
     }
 
-    /// Resolve the API key from the named env var. Returns None when
-    /// no env var is configured or the var is unset.
+    /// Resolve the API key from the named env var. Returns None when no env
+    /// var is configured, the var is unset, or it is present-but-empty. (#32)
     pub fn resolved_api_key(&self) -> Option<String> {
-        self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok())
+        self.api_key_env
+            .as_deref()
+            .and_then(|v| std::env::var(v).ok())
+            .filter(|k| !k.trim().is_empty())
     }
 
     /// Full chat URL. Resolution order:

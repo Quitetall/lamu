@@ -49,8 +49,13 @@ impl Router {
         let resolved_model: Option<String> = model.and_then(|n| {
             let lc = n.to_ascii_lowercase();
             if matches!(lc.as_str(), "default" | "main" | "lamu") {
+                // Deterministic when >1 entry sets main:true: HashMap
+                // iteration order is randomized per process, so `find`
+                // resolved "lamu"/"main"/"default" to different models on
+                // different starts. Pick the lowest name. (#22)
                 self.registry.values()
-                    .find(|e| e.main)
+                    .filter(|e| e.main)
+                    .min_by(|a, b| a.name.cmp(&b.name))
                     .map(|e| e.name.clone())
             } else {
                 None

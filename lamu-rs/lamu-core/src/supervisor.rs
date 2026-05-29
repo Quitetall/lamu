@@ -98,11 +98,20 @@ where
     }
 
     async fn attempt_restart(&mut self, health: &mut BackendHealth) {
-        for (idx, &delay) in self.policy.backoff_secs.iter().enumerate() {
+        // Drive the loop by max_attempts, reusing the last backoff value
+        // when there are fewer entries than attempts. The old loop iterated
+        // backoff_secs, so a backoff list SHORTER than max_attempts silently
+        // capped retries below the configured policy. (#21) max_attempts==0
+        // means "never restart" — 0..0 yields zero iterations (do NOT clamp
+        // to 1, which would force a restart against an explicit no-restart
+        // policy).
+        let max = self.policy.max_attempts as usize;
+        for idx in 0..max {
             let attempt = (idx + 1) as u32;
-            if attempt > self.policy.max_attempts {
-                break;
-            }
+            let delay = self.policy.backoff_secs.get(idx)
+                .or_else(|| self.policy.backoff_secs.last())
+                .copied()
+                .unwrap_or(1);
             health.restart_attempts = attempt;
             emit_event(
                 "backend_restart_attempt",

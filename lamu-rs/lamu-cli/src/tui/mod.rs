@@ -708,12 +708,20 @@ fn run_loop<B: ratatui::backend::Backend>(
                                 s.status = mcp_servers::probe(s);
                             }
                             state.mcp_servers = servers;
+                            // Count Unreachable and Untested separately —
+                            // probe() returns Untested for non-stdio (http/
+                            // sse) servers it never connects to, so lumping
+                            // them into `len - healthy` mislabeled them as
+                            // failures. (#31)
                             let healthy = state.mcp_servers.iter().filter(|s| matches!(s.status, ProbeStatus::Healthy{..})).count();
+                            let unreachable = state.mcp_servers.iter().filter(|s| matches!(s.status, ProbeStatus::Unreachable{..})).count();
+                            let untested = state.mcp_servers.iter().filter(|s| matches!(s.status, ProbeStatus::Untested)).count();
                             state.status_msg = format!(
-                                "Probed {}: {} healthy, {} unreachable",
+                                "Probed {}: {} healthy, {} unreachable, {} not probed",
                                 state.mcp_servers.len(),
                                 healthy,
-                                state.mcp_servers.len() - healthy,
+                                unreachable,
+                                untested,
                             );
                         }
                         _ => {}

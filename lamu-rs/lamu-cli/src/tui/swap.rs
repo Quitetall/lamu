@@ -87,7 +87,11 @@ pub(super) fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
     for (k, v) in &spawn.envs {
         cmd.env(k, v);
     }
-    cmd.stdin(std::process::Stdio::null())
+    // Bind the child so the timeout path can kill it — `.spawn()?;` dropped
+    // the handle, orphaning a still-loading llama-server that kept holding
+    // VRAM after the bail below. (#26)
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
@@ -122,5 +126,9 @@ pub(super) fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
         if i % 5 == 0 { print!(" {}s", i); }
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
+    // Health never came up: kill + reap the loading server so it doesn't
+    // sit orphaned holding VRAM. (#26)
+    let _ = child.kill();
+    let _ = child.wait();
     anyhow::bail!("timeout waiting for {} to load", entry.name)
 }
