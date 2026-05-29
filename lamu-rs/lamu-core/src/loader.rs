@@ -202,6 +202,7 @@ mod tests {
             capabilities: vec![Capability::Chat],
             reasoning_marker: None,
             speculative: None,
+            sampling: None,
             pinned: false,
             main: false,
             notes: String::new(),

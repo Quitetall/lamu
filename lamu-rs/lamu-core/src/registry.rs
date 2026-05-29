@@ -2,7 +2,8 @@
 //! Direct port of `lamu/core/registry.py`.
 
 use crate::types::{
-    BackendType, Capability, ModelEntry, ModelFormat, ReasoningMarker, SpeculativeConfig,
+    BackendType, Capability, ModelEntry, ModelFormat, ReasoningMarker, SamplingProfile,
+    SpeculativeConfig,
 };
 use crate::Result;
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -284,6 +285,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             capabilities,
             reasoning_marker,
             speculative: None,
+            sampling: None,
             pinned: false,
             main: false,
             notes: String::new(),
@@ -317,6 +319,8 @@ struct ModelEntryYaml {
     reasoning_marker: Option<ReasoningMarker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     speculative: Option<SpeculativeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampling: Option<SamplingProfile>,
     #[serde(default, skip_serializing_if = "is_false")]
     pinned: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -344,6 +348,7 @@ impl From<ModelEntry> for ModelEntryYaml {
             capabilities: e.capabilities,
             reasoning_marker: e.reasoning_marker,
             speculative: e.speculative,
+            sampling: e.sampling,
             pinned: e.pinned,
             main: e.main,
             notes: e.notes,
@@ -367,6 +372,7 @@ impl ModelEntryYaml {
             capabilities: self.capabilities,
             reasoning_marker: self.reasoning_marker,
             speculative: self.speculative,
+            sampling: self.sampling,
             pinned: self.pinned,
             main: self.main,
             notes: self.notes,
@@ -516,6 +522,7 @@ mod tests {
             capabilities: vec![Capability::Chat],
             reasoning_marker: None,
             speculative: None,
+            sampling: None,
             pinned: false,
             main: false,
             notes: String::new(),
@@ -533,6 +540,51 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "alpha");
         assert_eq!(loaded[0].path, entry.path);
+    }
+
+    #[test]
+    fn sampling_profile_round_trips_through_registry_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        let mut entry = sample_entry("withsamp", Path::new("/models/s.gguf"));
+        entry.sampling = Some(SamplingProfile {
+            temperature: Some(0.2),
+            top_p: Some(0.95),
+            top_k: Some(50),
+            min_p: None,
+            repeat_penalty: Some(1.05),
+            max_tokens: Some(4096),
+            lock: true,
+        });
+        add_entry(entry.clone(), &reg, false).expect("add");
+        let loaded = load_registry(&reg).expect("load");
+        assert_eq!(loaded.len(), 1);
+        let s = loaded[0].sampling.clone().expect("sampling survives round-trip");
+        assert_eq!(s.temperature, Some(0.2));
+        assert_eq!(s.top_p, Some(0.95));
+        assert_eq!(s.top_k, Some(50));
+        assert_eq!(s.min_p, None);
+        assert_eq!(s.repeat_penalty, Some(1.05));
+        assert_eq!(s.max_tokens, Some(4096));
+        assert!(s.lock);
+    }
+
+    #[test]
+    fn no_sampling_profile_round_trips_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        // sample_entry has sampling: None — confirm it stays None and the
+        // written YAML carries no `sampling:` key (skip_serializing_if).
+        add_entry(
+            sample_entry("nosamp", Path::new("/models/n.gguf")),
+            &reg,
+            false,
+        )
+        .expect("add");
+        let yaml = std::fs::read_to_string(&reg).unwrap();
+        assert!(!yaml.contains("sampling"), "empty profile must not write a key: {yaml}");
+        let loaded = load_registry(&reg).expect("load");
+        assert!(loaded[0].sampling.is_none());
     }
 
     #[test]

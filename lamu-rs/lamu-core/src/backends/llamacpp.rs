@@ -408,6 +408,12 @@ impl Backend for LlamaCppBackend {
         if let Some(et) = opts.enable_thinking {
             payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
         }
+        // Extra samplers — llama-server's OpenAI-compat endpoint accepts
+        // these as top-level fields. Only send when Some (no nulls).
+        if let Some(v) = opts.top_p { payload["top_p"] = json!(v); }
+        if let Some(v) = opts.top_k { payload["top_k"] = json!(v); }
+        if let Some(v) = opts.min_p { payload["min_p"] = json!(v); }
+        if let Some(v) = opts.repeat_penalty { payload["repeat_penalty"] = json!(v); }
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;
@@ -527,6 +533,7 @@ mod tests {
             capabilities: vec![Capability::Code],
             reasoning_marker: None,
             speculative: None,
+            sampling: None,
             pinned: false,
             main: false,
             notes: String::new(),

@@ -63,6 +63,160 @@ pub struct SpeculativeConfig {
 
 fn default_draft_max() -> u32 { 8 }
 
+/// Optional per-model sampling overrides. Any omitted field falls back
+/// to the caller-supplied value (or the builtin backend default) at
+/// request time — see the `effective_*` merge helpers. A profile with
+/// no fields set serializes to an empty map (every `Option` field is
+/// `skip_serializing_if` when `None`, and `lock` is omitted when false),
+/// so absent fields round-trip cleanly and existing registries that
+/// carry no `sampling:` key deserialize to `None`.
+///
+/// `lock` flips the precedence: when set, a profile field that is `Some`
+/// OVERRIDES the caller's request value instead of merely filling in for
+/// an omitted one. This lets an operator pin, e.g., a deterministic
+/// `temperature: 0.0` that clients cannot override.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SamplingProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// When true, any field set on this profile overrides the caller's
+    /// request value (operator-pinned sampling). When false (default),
+    /// the profile only fills fields the caller omitted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lock: bool,
+}
+
+fn is_false(b: &bool) -> bool { !*b }
+
+/// Total, side-effect-free precedence resolver shared by every typed
+/// `effective_*` helper:
+///   1. profile.lock AND profile field is Some  => profile value (pin)
+///   2. else request value if Some               => caller wins
+///   3. else profile value if Some               => profile fills gap
+///   4. else builtin default
+fn merge_sampler<T: Copy>(lock: bool, profile: Option<T>, req: Option<T>, default: T) -> T {
+    if lock {
+        if let Some(p) = profile {
+            return p;
+        }
+    }
+    req.or(profile).unwrap_or(default)
+}
+
+impl SamplingProfile {
+    pub fn temperature(&self, req: Option<f32>, default: f32) -> f32 {
+        merge_sampler(self.lock, self.temperature, req, default)
+    }
+
+    pub fn top_p(&self, req: Option<f32>, default: f32) -> f32 {
+        merge_sampler(self.lock, self.top_p, req, default)
+    }
+
+    pub fn top_k(&self, req: Option<u32>, default: u32) -> u32 {
+        merge_sampler(self.lock, self.top_k, req, default)
+    }
+
+    pub fn min_p(&self, req: Option<f32>, default: f32) -> f32 {
+        merge_sampler(self.lock, self.min_p, req, default)
+    }
+
+    pub fn repeat_penalty(&self, req: Option<f32>, default: f32) -> f32 {
+        merge_sampler(self.lock, self.repeat_penalty, req, default)
+    }
+
+    pub fn max_tokens(&self, req: Option<u32>, default: u32) -> u32 {
+        merge_sampler(self.lock, self.max_tokens, req, default)
+    }
+
+    /// Resolve a single optional sampler field WITHOUT collapsing to a
+    /// builtin default — used by request-build sites that only want to
+    /// emit a field downstream when the merged result is actually set
+    /// (profile or caller supplied it). Honors the same lock precedence.
+    pub fn resolve_temperature(&self, req: Option<f32>) -> Option<f32> {
+        merge_opt(self.lock, self.temperature, req)
+    }
+    pub fn resolve_top_p(&self, req: Option<f32>) -> Option<f32> {
+        merge_opt(self.lock, self.top_p, req)
+    }
+    pub fn resolve_top_k(&self, req: Option<u32>) -> Option<u32> {
+        merge_opt(self.lock, self.top_k, req)
+    }
+    pub fn resolve_min_p(&self, req: Option<f32>) -> Option<f32> {
+        merge_opt(self.lock, self.min_p, req)
+    }
+    pub fn resolve_repeat_penalty(&self, req: Option<f32>) -> Option<f32> {
+        merge_opt(self.lock, self.repeat_penalty, req)
+    }
+    pub fn resolve_max_tokens(&self, req: Option<u32>) -> Option<u32> {
+        merge_opt(self.lock, self.max_tokens, req)
+    }
+}
+
+/// Like `merge_sampler` but yields `None` when neither profile nor
+/// request supplies a value, so the caller can decide the fallback
+/// (or omit the field downstream). Same lock precedence.
+fn merge_opt<T: Copy>(lock: bool, profile: Option<T>, req: Option<T>) -> Option<T> {
+    if lock && profile.is_some() {
+        return profile;
+    }
+    req.or(profile)
+}
+
+/// Free-function convenience: resolve the four sampler fields against an
+/// optional profile, returning `Option`s suitable for conditional
+/// payload injection. `None` profile behaves as "no overrides".
+pub fn resolve_samplers(
+    profile: Option<&SamplingProfile>,
+    req_temperature: Option<f32>,
+    req_top_p: Option<f32>,
+    req_top_k: Option<u32>,
+    req_min_p: Option<f32>,
+    req_repeat_penalty: Option<f32>,
+    req_max_tokens: Option<u32>,
+) -> ResolvedSamplers {
+    match profile {
+        Some(p) => ResolvedSamplers {
+            temperature: p.resolve_temperature(req_temperature),
+            top_p: p.resolve_top_p(req_top_p),
+            top_k: p.resolve_top_k(req_top_k),
+            min_p: p.resolve_min_p(req_min_p),
+            repeat_penalty: p.resolve_repeat_penalty(req_repeat_penalty),
+            max_tokens: p.resolve_max_tokens(req_max_tokens),
+        },
+        None => ResolvedSamplers {
+            temperature: req_temperature,
+            top_p: req_top_p,
+            top_k: req_top_k,
+            min_p: req_min_p,
+            repeat_penalty: req_repeat_penalty,
+            max_tokens: req_max_tokens,
+        },
+    }
+}
+
+/// Result of merging a request's sampler values against a per-model
+/// profile. Each field is `None` when neither side supplied it; the
+/// caller applies its own builtin default for those.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedSamplers {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
 /// A discovered model on disk. Immutable after scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -80,6 +234,12 @@ pub struct ModelEntry {
     pub reasoning_marker: Option<ReasoningMarker>,
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
+    /// Optional per-model sampling overrides (temperature/top_p/top_k/
+    /// min_p/repeat_penalty/max_tokens + a `lock` flag). Merged into
+    /// requests at the API/MCP layer. Absent in existing registries →
+    /// `None` (no overrides).
+    #[serde(default)]
+    pub sampling: Option<SamplingProfile>,
     #[serde(default)]
     pub pinned: bool,
     /// Designate this entry as the default model when external harnesses
@@ -262,6 +422,200 @@ method: dflash
 "#;
         let cfg: SpeculativeConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.draft_max, 8);
+    }
+
+    // ── SamplingProfile: serde + merge precedence + lock matrix ─────
+
+    fn empty_profile() -> SamplingProfile {
+        SamplingProfile {
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            max_tokens: None,
+            lock: false,
+        }
+    }
+
+    #[test]
+    fn sampling_profile_empty_yaml_parses() {
+        // A profile with no fields → all None, lock false.
+        let p: SamplingProfile = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(p, empty_profile());
+    }
+
+    #[test]
+    fn sampling_profile_partial_yaml_round_trips() {
+        // Only temperature set; the rest stay None and `lock` defaults
+        // false. Re-serializing must omit every absent field.
+        let yaml = "temperature: 0.2\n";
+        let p: SamplingProfile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.top_p, None);
+        assert!(!p.lock);
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert_eq!(back.trim(), "temperature: 0.2");
+    }
+
+    #[test]
+    fn sampling_profile_empty_serializes_empty() {
+        let back = serde_yaml::to_string(&empty_profile()).unwrap();
+        assert_eq!(back.trim(), "{}");
+    }
+
+    #[test]
+    fn resolve_samplers_unlocked_profile_fills_and_yields() {
+        // UNLOCKED profile (lock=false) — the previously-untested branch:
+        //   row 2 (request wins over an unlocked profile field), and
+        //   row 3 (profile fills a caller-omitted field).
+        let p = SamplingProfile {
+            temperature: Some(0.2),   // caller overrides this below
+            top_k: Some(40),          // caller omits → profile fills
+            top_p: None,
+            min_p: None,
+            repeat_penalty: None,
+            max_tokens: None,
+            lock: false,
+        };
+        let r = resolve_samplers(
+            Some(&p),
+            Some(0.9), // req temperature — must win (unlocked)
+            None,      // req top_p
+            None,      // req top_k — profile must fill
+            None, None, None,
+        );
+        assert_eq!(r.temperature, Some(0.9), "unlocked: caller value wins");
+        assert_eq!(r.top_k, Some(40), "profile fills caller-omitted field");
+        assert_eq!(r.top_p, None, "neither side set → stays None (no builtin)");
+        assert_eq!(r.max_tokens, None);
+    }
+
+    #[test]
+    fn sampling_profile_lock_serializes_when_true() {
+        let mut p = empty_profile();
+        p.lock = true;
+        p.temperature = Some(0.0);
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(back.contains("lock: true"), "got: {back}");
+        assert!(back.contains("temperature: 0.0"), "got: {back}");
+    }
+
+    #[test]
+    fn model_entry_no_sampling_key_is_none() {
+        // Backward compat: a registry-proxy-shaped YAML with no
+        // `sampling:` key deserializes the field to None.
+        let yaml = r#"
+name: m
+path: /tmp/m.gguf
+format: gguf
+backend: llama_cpp
+arch: qwen3
+params_b: 7.0
+quant: Q4_K_M
+vram_mb: 8000
+context_max: 32768
+capabilities: [chat]
+"#;
+        let e: ModelEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(e.sampling.is_none());
+    }
+
+    #[test]
+    fn model_entry_with_sampling_round_trips() {
+        let yaml = r#"
+name: m
+path: /tmp/m.gguf
+format: gguf
+backend: llama_cpp
+arch: qwen3
+params_b: 7.0
+quant: Q4_K_M
+vram_mb: 8000
+context_max: 32768
+capabilities: [chat]
+sampling:
+  temperature: 0.3
+  top_p: 0.9
+  lock: true
+"#;
+        let e: ModelEntry = serde_yaml::from_str(yaml).unwrap();
+        let s = e.sampling.expect("sampling present");
+        assert_eq!(s.temperature, Some(0.3));
+        assert_eq!(s.top_p, Some(0.9));
+        assert_eq!(s.top_k, None);
+        assert!(s.lock);
+    }
+
+    #[test]
+    fn merge_unlocked_request_wins_over_profile() {
+        let mut p = empty_profile();
+        p.temperature = Some(0.1);
+        // caller supplied 0.9 → caller wins (unlocked).
+        assert_eq!(p.temperature(Some(0.9), 0.7), 0.9);
+    }
+
+    #[test]
+    fn merge_unlocked_profile_fills_omitted() {
+        let mut p = empty_profile();
+        p.temperature = Some(0.1);
+        // caller omitted → profile fills.
+        assert_eq!(p.temperature(None, 0.7), 0.1);
+    }
+
+    #[test]
+    fn merge_unlocked_default_when_neither() {
+        let p = empty_profile();
+        // neither profile nor caller → builtin default.
+        assert_eq!(p.temperature(None, 0.7), 0.7);
+        assert_eq!(p.max_tokens(None, 16384), 16384);
+    }
+
+    #[test]
+    fn merge_locked_profile_overrides_request() {
+        let mut p = empty_profile();
+        p.lock = true;
+        p.temperature = Some(0.0);
+        // locked + profile Some → profile overrides caller's 0.9.
+        assert_eq!(p.temperature(Some(0.9), 0.7), 0.0);
+    }
+
+    #[test]
+    fn merge_locked_but_field_unset_falls_back_to_request() {
+        let mut p = empty_profile();
+        p.lock = true;
+        // lock is on but THIS field unset → caller still wins.
+        assert_eq!(p.top_p(Some(0.5), 1.0), 0.5);
+        // and falls to default when caller also omits.
+        assert_eq!(p.top_p(None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn resolve_opt_keeps_none_when_neither_supplies() {
+        let p = empty_profile();
+        assert_eq!(p.resolve_top_k(None), None);
+        assert_eq!(p.resolve_temperature(Some(0.4)), Some(0.4));
+    }
+
+    #[test]
+    fn resolve_samplers_none_profile_passthrough() {
+        let r = resolve_samplers(None, Some(0.5), None, Some(40), None, None, Some(256));
+        assert_eq!(r.temperature, Some(0.5));
+        assert_eq!(r.top_k, Some(40));
+        assert_eq!(r.max_tokens, Some(256));
+        assert_eq!(r.top_p, None);
+    }
+
+    #[test]
+    fn resolve_samplers_locked_profile_overrides() {
+        let mut p = empty_profile();
+        p.lock = true;
+        p.temperature = Some(0.0);
+        p.max_tokens = Some(4096);
+        let r = resolve_samplers(Some(&p), Some(0.9), None, None, None, None, Some(99));
+        assert_eq!(r.temperature, Some(0.0)); // locked override
+        assert_eq!(r.max_tokens, Some(4096)); // locked override
+        assert_eq!(r.top_k, None); // unset everywhere
     }
 
     #[test]

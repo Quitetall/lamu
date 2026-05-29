@@ -35,6 +35,14 @@ pub struct GenerateOpts {
     /// `<think>` block via `chat_template_kwargs.enable_thinking`. `None`
     /// leaves the model's default behaviour (thinking on).
     pub enable_thinking: Option<bool>,
+    /// Nucleus sampling cutoff. `None` = leave the backend/server default.
+    pub top_p: Option<f32>,
+    /// Top-k truncation (integer count). `None` = server default.
+    pub top_k: Option<u32>,
+    /// Min-p sampling cutoff. `None` = server default.
+    pub min_p: Option<f32>,
+    /// Repetition penalty. `None` = server default.
+    pub repeat_penalty: Option<f32>,
 }
 
 #[async_trait]
@@ -175,4 +183,35 @@ pub async fn graceful_kill(child: &mut tokio::process::Child) {
 pub async fn graceful_kill(child: &mut tokio::process::Child) {
     // No SIGTERM on non-Unix; just kill.
     let _ = child.kill().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_opts_default_all_none() {
+        let o = GenerateOpts::default();
+        assert_eq!(o.enable_thinking, None);
+        assert_eq!(o.top_p, None);
+        assert_eq!(o.top_k, None);
+        assert_eq!(o.min_p, None);
+        assert_eq!(o.repeat_penalty, None);
+    }
+
+    #[test]
+    fn generate_opts_carries_new_sampler_fields() {
+        let o = GenerateOpts {
+            enable_thinking: Some(false),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.1),
+        };
+        assert_eq!(o.top_p, Some(0.9));
+        assert_eq!(o.top_k, Some(40));
+        assert_eq!(o.min_p, Some(0.05));
+        assert_eq!(o.repeat_penalty, Some(1.1));
+        assert_eq!(o.enable_thinking, Some(false));
+    }
 }

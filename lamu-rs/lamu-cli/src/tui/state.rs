@@ -546,6 +546,7 @@ mod default_main_idx_tests {
             capabilities: vec![Capability::Chat],
             reasoning_marker: None,
             speculative: None,
+            sampling: None,
             pinned: false,
             main,
             notes: String::new(),

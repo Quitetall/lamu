@@ -31,6 +31,7 @@ fn sample_entry(name: &str) -> ModelEntry {
         capabilities: vec![Capability::Chat, Capability::Code],
         reasoning_marker: None,
         speculative: None,
+        sampling: None,
         pinned: false,
         main: false,
         notes: String::new(),

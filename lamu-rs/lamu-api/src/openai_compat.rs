@@ -14,7 +14,7 @@ use lamu_core::reasoning::get_extractor;
 use lamu_core::registry::load_registry;
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
-use lamu_core::types::{Capability, ModelEntry, ReasoningMarker};
+use lamu_core::types::{Capability, ModelEntry, ReasoningMarker, SamplingProfile};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -74,16 +74,26 @@ pub struct ChatRequest {
     #[serde(default)]
     pub model: Option<String>,
     pub messages: Vec<Message>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    // `max_tokens` / `temperature` are `Option` (NOT plain-with-default)
+    // so omission is detectable — required to merge a per-model sampling
+    // profile without clobbering legitimate client values. The builtin
+    // defaults (16384 / 0.7) are applied at the payload-build site as the
+    // final merge fallback, preserving prior effective behavior when no
+    // profile and no request value are present.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub top_k: Option<u32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     /// Toggle Qwen3.6 / Qwen3.5 reasoning mode. When None, defaults to
     /// the backend's chat template default (typically thinking ON for
     /// Qwen3.6). Set false to skip the `<think>` block entirely and
@@ -157,15 +167,18 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// Route the request to a loaded model, spawning the backend on demand
-/// if the router says "will load". Returns `(port, model_name, marker)`
-/// on success or an `IntoResponse` error envelope (503/500) on failure.
+/// if the router says "will load". Returns
+/// `(port, model_name, marker, sampling_profile)` on success or an
+/// `IntoResponse` error envelope (503/500) on failure. The sampling
+/// profile (if the resolved entry carries one) is merged into the
+/// downstream payload by each caller.
 ///
 /// Single place where `lamu serve` decides whether to spawn a backend.
 /// Used by the OpenAI, Anthropic-stream, and Ollama-stream entry points.
 async fn resolve_and_ensure_loaded(
     state: &AppState,
     model_req: Option<&str>,
-) -> std::result::Result<(u16, String, Option<ReasoningMarker>), Response> {
+) -> std::result::Result<(u16, String, Option<ReasoningMarker>, Option<SamplingProfile>), Response> {
     let decision = {
         let scheduler = state.scheduler.lock();
         let router = state.router.lock();
@@ -217,7 +230,8 @@ async fn resolve_and_ensure_loaded(
     let port = loaded.port;
     let entry = state.entries.get(&decision.model_name).cloned();
     let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
-    Ok((port, decision.model_name, marker))
+    let sampling = entry.as_ref().and_then(|e| e.sampling.clone());
+    Ok((port, decision.model_name, marker, sampling))
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
@@ -288,11 +302,11 @@ async fn chat_completions(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body_json)).into_response();
     }
 
-    let (port, model_name, marker) = match resolve_and_ensure_loaded(
+    let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         req.model.as_deref(),
     ).await {
-        Ok(triple) => triple,
+        Ok(t) => t,
         Err(resp) => return resp,
     };
 
@@ -305,14 +319,30 @@ async fn chat_completions(
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
 
+    // Merge the per-model sampling profile (if any) with the request's
+    // sampler values. Precedence: locked profile field > request value >
+    // unlocked profile field > builtin default. temperature/max_tokens
+    // collapse to a concrete value (builtin default 0.7 / 16384) since
+    // they're always present in the OpenAI payload; the others stay
+    // Option so we only emit them when actually set (no nulls).
+    let s = lamu_core::types::resolve_samplers(
+        sampling.as_ref(),
+        req.temperature, req.top_p, req.top_k, req.min_p, req.repeat_penalty,
+        req.max_tokens,
+    );
+    let eff_temperature = s.temperature.unwrap_or_else(default_temperature);
+    let eff_max_tokens = s.max_tokens.unwrap_or_else(default_max_tokens);
+
     let mut payload = json!({
         "messages": messages_json,
-        "max_tokens": req.max_tokens,
-        "temperature": req.temperature,
+        "max_tokens": eff_max_tokens,
+        "temperature": eff_temperature,
         "stream": req.stream,
     });
-    if let Some(k) = req.top_k { payload["top_k"] = json!(k); }
-    if let Some(p) = req.top_p { payload["top_p"] = json!(p); }
+    if let Some(k) = s.top_k { payload["top_k"] = json!(k); }
+    if let Some(p) = s.top_p { payload["top_p"] = json!(p); }
+    if let Some(v) = s.min_p { payload["min_p"] = json!(v); }
+    if let Some(v) = s.repeat_penalty { payload["repeat_penalty"] = json!(v); }
     // Thread enable_thinking through to backend's chat template kwargs.
     // bee llama-server consumes chat_template_kwargs.enable_thinking
     // (Qwen3.6 / Qwen3.5 chat templates honor it).
@@ -772,16 +802,24 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(default)]
     system: Option<serde_json::Value>, // string OR vec of content blocks
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
-    #[serde(default = "default_temperature")]
-    temperature: f32,
+    // `Option` (not plain-with-default) so the per-model sampling profile
+    // merge can distinguish omitted-vs-default. Anthropic's spec makes
+    // `max_tokens` required, but we keep it lenient + Option here and let
+    // the merge apply the builtin default (16384) when absent.
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
     top_k: Option<u32>,
     #[serde(default)]
     top_p: Option<f32>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
     /// Anthropic tool spec. Translated to OpenAI tools array.
     /// Each tool: {name, description, input_schema}.
     #[serde(default)]
@@ -974,6 +1012,7 @@ async fn anthropic_messages(
         return stream_response_anthropic(state, messages, req.model.clone(),
                                          req.max_tokens, req.temperature,
                                          req.top_k, req.top_p,
+                                         req.min_p, req.repeat_penalty,
                                          req.enable_thinking,
                                          oai_tools, oai_tool_choice).await;
     }
@@ -986,6 +1025,8 @@ async fn anthropic_messages(
         stream: false,
         top_k: req.top_k,
         top_p: req.top_p,
+        min_p: req.min_p,
+        repeat_penalty: req.repeat_penalty,
         enable_thinking: req.enable_thinking,
         tools: oai_tools,
         tool_choice: oai_tool_choice,
@@ -1116,35 +1157,49 @@ struct ToolAcc {
 // Anthropic streaming: bridge OpenAI SSE → Anthropic event-typed SSE.
 // Re-uses chat_completions routing/lock acquisition by calling backend
 // directly via the routing decision pulled from state.
+#[allow(clippy::too_many_arguments)]
 async fn stream_response_anthropic(
     state: AppState,
     messages: Vec<Message>,
     model_req: Option<String>,
-    max_tokens: u32,
-    temperature: f32,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
     top_k: Option<u32>,
     top_p: Option<f32>,
+    min_p: Option<f32>,
+    repeat_penalty: Option<f32>,
     enable_thinking: Option<bool>,
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
 ) -> Response {
-    let (port, model_name, _marker) = match resolve_and_ensure_loaded(
+    let (port, model_name, _marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
     ).await {
-        Ok(triple) => triple,
+        Ok(t) => t,
         Err(resp) => return resp,
     };
+
+    // Merge the per-model sampling profile with the request values.
+    let s = lamu_core::types::resolve_samplers(
+        sampling.as_ref(), temperature, top_p, top_k, min_p, repeat_penalty, max_tokens,
+    );
+    let eff_temperature = s.temperature.unwrap_or_else(default_temperature);
+    let eff_max_tokens = s.max_tokens.unwrap_or_else(default_max_tokens);
 
     let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
     let mut payload = json!({
         "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+        "max_tokens": eff_max_tokens,
+        "temperature": eff_temperature,
         "stream": true,
-        "top_k": top_k,
-        "top_p": top_p,
     });
+    // Only emit samplers when actually set (no nulls — fixes the prior
+    // quirk where an omitted top_k/top_p serialized to JSON `null`).
+    if let Some(k) = s.top_k { payload["top_k"] = json!(k); }
+    if let Some(p) = s.top_p { payload["top_p"] = json!(p); }
+    if let Some(v) = s.min_p { payload["min_p"] = json!(v); }
+    if let Some(v) = s.repeat_penalty { payload["repeat_penalty"] = json!(v); }
     if let Some(et) = enable_thinking {
         payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
     }
@@ -1384,6 +1439,10 @@ struct OllamaOptions {
     #[serde(default)]
     top_k: Option<u32>,
     #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
+    #[serde(default)]
     num_predict: Option<u32>,
 }
 
@@ -1411,8 +1470,12 @@ async fn ollama_chat(
 ) -> Response {
     let stream_on = req.stream.unwrap_or(true);
     let opts = req.options.unwrap_or_default();
-    let max_tokens = opts.num_predict.unwrap_or(default_max_tokens());
-    let temperature = opts.temperature.unwrap_or(default_temperature());
+    // Keep as Option (don't collapse to defaults here) so the per-model
+    // sampling profile merge downstream can distinguish omitted-vs-set.
+    // The builtin default is applied as the final merge fallback in
+    // chat_completions / stream_response_ollama.
+    let max_tokens = opts.num_predict;
+    let temperature = opts.temperature;
 
     let messages: Vec<Message> = req.messages.iter().map(|m| Message {
         role: m.role.clone(),
@@ -1423,6 +1486,7 @@ async fn ollama_chat(
         return stream_response_ollama(state, messages, req.model.clone(),
                                       max_tokens, temperature,
                                       opts.top_k, opts.top_p,
+                                      opts.min_p, opts.repeat_penalty,
                                       req.enable_thinking).await;
     }
 
@@ -1434,6 +1498,8 @@ async fn ollama_chat(
         stream: false,
         top_k: opts.top_k,
         top_p: opts.top_p,
+        min_p: opts.min_p,
+        repeat_penalty: opts.repeat_penalty,
         enable_thinking: req.enable_thinking,
         tools: None,
         tool_choice: None,
@@ -1508,33 +1574,45 @@ fn epoch_to_civil(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (yr, mo, d, h, mi, sc)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_response_ollama(
     state: AppState,
     messages: Vec<Message>,
     model_req: Option<String>,
-    max_tokens: u32,
-    temperature: f32,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
     top_k: Option<u32>,
     top_p: Option<f32>,
+    min_p: Option<f32>,
+    repeat_penalty: Option<f32>,
     enable_thinking: Option<bool>,
 ) -> Response {
-    let (port, model_name, _marker) = match resolve_and_ensure_loaded(
+    let (port, model_name, _marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
     ).await {
-        Ok(triple) => triple,
+        Ok(t) => t,
         Err(resp) => return resp,
     };
+
+    // Merge the per-model sampling profile with the request values.
+    let s = lamu_core::types::resolve_samplers(
+        sampling.as_ref(), temperature, top_p, top_k, min_p, repeat_penalty, max_tokens,
+    );
+    let eff_temperature = s.temperature.unwrap_or_else(default_temperature);
+    let eff_max_tokens = s.max_tokens.unwrap_or_else(default_max_tokens);
 
     let backend_url = format!("http://localhost:{}/v1/chat/completions", port);
     let mut payload = json!({
         "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+        "max_tokens": eff_max_tokens,
+        "temperature": eff_temperature,
         "stream": true,
-        "top_k": top_k,
-        "top_p": top_p,
     });
+    if let Some(k) = s.top_k { payload["top_k"] = json!(k); }
+    if let Some(p) = s.top_p { payload["top_p"] = json!(p); }
+    if let Some(v) = s.min_p { payload["min_p"] = json!(v); }
+    if let Some(v) = s.repeat_penalty { payload["repeat_penalty"] = json!(v); }
     if let Some(et) = enable_thinking {
         payload["chat_template_kwargs"] = json!({ "enable_thinking": et });
     }
@@ -1796,6 +1874,41 @@ mod compat_tests {
         }"#;
         let req: OllamaChatRequest = serde_json::from_str(body).expect("parse");
         assert_eq!(req.enable_thinking, None);
+    }
+
+    // ── per-model sampling: request serde (Option-ization) ──────────
+
+    #[test]
+    fn chat_request_omitted_samplers_are_none() {
+        // temperature/max_tokens were Option-ized (were plain-with-default)
+        // so omission is detectable → the per-model profile can fill, and
+        // the builtin 0.7/16384 fallback is applied at the payload site.
+        // A regression that reverts them to plain-with-default would break
+        // profile fill silently; this pins None-on-omission.
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+        ).unwrap();
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.max_tokens, None);
+        assert_eq!(req.top_k, None);
+        assert_eq!(req.top_p, None);
+        assert_eq!(req.min_p, None);
+        assert_eq!(req.repeat_penalty, None);
+    }
+
+    #[test]
+    fn chat_request_parses_full_sampler_set() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":"hi"}],
+                "temperature":0.3,"max_tokens":256,"top_k":40,
+                "top_p":0.9,"min_p":0.05,"repeat_penalty":1.1}"#,
+        ).unwrap();
+        assert_eq!(req.temperature, Some(0.3));
+        assert_eq!(req.max_tokens, Some(256));
+        assert_eq!(req.top_k, Some(40));
+        assert_eq!(req.top_p, Some(0.9));
+        assert_eq!(req.min_p, Some(0.05));
+        assert_eq!(req.repeat_penalty, Some(1.1));
     }
 
     // ── streaming empty-backend gate ────────────────────────────────

@@ -58,8 +58,18 @@ impl LamuMcpServer {
         let model = args.get("model").and_then(|v| v.as_str());
         let caps_raw = args.get("capabilities").and_then(|v| v.as_array());
         let system = args.get("system").and_then(|v| v.as_str()).unwrap_or("");
-        let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(16384) as u32;
-        let temperature = args.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
+        // Parse samplers as Option so we can distinguish "caller omitted"
+        // from "caller passed the default" when merging the per-model
+        // sampling profile (see lamu_core::types::SamplingProfile). The
+        // builtin defaults (16384 / 0.7) are applied as the final merge
+        // fallback below, preserving prior behavior when no profile + no
+        // request value.
+        let req_max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|x| x as u32);
+        let req_temperature = args.get("temperature").and_then(|v| v.as_f64()).map(|x| x as f32);
+        let req_top_p = args.get("top_p").and_then(|v| v.as_f64()).map(|x| x as f32);
+        let req_top_k = args.get("top_k").and_then(|v| v.as_u64()).map(|x| x as u32);
+        let req_min_p = args.get("min_p").and_then(|v| v.as_f64()).map(|x| x as f32);
+        let req_repeat_penalty = args.get("repeat_penalty").and_then(|v| v.as_f64()).map(|x| x as f32);
         let include_reasoning = args.get("include_reasoning").and_then(|v| v.as_bool()).unwrap_or(false);
         let priority = args.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let origin = args.get("origin").and_then(|v| v.as_str()).unwrap_or("anonymous").to_string();
@@ -101,7 +111,7 @@ impl LamuMcpServer {
         // Route + collect target info under lock. Backend Arc is
         // cloned out of the map so .generate() can run without holding
         // the state lock across .await.
-        let (model_name, marker, backend_arc) = {
+        let (model_name, marker, sampling, backend_arc) = {
             let st = self.state.lock();
             let decision = st.router.route(&st.scheduler, model, caps_opt, Some(st.health.all()));
 
@@ -121,13 +131,14 @@ impl LamuMcpServer {
             };
             let entry = st.entries.get(&decision.model_name).cloned();
             let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
+            let sampling = entry.as_ref().and_then(|e| e.sampling.clone());
             let Some(backend_arc) = st.backends.get(&decision.model_name).cloned() else {
                 return format!(
                     "error: internal: model '{}' marked loaded but missing from backends map",
                     decision.model_name
                 );
             };
-            (decision.model_name, marker, backend_arc)
+            (decision.model_name, marker, sampling, backend_arc)
         };
 
         // Mark used (separate lock acquisition)
@@ -183,8 +194,36 @@ impl LamuMcpServer {
                     model_name
                 );
             }
-            let opts = lamu_core::backends::GenerateOpts {
-                enable_thinking,
+            // Merge the per-model sampling profile (if any) with the
+            // caller's request values. Precedence: locked profile field >
+            // request value > unlocked profile field > builtin default.
+            // temperature/max_tokens are passed positionally so they
+            // collapse to a concrete value (builtin default = 16384/0.7);
+            // top_p/top_k/min_p/repeat_penalty stay Option so the backend
+            // only sends them downstream when actually set.
+            let (max_tokens, temperature, opts) = match sampling.as_ref() {
+                Some(p) => {
+                    let mt = p.max_tokens(req_max_tokens, 16384);
+                    let temp = p.temperature(req_temperature, 0.7);
+                    let opts = lamu_core::backends::GenerateOpts {
+                        enable_thinking,
+                        top_p: p.resolve_top_p(req_top_p),
+                        top_k: p.resolve_top_k(req_top_k),
+                        min_p: p.resolve_min_p(req_min_p),
+                        repeat_penalty: p.resolve_repeat_penalty(req_repeat_penalty),
+                    };
+                    (mt, temp, opts)
+                }
+                None => {
+                    let opts = lamu_core::backends::GenerateOpts {
+                        enable_thinking,
+                        top_p: req_top_p,
+                        top_k: req_top_k,
+                        min_p: req_min_p,
+                        repeat_penalty: req_repeat_penalty,
+                    };
+                    (req_max_tokens.unwrap_or(16384), req_temperature.unwrap_or(0.7), opts)
+                }
             };
             match backend.generate_with_opts(chat_messages, max_tokens, temperature, opts).await {
                 Ok(s) => s,

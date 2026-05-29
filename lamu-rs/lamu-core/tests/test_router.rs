@@ -22,6 +22,7 @@ fn sample_entry(name: &str, main: bool) -> ModelEntry {
         capabilities: vec![Capability::Chat],
         reasoning_marker: None,
         speculative: None,
+        sampling: None,
         pinned: false,
         main,
         notes: String::new(),
