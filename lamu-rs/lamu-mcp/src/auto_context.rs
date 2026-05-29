@@ -199,10 +199,19 @@ pub fn assemble_auto_context_with_opts(
     }
 
     if out.len() > MAX_AUTO_BYTES {
-        out.truncate(MAX_AUTO_BYTES);
-        out.push_str("\n\n[…auto-context truncated to ");
-        out.push_str(&MAX_AUTO_BYTES.to_string());
-        out.push_str(" bytes]\n");
+        // Reserve room for the marker so the final string stays within
+        // MAX_AUTO_BYTES, then walk back to a UTF-8 char boundary — file
+        // bodies appended above carry multibyte content and a raw truncate
+        // that splits a codepoint panics. (server.rs dispatches handlers
+        // inline, so that panic would kill the whole stdio server.) The
+        // walk-back is ≤3 iterations (max UTF-8 char width), not O(n).
+        const MARKER_RESERVE: usize = 64;
+        let mut cut = MAX_AUTO_BYTES.saturating_sub(MARKER_RESERVE);
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str(&format!("\n\n[…auto-context truncated to {cut} bytes]\n"));
     }
 
     Ok(out)

@@ -73,10 +73,11 @@ pub fn trace_id_from_traceparent(tp: &str) -> Option<String> {
         return None;
     }
     let traceid = parts[1];
-    if traceid.len() < 16 {
-        return None;
-    }
-    Some(traceid[..16].to_string())
+    // `str::get` returns None if traceid is shorter than 16 bytes OR if
+    // byte 16 is not a UTF-8 char boundary — both "malformed". The old
+    // `len() < 16` + `traceid[..16]` byte-slice panicked when an
+    // attacker-supplied multibyte char straddled byte 16.
+    traceid.get(..16).map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -112,6 +113,21 @@ mod tests {
     fn traceparent_rejects_short_input() {
         assert_eq!(trace_id_from_traceparent("nope"), None);
         assert_eq!(trace_id_from_traceparent("00-short-x-01"), None);
+    }
+
+    #[test]
+    fn traceparent_multibyte_does_not_panic() {
+        // Attacker-controlled traceid whose byte 16 splits a multibyte
+        // codepoint: `€` is 3 bytes, so "€€€€€€" is 18 bytes and byte 16
+        // lands mid-`€`. Old `traceid[..16]` panicked; `str::get` returns
+        // None (treated as malformed) without unwinding the server loop.
+        let tp = "00-€€€€€€-0011223344556677-01";
+        assert_eq!(trace_id_from_traceparent(tp), None);
+        // ASCII traceid exactly 16 bytes still extracts.
+        assert_eq!(
+            trace_id_from_traceparent("00-0123456789abcdef-aa-01").as_deref(),
+            Some("0123456789abcdef")
+        );
     }
 
     #[test]
