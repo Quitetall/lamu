@@ -429,7 +429,7 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     // latency, zero behavior change. Gated additionally on a real
     // conversation turn (`conv_id` non-empty — which excludes every
     // internal warmup/review caller, none of which set conversation_id)
-    // and on a non-error reply. The work runs in a DETACHED task that
+    // and on a non-error reply. The work runs on a DETACHED thread that
     // captures only owned data, so `result` is returned IMMEDIATELY below
     // and the user's reply is never blocked or delayed; facts land
     // shortly AFTER the reply (eventual consistency, by design).

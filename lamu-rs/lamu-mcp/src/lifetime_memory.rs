@@ -471,6 +471,9 @@ pub async fn extract_from_exchange(user: &str, assistant: &str) -> Result<Vec<St
         "temperature": 0.2,
         "include_reasoning": false,
     });
+    // LOAD-BEARING: `args` has NO `conversation_id`, so handle_cloud_query's
+    // autocapture gate (`!conv_id.is_empty()`) is false for THIS call — the
+    // extraction request cannot itself trigger autocapture and recurse.
     let resp = crate::cloud::handle_cloud_query(args).await;
     if resp.starts_with("error:") {
         return Err(anyhow!("fact extraction failed: {resp}"));
