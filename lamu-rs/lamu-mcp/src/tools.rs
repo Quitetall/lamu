@@ -261,9 +261,30 @@ fn schema_recall_memory() -> Value {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Natural-language query to recall relevant memories for."},
-            "k": {"type": "integer", "default": 8, "description": "Max number of memories to return. Default 8."}
+            "k": {"type": "integer", "default": 8, "description": "Max number of memories to return. Default 8."},
+            "include_expired": {"type": "boolean", "default": false, "description": "When false (default) only CURRENTLY-VALID facts are returned — facts that were superseded (replaced) or forgotten (soft-deleted) are hidden. When true, historical recall: returns the full timeline including expired facts (none are ever hard-deleted)."}
         },
         "required": ["query"]
+    })
+}
+
+fn schema_forget_memory() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer", "description": "Id of the memory to soft-delete (forget). The fact's valid_until is set so it drops out of default recall, but it is NEVER hard-deleted — it stays recoverable and the timeline survives."}
+        },
+        "required": ["id"]
+    })
+}
+
+fn schema_export_memory_graph() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dir": {"type": "string", "description": "Output directory for the corpus. Defaults to <data_dir>/lamu/memory-corpus. Created if missing."},
+            "include_expired": {"type": "boolean", "default": false, "description": "When false (default) export only currently-valid facts. When true, export every fact (so the graph shows the full timeline, including superseded/forgotten facts)."}
+        }
     })
 }
 
@@ -424,6 +445,14 @@ fn dispatch_recall_memory(args: Value) -> Pin<Box<dyn Future<Output = String> + 
 
 fn dispatch_consolidate_memory(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::lifetime_memory::handle_consolidate_memory(args))
+}
+
+fn dispatch_forget_memory(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_forget_memory(args))
+}
+
+fn dispatch_export_memory_graph(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_export_memory_graph(args))
 }
 
 // ── The catalog ─────────────────────────────────────────────────────
@@ -587,7 +616,7 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "recall_memory",
-        description: "Semantic search over lifetime cross-session memory (the global fact store at ~/.local/share/lamu/memory.db). Embeds the query and ranks stored facts by cosine similarity via the shared vector-index seam. With an OPENAI_API_KEY it returns the top-k most relevant facts; without a key it degrades gracefully to the most-recent k facts by timestamp. Args: query (required), k (default 8). Returns a formatted hit list (text + kind + source + score).",
+        description: "Semantic search over lifetime cross-session memory (the global fact store at ~/.local/share/lamu/memory.db). Embeds the query and ranks stored facts by cosine similarity via the shared vector-index seam. With an OPENAI_API_KEY it returns the top-k most relevant facts; without a key it degrades gracefully to the most-recent k facts by timestamp. TEMPORAL: by default returns ONLY currently-valid facts — facts that were superseded or forgotten are hidden; set include_expired=true for historical recall over the full timeline. Args: query (required), k (default 8), include_expired (default false). Returns a formatted hit list (text + kind + source + score).",
         schema_fn: schema_recall_memory,
         handler: HandlerKind::Free(dispatch_recall_memory),
         cloud: false,
@@ -598,6 +627,20 @@ pub static TOOLS: &[ToolDef] = &[
         schema_fn: schema_consolidate_memory,
         handler: HandlerKind::Free(dispatch_consolidate_memory),
         cloud: true,
+    },
+    ToolDef {
+        name: "forget_memory",
+        description: "Soft-delete a fact from lifetime cross-session memory. Sets the fact's valid_until so it drops out of default recall, but the fact is NEVER hard-deleted — it stays recoverable and the timeline survives (recall it again with recall_memory include_expired=true). Local store op, no network. Args: id (required integer). Returns 'forgot memory <id>' or 'no current memory with id <id>'.",
+        schema_fn: schema_forget_memory,
+        handler: HandlerKind::Free(dispatch_forget_memory),
+        cloud: false,
+    },
+    ToolDef {
+        name: "export_memory_graph",
+        description: "Export lifetime cross-session memory as a graphify-ready corpus: one markdown file per fact (mem_<id>.md) with YAML frontmatter (id/kind/source/ts/valid_from/valid_until/supersedes) + the fact text. lamu does NOT extract entities/edges/hyperedges/communities — it only emits the corpus; you then run `/graphify <dir>` (or `graphify <dir>`) and graphify's LLM extraction + clustering pipeline builds the entity/hypergraph/community graph (queryable live via its graphify.serve MCP server). Local filesystem op, no network. Args: dir (default <data_dir>/lamu/memory-corpus), include_expired (default false — true exports the full timeline). Returns the count written + the graphify command to run.",
+        schema_fn: schema_export_memory_graph,
+        handler: HandlerKind::Free(dispatch_export_memory_graph),
+        cloud: false,
     },
 ];
 
@@ -667,6 +710,7 @@ mod tests {
             "set_routing_mode", "routing_status", "search_repo", "index_repo",
             "recall_conversation", "train_from_conversations", "write_file",
             "parallel_query", "remember", "recall_memory",
+            "forget_memory", "export_memory_graph",
         ] {
             assert!(!find(name).unwrap().cloud, "{name} must have cloud:false");
         }
