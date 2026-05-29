@@ -636,16 +636,27 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
         Some(k) => k,
     };
 
-    let emb = embed_one(text, &key).await?;
+    let emb = embed_one(text, &key).await?; // embed BEFORE taking the lock
     let arc = memory_db()?;
-    // Load existing embeddings under the lock, then release BEFORE the
-    // cosine pass — same discipline as recall_memory: never hold the
-    // mutex across ranking. Same SELECT + blob_to_vec the recall path uses.
+    let now = now_secs();
+    // Dedup only against CURRENTLY-VALID facts. The old SELECT had no
+    // valid-time filter, so a re-asserted fact whose near-duplicate had
+    // been superseded/forgotten (row still present, just expired) was
+    // dropped as a "duplicate" — but default recall hides the expired row,
+    // so the now-current fact silently vanished.
+    let valid = valid_time_clause(false, now);
+    let sql =
+        format!("SELECT embedding FROM memories WHERE embedding IS NOT NULL AND {valid}");
+    // Hold ONE guard across SELECT + is_novel + insert. is_novel (cosine)
+    // and insert_memory are synchronous (no await), so this is safe and
+    // closes the TOCTOU window where two concurrent autocapture threads
+    // both passed the novelty check against the same pre-insert snapshot
+    // and both inserted. Trade-off: the cosine scan now runs under the
+    // lock, serializing concurrent novelty checks — fine while memory.db
+    // is small + autocapture is bounded; revisit if the store grows large.
+    let conn = arc.lock();
     let existing: Vec<Vec<f32>> = {
-        let conn = arc.lock();
-        let mut stmt = conn.prepare(
-            "SELECT embedding FROM memories WHERE embedding IS NOT NULL",
-        )?;
+        let mut stmt = conn.prepare(&sql)?;
         let mapped = stmt.query_map([], |r| {
             let blob: Vec<u8> = r.get(0)?;
             Ok(blob_to_vec(&blob))
@@ -661,8 +672,7 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
         return Ok(None);
     }
 
-    let conn = arc.lock();
-    let id = insert_memory(&conn, text, Some(&emb), kind, source, now_secs())?;
+    let id = insert_memory(&conn, text, Some(&emb), kind, source, now)?;
     Ok(Some(id))
 }
 
@@ -859,6 +869,39 @@ pub(crate) fn write_corpus_rows(dir: &Path, rows: &[CorpusRow]) -> Result<usize>
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create corpus dir {}", dir.display()))?;
+
+    // Prune stale `mem_<id>.md` from a prior export: forgotten/expired
+    // facts excluded from `rows` would otherwise linger on disk and get
+    // re-ingested by graphify (the export dir is reused across runs).
+    // Only our own `mem_<digits>.md` files are touched — foreign files in
+    // the dir are left alone.
+    let keep: std::collections::HashSet<String> =
+        rows.iter().map(|r| format!("mem_{}.md", r.id)).collect();
+    // Best-effort prune: failures are logged, not fatal — exporting the
+    // current facts (below) is the load-bearing part. But DO log, because a
+    // silent failure means a forgotten fact lingers and #6 re-surfaces.
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let Some(name) = fname.to_str() else { continue };
+                // Only our own mem_<digits>.md (ids are SQLite rowids).
+                let is_ours = name
+                    .strip_prefix("mem_")
+                    .and_then(|s| s.strip_suffix(".md"))
+                    .map_or(false, |d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+                if is_ours && !keep.contains(name) {
+                    if let Err(e) = std::fs::remove_file(entry.path()) {
+                        tracing::warn!(
+                            "prune stale corpus file {}: {e}",
+                            entry.path().display()
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("prune: read_dir {} failed: {e}", dir.display()),
+    }
 
     let mut written = 0usize;
     for row in rows {
@@ -1496,6 +1539,41 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let n = write_corpus_rows(&nested, &rows).unwrap();
         assert_eq!(n, 1);
         assert!(nested.join("mem_1.md").exists());
+    }
+
+    #[test]
+    fn export_prunes_stale_files_but_keeps_foreign() {
+        let conn = open_test_db();
+        let id1 = insert_memory(&conn, "fact one", None, "fact", "manual", 100).unwrap();
+        let id2 = insert_memory(&conn, "fact two", None, "fact", "manual", 100).unwrap();
+        let id3 = insert_memory(&conn, "fact three", None, "fact", "manual", 100).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First export: all three written.
+        let rows = load_corpus_rows(&conn, false, 1000).unwrap();
+        assert_eq!(write_corpus_rows(tmp.path(), &rows).unwrap(), 3);
+        // A foreign file the prune must never touch.
+        std::fs::write(tmp.path().join("README.md"), b"keep me").unwrap();
+
+        // Forget id2, then re-export to the SAME dir.
+        conn.execute(
+            "UPDATE memories SET valid_until = ? WHERE id = ?",
+            params![500i64, id2],
+        )
+        .unwrap();
+        let rows2 = load_corpus_rows(&conn, false, 1000).unwrap();
+        assert_eq!(write_corpus_rows(tmp.path(), &rows2).unwrap(), 2);
+
+        assert!(tmp.path().join(format!("mem_{id1}.md")).exists());
+        assert!(
+            !tmp.path().join(format!("mem_{id2}.md")).exists(),
+            "forgotten fact's stale file must be pruned"
+        );
+        assert!(tmp.path().join(format!("mem_{id3}.md")).exists());
+        assert!(
+            tmp.path().join("README.md").exists(),
+            "foreign file must be left alone"
+        );
     }
 
     #[tokio::test]
