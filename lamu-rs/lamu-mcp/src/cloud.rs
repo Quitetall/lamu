@@ -101,7 +101,7 @@ pub(crate) fn handle_list_cloud_models() -> String {
 /// "true" (case-insensitive), false for everything else (including
 /// unset → `None`). Split out so it is unit-testable without touching
 /// the process environment.
-fn autocapture_flag(val: Option<&str>) -> bool {
+fn truthy_env_flag(val: Option<&str>) -> bool {
     matches!(
         val.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
         Some("1") | Some("true")
@@ -113,7 +113,25 @@ fn autocapture_flag(val: Option<&str>) -> bool {
 /// autocapture spawn below is unreachable — zero extra MiMo/embedding
 /// calls, zero added latency, zero behavior change.
 fn autocapture_enabled() -> bool {
-    autocapture_flag(std::env::var("LAMU_AUTOCAPTURE").ok().as_deref())
+    truthy_env_flag(std::env::var("LAMU_AUTOCAPTURE").ok().as_deref())
+}
+
+/// Temporary / memoryless ("incognito") chat. When true, the call does
+/// NOT recall prior turns, does NOT persist the turn to conversation
+/// memory, and is NOT autocaptured — even if `conversation_id` is set.
+/// Enabled per-call via the `ephemeral` arg OR globally via
+/// `LAMU_EPHEMERAL=1`/`true` (same "1"/"true" parser as autocapture).
+fn ephemeral_enabled(arg: Option<bool>) -> bool {
+    arg.unwrap_or(false) || truthy_env_flag(std::env::var("LAMU_EPHEMERAL").ok().as_deref())
+}
+
+/// Coerce the per-call `ephemeral` arg from EITHER a JSON bool (`true`)
+/// OR a "true"/"1" string. `None` when the key is absent (so the env
+/// fallback applies). Incognito is privacy-adjacent, so a client that
+/// sends `"ephemeral":"true"` must engage it, not silently fall through.
+fn coerce_ephemeral_arg(v: &Value) -> Option<bool> {
+    v.as_bool()
+        .or_else(|| v.as_str().map(|s| truthy_env_flag(Some(s))))
 }
 
 pub(crate) async fn handle_cloud_query(args: Value) -> String {
@@ -133,7 +151,18 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     // context layer engages with the corresponding tiers. Otherwise the
     // pre-step-6 wire format is preserved exactly.
     let plan_arg = args["plan_file"].as_str();
-    let conv_id = args["conversation_id"].as_str().unwrap_or("");
+    // Temporary/memoryless chat: when ephemeral (per-call `ephemeral` arg
+    // or global LAMU_EPHEMERAL), blank conv_id so the recall / persist /
+    // autocapture paths below — all gated on `!conv_id.is_empty()` — skip
+    // entirely. Nothing is read from or written to conversation memory.
+    // Accept bool OR "true"/"1" string for the per-call arg (privacy-
+    // adjacent: a string must not silently fall through to not-ephemeral).
+    let ephemeral = ephemeral_enabled(coerce_ephemeral_arg(&args["ephemeral"]));
+    let conv_id = if ephemeral {
+        ""
+    } else {
+        args["conversation_id"].as_str().unwrap_or("")
+    };
 
     // V4 Batch 4: when conversation_id is set, recall prior turns via
     // semantic ranking when available (top-K relevant + last 5
@@ -1473,20 +1502,20 @@ mod tests {
     }
 
     #[test]
-    fn autocapture_flag_pure_truth_table() {
+    fn truthy_env_flag_pure_truth_table() {
         // ON only for "1"/"true" (case-insensitive, trimmed).
-        assert!(autocapture_flag(Some("1")));
-        assert!(autocapture_flag(Some("true")));
-        assert!(autocapture_flag(Some("TRUE")));
-        assert!(autocapture_flag(Some("True")));
-        assert!(autocapture_flag(Some("  true  ")));
+        assert!(truthy_env_flag(Some("1")));
+        assert!(truthy_env_flag(Some("true")));
+        assert!(truthy_env_flag(Some("TRUE")));
+        assert!(truthy_env_flag(Some("True")));
+        assert!(truthy_env_flag(Some("  true  ")));
         // OFF for unset and any other value.
-        assert!(!autocapture_flag(None));
-        assert!(!autocapture_flag(Some("")));
-        assert!(!autocapture_flag(Some("0")));
-        assert!(!autocapture_flag(Some("false")));
-        assert!(!autocapture_flag(Some("yes")));
-        assert!(!autocapture_flag(Some("2")));
+        assert!(!truthy_env_flag(None));
+        assert!(!truthy_env_flag(Some("")));
+        assert!(!truthy_env_flag(Some("0")));
+        assert!(!truthy_env_flag(Some("false")));
+        assert!(!truthy_env_flag(Some("yes")));
+        assert!(!truthy_env_flag(Some("2")));
     }
 
     #[test]
@@ -1494,12 +1523,39 @@ mod tests {
         // Rust 2024 makes std::env::set_var unsafe (env mutation races
         // with concurrent test threads), so we don't mutate the env here.
         // The ON/value branches are exhaustively covered by the pure
-        // `autocapture_flag` truth-table test above. This asserts the
+        // `truthy_env_flag` truth-table test above. This asserts the
         // load-bearing default: the test harness runs WITHOUT
         // LAMU_AUTOCAPTURE set, so the real env-reading wrapper reports
         // OFF — proving the autocapture spawn is unreachable by default.
         if std::env::var("LAMU_AUTOCAPTURE").is_err() {
             assert!(!autocapture_enabled(), "unset env → autocapture OFF");
+        }
+    }
+
+    #[test]
+    fn coerce_ephemeral_arg_accepts_bool_and_string() {
+        use serde_json::json;
+        // JSON bool both ways.
+        assert_eq!(coerce_ephemeral_arg(&json!(true)), Some(true));
+        assert_eq!(coerce_ephemeral_arg(&json!(false)), Some(false));
+        // String form must engage (the privacy footgun this guards).
+        assert_eq!(coerce_ephemeral_arg(&json!("true")), Some(true));
+        assert_eq!(coerce_ephemeral_arg(&json!("1")), Some(true));
+        assert_eq!(coerce_ephemeral_arg(&json!("false")), Some(false));
+        assert_eq!(coerce_ephemeral_arg(&json!("nonsense")), Some(false));
+        // Absent / wrong-type → None so the env fallback applies.
+        assert_eq!(coerce_ephemeral_arg(&json!(null)), None);
+        assert_eq!(coerce_ephemeral_arg(&json!(5)), None);
+    }
+
+    #[test]
+    fn ephemeral_per_call_arg_truth_table() {
+        // The per-call arg drives ephemeral regardless of env (the test
+        // harness runs without LAMU_EPHEMERAL, so arg is the only signal).
+        if std::env::var("LAMU_EPHEMERAL").is_err() {
+            assert!(ephemeral_enabled(Some(true)), "arg true → ephemeral");
+            assert!(!ephemeral_enabled(Some(false)), "arg false + no env → not ephemeral");
+            assert!(!ephemeral_enabled(None), "unset arg + no env → not ephemeral (default)");
         }
     }
 

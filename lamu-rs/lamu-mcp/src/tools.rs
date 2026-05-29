@@ -121,7 +121,8 @@ fn schema_cloud_query() -> Value {
             "thinking_enabled": {"type": "boolean", "description": "Engage the model's extended thinking pass. Default: ON for Pro/reasoner/opus model names, OFF for Flash and similar. OFF saves 50-80% wall time on simple tasks. Set explicitly when defaults don't fit."},
             "plan_file": {"type": "string", "description": "Optional path to a plan/spec markdown file to inject as Plan-tier context before the system prompt. Overrides $LAMU_PLAN env and any auto-detected ~/.claude/plans/active.md."},
             "context": {"type": "string", "description": "Optional verbatim Tactical-tier context (file fragments, recent commits, etc.) injected before the system prompt and after Plan tier. Truncated at 200 KiB."},
-            "conversation_id": {"type": "string", "description": "Optional conversation identifier. When set, the last 20 turns under this id are prepended to the Tactical tier as prior context, and this turn (user prompt + assistant reply) is appended to the conversation log at ~/.local/share/lamu/conversations.db. Allowed chars: [A-Za-z0-9_-.]"}
+            "conversation_id": {"type": "string", "description": "Optional conversation identifier. When set, the last 20 turns under this id are prepended to the Tactical tier as prior context, and this turn (user prompt + assistant reply) is appended to the conversation log at ~/.local/share/lamu/conversations.db. Allowed chars: [A-Za-z0-9_-.]"},
+            "ephemeral": {"type": "boolean", "default": false, "description": "Temporary/memoryless ('incognito') chat. When true, this call recalls NO prior turns, is NOT written to the conversation log, and is NOT autocaptured into lifetime memory — even if conversation_id is set. For one-off or sensitive turns you don't want remembered. Can also be forced globally with LAMU_EPHEMERAL=1."}
         },
         "required": ["prompt"]
     })
