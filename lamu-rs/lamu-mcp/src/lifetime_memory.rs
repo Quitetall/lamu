@@ -688,16 +688,23 @@ pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) ->
     };
     let now = now_secs();
     let arc = memory_db()?;
-    let conn = arc.lock();
-    supersede_conn(&conn, old_id, new_text, embedding.as_deref(), kind, source, now)
+    let mut conn = arc.lock();
+    supersede_conn(&mut conn, old_id, new_text, embedding.as_deref(), kind, source, now)
 }
 
 /// Connection-level core of [`supersede`]: insert the new fact with
 /// `supersedes = Some(old_id)` / `valid_from = now`, then expire the old
 /// fact if it is currently valid. Factored out so tests can drive it
 /// against an in-memory connection with a known embedding and `now`.
+///
+/// ATOMICITY: the INSERT (new fact) and UPDATE (expire old fact) run in a
+/// single SQLite transaction. Without it, a crash or error between the two
+/// statements would leave the new fact inserted while the old fact is still
+/// `valid_until IS NULL` — both then appear in default recall, violating the
+/// "exactly one valid version" invariant supersession exists to enforce.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn supersede_conn(
-    conn: &Connection,
+    conn: &mut Connection,
     old_id: i64,
     new_text: &str,
     embedding: Option<&[f32]>,
@@ -705,11 +712,13 @@ pub(crate) fn supersede_conn(
     source: &str,
     now: i64,
 ) -> Result<i64> {
-    let new_id = insert_memory_full(conn, new_text, embedding, kind, source, now, now, Some(old_id))?;
-    conn.execute(
+    let tx = conn.transaction()?;
+    let new_id = insert_memory_full(&tx, new_text, embedding, kind, source, now, now, Some(old_id))?;
+    tx.execute(
         "UPDATE memories SET valid_until = ? WHERE id = ? AND valid_until IS NULL",
         params![now, old_id],
     )?;
+    tx.commit()?;
     Ok(new_id)
 }
 
@@ -740,10 +749,28 @@ pub(crate) fn forget_conn(conn: &Connection, id: i64, now: i64) -> Result<bool> 
 // ── graphify corpus exporter ───────────────────────────────────────
 
 /// Sanitize a frontmatter scalar for single-line YAML: drop newlines and
-/// trailing whitespace so the `---` block stays well-formed. The body
-/// (fact text) is written as-is below the block.
+/// trailing whitespace so the `---` block stays well-formed, and
+/// double-quote the value when it would otherwise be misread by a YAML
+/// parser (empty, a YAML-special bare word like `null`/`true`/`yes`/`no`,
+/// or containing `:` / `#` / a leading quote). Plain words (the common
+/// case — `fact`, `preference`, a `[A-Za-z0-9_-.]` source) pass through
+/// unquoted. The body (fact text) is written as-is below the block.
 fn yaml_scalar(s: &str) -> String {
-    s.replace(['\n', '\r'], " ").trim().to_string()
+    let s = s.replace(['\n', '\r'], " ");
+    let s = s.trim();
+    let needs_quote = s.is_empty()
+        || s.contains(':')
+        || s.contains('#')
+        || s.starts_with(['"', '\'', '[', '{', '*', '&', '!', '|', '>', '@', '`'])
+        || matches!(
+            s.to_ascii_lowercase().as_str(),
+            "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+        );
+    if needs_quote {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// Export the fact store as a graphify-ready corpus: one markdown file per
@@ -1296,12 +1323,12 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
 
     #[test]
     fn supersede_expires_old_and_links_new() {
-        let conn = open_test_db();
+        let mut conn = open_test_db();
         let old_id = insert_memory(&conn, "lives in SF", None, "fact", "manual", 100).unwrap();
 
         // Supersede at now = 500.
         let new_id =
-            supersede_conn(&conn, old_id, "lives in NYC", None, "fact", "manual", 500).unwrap();
+            supersede_conn(&mut conn, old_id, "lives in NYC", None, "fact", "manual", 500).unwrap();
         assert_ne!(old_id, new_id);
 
         // Old row: valid_until now set to 500.
@@ -1326,6 +1353,36 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         assert_eq!(supersedes, Some(old_id));
         assert!(valid_until.is_none());
         assert_eq!(valid_from, 500);
+
+        // INVARIANT (atomic supersede): after the transaction commits there
+        // is EXACTLY ONE currently-valid row — the new fact. The old fact is
+        // expired in the same transaction, so default recall never sees both.
+        let valid_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE valid_until IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(valid_count, 1, "exactly one valid version after supersede");
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_special_values() {
+        // Plain words pass through unquoted (the common case).
+        assert_eq!(yaml_scalar("fact"), "fact");
+        assert_eq!(yaml_scalar("sess-1_2.3"), "sess-1_2.3");
+        // YAML-special bare words get quoted so they aren't read as bool/null.
+        assert_eq!(yaml_scalar("null"), "\"null\"");
+        assert_eq!(yaml_scalar("true"), "\"true\"");
+        assert_eq!(yaml_scalar("Yes"), "\"Yes\"");
+        // Values with structural chars get quoted.
+        assert_eq!(yaml_scalar("a: b"), "\"a: b\"");
+        assert_eq!(yaml_scalar("#tag"), "\"#tag\"");
+        // Empty gets quoted (empty bare scalar is null in YAML).
+        assert_eq!(yaml_scalar(""), "\"\"");
+        // Newlines collapsed to a space before the quote decision.
+        assert_eq!(yaml_scalar("line\nbreak"), "line break");
     }
 
     #[test]
