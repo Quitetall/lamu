@@ -1000,6 +1000,13 @@ pub(crate) async fn handle_export_memory_graph(args: serde_json::Value) -> Strin
             base.join("lamu").join("memory-corpus")
         }
     };
+    // Defense-in-depth: allow absolute paths (the documented
+    // `/graphify <abs-dir>` workflow needs them) but reject `..`
+    // traversal so a controlled `dir` arg can't escape upward into a
+    // surprising tree. Mirrors write_file's `..` refusal.
+    if dir.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return "error: '..' is not allowed in the export dir path".to_string();
+    }
     let include_expired = args["include_expired"].as_bool().unwrap_or(false);
     match export_graph_corpus(&dir, include_expired) {
         Ok(n) => format!(
@@ -1489,5 +1496,15 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let n = write_corpus_rows(&nested, &rows).unwrap();
         assert_eq!(n, 1);
         assert!(nested.join("mem_1.md").exists());
+    }
+
+    #[tokio::test]
+    async fn export_memory_graph_rejects_parent_dir_traversal() {
+        // The `..` guard fires BEFORE any db/fs work, so this is hermetic.
+        let r = handle_export_memory_graph(serde_json::json!({"dir": "../escape"})).await;
+        assert!(r.starts_with("error:"), "got: {r}");
+        assert!(r.contains(".."), "got: {r}");
+        let r2 = handle_export_memory_graph(serde_json::json!({"dir": "ok/../../up"})).await;
+        assert!(r2.starts_with("error:"), "got: {r2}");
     }
 }
