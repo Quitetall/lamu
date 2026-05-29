@@ -244,6 +244,39 @@ fn schema_recall_conversation() -> Value {
     })
 }
 
+fn schema_remember() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "The fact to remember (a durable, user-specific statement)."},
+            "kind": {"type": "string", "default": "fact", "description": "Memory category. Defaults to 'fact'."},
+            "source": {"type": "string", "default": "manual", "description": "Provenance — a conversation_id or 'manual'. Defaults to 'manual'."}
+        },
+        "required": ["text"]
+    })
+}
+
+fn schema_recall_memory() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Natural-language query to recall relevant memories for."},
+            "k": {"type": "integer", "default": 8, "description": "Max number of memories to return. Default 8."}
+        },
+        "required": ["query"]
+    })
+}
+
+fn schema_consolidate_memory() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Identifier for the conversation to extract durable facts from. Allowed chars: [A-Za-z0-9_-.]"}
+        },
+        "required": ["conversation_id"]
+    })
+}
+
 fn schema_write_file() -> Value {
     json!({
         "type": "object",
@@ -379,6 +412,18 @@ fn dispatch_train_from_conversations(
 
 fn dispatch_write_file(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::server::handle_write_file(args))
+}
+
+fn dispatch_remember(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_remember(args))
+}
+
+fn dispatch_recall_memory(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_recall_memory(args))
+}
+
+fn dispatch_consolidate_memory(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_consolidate_memory(args))
 }
 
 // ── The catalog ─────────────────────────────────────────────────────
@@ -533,6 +578,27 @@ pub static TOOLS: &[ToolDef] = &[
         handler: HandlerKind::Stateful(dispatch_parallel_query),
         cloud: false, // mixes local+cloud; self-enforces local-only per-task
     },
+    ToolDef {
+        name: "remember",
+        description: "Store a durable, user-specific fact in lifetime cross-session memory. Unlike recall_conversation (per-conversation turns), this is a GLOBAL fact store at ~/.local/share/lamu/memory.db that spans every conversation. The fact is embedded via OpenAI text-embedding-3-small for later semantic recall; with no OPENAI_API_KEY it is still stored (embedding=NULL) and recallable by recency. Args: text (required), kind (default 'fact'), source (default 'manual'). Returns the new memory id.",
+        schema_fn: schema_remember,
+        handler: HandlerKind::Free(dispatch_remember),
+        cloud: false,
+    },
+    ToolDef {
+        name: "recall_memory",
+        description: "Semantic search over lifetime cross-session memory (the global fact store at ~/.local/share/lamu/memory.db). Embeds the query and ranks stored facts by cosine similarity via the shared vector-index seam. With an OPENAI_API_KEY it returns the top-k most relevant facts; without a key it degrades gracefully to the most-recent k facts by timestamp. Args: query (required), k (default 8). Returns a formatted hit list (text + kind + source + score).",
+        schema_fn: schema_recall_memory,
+        handler: HandlerKind::Free(dispatch_recall_memory),
+        cloud: false,
+    },
+    ToolDef {
+        name: "consolidate_memory",
+        description: "Extract durable, user-specific facts from a logged conversation (via MiMo) and store each into lifetime cross-session memory keyed by the conversation_id. Pulls the full transcript from conversations.db, asks mimo-v2.5 to distill preferences/identity/project facts/decisions (one per line, NONE if nothing worth keeping), then remembers each. Cloud tool — refused under routing mode 'local-only'. Args: conversation_id (required). Returns 'stored N memories from <id>'.",
+        schema_fn: schema_consolidate_memory,
+        handler: HandlerKind::Free(dispatch_consolidate_memory),
+        cloud: true,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static ToolDef> {
@@ -584,18 +650,23 @@ mod tests {
 
     #[test]
     fn cloud_flag_matches_routing_policy() {
-        // The four cloud-LLM tools must be gated under local-only.
-        for name in ["cloud_query", "review_commit", "review_diff", "warmup"] {
+        // The cloud-LLM tools must be gated under local-only.
+        // consolidate_memory reaches MiMo for fact extraction.
+        for name in [
+            "cloud_query", "review_commit", "review_diff", "warmup",
+            "consolidate_memory",
+        ] {
             assert!(find(name).unwrap().cloud, "{name} must have cloud:true (local-only gate)");
         }
         // Local / read-only / RAG / mixed tools must NOT be blanket-gated
-        // (parallel_query self-enforces per-task; search/index degrade).
+        // (parallel_query self-enforces per-task; search/index degrade;
+        // remember/recall_memory are local stores that degrade without a key).
         for name in [
             "query", "plan_query", "list_models", "load_model", "unload_model",
             "vram_status", "scan_models", "queue_status", "list_cloud_models",
             "set_routing_mode", "routing_status", "search_repo", "index_repo",
             "recall_conversation", "train_from_conversations", "write_file",
-            "parallel_query",
+            "parallel_query", "remember", "recall_memory",
         ] {
             assert!(!find(name).unwrap().cloud, "{name} must have cloud:false");
         }

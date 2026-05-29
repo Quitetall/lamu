@@ -462,6 +462,7 @@ mod tests {
             "cloud_query", "list_cloud_models",
             "review_commit", "review_diff", "set_routing_mode", "routing_status",
             "parallel_query", "write_file",
+            "remember", "recall_memory", "consolidate_memory",
         ] {
             assert!(names.contains(&required), "missing tool: {}", required);
         }

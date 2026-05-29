@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 /// text-embedding-3-small (1536 dims, $0.02/M tokens). If we ever
 /// support multiple models, every embedding row has the same shape so
 /// they're never mixed within one DB.
-const EMBED_MODEL: &str = "text-embedding-3-small";
+pub(crate) const EMBED_MODEL: &str = "text-embedding-3-small";
 
 /// Chunk size in characters. ~1KB hits a sweet spot: large enough to
 /// preserve local context, small enough to keep per-chunk embeddings
@@ -165,13 +165,13 @@ pub fn ripgrep_search(query: &str, repo: &Path, k: usize) -> Result<Vec<SearchHi
 // ── Semantic mode ──────────────────────────────────────────────────
 
 /// Resolve the OpenAI API key. If unset, semantic mode is unavailable.
-fn openai_key() -> Option<String> {
+pub(crate) fn openai_key() -> Option<String> {
     std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty())
 }
 
 /// POST a single string to OpenAI's `/embeddings` endpoint. Returns
 /// the 1536-dim vector for text-embedding-3-small.
-async fn embed_one(text: &str, key: &str) -> Result<Vec<f32>> {
+pub(crate) async fn embed_one(text: &str, key: &str) -> Result<Vec<f32>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
@@ -232,7 +232,7 @@ async fn embed_batch(texts: &[String], key: &str) -> Result<Vec<Vec<f32>>> {
     Ok(all)
 }
 
-fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(v.len() * 4);
     for x in v {
         buf.extend_from_slice(&x.to_le_bytes());
@@ -240,7 +240,7 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     buf
 }
 
-fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+pub(crate) fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(b.len() / 4);
     for chunk in b.chunks_exact(4) {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
