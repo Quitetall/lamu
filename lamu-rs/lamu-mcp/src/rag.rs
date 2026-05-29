@@ -128,6 +128,7 @@ pub fn ripgrep_search(query: &str, repo: &Path, k: usize) -> Result<Vec<SearchHi
             "--max-count",
             "5",
             "-i",
+            "--", // end of options: a query starting with '-' is a pattern, not a flag
             query,
         ])
         .output();
@@ -298,8 +299,8 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
             if body.contains('\0') {
                 continue;
             }
-            // Drop existing chunks for this path so re-index is clean.
-            let _ = conn.execute("DELETE FROM chunks WHERE path = ?", params![path]);
+            // Stale chunks for this path are cleared inside the final write
+            // transaction (after embed succeeds), NOT here — see #7.
             for (idx, chunk) in chunk_text(&body, CHUNK_BYTES).into_iter().enumerate() {
                 to_embed.push((path.clone(), idx, chunk, mtime));
             }
@@ -321,9 +322,20 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
         ));
     }
 
-    // Bulk insert under one transaction.
+    // Bulk replace under one transaction: clear each affected path's old
+    // chunks, THEN insert the freshly embedded ones — atomic with embed
+    // SUCCESS. The DELETE used to run eagerly in autocommit BEFORE the
+    // await on embed_batch above; a transient embed failure (429/timeout/
+    // network) then committed the deletes with no inserts, silently
+    // dropping the path's chunks until a later successful re-index (#7).
     let mut conn = arc.lock();
     let tx = conn.transaction()?;
+    let mut cleared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (path, _, _, _) in &to_embed {
+        if cleared.insert(path.as_str()) {
+            tx.execute("DELETE FROM chunks WHERE path = ?", params![path])?;
+        }
+    }
     for ((path, idx, content, mtime), emb) in to_embed.iter().zip(embeddings.iter()) {
         tx.execute(
             "INSERT OR REPLACE INTO chunks (path, chunk_idx, content, embedding, mtime) VALUES (?, ?, ?, ?, ?)",
