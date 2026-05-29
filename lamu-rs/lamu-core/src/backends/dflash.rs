@@ -198,13 +198,14 @@ impl Backend for DflashBackend {
             .map(|res| res.map_err(|e| Error::Backend(format!("stream: {}", e))));
 
         let decoded = async_stream::try_stream! {
-            let mut buf = String::new();
+            let mut buf: Vec<u8> = Vec::new();
             let mut s = std::pin::pin!(line_stream);
             while let Some(chunk) = s.next().await {
                 let chunk = chunk?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf.drain(..=nl).collect();
+                // Byte-buffer, decode whole lines only: from_utf8_lossy on a
+                // raw chunk corrupts a multibyte char split across chunks.
+                buf.extend_from_slice(&chunk);
+                while let Some(line) = crate::sse::next_sse_line(&mut buf) {
                     let line = line.trim();
                     if let Some(rest) = line.strip_prefix("data: ") {
                         if rest == "[DONE]" { return; }

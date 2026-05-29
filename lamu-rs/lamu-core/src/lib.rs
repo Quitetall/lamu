@@ -9,6 +9,7 @@ pub mod scheduler;
 pub mod scheduler_lock;
 pub mod router;
 pub mod reasoning;
+pub mod sse;
 pub mod config;
 pub mod error;
 pub mod health;

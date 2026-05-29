@@ -551,7 +551,7 @@ async fn stream_response(
         };
 
         let mut byte_stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
 
         let open_tag = marker.as_ref().map(|m| m.open_tag.clone()).unwrap_or_else(|| "<think>".to_string());
         let close_tag = marker.as_ref().map(|m| m.close_tag.clone()).unwrap_or_else(|| "</think>".to_string());
@@ -568,10 +568,11 @@ async fn stream_response(
         use futures_util::stream::StreamExt;
         while let Some(chunk_res) = byte_stream.next().await {
             let Ok(bytes) = chunk_res else { break };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
+            // Byte-buffer, decode whole lines only: from_utf8_lossy on a raw
+            // chunk corrupts a multibyte char split across chunk boundaries.
+            buf.extend_from_slice(&bytes);
 
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
+            while let Some(line) = lamu_core::sse::next_sse_line(&mut buf) {
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("data: ") else { continue };
                 if rest == "[DONE]" {
@@ -646,7 +647,21 @@ async fn stream_response(
                             pending.clear();
                         }
                     } else {
-                        pending.clear();
+                        // close_tag may be split across tokens (`</`,`think`,`>`).
+                        // Keep only the trailing close_tag.len()-1 bytes so a
+                        // split tag matches on the next token; the rest is
+                        // reasoning content we intentionally discard. The old
+                        // `pending.clear()` here meant a split close tag NEVER
+                        // matched → in_reasoning stuck → every post-</think>
+                        // answer token dropped → empty completion to the client.
+                        let keep = close_tag.len().saturating_sub(1);
+                        if pending.len() > keep {
+                            let mut cut = pending.len() - keep;
+                            while cut < pending.len() && !pending.is_char_boundary(cut) {
+                                cut += 1;
+                            }
+                            pending.drain(..cut);
+                        }
                     }
                 } else if reasoning_done {
                     let chunk = make_chunk(&completion_id, created, &model_name, token);
@@ -1253,7 +1268,7 @@ async fn stream_response_anthropic(
         };
 
         let mut byte_stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut out_tokens: u64 = 0;
         // Tool calls accumulated by their OpenAI delta index. BTreeMap so
         // the emitted tool_use blocks keep the backend's call order.
@@ -1265,9 +1280,10 @@ async fn stream_response_anthropic(
         use futures_util::stream::StreamExt;
         'read: while let Some(chunk_res) = byte_stream.next().await {
             let Ok(bytes) = chunk_res else { break 'read };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
+            // Byte-buffer, decode whole lines only: from_utf8_lossy on a raw
+            // chunk corrupts a multibyte char split across chunk boundaries.
+            buf.extend_from_slice(&bytes);
+            while let Some(line) = lamu_core::sse::next_sse_line(&mut buf) {
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("data: ") else { continue };
                 if rest == "[DONE]" { break 'read; }
@@ -1628,7 +1644,7 @@ async fn stream_response_ollama(
             }
         };
         let mut byte_stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut out_tokens: u64 = 0;
         // Empty-backend gate state (mirrors the non-streaming 502).
         let mut finish_reason = String::new();
@@ -1636,9 +1652,10 @@ async fn stream_response_ollama(
         use futures_util::stream::StreamExt;
         'read: while let Some(chunk_res) = byte_stream.next().await {
             let Ok(bytes) = chunk_res else { break 'read };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
+            // Byte-buffer, decode whole lines only: from_utf8_lossy on a raw
+            // chunk corrupts a multibyte char split across chunk boundaries.
+            buf.extend_from_slice(&bytes);
+            while let Some(line) = lamu_core::sse::next_sse_line(&mut buf) {
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("data: ") else { continue };
                 if rest == "[DONE]" { break 'read; }
