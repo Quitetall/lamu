@@ -248,8 +248,20 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             let size_mb = std::fs::metadata(path)
                 .map(|m| (m.len() / 1_048_576) as u32)
                 .unwrap_or(0);
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
-            let name = stem.to_lowercase().replace(' ', "-");
+            // HF checkpoints are always "model[.…].safetensors" inside a
+            // named dir — name from the PARENT DIR so sibling dirs each
+            // holding a "model.safetensors" don't all collapse to "model".
+            let name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_lowercase().replace(' ', "-"))
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(filename)
+                        .to_lowercase()
+                });
             discovered.push(ModelEntry {
                 name,
                 path: path.to_path_buf(),
@@ -332,6 +344,23 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
 
     // Stable sort by name (matches Python's `sorted()`)
     discovered.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Drop duplicate names: the registry is a name-keyed map, so dups would
+    // silently collapse on write (e.g. sibling dirs each with a
+    // "model.safetensors"). Keep the first; warn on the rest.
+    let mut seen = std::collections::HashSet::new();
+    discovered.retain(|e| {
+        if seen.insert(e.name.clone()) {
+            true
+        } else {
+            tracing::warn!(
+                "scan: dropping duplicate model name '{}' ({})",
+                e.name,
+                e.path.display()
+            );
+            false
+        }
+    });
 
     Ok(discovered)
 }
@@ -647,27 +676,27 @@ mod tests {
     }
 
     #[test]
-    fn scan_discovers_safetensors_skipping_nonprimary_shards() {
+    fn scan_discovers_safetensors_named_by_dir_skipping_shards() {
         use crate::types::ModelFormat;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mymodel.safetensors"), b"x").unwrap();
-        std::fs::write(dir.path().join("big-00001-of-00003.safetensors"), b"x").unwrap();
-        std::fs::write(dir.path().join("big-00002-of-00003.safetensors"), b"x").unwrap(); // skip
-        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap(); // ignored
-        let found = scan_directory(dir.path()).unwrap();
+        // HF convention: one model per dir, file always model[.…].safetensors
+        // → name from the PARENT DIR (so sibling "model.safetensors" don't
+        // collapse). Non-primary shards skipped; one entry per model dir.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("modela")).unwrap();
+        std::fs::write(root.path().join("modela/model.safetensors"), b"x").unwrap();
+        std::fs::create_dir_all(root.path().join("modelb")).unwrap();
+        std::fs::write(root.path().join("modelb/model-00001-of-00003.safetensors"), b"x").unwrap();
+        std::fs::write(root.path().join("modelb/model-00002-of-00003.safetensors"), b"x").unwrap(); // skip
+        std::fs::write(root.path().join("modelb/notes.txt"), b"x").unwrap(); // ignored
+        let found = scan_directory(root.path()).unwrap();
         let st: Vec<&ModelEntry> = found
             .iter()
             .filter(|e| matches!(e.format, ModelFormat::Safetensors))
             .collect();
-        assert_eq!(
-            st.len(),
-            2,
-            "primary single + first shard only; got {:?}",
-            found.iter().map(|e| &e.name).collect::<Vec<_>>()
-        );
-        assert!(st.iter().any(|e| e.name == "mymodel"));
-        assert!(st.iter().any(|e| e.name.contains("00001-of")));
-        assert!(!st.iter().any(|e| e.name.contains("00002-of")));
+        let names: Vec<&String> = st.iter().map(|e| &e.name).collect();
+        assert_eq!(st.len(), 2, "one entry per model dir; got {names:?}");
+        assert!(names.iter().any(|n| n.as_str() == "modela"));
+        assert!(names.iter().any(|n| n.as_str() == "modelb"));
     }
 
     #[test]
