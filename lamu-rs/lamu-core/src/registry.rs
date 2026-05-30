@@ -549,6 +549,39 @@ mod tests {
     }
 
     #[test]
+    fn load_registry_parses_fish_speech_tts_entry() {
+        // Mirrors the live `local-fish-s2pro` registry entry shape, so a
+        // format mistake there is caught here (a parse failure would brick
+        // the whole registry at startup).
+        use crate::types::{BackendType, Modality};
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        std::fs::write(
+            &reg,
+            "models:\n  \
+             local-fish-s2pro:\n    \
+             path: /tmp/fish-speech/checkpoints/s2-pro\n    \
+             format: custom\n    \
+             backend: fish_speech\n    \
+             arch: fish-speech-s2\n    \
+             params_b: 4.0\n    \
+             quant: fp16\n    \
+             vram_mb: 16000\n    \
+             context_max: 0\n    \
+             capabilities: []\n    \
+             modality: tts\n",
+        )
+        .unwrap();
+        let loaded = load_registry(&reg).expect("fish-speech tts entry must parse");
+        assert_eq!(loaded.len(), 1);
+        let e = &loaded[0];
+        assert_eq!(e.name, "local-fish-s2pro");
+        assert_eq!(e.backend, BackendType::FishSpeech);
+        assert_eq!(e.modality, Modality::Tts);
+        assert!(e.capabilities.is_empty());
+    }
+
+    #[test]
     fn sampling_profile_round_trips_through_registry_yaml() {
         let dir = tempfile::tempdir().unwrap();
         let reg = dir.path().join("models.yaml");

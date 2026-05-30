@@ -222,6 +222,7 @@ impl Router {
         required: &HashSet<Capability>,
     ) -> Vec<&'b LoadedModel> {
         scheduler.loaded_models().into_iter()
+            .filter(|loaded| loaded.entry.modality.is_llm()) // never chat-route a tts/image model
             .filter(|loaded| {
                 let model_caps: HashSet<Capability> = loaded.entry.capabilities.iter().copied().collect();
                 required.is_subset(&model_caps)
@@ -231,8 +232,15 @@ impl Router {
 
     fn find_registry_matching(&self, required: &HashSet<Capability>) -> Vec<&ModelEntry> {
         self.registry.values().filter(|entry| {
-            let model_caps: HashSet<Capability> = entry.capabilities.iter().copied().collect();
-            required.is_subset(&model_caps)
+            // Non-LLM modalities (tts/image) are never chat-routable — an
+            // empty-capabilities tts entry would otherwise match a no-filter
+            // request (empty `required` is a subset of everything).
+            entry.modality.is_llm()
+                && {
+                    let model_caps: HashSet<Capability> =
+                        entry.capabilities.iter().copied().collect();
+                    required.is_subset(&model_caps)
+                }
         }).collect()
     }
 
