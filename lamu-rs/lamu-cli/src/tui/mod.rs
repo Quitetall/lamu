@@ -1212,6 +1212,7 @@ mod tests {
             main: false,
             notes: String::new(),
             status: lamu_core::types::ModelStatus::default(),
+            modality: lamu_core::types::Modality::Llm,
         }
     }
 }

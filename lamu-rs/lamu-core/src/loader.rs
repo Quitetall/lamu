@@ -207,6 +207,7 @@ mod tests {
             main: false,
             notes: String::new(),
             status: ModelStatus::Unspecified,
+            modality: crate::types::Modality::Llm,
         }
     }
 

@@ -551,6 +551,7 @@ mod default_main_idx_tests {
             main,
             notes: String::new(),
             status: ModelStatus::Unspecified,
+            modality: lamu_core::types::Modality::Llm,
         }
     }
 

@@ -290,6 +290,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             main: false,
             notes: String::new(),
             status: crate::types::ModelStatus::default(),
+            modality: crate::types::Modality::Llm,
         });
     }
 
@@ -330,6 +331,8 @@ struct ModelEntryYaml {
     #[serde(default, deserialize_with = "crate::types::ModelStatus::deserialize_lenient",
             skip_serializing_if = "crate::types::ModelStatus::is_unspecified")]
     status: crate::types::ModelStatus,
+    #[serde(default, skip_serializing_if = "crate::types::Modality::is_llm")]
+    modality: crate::types::Modality,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
@@ -353,6 +356,7 @@ impl From<ModelEntry> for ModelEntryYaml {
             main: e.main,
             notes: e.notes,
             status: e.status,
+            modality: e.modality,
         }
     }
 }
@@ -377,6 +381,7 @@ impl ModelEntryYaml {
             main: self.main,
             notes: self.notes,
             status: self.status,
+            modality: self.modality,
         }
     }
 }
@@ -527,6 +532,7 @@ mod tests {
             main: false,
             notes: String::new(),
             status: ModelStatus::default(),
+            modality: crate::types::Modality::Llm,
         }
     }
 

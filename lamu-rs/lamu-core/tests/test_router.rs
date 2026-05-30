@@ -27,6 +27,7 @@ fn sample_entry(name: &str, main: bool) -> ModelEntry {
         main,
         notes: String::new(),
         status: ModelStatus::Unspecified,
+        modality: lamu_core::types::Modality::Llm,
     }
 }
 

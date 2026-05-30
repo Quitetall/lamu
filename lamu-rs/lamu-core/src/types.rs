@@ -37,6 +37,25 @@ pub enum BackendType {
     DflashLucebox,
 }
 
+/// Model modality. `Default == Llm` keeps every existing models.yaml valid
+/// (an entry with no `modality:` key deserializes to `Llm`). Drives
+/// modality-aware VRAM eviction (evict image/tts before LLMs) and
+/// `text_to_speech` local-vs-cloud routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Modality {
+    #[default]
+    Llm,
+    Image,
+    Tts,
+}
+
+impl Modality {
+    pub fn is_llm(&self) -> bool {
+        matches!(self, Modality::Llm)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelState {
     Unloaded,
@@ -259,6 +278,10 @@ pub struct ModelEntry {
     /// when Unspecified.
     #[serde(default, deserialize_with = "ModelStatus::deserialize_lenient")]
     pub status: ModelStatus,
+    /// Model modality (llm/image/tts). Absent in existing registries → Llm.
+    /// Drives VRAM eviction tiering + text_to_speech routing.
+    #[serde(default)]
+    pub modality: Modality,
 }
 
 /// Operator-curated status tag for a model. Stored in the YAML registry
@@ -519,6 +542,48 @@ capabilities: [chat]
 "#;
         let e: ModelEntry = serde_yaml::from_str(yaml).unwrap();
         assert!(e.sampling.is_none());
+    }
+
+    #[test]
+    fn modality_defaults_to_llm_when_absent() {
+        // Back-compat: a YAML with no `modality:` key → Llm.
+        let yaml = r#"
+name: m
+path: /tmp/m.gguf
+format: gguf
+backend: llama_cpp
+arch: qwen3
+params_b: 7.0
+quant: Q4_K_M
+vram_mb: 8000
+context_max: 32768
+capabilities: [chat]
+"#;
+        let e: ModelEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(e.modality, Modality::Llm);
+        assert!(e.modality.is_llm());
+    }
+
+    #[test]
+    fn modality_tts_parses_and_round_trips() {
+        let yaml = r#"
+name: t
+path: /tmp/s2-pro
+format: gguf
+backend: llama_cpp
+arch: fish
+params_b: 0.5
+quant: fp16
+vram_mb: 16000
+context_max: 0
+capabilities: []
+modality: tts
+"#;
+        let e: ModelEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(e.modality, Modality::Tts);
+        assert!(!e.modality.is_llm());
+        let s = serde_yaml::to_string(&e).unwrap();
+        assert!(s.contains("modality: tts"), "serialized: {s}");
     }
 
     #[test]

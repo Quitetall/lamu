@@ -550,6 +550,7 @@ mod tests {
             main: false,
             notes: String::new(),
             status: crate::types::ModelStatus::default(),
+            modality: crate::types::Modality::Llm,
         }
     }
 
