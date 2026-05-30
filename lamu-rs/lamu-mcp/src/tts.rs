@@ -155,6 +155,13 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
         Err(e) => return format!("error: post {url}: {e}"),
     };
     let st = resp.status();
+    // Size guard, same as the cloud path — a misbehaving local server must
+    // not OOM us with an unbounded body.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_AUDIO_BYTES {
+            return format!("error: fish-speech response too large ({len} bytes)");
+        }
+    }
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => return format!("error: read audio bytes: {e}"),
@@ -165,6 +172,9 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
     }
     if bytes.is_empty() {
         return "error: fish-speech returned empty audio (no bytes)".into();
+    }
+    if bytes.len() as u64 > MAX_AUDIO_BYTES {
+        return format!("error: fish-speech audio exceeds cap ({} bytes)", bytes.len());
     }
     if let Err(e) = std::fs::write(&out_path, &bytes) {
         return format!("error: write {}: {e}", out_path.display());

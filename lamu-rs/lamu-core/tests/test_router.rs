@@ -80,6 +80,38 @@ fn route_loaded() {
     assert_ne!(d.model_name, heretic.name);
 }
 
+#[test]
+fn route_excludes_non_llm_modality_from_chat() {
+    use lamu_core::types::Modality;
+    // A tts entry with EMPTY capabilities would match a no-filter chat
+    // request (empty `required` ⊆ everything) if the modality guard didn't
+    // exclude it — the exact regression the guard prevents.
+    let mut tts = sample_entry("local-tts", false);
+    tts.modality = Modality::Tts;
+    tts.capabilities = vec![];
+    let llm = sample_entry("chat-llm", false); // default caps = [Chat]
+    let (sched, router) = alias_router(vec![tts, llm]);
+    let d = router.route(&sched, None, None, None);
+    assert_eq!(
+        d.model_name, "chat-llm",
+        "chat must route to the LLM, never the tts entry; got {:?} ({})",
+        d.model_name, d.reason
+    );
+
+    // A registry with ONLY a tts entry yields no chat candidate at all.
+    let mut only = sample_entry("only-tts", false);
+    only.modality = Modality::Tts;
+    only.capabilities = vec![];
+    let (sched2, router2) = alias_router(vec![only]);
+    let d2 = router2.route(&sched2, None, None, None);
+    assert_ne!(d2.model_name, "only-tts", "tts entry must never be chat-routable");
+    assert!(
+        d2.model_name.is_empty() || d2.reason.contains("no model"),
+        "expected no chat candidate; got {:?} ({})",
+        d2.model_name, d2.reason
+    );
+}
+
 // ── Alias resolution ─────────────────────────────────────────────────
 //
 // These tests don't depend on a real GGUF on disk — they exercise the
