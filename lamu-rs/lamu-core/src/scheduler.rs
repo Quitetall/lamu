@@ -172,7 +172,13 @@ impl VramScheduler {
         let mut evictable: Vec<(&String, &LoadedModel)> = self.loaded.iter()
             .filter(|(_, m)| !m.entry.pinned && m.state == ModelState::Loaded)
             .collect();
-        evictable.sort_by_key(|(_, m)| m.last_used);
+        // Modality-tiered LRU: evict non-LLM (image/tts) models BEFORE
+        // LLMs, LRU within each tier. `is_llm()` is false (sorts first) for
+        // image/tts, true (sorts last) for LLMs. So a heavy idle TTS model
+        // is reclaimed ahead of an active chat LLM, and loading the ~16GB
+        // S2-Pro evicts other modalities + idle LLMs as needed without
+        // disturbing a recently-used LLM until it's the only option.
+        evictable.sort_by_key(|(_, m)| (m.entry.modality.is_llm(), m.last_used));
 
         let mut to_evict = vec![];
         let mut freed: u32 = 0;
