@@ -756,6 +756,125 @@ pub(crate) fn forget_conn(conn: &Connection, id: i64, now: i64) -> Result<bool> 
     Ok(affected > 0)
 }
 
+// ── Auto-contradiction (retire facts a new one supersedes) ──────────
+
+const CONTRADICTION_PROMPT: &str = "\
+You compare a NEW fact against EXISTING stored facts and report which \
+EXISTING facts the new fact makes OUTDATED — same subject with a \
+conflicting value (e.g. NEW 'lives in SF' vs EXISTING 'lives in NYC', or \
+NEW 'uses Rust' vs EXISTING 'uses Go'). Do NOT flag facts that are merely \
+related, additional, or compatible — only direct contradictions/updates. \
+Reply with ONLY a JSON object {\"outdated\": [<id>, ...]} listing the ids \
+of the EXISTING facts the new fact supersedes; empty list if none.";
+
+/// Parse the judge's reply into the ids of existing facts to retire.
+/// Accepts `{"outdated":[..]}`, a bare `[..]`, optionally wrapped in code
+/// fences or prose. Returns `[]` on anything unparseable.
+pub(crate) fn parse_contradiction_ids(reply: &str) -> Vec<i64> {
+    let trimmed = reply
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(arr) = v.get("outdated").and_then(|x| x.as_array()) {
+            return arr.iter().filter_map(|x| x.as_i64()).collect();
+        }
+        if let Some(arr) = v.as_array() {
+            return arr.iter().filter_map(|x| x.as_i64()).collect();
+        }
+    }
+    // Fallback: first bracketed int list anywhere in the reply.
+    if let (Some(s), Some(e)) = (reply.find('['), reply.rfind(']')) {
+        if e > s {
+            if let Ok(arr) = serde_json::from_str::<Vec<i64>>(&reply[s..=e]) {
+                return arr;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn autocontradict_enabled() -> bool {
+    matches!(
+        std::env::var("LAMU_AUTOCONTRADICT")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Find current facts that the freshly-stored `new_text` (rowid `new_id`)
+/// makes outdated and expire them via [`forget`]. MiMo judges against the
+/// new fact's nearest current neighbors; only ids that were actually in the
+/// candidate set are acted on (guards against hallucinated ids). Near-
+/// identical neighbors (cosine ≥ NOVELTY_THRESHOLD) are skipped — those are
+/// duplicates, not contradictions. Returns the count expired. Needs an
+/// OPENAI key (neighbor search) + a reachable cloud model.
+pub async fn reconcile_memory(new_id: i64, new_text: &str) -> Result<usize> {
+    let neighbors = recall_memory(new_text, 8, false).await?;
+    let candidates: Vec<&MemoryHit> = neighbors
+        .iter()
+        .filter(|h| h.id != new_id)
+        .filter(|h| h.score.map(|s| s < NOVELTY_THRESHOLD).unwrap_or(true))
+        .take(6)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let listing = candidates
+        .iter()
+        .map(|h| format!("[{}] {}", h.id, h.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let args = serde_json::json!({
+        "model": "mimo-v2.5",
+        "system": CONTRADICTION_PROMPT,
+        "prompt": format!("NEW fact:\n{new_text}\n\nEXISTING facts:\n{listing}"),
+        "max_tokens": 256,
+        "temperature": 0.1,
+        "include_reasoning": false,
+    });
+    let resp = crate::cloud::handle_cloud_query(args).await;
+    if resp.starts_with("error:") {
+        return Err(anyhow!("contradiction judge failed: {resp}"));
+    }
+    let valid: std::collections::HashSet<i64> = candidates.iter().map(|h| h.id).collect();
+    let mut expired = 0usize;
+    for id in parse_contradiction_ids(&resp) {
+        if id == new_id || !valid.contains(&id) {
+            continue; // self, or a hallucinated id outside the candidate set
+        }
+        match forget(id) {
+            Ok(true) => expired += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("reconcile: forget({id}) failed: {e}"),
+        }
+    }
+    Ok(expired)
+}
+
+/// Opt-in (`LAMU_AUTOCONTRADICT=1`) fire-and-forget reconcile after a
+/// remember. Detached on the current tokio runtime; only owned data crosses
+/// the boundary. No-op when the flag is off or no runtime is present (tests).
+pub fn maybe_spawn_reconcile(new_id: i64, new_text: &str) {
+    if !autocontradict_enabled() || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let txt = new_text.to_string();
+    tokio::spawn(async move {
+        match reconcile_memory(new_id, &txt).await {
+            Ok(n) if n > 0 => {
+                tracing::info!("auto-contradiction: retired {n} outdated fact(s) superseded by #{new_id}")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("auto-contradiction(#{new_id}): {e}"),
+        }
+    });
+}
+
 // ── graphify corpus exporter ───────────────────────────────────────
 
 /// Sanitize a frontmatter scalar for single-line YAML: drop newlines and
@@ -962,7 +1081,11 @@ pub(crate) async fn handle_remember(args: serde_json::Value) -> String {
         _ => "manual",
     };
     match remember(text, kind, source).await {
-        Ok(id) => format!("remembered memory #{id} (kind={kind}, source={source})"),
+        Ok(id) => {
+            // Opt-in: retire any current fact this one contradicts (detached).
+            maybe_spawn_reconcile(id, text);
+            format!("remembered memory #{id} (kind={kind}, source={source})")
+        }
         Err(e) => format!("error: {e}"),
     }
 }
@@ -1373,6 +1496,19 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let ids: std::collections::HashSet<i64> = all_rows.iter().map(|r| r.0).collect();
         assert!(ids.contains(&id_current));
         assert!(ids.contains(&id_expired));
+    }
+
+    #[test]
+    fn parse_contradiction_ids_handles_shapes() {
+        assert_eq!(parse_contradiction_ids(r#"{"outdated":[3,7]}"#), vec![3, 7]);
+        assert_eq!(parse_contradiction_ids("```json\n{\"outdated\":[]}\n```"), Vec::<i64>::new());
+        assert_eq!(parse_contradiction_ids("[1, 2]"), vec![1, 2]);
+        assert_eq!(
+            parse_contradiction_ids("facts 5 and 9 conflict: [5, 9]."),
+            vec![5, 9]
+        );
+        assert_eq!(parse_contradiction_ids("none of them"), Vec::<i64>::new());
+        assert_eq!(parse_contradiction_ids(""), Vec::<i64>::new());
     }
 
     #[test]
