@@ -129,7 +129,10 @@ impl Backend for FishSpeechBackend {
             .arg("cuda")
             .arg("--half") // fp16: ~halves resident VRAM (~16GB)
             .arg("--max-text-length")
-            .arg("2000") // cap per-request decode so it can't OOM the card
+            // Generous cap: the per-batch codec decode is bounded by the
+            // request's chunk_length (200), so total text length drives
+            // TIME not peak VRAM — this only rejects absurd inputs.
+            .arg("4000")
             .arg("--workers")
             .arg("1")
             .current_dir(repo)

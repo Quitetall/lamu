@@ -413,8 +413,13 @@ fn dispatch_cloud_query(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_cloud_query(args))
 }
 
-fn dispatch_text_to_speech(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
-    Box::pin(crate::tts::handle_text_to_speech(args))
+fn dispatch_text_to_speech<'a>(
+    s: &'a LamuMcpServer,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    // Stateful: the local path needs the scheduler/backends to spawn the
+    // fish-speech server; the cloud path ignores `s`.
+    Box::pin(crate::tts::handle_text_to_speech_stateful(s, args))
 }
 
 fn dispatch_list_cloud_models(_args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
@@ -547,9 +552,9 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "text_to_speech",
-        description: "Synthesize speech from text via the Fish Audio cloud API (model 's2-pro' by default). Writes an audio file and returns its path. Needs FISH_AUDIO_API_KEY. Pass VERBALIZED prose — raw LaTeX/markup is spoken literally.",
+        description: "Synthesize speech from text. Routes by the model's registry modality: a `modality: tts` entry (e.g. 'local-fish-s2pro') is served LOCALLY (spawns the managed fish-speech S2-Pro server, evicting LLMs as needed); any other model goes to the Fish Audio CLOUD API ('s2-pro'/'s1', needs FISH_AUDIO_API_KEY). Writes an audio file under <data_dir>/lamu/tts and returns its path. Pass VERBALIZED prose — raw LaTeX/markup is spoken literally.",
         schema_fn: schema_text_to_speech,
-        handler: HandlerKind::Free(dispatch_text_to_speech),
+        handler: HandlerKind::Stateful(dispatch_text_to_speech),
         cloud: true,
     },
     ToolDef {
