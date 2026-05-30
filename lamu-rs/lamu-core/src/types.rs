@@ -35,6 +35,8 @@ pub enum BackendType {
     Megakernel,
     Dflash,
     DflashLucebox,
+    /// Local fish-speech (OpenAudio S2-Pro) TTS server. Non-LLM modality.
+    FishSpeech,
 }
 
 /// Model modality. `Default == Llm` keeps every existing models.yaml valid

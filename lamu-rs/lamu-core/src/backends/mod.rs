@@ -2,6 +2,7 @@
 //! Direct port of `lamu/backends/`.
 
 pub mod dflash;
+pub mod fish_speech;
 pub mod llamacpp;
 pub mod megakernel;
 
@@ -24,6 +25,7 @@ pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
         BackendType::Dflash | BackendType::DflashLucebox => {
             Ok(Box::new(dflash::DflashBackend::new()?))
         }
+        BackendType::FishSpeech => Ok(Box::new(fish_speech::FishSpeechBackend::new()?)),
     }
 }
 
