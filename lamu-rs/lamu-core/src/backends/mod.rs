@@ -1,6 +1,7 @@
 //! Backends — model lifecycle management.
 //! Direct port of `lamu/backends/`.
 
+pub mod comfyui;
 pub mod dflash;
 pub mod fish_speech;
 pub mod llamacpp;
@@ -26,6 +27,7 @@ pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
             Ok(Box::new(dflash::DflashBackend::new()?))
         }
         BackendType::FishSpeech => Ok(Box::new(fish_speech::FishSpeechBackend::new()?)),
+        BackendType::ComfyUI => Ok(Box::new(comfyui::ComfyUIBackend::new()?)),
     }
 }
 

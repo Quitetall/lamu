@@ -37,6 +37,9 @@ pub enum BackendType {
     DflashLucebox,
     /// Local fish-speech (OpenAudio S2-Pro) TTS server. Non-LLM modality.
     FishSpeech,
+    /// Local ComfyUI image-generation server. Non-LLM modality.
+    #[serde(rename = "comfyui")]
+    ComfyUI,
 }
 
 /// Model modality. `Default == Llm` keeps every existing models.yaml valid
