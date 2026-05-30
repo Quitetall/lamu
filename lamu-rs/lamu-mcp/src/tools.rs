@@ -128,6 +128,23 @@ fn schema_cloud_query() -> Value {
     })
 }
 
+fn schema_text_to_speech() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Text to synthesize. Pass already-VERBALIZED prose — spell math/symbols out ('the integral of x squared'); raw LaTeX/markup is read literally."},
+            "model": {"type": "string", "default": "s2-pro", "description": "Fish Audio model header: 's2-pro' (default) or 's1'."},
+            "format": {"type": "string", "enum": ["mp3", "wav", "pcm", "opus"], "default": "mp3"},
+            "reference_id": {"type": "string", "description": "Optional Fish Audio voice model id (cloned/preset voice)."},
+            "temperature": {"type": "number", "description": "Expressiveness 0-1 (Fish default 0.7)."},
+            "top_p": {"type": "number", "description": "Nucleus sampling 0-1 (Fish default 0.7)."},
+            "mp3_bitrate": {"type": "integer", "enum": [64, 128, 192], "description": "mp3 only."},
+            "output_path": {"type": "string", "description": "Where to write the audio file. Default: <data_dir>/lamu/tts/tts-<unixsecs>.<format>."}
+        },
+        "required": ["text"]
+    })
+}
+
 fn schema_review_commit() -> Value {
     json!({
         "type": "object",
@@ -396,6 +413,10 @@ fn dispatch_cloud_query(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_cloud_query(args))
 }
 
+fn dispatch_text_to_speech(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::tts::handle_text_to_speech(args))
+}
+
 fn dispatch_list_cloud_models(_args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     let r = crate::cloud::handle_list_cloud_models();
     Box::pin(async move { r })
@@ -522,6 +543,13 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Send prompt to a cloud model (DeepSeek V4, Claude, GLM, Kimi, Qwen-Max, etc.). Use this for tasks that need stronger reasoning than local, OR cheaper inference than the calling agent (e.g. Claude Code → DeepSeek V4 Flash for code generation at ~$0.07/M input, currently 75% off). Auto-routes via OpenAI/Anthropic format detection.",
         schema_fn: schema_cloud_query,
         handler: HandlerKind::Free(dispatch_cloud_query),
+        cloud: true,
+    },
+    ToolDef {
+        name: "text_to_speech",
+        description: "Synthesize speech from text via the Fish Audio cloud API (model 's2-pro' by default). Writes an audio file and returns its path. Needs FISH_AUDIO_API_KEY. Pass VERBALIZED prose — raw LaTeX/markup is spoken literally.",
+        schema_fn: schema_text_to_speech,
+        handler: HandlerKind::Free(dispatch_text_to_speech),
         cloud: true,
     },
     ToolDef {
@@ -698,7 +726,7 @@ mod tests {
         // consolidate_memory reaches MiMo for fact extraction.
         for name in [
             "cloud_query", "review_commit", "review_diff", "warmup",
-            "consolidate_memory",
+            "consolidate_memory", "text_to_speech",
         ] {
             assert!(find(name).unwrap().cloud, "{name} must have cloud:true (local-only gate)");
         }
