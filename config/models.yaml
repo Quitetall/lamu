@@ -104,3 +104,42 @@ models:
     notes: |
       Origin model. Kept for nostalgia + GPT-2 proxy paths. Not a
       daily-use entry but not dead code either.
+  local-fish-s2pro:
+    path: /home/brianklam/local-llm/fish-speech/checkpoints/s2-pro
+    format: custom
+    backend: fish_speech
+    arch: fish-speech-s2
+    params_b: 4.0
+    quant: fp16
+    vram_mb: 16000
+    context_max: 0
+    capabilities: []
+    modality: tts
+    notes: |
+      Local fish-speech OpenAudio S2-Pro TTS (managed subprocess). Resident
+      ~16 GB fp16; the per-batch codec decode is bounded by the request's
+      chunk_length, so total text length is a time cost, not a memory one.
+      Loading auto-evicts unpinned LLMs (modality-tiered scheduler) — S2-Pro
+      + a 7B+ LLM cannot co-reside on the 24 GB 4090. Repo dir (venv +
+      tools/api_server.py) is derived as the checkpoint path's grandparent.
+      Use: text_to_speech(model="local-fish-s2pro", text="...verbalized...").
+  comfy-image:
+    path: /home/brianklam/ComfyUI
+    format: custom
+    backend: comfyui
+    arch: comfyui
+    params_b: 0.0
+    quant: fp16
+    vram_mb: 9000
+    context_max: 0
+    capabilities: []
+    modality: image
+    notes: |
+      Local ComfyUI image-gen (managed subprocess). Spawns
+      <path>/.venv/bin/python main.py --listen 127.0.0.1 --port <p>. One
+      server serves many checkpoints — pass checkpoint=<file under
+      models/checkpoints/> to generate_image. vram_mb 9000 ≈ SDXL fp16;
+      auto-evicts unpinned LLMs. NEEDS a checkpoint in models/checkpoints/
+      (none present yet — download an SDXL/SD3.5/Flux .safetensors). Use:
+      generate_image(model="comfy-image",
+        checkpoint="sd_xl_base_1.0.safetensors", prompt="...").
