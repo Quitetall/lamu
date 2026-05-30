@@ -111,12 +111,22 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
         }
     };
 
-    // ServeTTSRequest. chunk_length=200 bounds the per-batch codec decode
-    // (the lever that keeps VRAM bounded regardless of total text length);
-    // max_new_tokens capped at the server default.
-    let mut body = json!({
-        "text": text,
-        "format": format,
+    // Long input: the server caps a single request at --max-text-length
+    // (4000). Sentence-split into <=TTS_CHUNK_MAX-char pieces, synthesize
+    // each, and concatenate the WAVs. (The request's chunk_length=200 still
+    // bounds the per-batch codec decode VRAM, independent of total length.)
+    const TTS_CHUNK_MAX: usize = 1800;
+    let needs_chunking = text.chars().count() > TTS_CHUNK_MAX;
+    // PCM WAV is the only byte-concatenable format → force wav when chunking.
+    let req_format = if needs_chunking { "wav".to_string() } else { format.clone() };
+    let chunks: Vec<String> = if needs_chunking {
+        split_for_tts(&text, TTS_CHUNK_MAX)
+    } else {
+        vec![text.clone()]
+    };
+
+    // Per-chunk request params (text + format set per call below).
+    let mut base = json!({
         "streaming": false,
         "normalize": true,
         "chunk_length": 200,
@@ -124,24 +134,23 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
     });
     if let Some(rid) = args["reference_id"].as_str() {
         if !rid.is_empty() {
-            body["reference_id"] = Value::String(rid.to_string());
+            base["reference_id"] = Value::String(rid.to_string());
         }
     }
     if let Some(seed) = args["seed"].as_u64() {
-        body["seed"] = json!(seed);
+        base["seed"] = json!(seed);
     }
     if let Some(t) = args["temperature"].as_f64() {
-        body["temperature"] = json!(t.clamp(0.1, 1.0)); // fish bounds 0.1-1.0
+        base["temperature"] = json!(t.clamp(0.1, 1.0)); // fish bounds 0.1-1.0
     }
     if let Some(tp) = args["top_p"].as_f64() {
-        body["top_p"] = json!(tp.clamp(0.1, 1.0));
+        base["top_p"] = json!(tp.clamp(0.1, 1.0));
     }
 
-    let out_path = match resolve_tts_output_path(args["output_path"].as_str(), &format) {
+    let out_path = match resolve_tts_output_path(args["output_path"].as_str(), &req_format) {
         Ok(p) => p,
         Err(e) => return e,
     };
-
     let url = format!("http://127.0.0.1:{port}/v1/tts");
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -150,40 +159,147 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
         Ok(c) => c,
         Err(e) => return format!("error: client init: {e}"),
     };
-    let resp = match client.post(&url).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => return format!("error: post {url}: {e}"),
-    };
-    let st = resp.status();
-    // Size guard, same as the cloud path — a misbehaving local server must
-    // not OOM us with an unbounded body.
-    if let Some(len) = resp.content_length() {
-        if len > MAX_AUDIO_BYTES {
-            return format!("error: fish-speech response too large ({len} bytes)");
+
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut body = base.clone();
+        body["text"] = Value::String(chunk.clone());
+        body["format"] = Value::String(req_format.clone());
+        match tts_post_one(&client, &url, &body).await {
+            Ok(b) => parts.push(b),
+            Err(e) => return format!("error: chunk {}/{}: {e}", i + 1, chunks.len()),
         }
     }
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return format!("error: read audio bytes: {e}"),
+    let audio: Vec<u8> = if parts.len() == 1 {
+        parts.pop().unwrap()
+    } else {
+        match concat_wav(&parts) {
+            Ok(w) => w,
+            Err(e) => return format!("error: concat wav: {e}"),
+        }
     };
-    if !st.is_success() {
-        let snippet: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-        return format!("error: fish-speech HTTP {}: {}", st.as_u16(), snippet);
+    if audio.is_empty() {
+        return "error: fish-speech returned empty audio".into();
     }
-    if bytes.is_empty() {
-        return "error: fish-speech returned empty audio (no bytes)".into();
-    }
-    if bytes.len() as u64 > MAX_AUDIO_BYTES {
-        return format!("error: fish-speech audio exceeds cap ({} bytes)", bytes.len());
-    }
-    if let Err(e) = std::fs::write(&out_path, &bytes) {
+    if let Err(e) = std::fs::write(&out_path, &audio) {
         return format!("error: write {}: {e}", out_path.display());
     }
     format!(
-        "ok: wrote {} bytes to {} (local {model}, format={format})",
-        bytes.len(),
-        out_path.display()
+        "ok: wrote {} bytes to {} (local {model}, format={req_format}, {} chunk(s))",
+        audio.len(),
+        out_path.display(),
+        chunks.len()
     )
+}
+
+/// POST one ServeTTSRequest body, returning the audio bytes (or a ready
+/// error string). Mirrors the cloud path's status + size guards.
+async fn tts_post_one(client: &reqwest::Client, url: &str, body: &Value) -> Result<Vec<u8>, String> {
+    let resp = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("post {url}: {e}"))?;
+    let st = resp.status();
+    if let Some(len) = resp.content_length() {
+        if len > MAX_AUDIO_BYTES {
+            return Err(format!("response too large ({len} bytes)"));
+        }
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("read audio bytes: {e}"))?;
+    if !st.is_success() {
+        let snippet: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
+        return Err(format!("fish-speech HTTP {}: {}", st.as_u16(), snippet));
+    }
+    if bytes.is_empty() {
+        return Err("empty audio (no bytes)".into());
+    }
+    if bytes.len() as u64 > MAX_AUDIO_BYTES {
+        return Err(format!("audio exceeds cap ({} bytes)", bytes.len()));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Split into sentence-ish units (break after . ! ? or newline, keeping
+/// trailing whitespace with the sentence).
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?' | '\n') {
+            while matches!(chars.peek(), Some(' ') | Some('\t')) {
+                cur.push(chars.next().unwrap());
+            }
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Hard char-split (for a single sentence longer than `max`).
+fn hard_split(s: &str, max: usize) -> Vec<String> {
+    s.chars()
+        .collect::<Vec<char>>()
+        .chunks(max.max(1))
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
+/// Sentence-aware chunking: pack sentences into <=`max`-char chunks; a
+/// single oversized sentence is hard-split. Empty pieces dropped.
+fn split_for_tts(text: &str, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for sentence in split_sentences(text) {
+        let slen = sentence.chars().count();
+        if slen > max {
+            if !cur.trim().is_empty() {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+            out.extend(hard_split(&sentence, max));
+            continue;
+        }
+        if cur.chars().count() + slen > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&sentence);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out.into_iter().filter(|s| !s.trim().is_empty()).collect()
+}
+
+/// Concatenate canonical 44-byte-header PCM WAVs into one. Keeps the first
+/// chunk's header (rate/channels/bits are identical across chunks — same
+/// model+format), appends every chunk's PCM data, and patches the RIFF
+/// chunk size (offset 4) + data subchunk size (offset 40).
+fn concat_wav(parts: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    const HDR: usize = 44;
+    let first = parts
+        .iter()
+        .find(|p| p.len() >= HDR)
+        .ok_or("no chunk has a valid WAV header")?;
+    let mut out = first[..HDR].to_vec();
+    let mut data_len: usize = 0;
+    for p in parts {
+        if p.len() > HDR {
+            out.extend_from_slice(&p[HDR..]);
+            data_len += p.len() - HDR;
+        }
+    }
+    let riff = (out.len() as u32).saturating_sub(8);
+    out[4..8].copy_from_slice(&riff.to_le_bytes());
+    out[40..44].copy_from_slice(&(data_len as u32).to_le_bytes());
+    Ok(out)
 }
 
 /// CLOUD path: Fish Audio api.fish.audio. `model:` is a request HEADER
@@ -341,5 +457,41 @@ mod tests {
         assert!(resolve_tts_output_path(Some("/etc/passwd"), "mp3").is_err());
         assert!(resolve_tts_output_path(Some("ok.mp3"), "mp3").is_ok());
         assert!(resolve_tts_output_path(None, "wav").is_ok());
+    }
+
+    #[test]
+    fn split_for_tts_packs_and_hard_splits() {
+        // Short → single chunk.
+        assert_eq!(split_for_tts("One. Two.", 100).len(), 1);
+
+        // Long → multiple chunks, each ≤ max, content preserved verbatim.
+        let long = "Sentence number one. ".repeat(20); // 420 chars
+        let parts = split_for_tts(&long, 100);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.chars().count() <= 100));
+        assert_eq!(parts.join(""), long);
+
+        // A single oversized sentence (no terminator) → hard char-split.
+        let mono = "x".repeat(250);
+        let hp = split_for_tts(&mono, 100);
+        assert_eq!(hp.len(), 3); // 100 + 100 + 50
+        assert!(hp.iter().all(|p| p.chars().count() <= 100));
+        assert_eq!(hp.join(""), mono);
+    }
+
+    #[test]
+    fn concat_wav_merges_and_patches_sizes() {
+        let mk = |data: &[u8]| {
+            let mut v = vec![0u8; 44];
+            v[0..4].copy_from_slice(b"RIFF");
+            v[8..12].copy_from_slice(b"WAVE");
+            v.extend_from_slice(data);
+            v
+        };
+        let out = concat_wav(&[mk(&[1, 2, 3, 4]), mk(&[5, 6])]).unwrap();
+        assert_eq!(out.len(), 44 + 6);
+        assert_eq!(u32::from_le_bytes(out[40..44].try_into().unwrap()), 6); // data size
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), (44 + 6 - 8)); // RIFF size
+        assert_eq!(&out[44..], &[1, 2, 3, 4, 5, 6]);
     }
 }
