@@ -513,41 +513,86 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
 /// `.await`, which is false (`remember_if_novel`/`recall` drop every guard
 /// before awaiting). The dedicated thread is for blocking-work isolation,
 /// not a Send workaround.
-fn spawn_autocapture(user: String, assistant: String, conv: String) {
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                tracing::debug!("autocapture({conv}): runtime build failed: {e}");
-                return;
-            }
-        };
-        rt.block_on(async move {
-            match crate::lifetime_memory::extract_from_exchange(&user, &assistant).await {
-                Ok(facts) => {
-                    let mut stored = 0usize;
-                    for f in &facts {
-                        match crate::lifetime_memory::remember_if_novel(f, "fact", &conv).await {
-                            Ok(Some(_)) => stored += 1,
-                            Ok(None) => {} // skipped as a near-duplicate
-                            Err(e) => {
-                                tracing::debug!("autocapture({conv}): store fact failed: {e}")
-                            }
-                        }
+struct AutocaptureJob {
+    user: String,
+    assistant: String,
+    conv: String,
+}
+
+/// Bounded queue depth. Beyond this, turns are DROPPED (best-effort) rather
+/// than spawning unbounded threads/work under a burst.
+const AUTOCAPTURE_QUEUE_CAP: usize = 64;
+
+/// One background worker (own current-thread runtime) draining a bounded
+/// channel — replaces the old thread-per-turn spawn, which could fan out
+/// unbounded threads under high cloud_query volume. Lazily started on first
+/// use. Single worker ⇒ sequential extraction (bounded concurrency = 1),
+/// fine for best-effort background capture.
+fn autocapture_sender() -> &'static std::sync::mpsc::SyncSender<AutocaptureJob> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<AutocaptureJob>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AutocaptureJob>(AUTOCAPTURE_QUEUE_CAP);
+        let spawned = std::thread::Builder::new()
+            .name("lamu-autocapture".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("autocapture worker: runtime build failed: {e}");
+                        return;
                     }
-                    tracing::info!(
-                        "autocapture({conv}): extracted {} fact(s), stored {} novel",
-                        facts.len(),
-                        stored
-                    );
+                };
+                while let Ok(job) = rx.recv() {
+                    rt.block_on(run_autocapture_job(job));
                 }
-                Err(e) => tracing::debug!("autocapture({conv}): extraction failed: {e}"),
+            });
+        if let Err(e) = spawned {
+            tracing::error!("autocapture worker: thread spawn failed: {e}");
+        }
+        tx
+    })
+}
+
+async fn run_autocapture_job(job: AutocaptureJob) {
+    let AutocaptureJob { user, assistant, conv } = job;
+    match crate::lifetime_memory::extract_from_exchange(&user, &assistant).await {
+        Ok(facts) => {
+            let mut stored = 0usize;
+            for f in &facts {
+                match crate::lifetime_memory::remember_if_novel(f, "fact", &conv).await {
+                    Ok(Some(_)) => stored += 1,
+                    Ok(None) => {} // skipped as a near-duplicate
+                    Err(e) => tracing::debug!("autocapture({conv}): store fact failed: {e}"),
+                }
             }
-        });
-    });
+            tracing::info!(
+                "autocapture({conv}): extracted {} fact(s), stored {} novel",
+                facts.len(),
+                stored
+            );
+        }
+        Err(e) => tracing::debug!("autocapture({conv}): extraction failed: {e}"),
+    }
+}
+
+fn spawn_autocapture(user: String, assistant: String, conv: String) {
+    let job = AutocaptureJob { user, assistant, conv };
+    // try_send, never block the caller. Full queue or a dead worker → drop
+    // the turn (best-effort capture) with a warn, not unbounded growth.
+    match autocapture_sender().try_send(job) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(j)) => tracing::warn!(
+            "autocapture({}): queue full (cap {AUTOCAPTURE_QUEUE_CAP}), dropping turn",
+            j.conv
+        ),
+        Err(std::sync::mpsc::TrySendError::Disconnected(j)) => {
+            tracing::error!("autocapture({}): worker gone, dropping turn", j.conv)
+        }
+    }
 }
 
 /// V5 improvement H: dedupe overlapping content between auto_context
