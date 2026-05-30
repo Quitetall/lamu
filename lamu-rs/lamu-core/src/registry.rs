@@ -233,12 +233,48 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
         if !path.is_file() {
             continue;
         }
-        let Some(ext) = path.extension() else { continue };
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        // Multi-format: also catalog `.safetensors` checkpoints. No built-in
+        // backend SERVES them (llama.cpp is GGUF-only), but discovering them
+        // beats hand-writing a registry entry — the user assigns a backend.
+        if ext == "safetensors" {
+            // Skip non-primary shards (model-00002-of-…) + index sidecars;
+            // catalog one entry per model from its first shard / single file.
+            if filename.contains("-of-") && !filename.contains("00001-of-") {
+                continue;
+            }
+            let size_mb = std::fs::metadata(path)
+                .map(|m| (m.len() / 1_048_576) as u32)
+                .unwrap_or(0);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
+            let name = stem.to_lowercase().replace(' ', "-");
+            discovered.push(ModelEntry {
+                name,
+                path: path.to_path_buf(),
+                format: ModelFormat::Safetensors,
+                backend: BackendType::LlamaCpp,
+                arch: "unknown".to_string(),
+                params_b: 0.0,
+                quant: "fp16".to_string(),
+                vram_mb: estimate_vram_mb(size_mb),
+                context_max: 0,
+                capabilities: vec![],
+                reasoning_marker: None,
+                speculative: None,
+                sampling: None,
+                pinned: false,
+                main: false,
+                notes: "safetensors checkpoint discovered by scan — assign a backend before use (no built-in safetensors LLM loader; llama.cpp serves GGUF).".to_string(),
+                status: crate::types::ModelStatus::default(),
+                modality: crate::types::Modality::Llm,
+            });
+            continue;
+        }
         if ext != "gguf" {
             continue;
         }
-
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // Skip draft models
         let lower = filename.to_lowercase();
@@ -608,6 +644,30 @@ mod tests {
         let e = &loaded[0];
         assert_eq!(e.backend, BackendType::ComfyUI);
         assert_eq!(e.modality, Modality::Image);
+    }
+
+    #[test]
+    fn scan_discovers_safetensors_skipping_nonprimary_shards() {
+        use crate::types::ModelFormat;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mymodel.safetensors"), b"x").unwrap();
+        std::fs::write(dir.path().join("big-00001-of-00003.safetensors"), b"x").unwrap();
+        std::fs::write(dir.path().join("big-00002-of-00003.safetensors"), b"x").unwrap(); // skip
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap(); // ignored
+        let found = scan_directory(dir.path()).unwrap();
+        let st: Vec<&ModelEntry> = found
+            .iter()
+            .filter(|e| matches!(e.format, ModelFormat::Safetensors))
+            .collect();
+        assert_eq!(
+            st.len(),
+            2,
+            "primary single + first shard only; got {:?}",
+            found.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert!(st.iter().any(|e| e.name == "mymodel"));
+        assert!(st.iter().any(|e| e.name.contains("00001-of")));
+        assert!(!st.iter().any(|e| e.name.contains("00002-of")));
     }
 
     #[test]
