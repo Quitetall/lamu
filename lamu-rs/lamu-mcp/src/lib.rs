@@ -10,6 +10,7 @@ pub mod auto_context;
 pub mod cloud;
 pub mod context;
 pub mod handlers;
+pub mod image;
 pub mod lifetime_memory;
 pub mod memory;
 pub mod rag;

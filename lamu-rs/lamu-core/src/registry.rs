@@ -582,6 +582,35 @@ mod tests {
     }
 
     #[test]
+    fn load_registry_parses_comfyui_image_entry() {
+        // Mirrors the live `comfy-image` entry shape.
+        use crate::types::{BackendType, Modality};
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        std::fs::write(
+            &reg,
+            "models:\n  \
+             comfy-image:\n    \
+             path: /home/x/ComfyUI\n    \
+             format: custom\n    \
+             backend: comfyui\n    \
+             arch: comfyui\n    \
+             params_b: 0.0\n    \
+             quant: fp16\n    \
+             vram_mb: 9000\n    \
+             context_max: 0\n    \
+             capabilities: []\n    \
+             modality: image\n",
+        )
+        .unwrap();
+        let loaded = load_registry(&reg).expect("comfyui image entry must parse");
+        assert_eq!(loaded.len(), 1);
+        let e = &loaded[0];
+        assert_eq!(e.backend, BackendType::ComfyUI);
+        assert_eq!(e.modality, Modality::Image);
+    }
+
+    #[test]
     fn sampling_profile_round_trips_through_registry_yaml() {
         let dir = tempfile::tempdir().unwrap();
         let reg = dir.path().join("models.yaml");
