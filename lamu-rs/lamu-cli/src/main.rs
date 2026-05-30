@@ -122,6 +122,15 @@ enum Command {
     DropAgent {
         session_id: String,
     },
+    /// Store cloud-provider API keys in ~/.config/lamu/api-keys.env (sourced
+    /// into the env at startup by `lamu`, `serve`, and the MCP server). Bare
+    /// `lamu login` prompts for every provider key in cloud-models.yaml that
+    /// isn't already set; `lamu login <name>` does just one.
+    Login {
+        /// Optional provider / env-var filter, e.g. `deepseek` or
+        /// `DEEPSEEK_API_KEY`. Omit to be prompted for all unset keys.
+        provider: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -192,7 +201,56 @@ async fn main() -> Result<()> {
         Some(Command::Preserve { session_id }) => cmd_preserve(&session_id),
         Some(Command::CherryPick { session_id, glob }) => cmd_cherry_pick(&session_id, &glob),
         Some(Command::DropAgent { session_id }) => cmd_drop_agent(&session_id),
+        Some(Command::Login { provider }) => cmd_login(provider),
     }
+}
+
+/// Interactive key entry → ~/.config/lamu/api-keys.env. Prompts for every
+/// distinct `api_key_env` in cloud-models.yaml (plus OPENAI/FISH_AUDIO for
+/// embeddings + cloud TTS) that isn't already set; `provider` narrows it.
+fn cmd_login(provider: Option<String>) -> Result<()> {
+    use std::io::Write;
+    let mut vars: Vec<String> = lamu_providers::cloud_config::load_or_empty()
+        .iter()
+        .filter_map(|m| m.api_key_env.clone())
+        .collect();
+    vars.push("OPENAI_API_KEY".to_string()); // memory/rag embeddings
+    vars.push("FISH_AUDIO_API_KEY".to_string()); // cloud TTS
+    vars.sort();
+    vars.dedup();
+    if let Some(p) = &provider {
+        let pl = p.to_lowercase();
+        let filtered: Vec<String> =
+            vars.iter().filter(|v| v.to_lowercase().contains(&pl)).cloned().collect();
+        vars = if filtered.is_empty() { vec![p.clone()] } else { filtered };
+    }
+
+    let mut wrote = 0usize;
+    for var in vars {
+        let set = std::env::var(&var).ok().map(|v| !v.trim().is_empty()).unwrap_or(false);
+        print!("{var} [{}] — paste key (blank to skip): ", if set { "set" } else { "unset" });
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let key = line.trim();
+        if key.is_empty() {
+            println!("  skipped");
+            continue;
+        }
+        let path = lamu_providers::cloud_config::save_api_key_env(&var, key)?;
+        // SAFETY: single-threaded CLI path, before any async/threads spawn.
+        unsafe { std::env::set_var(&var, key); }
+        println!("  ✓ saved to {}", path.display());
+        wrote += 1;
+    }
+    if wrote > 0 {
+        println!(
+            "\n{wrote} key(s) saved. They load automatically on `lamu` / `lamu serve` / MCP startup."
+        );
+    } else {
+        println!("No keys entered.");
+    }
+    Ok(())
 }
 
 fn cmd_agents() -> Result<()> {

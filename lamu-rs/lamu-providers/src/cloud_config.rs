@@ -135,6 +135,50 @@ pub fn config_path() -> PathBuf {
     PathBuf::from("./cloud-models.yaml")
 }
 
+/// Append-or-replace `export VAR=val` in `~/.config/lamu/api-keys.env` —
+/// the file `lamu`/serve/MCP source into the process env at startup.
+/// Returns the path written. Tightens perms to 0o600 (it holds secrets).
+pub fn save_api_key_env(var: &str, val: &str) -> std::io::Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .map(|d| d.join("lamu"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("api-keys.env");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let prefix = format!("export {}=", var);
+    let new_line = format!("export {}={}", var, val);
+    let updated = if existing.lines().any(|l| l.trim_start().starts_with(&prefix)) {
+        let mut s = existing
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with(&prefix) {
+                    new_line.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.push('\n');
+        s
+    } else {
+        let mut s = existing;
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&new_line);
+        s.push('\n');
+        s
+    };
+    std::fs::write(&path, updated)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
 /// Best-effort load: missing file → empty Vec, parse error → empty Vec
 /// + a stderr warning so a broken YAML isn't invisible.
 ///
