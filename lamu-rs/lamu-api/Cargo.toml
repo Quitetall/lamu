@@ -24,6 +24,8 @@ prometheus = { version = "0.13", default-features = false }
 socket2 = "0.5"
 nix = { version = "0.29", features = ["signal"] }
 dirs = "5"
+# Constant-time bearer-token compare (auth.rs). Already in the tree.
+subtle = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

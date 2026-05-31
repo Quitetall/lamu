@@ -56,6 +56,7 @@ fn make_state() -> AppState {
         health: Arc::new(Mutex::new(HealthRegistry::new())),
         metrics: Arc::new(LamuMetrics::new().unwrap()),
         http_port: 8020,
+        auth_token: Arc::new(None), // auth off by default in route tests
     }
 }
 
@@ -171,4 +172,75 @@ async fn unknown_route_404() {
         Request::builder().uri("/nonexistent").body(Body::empty()).unwrap(),
     ).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── bearer auth middleware (ADR 0012) ───────────────────────────────
+
+fn state_with_token(tok: &str) -> AppState {
+    let mut st = make_state();
+    st.auth_token = Arc::new(Some(tok.to_string()));
+    st
+}
+
+#[tokio::test]
+async fn auth_health_exempt_even_with_token() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_401_without_bearer_when_token_set() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_401_with_wrong_bearer() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer lamu_wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_200_with_right_bearer() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer lamu_secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_off_passes_without_bearer() {
+    // make_state() has auth_token None → middleware is a no-op.
+    let app = build_app(make_state());
+    let resp = app
+        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

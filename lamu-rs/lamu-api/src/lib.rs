@@ -1,6 +1,7 @@
 //! lamu-api — OpenAI-compatible HTTP layer.
 //! Direct port of `lamu/api/openai_compat.py`.
 
+pub mod auth;
 pub mod metrics;
 pub mod openai_compat;
 
@@ -23,14 +24,26 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| {
         anyhow::anyhow!("LAMU_BIND_HOST='{host}' is not a valid IP (need e.g. 127.0.0.1 or 0.0.0.0): {e}")
     })?;
-    let listener = bind_reuseaddr(addr)?;
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            "LAMU bound to {} — the OpenAI-compat API is UNAUTHENTICATED and reachable off-host. \
-             Put it behind a reverse proxy / firewall, or bind 127.0.0.1.",
-            addr
-        );
+    // Off-loopback bind is only allowed with a token (ADR 0012) — otherwise the
+    // unauthenticated API would be reachable on the LAN. LAMU_ALLOW_INSECURE=1
+    // is the explicit, loud escape hatch.
+    if !addr.ip().is_loopback() && auth::resolve_token().is_none() {
+        if std::env::var("LAMU_ALLOW_INSECURE").ok().as_deref() == Some("1") {
+            tracing::warn!(
+                "LAMU_ALLOW_INSECURE=1: serving an UNAUTHENTICATED API on {} — anyone reachable \
+                 can drive inference and spend cloud credits. You asked for this.",
+                addr
+            );
+        } else {
+            anyhow::bail!(
+                "LAMU_BIND_HOST='{host}' is off-loopback but no API token is set — the \
+                 OpenAI-compat API would be unauthenticated on the LAN. Run `lamu auth init` \
+                 (writes ~/.config/lamu/api-token) or set LAMU_API_TOKEN, then retry. To expose \
+                 without auth on purpose, set LAMU_ALLOW_INSECURE=1."
+            );
+        }
     }
+    let listener = bind_reuseaddr(addr)?;
     tracing::info!("LAMU OpenAI-compat listening on {} (pid {})", addr, std::process::id());
 
     // Graceful shutdown on SIGINT/SIGTERM so the pidfile gets cleaned up.

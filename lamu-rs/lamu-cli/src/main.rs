@@ -134,6 +134,19 @@ enum Command {
     /// Hardware-aware model fit: show GPU VRAM + which registry models fit
     /// now / after an unload / not at all, plus popular models by tier.
     Cookbook,
+    /// Manage the optional HTTP API bearer token (ADR 0012). Auth is off on a
+    /// loopback bind; a token is required to bind off-loopback.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuthAction {
+    /// Mint a new API token, write it to ~/.config/lamu/api-token (chmod
+    /// 0600), and print it once. Enables bearer auth on `lamu serve`.
+    Init,
 }
 
 #[tokio::main]
@@ -206,6 +219,7 @@ async fn main() -> Result<()> {
         Some(Command::DropAgent { session_id }) => cmd_drop_agent(&session_id),
         Some(Command::Login { provider }) => cmd_login(provider),
         Some(Command::Cookbook) => cmd_cookbook(),
+        Some(Command::Auth { action }) => cmd_auth(action),
     }
 }
 
@@ -287,6 +301,59 @@ fn cmd_cookbook() -> Result<()> {
         let b = fit_bucket(*vram, free, total);
         println!("  {} {:<22} ~{:>6} MB  {}", b.glyph(), name, vram, repo);
     }
+    Ok(())
+}
+
+fn cmd_auth(action: AuthAction) -> Result<()> {
+    match action {
+        AuthAction::Init => cmd_auth_init(),
+    }
+}
+
+/// Mint a `lamu_<64-hex>` API token, write it to ~/.config/lamu/api-token at
+/// mode 0600, and print it once (ADR 0012). Refuses to clobber an existing
+/// token (delete it to rotate). The token enables bearer auth on `lamu serve`
+/// and is required to bind off-loopback.
+fn cmd_auth_init() -> Result<()> {
+    use std::io::Write as _;
+    let dir = dirs::config_dir()
+        .map(|d| d.join("lamu"))
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir (~/.config)"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("api-token");
+
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    let tok = format!(
+        "lamu_{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true); // refuse to overwrite an existing token
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = match opts.open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!(
+                "a token already exists at {} — delete it to rotate, or set LAMU_API_TOKEN to override",
+                path.display()
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+    f.write_all(tok.as_bytes())?;
+    f.write_all(b"\n")?;
+
+    println!("API token written to {} (chmod 0600).", path.display());
+    println!("\n    {tok}\n");
+    println!("Shown ONCE. Clients send:  Authorization: Bearer {tok}");
+    println!("Auth is OFF on a loopback bind; this token is required to bind off-loopback");
+    println!("(LAMU_BIND_HOST=0.0.0.0). Override per-process with LAMU_API_TOKEN.");
     Ok(())
 }
 

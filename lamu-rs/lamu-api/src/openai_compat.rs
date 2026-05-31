@@ -126,6 +126,10 @@ pub struct AppState {
     /// `lamu_core::loader::ensure_loaded` so spawned backends don't try
     /// to bind the same port we already own.
     pub http_port: u16,
+    /// Optional bearer token (ADR 0012). `None` → auth off (frictionless
+    /// loopback). `Some` → every route except /health + /metrics requires
+    /// `Authorization: Bearer <token>`. Resolved once at `build_state`.
+    pub auth_token: Arc<Option<String>>,
 }
 
 pub fn build_app(state: AppState) -> AxumRouter {
@@ -145,6 +149,12 @@ pub fn build_app(state: AppState) -> AxumRouter {
         // and other tools that hardcode the Ollama API surface.
         .route("/api/tags", get(ollama_tags))
         .route("/api/chat", post(ollama_chat))
+        // Bearer auth (ADR 0012). No-op when no token is configured; /health +
+        // /metrics are exempt inside the middleware.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_bearer,
+        ))
         .with_state(state)
 }
 
@@ -887,6 +897,7 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
         health: Arc::new(Mutex::new(HealthRegistry::new())),
         metrics: Arc::new(metrics),
         http_port,
+        auth_token: Arc::new(crate::auth::resolve_token()),
     })
 }
 
