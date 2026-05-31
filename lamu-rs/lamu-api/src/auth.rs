@@ -57,17 +57,25 @@ pub async fn require_bearer(State(st): State<AppState>, req: Request, next: Next
     if path == "/health" || path == "/metrics" {
         return next.run(req).await;
     }
+    // Parse leniently per RFC 7235: the auth scheme is case-insensitive and
+    // surrounding/inner whitespace is allowed. Real clients send
+    // "Bearer <token>", but accept "bearer", extra spaces, etc.
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, tok)| tok.trim());
     let ok = match presented {
-        Some(t) => {
+        Some(t) if !t.is_empty() => {
             use subtle::ConstantTimeEq;
+            // ct_eq is constant-time over CONTENT for equal-length inputs; it
+            // short-circuits on length mismatch, leaking only token length —
+            // harmless here (the lamu_<64hex> length is public by design).
             t.as_bytes().ct_eq(expected.as_bytes()).into()
         }
-        None => false,
+        _ => false,
     };
     if ok {
         next.run(req).await

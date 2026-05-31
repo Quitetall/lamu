@@ -14,6 +14,10 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let state = openai_compat::build_state(&registry_path(), port)?;
     openai_compat::auto_register(&state).await;
     spawn_main_preload(state.clone());
+    // Resolve auth once: the value the middleware will enforce (in
+    // state.auth_token) is the same one the off-loopback gate checks below.
+    // Avoids a second resolve_token() read (and the startup TOCTOU it'd open).
+    let auth_configured = state.auth_token.is_some();
     let app = openai_compat::build_app(state);
 
     // Default to LOCALHOST — the OpenAI-compat API is unauthenticated, so it
@@ -27,7 +31,7 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     // Off-loopback bind is only allowed with a token (ADR 0012) — otherwise the
     // unauthenticated API would be reachable on the LAN. LAMU_ALLOW_INSECURE=1
     // is the explicit, loud escape hatch.
-    if !addr.ip().is_loopback() && auth::resolve_token().is_none() {
+    if !addr.ip().is_loopback() && !auth_configured {
         if std::env::var("LAMU_ALLOW_INSECURE").ok().as_deref() == Some("1") {
             tracing::warn!(
                 "LAMU_ALLOW_INSECURE=1: serving an UNAUTHENTICATED API on {} — anyone reachable \

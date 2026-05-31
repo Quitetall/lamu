@@ -235,6 +235,32 @@ async fn auth_200_with_right_bearer() {
 }
 
 #[tokio::test]
+async fn auth_metrics_exempt_even_with_token() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_case_insensitive_scheme_accepted() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "bearer lamu_secret") // lowercase scheme
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn auth_off_passes_without_bearer() {
     // make_state() has auth_token None → middleware is a no-op.
     let app = build_app(make_state());
