@@ -22,6 +22,10 @@ humantime = "2"
 which = "6"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 dirs = "5"
+# Random per-process sentinel nonce for the untrusted-content envelope
+# (untrusted.rs). Already in the dependency tree transitively; pinned to 0.2
+# (stable getrandom::getrandom API). No new third-party surface.
+getrandom = "0.2"
 futures-util = "0.3"
 serde_yaml = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }

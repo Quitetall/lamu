@@ -55,6 +55,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0008](./0008-headless-council-instead-of-compare-ui.md) | Provide multi-model comparison as a headless judged council, not a compare UI | Accepted |
 | [0009](./0009-confined-media-output-paths.md) | Confine media output paths to a per-modality dir | Accepted |
 | [0010](./0010-capability-modality-routing-embedding-never-chat-routed.md) | Route by capability subset AND modality; never chat-route embedding or non-LLM models | Accepted |
+| [0011](./0011-structural-untrusted-content-envelope.md) | Structural prompt-injection boundary — one untrusted-content envelope | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.
