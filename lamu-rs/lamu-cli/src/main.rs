@@ -223,84 +223,91 @@ async fn main() -> Result<()> {
     }
 }
 
-/// VRAM-fit bucket for a model of `vram` MB given `free`/`total` MB.
-#[derive(Debug, PartialEq, Eq)]
-enum Fit {
-    FitsNow,
-    AfterUnload,
-    TooBig,
-}
-
-impl Fit {
-    fn glyph(&self) -> &'static str {
-        match self {
-            Fit::FitsNow => "🟢",
-            Fit::AfterUnload => "🟡",
-            Fit::TooBig => "🔴",
-        }
+/// Infer a cookbook use-case bucket from a registry entry's modality +
+/// capabilities (drives the scoring weights + speed/context targets).
+fn infer_use_case(e: &lamu_core::types::ModelEntry) -> String {
+    use lamu_core::types::{Capability, Modality};
+    if e.modality == Modality::Tts {
+        return "tts".to_string();
     }
-    fn label(&self) -> &'static str {
-        match self {
-            Fit::FitsNow => "fits now",
-            Fit::AfterUnload => "fits after unload",
-            Fit::TooBig => "too big",
-        }
-    }
-}
-
-fn fit_bucket(vram: u32, free: u32, total: u32) -> Fit {
-    if total == 0 {
-        return Fit::FitsNow; // unknown GPU (no NVML) — don't mislabel
-    }
-    if vram <= free {
-        Fit::FitsNow
-    } else if vram <= total {
-        Fit::AfterUnload
+    let has = |c: Capability| e.capabilities.contains(&c);
+    if has(Capability::Embedding) {
+        "embedding".to_string()
+    } else if has(Capability::Vision) {
+        "multimodal".to_string()
+    } else if has(Capability::Code) {
+        "coding".to_string()
+    } else if has(Capability::Reasoning) {
+        "reasoning".to_string()
+    } else if has(Capability::Chat) {
+        "chat".to_string()
     } else {
-        Fit::TooBig
+        "general".to_string()
     }
 }
-
-/// (display name, ~Q4_K_M VRAM MB, HuggingFace GGUF repo) — a small static
-/// reference so `cookbook` can suggest downloads by tier. Examples, not
-/// exhaustive; `lamu pull <repo>` to grab one.
-const CURATED: &[(&str, u32, &str)] = &[
-    ("qwen3.5-4b", 3000, "Qwen/Qwen2.5-4B-Instruct-GGUF"),
-    ("mistral-small-24b", 14000, "bartowski/Mistral-Small-24B-Instruct-GGUF"),
-    ("qwen3.6-27b", 17000, "Qwen/Qwen3-27B-Instruct-GGUF"),
-    ("gemma-3-27b", 17000, "bartowski/gemma-3-27b-it-GGUF"),
-    ("llama-3.3-70b", 42000, "bartowski/Llama-3.3-70B-Instruct-GGUF"),
-];
 
 fn cmd_cookbook() -> Result<()> {
+    use lamu_core::cookbook::{self, Backend, FitLevel, Hardware};
+
     let sched = lamu_core::scheduler::VramScheduler::new();
     let (used, total) = sched.query_vram();
-    let free = total.saturating_sub(used);
+    let gpu_name = sched.gpu_name();
     if total == 0 {
-        println!("GPU: no NVIDIA GPU detected via NVML (fit checks disabled).\n");
+        println!("GPU: no NVIDIA GPU detected via NVML — throughput uses the CPU fallback.\n");
     } else {
-        println!("GPU VRAM: {total} MB total · {free} MB free · {used} MB in use\n");
+        println!(
+            "GPU: {} — {:.1} GB VRAM ({:.1} GB free)\n",
+            gpu_name.as_deref().unwrap_or("unknown"),
+            total as f32 / 1024.0,
+            total.saturating_sub(used) as f32 / 1024.0,
+        );
     }
 
     let entries =
         lamu_core::registry::load_registry(&lamu_core::config::registry_path()).unwrap_or_default();
-    if entries.is_empty() {
-        println!("Registry empty — run `lamu scan` or `lamu pull <repo>`.");
-    } else {
-        let mut sorted = entries;
-        sorted.sort_by_key(|e| e.vram_mb);
-        println!("Registry models by fit:");
-        for e in &sorted {
-            let b = fit_bucket(e.vram_mb, free, total);
-            println!("  {} {:<30} {:>6} MB  {}", b.glyph(), e.name, e.vram_mb, b.label());
-        }
+    let specs: Vec<cookbook::ModelSpec> = entries
+        .iter()
+        .filter(|e| e.modality.is_llm() && e.params_b > 0.0)
+        .map(|e| cookbook::ModelSpec {
+            name: e.name.clone(),
+            params_b: e.params_b,
+            active_params_b: e.params_b, // dense; MoE fidelity is Phase 2
+            is_moe: false,
+            quant: e.quant.clone(),
+            context_max: e.context_max,
+            use_case: infer_use_case(e),
+        })
+        .collect();
+
+    if specs.is_empty() {
+        println!("No LLM models in the registry — run `lamu scan` or `lamu pull <repo>`.");
+        return Ok(());
     }
 
-    println!("\nPopular models by VRAM tier (~Q4_K_M; `lamu pull <repo>`):");
-    for (name, vram, repo) in CURATED {
-        let b = fit_bucket(*vram, free, total);
-        println!("  {} {:<22} ~{:>6} MB  {}", b.glyph(), name, vram, repo);
+    // GPU-only budget (Phase 1): rank by what runs on the card itself, with
+    // throughput-aware scoring rather than a fits/doesn't bucket.
+    let hw = Hardware {
+        gpu_name,
+        gpu_vram_gb: total as f32 / 1024.0,
+        avail_ram_gb: 0.0,
+        backend: Backend::Cuda,
+    };
+    let ranked = cookbook::rank(&specs, &hw, "general", None);
+
+    println!("  {:<30} {:>16} {:>9} {:>8} {:>6}", "model", "quant@ctx", "VRAM", "tok/s~", "score");
+    for r in &ranked {
+        let glyph = match r.fit_level {
+            FitLevel::Perfect | FitLevel::Good => "🟢",
+            FitLevel::Marginal => "🟡",
+            FitLevel::TooTight => "🔴",
+        };
+        let qc = format!("{}@{}", r.quant, r.context);
+        println!(
+            "  {} {:<28} {:>16} {:>6.1} GB {:>8.0} {:>6.1}",
+            glyph, r.name, qc, r.required_gb, r.tps_est, r.score
+        );
     }
+    println!("\n🟢 fits comfortably · 🟡 marginal · 🔴 won't fit on this GPU");
     Ok(())
 }
 
@@ -932,16 +939,6 @@ fn load_api_keys_env() {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn fit_bucket_tiers() {
-        // 24GB card, 10GB free.
-        assert_eq!(fit_bucket(8000, 10_000, 24_000), Fit::FitsNow);
-        assert_eq!(fit_bucket(17_000, 10_000, 24_000), Fit::AfterUnload);
-        assert_eq!(fit_bucket(42_000, 10_000, 24_000), Fit::TooBig);
-        // No NVML (total 0) → don't mislabel as too-big.
-        assert_eq!(fit_bucket(42_000, 0, 0), Fit::FitsNow);
-    }
 
     #[test]
     fn status_line_down_when_health_missing() {
