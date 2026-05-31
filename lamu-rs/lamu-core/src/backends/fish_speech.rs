@@ -30,25 +30,11 @@ use crate::types::ModelEntry;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
-use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-
-/// Last ~2 KiB of the captured server log, for surfacing WHY a spawn
-/// failed (CUDA OOM, missing dep, bad checkpoint) — otherwise a health
-/// timeout is opaque. Empty string if the log can't be read.
-fn read_log_tail(path: &Path) -> String {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let start = bytes.len().saturating_sub(2048);
-            String::from_utf8_lossy(&bytes[start..]).trim().to_string()
-        }
-        Err(_) => String::new(),
-    }
-}
 
 pub struct FishSpeechBackend {
     proc: Option<Child>,
@@ -164,7 +150,7 @@ impl Backend for FishSpeechBackend {
                 if let Ok(Some(status)) = p.try_wait() {
                     return Err(Error::Backend(format!(
                         "fish_speech server exited during startup (port {port}, {status})\nstderr tail:\n{}",
-                        read_log_tail(&log_file)
+                        crate::backends::read_log_tail(&log_file)
                     )));
                 }
             }
@@ -176,7 +162,7 @@ impl Backend for FishSpeechBackend {
         let _ = self.unload().await;
         Err(Error::Backend(format!(
             "fish_speech health timeout (port {port})\nstderr tail:\n{}",
-            read_log_tail(&log_file)
+            crate::backends::read_log_tail(&log_file)
         )))
     }
 

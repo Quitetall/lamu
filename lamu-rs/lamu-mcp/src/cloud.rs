@@ -890,8 +890,12 @@ impl Preset {
     }
 }
 
-fn env_flag_on(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+/// `Some(true/false)` from a truthy env var, `None` when unset — lets the
+/// caller fall back to a preset default. Truthiness goes through the one
+/// [`truthy_env_flag`] primitive ("1"/"true", case-insensitive, trimmed) so
+/// every flag (here + auto_context's LAMU_TEST_PREFLIGHT) parses identically.
+pub(crate) fn env_flag_on(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|v| truthy_env_flag(Some(&v)))
 }
 
 const REVIEW_SYSTEM_PROMPT: &str = "You are a senior staff engineer doing a code review. Your job is to find real issues, not to pat anyone on the back.\n\nAlways check:\n  1. SECURITY — injection (SQL/shell/XSS/prompt), auth/authz holes, secrets in code, unsafe deserialization, TOCTOU, missing input validation.\n  2. CORRECTNESS — off-by-one, null/empty cases, integer overflow, floating-point traps, race conditions, deadlocks, missing error handling.\n  3. EDGE CASES — what happens at boundaries, with empty inputs, with hostile inputs, under concurrency, on partial failure, on retry.\n  4. ARCHITECTURE — does this fit the existing design? Does it leak abstraction? Does it create coupling that will hurt later? Is there a simpler shape?\n  5. CLARITY — would a stranger understand the intent? Are names accurate? Are comments necessary or noise?\n\nFormat your output:\n  - One-sentence verdict (PASS / PASS WITH NITS / NEEDS CHANGES / REJECT).\n  - Numbered list of findings, each: severity [BUG/SECURITY/STYLE/QUESTION], file:line if knowable, the problem, the suggested fix.\n  - End with a single 'Recommend' line.\n\nBe terse. Be honest. Don't praise unless something is genuinely surprising in a good way. If the code is fine, say so in one line and stop.";

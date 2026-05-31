@@ -9,38 +9,13 @@ use crate::types::ModelEntry;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::{Stream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-
-/// Build the OpenAI-compat request payload, folding in any sampler
-/// overrides carried by `opts`. Extra samplers are only emitted when
-/// `Some` (no nulls). NOTE: the custom `megakernel_server.py` must parse
-/// these fields for them to take effect; unknown fields are ignored
-/// server-side, so this is a safe no-op when unsupported.
-fn build_payload(
-    messages: &[ChatMessage],
-    max_tokens: u32,
-    temperature: f32,
-    stream: bool,
-    opts: &crate::backends::GenerateOpts,
-) -> Value {
-    let mut payload = json!({
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": stream,
-    });
-    if let Some(v) = opts.top_p { payload["top_p"] = json!(v); }
-    if let Some(v) = opts.top_k { payload["top_k"] = json!(v); }
-    if let Some(v) = opts.min_p { payload["min_p"] = json!(v); }
-    if let Some(v) = opts.repeat_penalty { payload["repeat_penalty"] = json!(v); }
-    payload
-}
 
 pub struct MegakernelBackend {
     python_bin: PathBuf,
@@ -158,7 +133,7 @@ impl Backend for MegakernelBackend {
         temperature: f32,
         opts: crate::backends::GenerateOpts,
     ) -> Result<String> {
-        let payload = build_payload(&messages, max_tokens, temperature, false, &opts);
+        let payload = crate::backends::build_payload(&messages, max_tokens, temperature, false, &opts);
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;
@@ -175,7 +150,7 @@ impl Backend for MegakernelBackend {
         max_tokens: u32,
         temperature: f32,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
-        let payload = build_payload(&messages, max_tokens, temperature, true,
+        let payload = crate::backends::build_payload(&messages, max_tokens, temperature, true,
                                     &crate::backends::GenerateOpts::default());
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await

@@ -158,9 +158,7 @@ pub struct AutoContextOpts {
 /// they succeed.
 pub fn assemble_auto_context(commit: &str, repo: &Path) -> Result<String> {
     let opts = AutoContextOpts {
-        test_preflight: std::env::var("LAMU_TEST_PREFLIGHT")
-            .map(|v| v == "1")
-            .unwrap_or(false),
+        test_preflight: crate::cloud::env_flag_on("LAMU_TEST_PREFLIGHT").unwrap_or(false),
     };
     assemble_auto_context_with_opts(commit, repo, opts)
 }

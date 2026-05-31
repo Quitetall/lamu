@@ -15,48 +15,13 @@
 
 use crate::server::LamuMcpServer;
 use lamu_core::types::Modality;
+use crate::media_paths::resolve_confined_output_path;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Component, PathBuf};
 
 const DEFAULT_BASE: &str = "https://api.fish.audio";
 const KEY_ENV: &str = "FISH_AUDIO_API_KEY";
 const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB safety cap
-
-/// Resolve where to write the audio, CONFINED to `<data_dir>/lamu/tts`. A
-/// caller-supplied `output_path` may only be a relative name with no `..`;
-/// absolute paths and parent traversal are rejected so an MCP caller can't
-/// turn this into an arbitrary file-write primitive. Shared by both the
-/// local and cloud paths. `Err` is a ready-to-return error string.
-fn resolve_tts_output_path(output_path: Option<&str>, format: &str) -> Result<PathBuf, String> {
-    let dir = dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
-        .join("lamu")
-        .join("tts");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("error: create tts dir {}: {e}", dir.display()))?;
-    match output_path {
-        Some(p) if !p.is_empty() => {
-            let pb = PathBuf::from(p);
-            if pb.is_absolute() || pb.components().any(|c| matches!(c, Component::ParentDir)) {
-                return Err(format!(
-                    "error: output_path must be a relative name with no '..' (writes are confined to {}): got '{p}'",
-                    dir.display()
-                ));
-            }
-            Ok(dir.join(pb))
-        }
-        _ => {
-            // nanos, not secs — two calls in the same second would otherwise
-            // overwrite each other.
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            Ok(dir.join(format!("tts-{stamp}.{format}")))
-        }
-    }
-}
 
 /// True iff `model` is a registry entry with `modality: tts` (→ serve
 /// locally). Pure over the entries map so it's unit-testable without a
@@ -147,7 +112,7 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
         base["top_p"] = json!(tp.clamp(0.1, 1.0));
     }
 
-    let out_path = match resolve_tts_output_path(args["output_path"].as_str(), &req_format) {
+    let out_path = match resolve_confined_output_path("tts", "tts", &req_format, args["output_path"].as_str()) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -343,7 +308,7 @@ async fn handle_text_to_speech_cloud(args: Value) -> String {
         .unwrap_or_else(|| DEFAULT_BASE.to_string());
     let url = format!("{}/v1/tts", base.trim_end_matches('/'));
 
-    let out_path = match resolve_tts_output_path(args["output_path"].as_str(), &format) {
+    let out_path = match resolve_confined_output_path("tts", "tts", &format, args["output_path"].as_str()) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -458,14 +423,6 @@ mod tests {
         m.insert("chat".to_string(), entry("chat", Modality::Llm));
         assert!(!is_local_tts(&m, "chat")); // an LLM entry
         assert!(!is_local_tts(&m, "s2-pro")); // unknown → cloud
-    }
-
-    #[test]
-    fn output_path_rejects_traversal_and_absolute() {
-        assert!(resolve_tts_output_path(Some("../escape.mp3"), "mp3").is_err());
-        assert!(resolve_tts_output_path(Some("/etc/passwd"), "mp3").is_err());
-        assert!(resolve_tts_output_path(Some("ok.mp3"), "mp3").is_ok());
-        assert!(resolve_tts_output_path(None, "wav").is_ok());
     }
 
     #[test]

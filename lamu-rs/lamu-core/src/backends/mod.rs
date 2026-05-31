@@ -11,6 +11,7 @@ use crate::types::{BackendType, ModelEntry};
 use crate::Result;
 use async_trait::async_trait;
 use futures_util::stream::Stream;
+use serde_json::{json, Value};
 use std::pin::Pin;
 
 /// Construct the right backend impl for the entry's declared type.
@@ -187,6 +188,43 @@ pub async fn graceful_kill(child: &mut tokio::process::Child) {
 pub async fn graceful_kill(child: &mut tokio::process::Child) {
     // No SIGTERM on non-Unix; just kill.
     let _ = child.kill().await;
+}
+
+/// Last ~2 KiB of a captured backend log — surfaces WHY a python-server
+/// spawn failed (CUDA OOM, missing dep, bad checkpoint) in the error.
+/// Empty if unreadable. Shared by the fish_speech + comfyui backends.
+pub(crate) fn read_log_tail(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(2048);
+            String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// OpenAI-compat chat payload + optional sampler overrides (only emitted
+/// when `Some`, no nulls). Unknown fields are ignored server-side, so it's
+/// a safe no-op where unsupported. Shared by the dflash + megakernel
+/// custom-server backends.
+pub(crate) fn build_payload(
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    stream: bool,
+    opts: &GenerateOpts,
+) -> Value {
+    let mut payload = json!({
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": stream,
+    });
+    if let Some(v) = opts.top_p { payload["top_p"] = json!(v); }
+    if let Some(v) = opts.top_k { payload["top_k"] = json!(v); }
+    if let Some(v) = opts.min_p { payload["min_p"] = json!(v); }
+    if let Some(v) = opts.repeat_penalty { payload["repeat_penalty"] = json!(v); }
+    payload
 }
 
 #[cfg(test)]

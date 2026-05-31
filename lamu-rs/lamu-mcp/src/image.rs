@@ -8,11 +8,12 @@
 //! graph, not at spawn. Output PNGs are written to a CONFINED dir
 //! (<data_dir>/lamu/images) — an MCP caller never gets an arbitrary write.
 
+use crate::media_paths::resolve_confined_output_path;
 use crate::server::LamuMcpServer;
 use lamu_core::types::Modality;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Component, PathBuf};
+use std::path::Component;
 use std::time::Duration;
 
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB/image safety cap
@@ -23,35 +24,6 @@ fn is_local_image(entries: &HashMap<String, lamu_core::types::ModelEntry>, model
         .get(model)
         .map(|e| e.modality == Modality::Image)
         .unwrap_or(false)
-}
-
-/// Confined output path under <data_dir>/lamu/images (reject absolute + `..`).
-fn resolve_image_output_path(output_path: Option<&str>, ext: &str) -> Result<PathBuf, String> {
-    let dir = dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
-        .join("lamu")
-        .join("images");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("error: create images dir {}: {e}", dir.display()))?;
-    match output_path {
-        Some(p) if !p.is_empty() => {
-            let pb = PathBuf::from(p);
-            if pb.is_absolute() || pb.components().any(|c| matches!(c, Component::ParentDir)) {
-                return Err(format!(
-                    "error: output_path must be a relative name with no '..' (writes are confined to {}): got '{p}'",
-                    dir.display()
-                ));
-            }
-            Ok(dir.join(pb))
-        }
-        _ => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            Ok(dir.join(format!("img-{stamp}.{ext}")))
-        }
-    }
 }
 
 /// Canonical SDXL/SD txt2img workflow in ComfyUI API format.
@@ -140,7 +112,7 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
         }
     };
 
-    let out_path = match resolve_image_output_path(args["output_path"].as_str(), "png") {
+    let out_path = match resolve_confined_output_path("images", "img", "png", args["output_path"].as_str()) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -281,6 +253,7 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
 mod tests {
     use super::*;
     use lamu_core::types::{BackendType, ModelEntry, ModelFormat, ModelStatus};
+    use std::path::PathBuf;
 
     fn entry(name: &str, modality: Modality) -> ModelEntry {
         ModelEntry {
@@ -313,14 +286,6 @@ mod tests {
         assert!(is_local_image(&m, "comfy-image"));
         assert!(!is_local_image(&m, "chat"));
         assert!(!is_local_image(&m, "unknown"));
-    }
-
-    #[test]
-    fn output_path_confined() {
-        assert!(resolve_image_output_path(Some("../x.png"), "png").is_err());
-        assert!(resolve_image_output_path(Some("/etc/x"), "png").is_err());
-        assert!(resolve_image_output_path(Some("ok.png"), "png").is_ok());
-        assert!(resolve_image_output_path(None, "png").is_ok());
     }
 
     #[test]

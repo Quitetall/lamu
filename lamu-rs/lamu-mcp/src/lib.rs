@@ -13,6 +13,7 @@ pub mod council;
 pub mod handlers;
 pub mod image;
 pub mod lifetime_memory;
+pub mod media_paths;
 pub mod memory;
 pub mod rag;
 pub mod server;
