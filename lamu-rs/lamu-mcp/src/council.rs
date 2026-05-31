@@ -107,15 +107,23 @@ pub async fn handle_council(server: &LamuMcpServer, args: Value) -> String {
 
     // Blind labels A, B, C, … for the judge.
     let labels: Vec<char> = ('A'..='Z').take(good.len()).collect();
+    // Peer answers are attacker-influenceable LLM output; fence each one so a
+    // member cannot address the judge in-band and flip the (acted-upon)
+    // verdict. The judge's own instructions stay in the trusted system tier.
     let blind = good
         .iter()
         .zip(&labels)
-        .map(|((_, a), l)| format!("Answer {l}:\n{a}"))
+        .map(|((_, a), l)| {
+            format!(
+                "Answer {l}:\n{}",
+                crate::untrusted::wrap_untrusted(&format!("council answer {l}"), a)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
     let verdict_raw = crate::cloud::handle_cloud_query(json!({
         "model": judge,
-        "system": JUDGE_PROMPT,
+        "system": format!("{}\n\n---\n\n{}", crate::untrusted::UNTRUSTED_POLICY, JUDGE_PROMPT),
         "prompt": format!("Question:\n{prompt}\n\n{blind}"),
         "max_tokens": 4096,
         "temperature": 0.2,

@@ -829,10 +829,17 @@ pub async fn reconcile_memory(new_id: i64, new_text: &str) -> Result<usize> {
         .map(|h| format!("[{}] {}", h.id, h.text))
         .collect::<Vec<_>>()
         .join("\n");
+    // The recalled neighbors are the attack vector (a poisoned fact could tell
+    // the judge to expire a real one); fence them. `new_text` is the just-stored
+    // user fact and stays trusted. The id-validation below is orthogonal — it
+    // guards against acting on hallucinated ids; the fence guards the verdict.
     let args = serde_json::json!({
         "model": "mimo-v2.5",
-        "system": CONTRADICTION_PROMPT,
-        "prompt": format!("NEW fact:\n{new_text}\n\nEXISTING facts:\n{listing}"),
+        "system": format!("{}\n\n---\n\n{}", crate::untrusted::UNTRUSTED_POLICY, CONTRADICTION_PROMPT),
+        "prompt": format!(
+            "NEW fact:\n{new_text}\n\nEXISTING facts:\n{}",
+            crate::untrusted::wrap_untrusted("recalled facts", &listing)
+        ),
         "max_tokens": 256,
         "temperature": 0.1,
         "include_reasoning": false,
@@ -1118,7 +1125,9 @@ pub(crate) async fn handle_recall_memory(args: serde_json::Value) -> String {
                     h.id, h.kind, source, score, h.text
                 ));
             }
-            out
+            // This tool result reaches the outer agent (Claude Code) verbatim;
+            // a poisoned memory could carry an injection. Fence it as data.
+            crate::untrusted::wrap_untrusted("recalled memory", &out)
         }
         Err(e) => format!("error: {e}"),
     }
