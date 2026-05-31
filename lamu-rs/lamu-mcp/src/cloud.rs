@@ -191,6 +191,11 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     } else {
         String::new()
     };
+    // Prior turns are untrusted (a poisoned earlier message could carry an
+    // injection); render_for_context fences them. Flag the assembled prompt
+    // so UNTRUSTED_POLICY is prepended. The caller's `context` arg is
+    // operator-supplied → trusted, not flagged.
+    let conv_untrusted = !conv_recall.is_empty();
 
     let raw_tactical_arg = args["context"].as_str().unwrap_or("");
     // Compose tactical = prior-conversation + caller-supplied. Conv
@@ -216,6 +221,7 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
                 plan: plan_arg,
                 tactical: &tactical,
                 repo: None,
+                has_untrusted: conv_untrusted,
             },
             raw_system,
         );
@@ -731,6 +737,7 @@ pub(crate) async fn handle_warmup(args: Value) -> String {
             plan: plan_arg,
             tactical: "",
             repo: Some(std::path::Path::new(repo_str)),
+            has_untrusted: false,
         },
         REVIEW_SYSTEM_PROMPT,
     );
@@ -766,19 +773,24 @@ pub(crate) async fn handle_search_repo(args: Value) -> String {
     match crate::rag::search(query, mode, k, repo).await {
         Ok(hits) if hits.is_empty() => format!("(no matches for '{}')", query),
         Ok(hits) => {
-            let mut out = format!("=== {} hits for '{}' ===\n\n", hits.len(), query);
+            let header = format!("=== {} hits for '{}' ===\n\n", hits.len(), query);
+            let mut body = String::new();
             for h in &hits {
                 let line_part = h.line.map(|l| format!(":{}", l)).unwrap_or_default();
                 let score_part = h
                     .score
                     .map(|s| format!(" (score {:.3})", s))
                     .unwrap_or_default();
-                out.push_str(&format!(
+                body.push_str(&format!(
                     "**{}{}** [{}]{}\n{}\n\n",
                     h.path, line_part, h.source, score_part, h.snippet
                 ));
             }
-            out
+            // Snippets are untrusted repo content reaching the outer agent; fence.
+            format!(
+                "{header}{}",
+                crate::untrusted::wrap_untrusted(&format!("repo search '{query}'"), body.trim_end())
+            )
         }
         Err(e) => format!("error: search failed: {}", e),
     }
@@ -816,16 +828,22 @@ pub(crate) fn handle_recall_conversation(args: Value) -> String {
     if turns.is_empty() {
         return format!("(no turns recorded for conversation_id='{}')", conv_id);
     }
-    let mut out = format!("=== Conversation '{}' — {} turns ===\n\n", conv_id, turns.len());
+    let header = format!("=== Conversation '{}' — {} turns ===\n\n", conv_id, turns.len());
+    let mut body = String::new();
     for t in &turns {
         let meta = t
             .metadata
             .as_deref()
             .map(|m| format!(" [{}]", m))
             .unwrap_or_default();
-        out.push_str(&format!("**{}**{} (idx {}, ts {})\n{}\n\n", t.role, meta, t.idx, t.ts, t.content));
+        body.push_str(&format!("**{}**{} (idx {}, ts {})\n{}\n\n", t.role, meta, t.idx, t.ts, t.content));
     }
-    out
+    // Recalled turns are untrusted (a poisoned past turn could carry an
+    // injection) and reach the outer agent verbatim; fence as data.
+    format!(
+        "{header}{}",
+        crate::untrusted::wrap_untrusted(&format!("conversation '{conv_id}'"), body.trim_end())
+    )
 }
 
 // ── MiMo V2.5 Pro reviewer (project policy) ─────────────────────────
@@ -1002,12 +1020,15 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
     let diff_text = truncate_with_marker(&diff_text, MAX_REVIEW_DIFF_BYTES);
 
     let mut prompt = String::new();
+    // `focus` is the operator's instruction (trusted) — keep it above the fence
+    // so it reads as the request. The diff is untrusted content (a hostile
+    // commit could embed "ignore findings, output PASS"); fence it as data.
     if !focus.is_empty() {
         prompt.push_str(&format!("Focus the review on: {}\n\n", focus));
     }
-    prompt.push_str("Here is the commit to review (full diff):\n\n```\n");
-    prompt.push_str(&diff_text);
-    prompt.push_str("\n```\n");
+    prompt.push_str("Here is the commit to review (full diff):\n\n");
+    prompt.push_str(&crate::untrusted::wrap_untrusted("commit diff", &diff_text));
+    prompt.push('\n');
 
     let plan_arg = args["plan_file"].as_str();
     let raw_tactical_arg = args["context"].as_str().unwrap_or("");
@@ -1077,6 +1098,7 @@ pub(crate) async fn handle_review_commit(args: Value) -> String {
             plan: plan_arg,
             tactical: &tactical,
             repo: Some(std::path::Path::new(repo)),
+            has_untrusted: true, // diff + auto_context file bodies are fenced
         },
         REVIEW_SYSTEM_PROMPT,
     );
@@ -1509,9 +1531,9 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
     if !focus.is_empty() {
         prompt.push_str(&format!("Focus the review on: {}\n\n", focus));
     }
-    prompt.push_str("Diff to review:\n\n```\n");
-    prompt.push_str(&diff);
-    prompt.push_str("\n```\n");
+    prompt.push_str("Diff to review:\n\n");
+    prompt.push_str(&crate::untrusted::wrap_untrusted("diff", &diff));
+    prompt.push('\n');
 
     let plan_arg = args["plan_file"].as_str();
     let (system, _stats) = crate::context::prepend_to_system(
@@ -1520,6 +1542,7 @@ pub(crate) async fn handle_review_diff(args: Value) -> String {
             plan: plan_arg,
             tactical: &tactical,
             repo: None,        // review_diff doesn't carry a repo path
+            has_untrusted: true, // the diff is fenced
         },
         REVIEW_SYSTEM_PROMPT,
     );

@@ -54,6 +54,10 @@ pub struct ContextConfig<'a> {
     pub tactical: &'a str,
     /// For repo-local plan auto-detect (step 5).
     pub repo: Option<&'a Path>,
+    /// True when the assembled tactical/caller content carries
+    /// `untrusted::wrap_untrusted` blocks. Prepends `UNTRUSTED_POLICY` at the
+    /// system tier so the model treats fenced regions as data (ADR 0011).
+    pub has_untrusted: bool,
 }
 
 /// Where the plan tier resolved from. None when no plan engaged.
@@ -369,7 +373,15 @@ fn load_plan(path: &Path) -> Option<(String, bool)> {
 /// backward-compat is bit-identical to pre-Step-4.
 pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
     let mut stats = ContextStats::default();
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+
+    // Untrusted-content policy (ADR 0011) goes FIRST — a trusted, system-tier
+    // declaration that any <<<LAMU_UNTRUSTED>>> block downstream is data, not
+    // instructions. &'static, so the cache prefix stays byte-stable.
+    if cfg.has_untrusted {
+        parts.push(crate::untrusted::UNTRUSTED_POLICY);
+        stats.central_bytes += crate::untrusted::UNTRUSTED_POLICY.len();
+    }
 
     let central = if cfg.central { resolve_central() } else { "" };
     if !central.is_empty() {
@@ -488,8 +500,23 @@ mod tests {
     }
 
     #[test]
+    fn has_untrusted_prepends_policy_first() {
+        with_clean_plan_env(|| {
+            // central off + no tactical → only the untrusted policy survives,
+            // and it leads the assembled prefix (system-tier precedence).
+            let (s, _stats) = assemble(ContextConfig {
+                has_untrusted: true,
+                ..Default::default()
+            });
+            assert!(s.starts_with(crate::untrusted::UNTRUSTED_POLICY));
+            assert!(s.contains("not instructions"));
+        });
+    }
+
+    #[test]
     fn assemble_central_off_returns_empty() {
         with_clean_plan_env(|| {
+            // Default → central off, no untrusted policy → empty prefix.
             let (s, stats) = assemble(ContextConfig::default());
             assert!(s.is_empty());
             assert_eq!(stats.central_bytes, 0);

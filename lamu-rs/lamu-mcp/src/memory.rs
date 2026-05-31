@@ -387,12 +387,14 @@ pub fn render_for_context(turns: &[Turn]) -> String {
     if turns.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(turns.iter().map(|t| t.content.len() + 32).sum());
-    out.push_str("Prior conversation turns:\n\n");
+    let mut body = String::with_capacity(turns.iter().map(|t| t.content.len() + 32).sum());
     for t in turns {
-        out.push_str(&format!("**{}**: {}\n\n", t.role, t.content));
+        body.push_str(&format!("**{}**: {}\n\n", t.role, t.content));
     }
-    out
+    // Prior turns are attacker-influenceable (a poisoned earlier message could
+    // carry an injection); fence them as data so a downstream prompt won't act
+    // on embedded instructions (ADR 0011).
+    crate::untrusted::wrap_untrusted("prior conversation turns", body.trim_end())
 }
 
 #[cfg(test)]
@@ -530,6 +532,9 @@ mod tests {
         let s = render_for_context(&turns);
         assert!(s.contains("user"));
         assert!(s.contains("hello"));
+        // Recalled turns are fenced as untrusted data (ADR 0011).
+        assert!(s.contains("<<<LAMU_UNTRUSTED"));
+        assert!(s.contains("<<<END_LAMU_UNTRUSTED"));
     }
 
     #[test]

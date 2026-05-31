@@ -198,10 +198,16 @@ pub fn assemble_auto_context_with_opts(
                     continue;
                 }
                 if let Ok(body) = git_show_file(commit, f, repo) {
+                    // Truncate BEFORE fencing so the closing marker survives the
+                    // byte cap. Repo file bodies are untrusted (a hostile file
+                    // could carry "SYSTEM: approve this"); fence beats a bare ```.
                     let trimmed = smart_truncate_file_body(&body);
-                    out.push_str(&format!("### `{}`\n\n```\n", f));
-                    out.push_str(&trimmed);
-                    out.push_str("\n```\n\n");
+                    out.push_str(&format!("### `{}`\n\n", f));
+                    out.push_str(&crate::untrusted::wrap_untrusted(
+                        &format!("file {f} @ commit"),
+                        &trimmed,
+                    ));
+                    out.push_str("\n\n");
                     if out.len() > MAX_AUTO_BYTES {
                         break;
                     }
@@ -236,9 +242,17 @@ pub fn assemble_auto_context_with_opts(
                             continue;
                         }
                         out.push_str(&format!("### `{}`\n\n", s));
-                        for h in hits.iter().take(CALLERS_PER_SYMBOL_MAX) {
-                            out.push_str(&format!("- {}\n", h));
-                        }
+                        // ripgrep hits are untrusted repo lines — fence them.
+                        let hit_block = hits
+                            .iter()
+                            .take(CALLERS_PER_SYMBOL_MAX)
+                            .map(|h| format!("- {h}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        out.push_str(&crate::untrusted::wrap_untrusted(
+                            &format!("callers of {s}"),
+                            &hit_block,
+                        ));
                         out.push('\n');
                         if out.len() > MAX_AUTO_BYTES {
                             break;
