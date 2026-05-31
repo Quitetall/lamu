@@ -239,7 +239,19 @@ async fn embeddings(State(state): State<AppState>, Json(body): Json<Value>) -> R
         Ok(r) => {
             let status =
                 StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let bytes = r.bytes().await.unwrap_or_default().to_vec();
+            // A read failure here previously became `200 OK` + empty body
+            // via unwrap_or_default → silent RAG breakage downstream. Surface
+            // it as 502 instead.
+            let bytes = match r.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"message": format!("embeddings backend read failed: {e}")}})),
+                    )
+                        .into_response();
+                }
+            };
             let mut resp = (status, bytes).into_response();
             resp.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,

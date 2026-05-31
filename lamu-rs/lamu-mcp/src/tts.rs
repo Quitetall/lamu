@@ -296,6 +296,15 @@ fn concat_wav(parts: &[Vec<u8>]) -> Result<Vec<u8>, String> {
             data_len += p.len() - HDR;
         }
     }
+    // The RIFF + data size fields are 32-bit; a >4 GiB concatenation would
+    // silently truncate them (corrupt WAV). Reject instead. (~6.7h of audio
+    // at 44.1kHz/16-bit mono — well past any real TTS request.)
+    if out.len() > u32::MAX as usize {
+        return Err(format!(
+            "concatenated WAV exceeds 4 GiB ({} bytes) — RIFF size is 32-bit",
+            out.len()
+        ));
+    }
     let riff = (out.len() as u32).saturating_sub(8);
     out[4..8].copy_from_slice(&riff.to_le_bytes());
     out[40..44].copy_from_slice(&(data_len as u32).to_le_bytes());

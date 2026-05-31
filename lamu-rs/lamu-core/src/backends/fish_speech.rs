@@ -107,7 +107,9 @@ impl Backend for FishSpeechBackend {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("lamu")
             .join("tts");
-        let _ = std::fs::create_dir_all(&log_path);
+        if let Err(e) = std::fs::create_dir_all(&log_path) {
+            tracing::warn!("fish_speech: log dir {} not creatable ({e}); startup diagnostics may be lost", log_path.display());
+        }
         let log_file = log_path.join(format!("fish-speech-{port}.log"));
         let stderr_sink = std::fs::File::create(&log_file)
             .map(Stdio::from)
