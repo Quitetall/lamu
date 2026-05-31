@@ -238,6 +238,11 @@ fn lookup_bandwidth(gpu_name: Option<&str>) -> Option<u32> {
 
 /// VRAM (GB) to serve `params_b` at `quant`/`ctx`. All weights resident
 /// (incl. all MoE experts); KV cache scales with ACTIVE params.
+///
+/// `0.000_008` (GB per billion-active-params per token) and the `+0.5` (GB
+/// runtime overhead) are hwfit's empirical constants, transcribed verbatim
+/// from `models.py::estimate_memory_gb` — not re-derived. The parity tests pin
+/// the result against hwfit, so any drift surfaces as a test failure.
 fn estimate_mem_gb(params_b: f32, active_params_b: f32, quant: &str, ctx: u32) -> f32 {
     params_b * quant_bpp(quant) + 0.000_008 * active_params_b * ctx as f32 + 0.5
 }
