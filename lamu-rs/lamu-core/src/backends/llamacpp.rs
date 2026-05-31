@@ -57,10 +57,8 @@ pub fn build_llama_spawn(
     supports_ngram: bool,
     bin: &std::path::Path,
 ) -> Result<LlamaSpawn> {
-    let ctx_cap = std::env::var("LAMU_DEFAULT_CTX")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(u32::MAX);
+    // Set-but-unparseable warns (was silently u32::MAX = unbounded ctx).
+    let ctx_cap = crate::config::parse_env_or("LAMU_DEFAULT_CTX", u32::MAX);
     let ctx = entry.context_max.min(ctx_cap);
 
     // Embedding models serve via llama-server `--embedding` with mean

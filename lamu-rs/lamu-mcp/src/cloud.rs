@@ -33,12 +33,12 @@ pub(crate) fn provider_concurrency(model_name: &str, cloud: &[CloudModel]) -> us
         .map(|m| m.provider.as_str())
         .unwrap_or("");
 
-    // Env override takes precedence.
+    // Env override takes precedence. parse_env_or warns on a set-but-garbage
+    // value instead of silently ignoring it. Sentinel 0 = "unset/invalid".
     let env_var = format!("LAMU_PARALLEL_{}", provider.to_uppercase());
-    if let Ok(v) = std::env::var(&env_var) {
-        if let Ok(n) = v.parse::<usize>() {
-            return n.max(1);
-        }
+    let n = lamu_core::config::parse_env_or::<usize>(&env_var, 0);
+    if n > 0 {
+        return n;
     }
 
     match provider {

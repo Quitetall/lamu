@@ -22,9 +22,12 @@ pub(super) fn settings_file_path(which: SettingFile) -> std::path::PathBuf {
         SettingFile::LocalModels => lamu_core::config::registry_path(),
         SettingFile::McpServers => mcp_servers::config_path(),
         SettingFile::Favorites => Favorites::path(),
-        SettingFile::ThemesDir => {
-            Theme::user_themes_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.config/lamu/themes"))
-        }
+        SettingFile::ThemesDir => Theme::user_themes_dir().unwrap_or_else(|| {
+            // A literal "~/..." never shell-expands — resolve the real dir.
+            dirs::config_dir()
+                .map(|d| d.join("lamu").join("themes"))
+                .unwrap_or_else(std::env::temp_dir)
+        }),
     }
 }
 

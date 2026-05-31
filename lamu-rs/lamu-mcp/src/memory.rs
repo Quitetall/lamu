@@ -287,6 +287,13 @@ pub async fn recall_ranked(
         Ok(k) if !k.is_empty() => k,
         _ => {
             // No embeddings available — fall back to chronological tail.
+            // Log once so degraded (non-semantic) recall is visible.
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "conversation recall: OPENAI_API_KEY unset — chronological tail, not semantic ranking"
+                )
+            });
             return mem.recall(conversation_id, keep_top + keep_recent);
         }
     };

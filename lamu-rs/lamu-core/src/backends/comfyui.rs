@@ -20,7 +20,7 @@ use crate::types::ModelEntry;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -79,7 +79,7 @@ impl Backend for ComfyUIBackend {
         // Capture stderr to a log (file, not a pipe — undrained pipe
         // deadlocks the child) for diagnostics on a failed startup.
         let log_path = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
             .join("lamu")
             .join("images");
         if let Err(e) = std::fs::create_dir_all(&log_path) {

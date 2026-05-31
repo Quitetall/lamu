@@ -28,7 +28,7 @@ fn is_local_image(entries: &HashMap<String, lamu_core::types::ModelEntry>, model
 /// Confined output path under <data_dir>/lamu/images (reject absolute + `..`).
 fn resolve_image_output_path(output_path: Option<&str>, ext: &str) -> Result<PathBuf, String> {
     let dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
         .join("lamu")
         .join("images");
     std::fs::create_dir_all(&dir)

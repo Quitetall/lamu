@@ -30,7 +30,7 @@ const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB safety cap
 /// local and cloud paths. `Err` is a ready-to-return error string.
 fn resolve_tts_output_path(output_path: Option<&str>, format: &str) -> Result<PathBuf, String> {
     let dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
         .join("lamu")
         .join("tts");
     std::fs::create_dir_all(&dir)

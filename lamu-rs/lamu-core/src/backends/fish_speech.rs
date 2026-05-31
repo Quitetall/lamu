@@ -30,7 +30,7 @@ use crate::types::ModelEntry;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -104,7 +104,7 @@ impl Backend for FishSpeechBackend {
         // crash/timeout we read its tail into the error so the failure
         // reason (CUDA OOM, missing dep, bad ckpt) isn't lost.
         let log_path = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
             .join("lamu")
             .join("tts");
         if let Err(e) = std::fs::create_dir_all(&log_path) {

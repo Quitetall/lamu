@@ -4,6 +4,26 @@ use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 
+/// Parse env var `key` into `T`, falling back to `default`. Unset → default
+/// silently; set-but-unparseable → default + a `warn!` (so a typo'd
+/// `LAMU_DEFAULT_CTX=abc` doesn't silently choose a surprising value). Trims
+/// surrounding whitespace.
+pub fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    match std::env::var(key) {
+        Ok(v) => match v.trim().parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                tracing::warn!(
+                    "{key}='{v}' is not a valid {}; using default",
+                    std::any::type_name::<T>()
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 pub fn lamu_root() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join("local-llm")
 }
