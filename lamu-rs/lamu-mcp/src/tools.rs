@@ -128,6 +128,20 @@ fn schema_cloud_query() -> Value {
     })
 }
 
+fn schema_council() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "The question/task posed to every model."},
+            "models": {"type": "array", "items": {"type": "string"}, "description": "Model names (local or cloud) to convene. >=2. Default: ['mimo-v2.5','deepseek-v4-flash']."},
+            "judge_model": {"type": "string", "default": "mimo-v2.5-pro", "description": "Model that picks the best blind answer + synthesizes."},
+            "system": {"type": "string", "default": "", "description": "Shared system prompt for the members."},
+            "include_answers": {"type": "boolean", "default": true, "description": "Include each member's full answer in the output (else just winner + synthesis)."}
+        },
+        "required": ["prompt"]
+    })
+}
+
 fn schema_generate_image() -> Value {
     json!({
         "type": "object",
@@ -440,6 +454,13 @@ fn dispatch_generate_image<'a>(
     Box::pin(crate::image::handle_generate_image(s, args))
 }
 
+fn dispatch_council<'a>(
+    s: &'a LamuMcpServer,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(crate::council::handle_council(s, args))
+}
+
 fn dispatch_text_to_speech<'a>(
     s: &'a LamuMcpServer,
     args: Value,
@@ -576,6 +597,13 @@ pub static TOOLS: &[ToolDef] = &[
         schema_fn: schema_cloud_query,
         handler: HandlerKind::Free(dispatch_cloud_query),
         cloud: true,
+    },
+    ToolDef {
+        name: "council",
+        description: "Convene N models on one prompt (local + cloud), then a judge model picks the best BLIND answer and synthesizes a final one combining their strengths. PewDiePie 'Council' pattern. cloud:false — mixes local+cloud, self-enforces local-only per member.",
+        schema_fn: schema_council,
+        handler: HandlerKind::Stateful(dispatch_council),
+        cloud: false,
     },
     ToolDef {
         name: "generate_image",
@@ -778,7 +806,7 @@ mod tests {
             "set_routing_mode", "routing_status", "search_repo", "index_repo",
             "recall_conversation", "train_from_conversations", "write_file",
             "parallel_query", "remember", "recall_memory",
-            "forget_memory", "export_memory_graph", "generate_image",
+            "forget_memory", "export_memory_graph", "generate_image", "council",
         ] {
             assert!(!find(name).unwrap().cloud, "{name} must have cloud:false");
         }
