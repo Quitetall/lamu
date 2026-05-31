@@ -16,6 +16,15 @@ pub(crate) fn resolve_confined_output_path(
     ext: &str,
     output_path: Option<&str>,
 ) -> Result<PathBuf, String> {
+    // `subdir` is a fixed literal at every call site ("tts"/"images"). Pin
+    // that invariant: a `subdir` carrying `..` or a root would escape the
+    // data dir BEFORE the per-call `output_path` guard below ever runs.
+    debug_assert!(
+        !std::path::Path::new(subdir)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir)),
+        "media subdir must be a plain relative segment, got {subdir:?}"
+    );
     let dir = dirs::data_dir()
         .unwrap_or_else(std::env::temp_dir) // never the cwd (CI/containers)
         .join("lamu")
