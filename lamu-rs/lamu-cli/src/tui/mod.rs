@@ -238,13 +238,16 @@ pub const HARNESSES: &[Harness] = &[
 /// later. Single source of truth so the two TUI launch paths
 /// (Dashboard Enter, Launchers Enter) can't drift.
 fn open_harness_script_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| {
-        eprintln!(
-            "warning: $HOME unset — open-harness.sh path resolution likely \
-             to fail; falling back to /home/brianklam"
-        );
-        "/home/brianklam".to_string()
-    });
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "warning: $HOME unset and home dir unresolved — open-harness.sh \
+                 path resolution likely to fail; falling back to cwd"
+            );
+            ".".to_string()
+        });
     format!("{}/local-llm/scripts/open-harness.sh", home)
 }
 
