@@ -67,3 +67,6 @@ exllamav3/
 FastDMS/
 fish-speech/
 lamu-rs/.lamu-harness-snap
+
+# scratch clone — pewdiepie/odysseus, mined for ideas, not vendored
+/odysseus/
