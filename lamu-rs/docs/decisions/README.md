@@ -59,6 +59,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0012](./0012-minimal-bearer-auth.md) | Minimal single-token HTTP bearer auth for lamu-api | Accepted |
 | [0013](./0013-at-rest-key-encryption-deferred.md) | At-rest encryption of cloud keys / API token deferred | Accepted |
 | [0014](./0014-single-gpu-and-root-paths-intentional.md) | Single-GPU + ~/local-llm path assumptions are intentional | Accepted |
+| [0015](./0015-cookbook-roofline-scoring-engine.md) | Cookbook roofline + composite scoring engine (ported from hwfit) | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.

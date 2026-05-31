@@ -37,6 +37,15 @@ impl VramScheduler {
 
     pub fn total_mb(&self) -> u32 { self.total_mb }
 
+    /// GPU product name from NVML (e.g. "NVIDIA GeForce RTX 4090"), or None
+    /// when NVML is unavailable. Feeds the cookbook's bandwidth lookup.
+    pub fn gpu_name(&self) -> Option<String> {
+        self.nvml
+            .as_ref()
+            .and_then(|n| n.device_by_index(0).ok())
+            .and_then(|d| d.name().ok())
+    }
+
     pub fn available_mb(&self) -> u32 {
         // Use the bigger of (sum of scheduler-registered models) vs
         // (actual NVML-reported usage). Otherwise an orphan llama-server

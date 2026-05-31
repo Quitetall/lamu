@@ -11,6 +11,7 @@ pub mod router;
 pub mod reasoning;
 pub mod sse;
 pub mod config;
+pub mod cookbook;
 pub mod error;
 pub mod health;
 pub mod backends;
