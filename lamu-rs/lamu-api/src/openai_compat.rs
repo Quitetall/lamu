@@ -895,7 +895,9 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
 // Claude Code, Continue (anthropic mode), and other tools call this
 // surface. We translate to our internal ChatRequest, reuse the OpenAI
 // pipeline, then map the response back into Anthropic's envelope.
-// Streaming SSE is not yet implemented — non-streaming only.
+// Both non-streaming and streaming (SSE) are supported: when the request
+// sets `stream: true`, `anthropic_messages` dispatches to
+// `stream_response_anthropic`, which emits Anthropic-shaped SSE events.
 
 #[derive(Debug, Clone, Deserialize)]
 struct AnthropicMessage {
