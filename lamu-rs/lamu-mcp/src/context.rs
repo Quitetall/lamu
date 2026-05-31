@@ -378,7 +378,13 @@ pub fn assemble(cfg: ContextConfig) -> (String, ContextStats) {
     // Untrusted-content policy (ADR 0011) goes FIRST — a trusted, system-tier
     // declaration that any <<<LAMU_UNTRUSTED>>> block downstream is data, not
     // instructions. &'static, so the cache prefix stays byte-stable.
-    if cfg.has_untrusted {
+    //
+    // Engage it when the caller flagged wrapped content OR when the tactical
+    // tier actually carries a fence marker — the auto-detect is a backstop so a
+    // future caller that wraps content but forgets `has_untrusted` still gets
+    // the policy (no silent flag-drift).
+    let has_untrusted = cfg.has_untrusted || cfg.tactical.contains("<<<LAMU_UNTRUSTED");
+    if has_untrusted {
         parts.push(crate::untrusted::UNTRUSTED_POLICY);
         stats.central_bytes += crate::untrusted::UNTRUSTED_POLICY.len();
     }
