@@ -15,8 +15,22 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     spawn_main_preload(state.clone());
     let app = openai_compat::build_app(state);
 
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    // Default to LOCALHOST — the OpenAI-compat API is unauthenticated, so it
+    // must not be reachable off-host unless the operator explicitly opts in
+    // via LAMU_BIND_HOST (same env the backends use), e.g. =0.0.0.0. Binding
+    // 0.0.0.0 by default exposed an unauthenticated API from day one.
+    let host = std::env::var("LAMU_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| {
+        anyhow::anyhow!("LAMU_BIND_HOST='{host}' is not a valid IP (need e.g. 127.0.0.1 or 0.0.0.0): {e}")
+    })?;
     let listener = bind_reuseaddr(addr)?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            "LAMU bound to {} — the OpenAI-compat API is UNAUTHENTICATED and reachable off-host. \
+             Put it behind a reverse proxy / firewall, or bind 127.0.0.1.",
+            addr
+        );
+    }
     tracing::info!("LAMU OpenAI-compat listening on {} (pid {})", addr, std::process::id());
 
     // Graceful shutdown on SIGINT/SIGTERM so the pidfile gets cleaned up.
