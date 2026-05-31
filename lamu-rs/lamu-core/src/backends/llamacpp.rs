@@ -63,6 +63,31 @@ pub fn build_llama_spawn(
         .unwrap_or(u32::MAX);
     let ctx = entry.context_max.min(ctx_cap);
 
+    // Embedding models serve via llama-server `--embedding` with mean
+    // pooling (OpenAI-compat /v1/embeddings + /embedding) — none of the
+    // chat KV/spec/flash-attn machinery applies. Short branch, early return.
+    if entry.capabilities.contains(&crate::types::Capability::Embedding) {
+        let host = std::env::var("LAMU_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        return Ok(LlamaSpawn {
+            args: vec![
+                "-m".into(),
+                entry.path.display().to_string(),
+                "--host".into(),
+                host,
+                "--port".into(),
+                port.to_string(),
+                "--embedding".into(),
+                "--pooling".into(),
+                "mean".into(),
+                "-ngl".into(),
+                "99".into(),
+                "--ctx-size".into(),
+                ctx.clamp(512, 8192).to_string(),
+            ],
+            envs: vec![("CUDA_VISIBLE_DEVICES".into(), "0".into())],
+        });
+    }
+
     // Decide whether the DFlash-on-bee path applies. Both the binary-
     // selection logic in `new_for_entry` and this arg-emission path
     // gate on `entry_has_usable_dflash(entry)`; if those diverge a
@@ -552,6 +577,20 @@ mod tests {
             status: crate::types::ModelStatus::default(),
             modality: crate::types::Modality::Llm,
         }
+    }
+
+    #[test]
+    fn build_llama_spawn_embedding_mode() {
+        let mut e = dummy_entry("nomic-bert", 8192);
+        e.capabilities = vec![Capability::Embedding];
+        let spawn =
+            build_llama_spawn(&e, 8030, false, std::path::Path::new("/usr/bin/llama-server"))
+                .unwrap();
+        assert!(spawn.args.iter().any(|a| a == "--embedding"), "args: {:?}", spawn.args);
+        assert!(spawn.args.windows(2).any(|w| w[0] == "--pooling" && w[1] == "mean"));
+        // None of the chat-only machinery in embedding mode.
+        assert!(!spawn.args.iter().any(|a| a == "--flash-attn"));
+        assert!(!spawn.args.iter().any(|a| a == "--cache-reuse"));
     }
 
     #[test]

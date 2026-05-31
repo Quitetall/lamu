@@ -104,6 +104,23 @@ models:
     notes: |
       Origin model. Kept for nostalgia + GPT-2 proxy paths. Not a
       daily-use entry but not dead code either.
+  nomic-embed:
+    path: /home/brianklam/models/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q8_0.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: nomic-bert
+    params_b: 0.137
+    quant: Q8_0
+    vram_mb: 600
+    context_max: 8192
+    capabilities:
+    - embedding
+    notes: |
+      Local embedding model (nomic-embed-text-v1.5, 768-dim). Served via
+      llama-server --embedding --pooling mean; backs the /v1/embeddings
+      endpoint (lamu serve). capability=embedding ⇒ never chat-routed,
+      auto-loaded on first embeddings request. Point a RAG front-end's
+      EMBEDDING_URL at http://<host>:8020/v1/embeddings.
   local-fish-s2pro:
     path: /home/brianklam/local-llm/fish-speech/checkpoints/s2-pro
     format: custom

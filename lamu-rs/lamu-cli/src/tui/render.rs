@@ -313,6 +313,7 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                     lamu_core::types::Capability::Routing => Some("route"),
                     lamu_core::types::Capability::Vision => Some("vis"),
                     lamu_core::types::Capability::LongContext => Some("long"),
+                    lamu_core::types::Capability::Embedding => Some("embed"),
                 }).collect::<Vec<_>>().join(" ");
                 // Empty caps (chat-only models) → blank, not a stray "[]"
                 let caps_field = if caps.is_empty() {

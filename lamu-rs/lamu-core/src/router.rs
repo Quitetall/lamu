@@ -264,6 +264,7 @@ fn required_vec(set: &HashSet<Capability>) -> Vec<&'static str> {
         Capability::Routing => "routing",
         Capability::Vision => "vision",
         Capability::LongContext => "long_context",
+        Capability::Embedding => "embedding",
     }).collect();
     v.sort();
     v

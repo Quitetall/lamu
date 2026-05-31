@@ -324,6 +324,7 @@ impl LamuMcpServer {
                 Capability::Routing => "routing",
                 Capability::Vision => "vision",
                 Capability::LongContext => "long_context",
+                Capability::Embedding => "embedding",
             }).collect();
             let mut line = format!(
                 "{} {}{} ({}B {}, {}MB, [{}])",

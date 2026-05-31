@@ -437,6 +437,7 @@ async fn cmd_scan() -> Result<()> {
             lamu_core::types::Capability::Routing => "routing",
             lamu_core::types::Capability::Vision => "vision",
             lamu_core::types::Capability::LongContext => "long_context",
+            lamu_core::types::Capability::Embedding => "embedding",
         }).collect();
         println!(
             "  {}: {}B {} ({}MB) [{}]",

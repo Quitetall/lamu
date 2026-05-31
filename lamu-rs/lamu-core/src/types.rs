@@ -17,6 +17,10 @@ pub enum Capability {
     Routing,
     Vision,
     LongContext,
+    /// Embedding model (served via llama-server `--embedding`). Carries
+    /// only this cap (no Chat) so it's never chat-routed; backs the
+    /// `/v1/embeddings` endpoint.
+    Embedding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

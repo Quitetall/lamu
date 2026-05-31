@@ -312,6 +312,7 @@ impl AppState {
                         lamu_core::types::Capability::Routing => "routing",
                         lamu_core::types::Capability::Vision => "vision",
                         lamu_core::types::Capability::LongContext => "long",
+                        lamu_core::types::Capability::Embedding => "embed",
                     };
                     cs.contains(&filter)
                 })

@@ -134,6 +134,9 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        // OpenAI-compat embeddings — backs RAG front-ends (odysseus
+        // ChromaDB, etc.). Proxies to a local llama-server `--embedding`.
+        .route("/v1/embeddings", post(embeddings))
         // Anthropic Messages API shim for Claude Code et al. Translates
         // /v1/messages payload → OpenAI ChatRequest, delegates to
         // chat_completions, then maps the response back.
@@ -175,6 +178,83 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 ///
 /// Single place where `lamu serve` decides whether to spawn a backend.
 /// Used by the OpenAI, Anthropic-stream, and Ollama-stream entry points.
+/// OpenAI-compat `/v1/embeddings`. Resolves an embedding model (the
+/// request's `model` if it's an embedding entry, else the first registry
+/// entry with `Capability::Embedding`), ensure-loads it (spawns
+/// llama-server `--embedding`), and proxies the body to the backend's
+/// `/v1/embeddings`, passing the response through verbatim. Lets RAG
+/// front-ends point `EMBEDDING_URL` at `lamu serve`.
+async fn embeddings(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let is_embed = |e: &ModelEntry| {
+        e.capabilities.contains(&lamu_core::types::Capability::Embedding)
+    };
+    let req_model = body.get("model").and_then(|m| m.as_str());
+    let name = req_model
+        .filter(|m| state.entries.get(*m).map(is_embed).unwrap_or(false))
+        .map(|m| m.to_string())
+        .or_else(|| state.entries.values().find(|e| is_embed(e)).map(|e| e.name.clone()));
+    let Some(name) = name else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {
+                "message": "no embedding model in registry — add one with capability 'embedding' (llama-server --embedding)",
+                "type": "model_not_available",
+            }})),
+        )
+            .into_response();
+    };
+
+    let port = {
+        let already = state.scheduler.lock().get_loaded(&name).and_then(|m| {
+            if m.port != 0 { Some(m.port) } else { None }
+        });
+        match already {
+            Some(p) => p,
+            None => match lamu_core::loader::ensure_loaded(
+                &name,
+                state.entries.as_ref(),
+                &state.scheduler,
+                &state.health,
+                Some(state.http_port),
+            )
+            .await
+            {
+                Ok(lm) => lm.port,
+                Err(e) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": {
+                            "message": format!("failed to load embedding model '{name}': {e}"),
+                            "type": "spawn_failed",
+                        }})),
+                    )
+                        .into_response();
+                }
+            },
+        }
+    };
+
+    let url = format!("http://localhost:{port}/v1/embeddings");
+    match state.client.post(&url).json(&body).send().await {
+        Ok(r) => {
+            let status =
+                StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let bytes = r.bytes().await.unwrap_or_default().to_vec();
+            let mut resp = (status, bytes).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"message": format!("embeddings backend: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
 async fn resolve_and_ensure_loaded(
     state: &AppState,
     model_req: Option<&str>,
@@ -246,6 +326,7 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
             Capability::Routing => "routing",
             Capability::Vision => "vision",
             Capability::LongContext => "long_context",
+            Capability::Embedding => "embedding",
         }).collect();
         data.push(json!({
             "id": name,
