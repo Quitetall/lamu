@@ -41,6 +41,8 @@ pub use lamu_providers::{
 // ── Provider trait ───────────────────────────────────────────────────
 
 pub trait Provider: Sync {
+    /// Provider id ("openai"/"anthropic") — reserved for logging/introspection.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
 
     /// Does this provider handle the given URL?
@@ -212,7 +214,6 @@ impl Provider for AnthropicProvider {
 
     fn parse_stream(&self, resp: reqwest::blocking::Response, tx: Sender<StreamEvent>) {
         let reader = BufReader::new(resp);
-        let mut current_block_type = String::new();
         let mut tool_id = String::new();
         let mut tool_name = String::new();
         let mut tool_args = String::new();
@@ -240,7 +241,7 @@ impl Provider for AnthropicProvider {
             match typ {
                 "content_block_start" => {
                     let cb = &v["content_block"];
-                    current_block_type = cb["type"].as_str().unwrap_or("").to_string();
+                    let current_block_type = cb["type"].as_str().unwrap_or("");
                     if current_block_type == "tool_use" {
                         tool_id = cb["id"].as_str().unwrap_or("").to_string();
                         tool_name = cb["name"].as_str().unwrap_or("").to_string();

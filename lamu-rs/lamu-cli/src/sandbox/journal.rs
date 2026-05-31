@@ -7,7 +7,4 @@
 //! `Journal` for a session via `Journal::open(session_id)`; the
 //! resolved on-disk path lives under `sandbox::sandbox_root()`.
 
-pub use lamu_core::sandbox::journal::{
-    rollback, rollback_one, safe_create_dir, safe_delete, safe_write, EncodedBlob, Journal,
-    JournalEntry,
-};
+pub use lamu_core::sandbox::journal::rollback;

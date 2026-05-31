@@ -7,21 +7,20 @@
 //! token-stat tracking. Free helpers (web_search, stream_worker)
 //! stay in mod.rs and are called via super::.
 
-use anyhow::Result;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::lamu_config::LamuConfig;
-use crate::providers::{self, Message, Provider, Role, StreamEvent, ToolCallRef};
+use crate::providers::{self, Message, Role, StreamEvent, ToolCallRef};
 use crate::theme::{self, Theme};
 
 use super::markdown::render_markdown;
 use super::{
-    chrono_or_timestamp, stream_worker, strip_rich_markup, strip_think_blocks,
+    chrono_or_timestamp, stream_worker, strip_think_blocks,
     web_search, API_KEY, SPINNER_TICK_MS,
 };
 

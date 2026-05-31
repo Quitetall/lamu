@@ -11,7 +11,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Represents a single agent worktree, as returned by `list_agent_worktrees`.
 pub struct AgentWorktree {
@@ -560,94 +559,6 @@ pub fn drop_session(session_id: &str, repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// 6. checkpoint_loop
-// ---------------------------------------------------------------------------
-
-/// Background task that auto-commits changes in the worktree every 60 seconds.
-///
-/// Runs until the provided `shutdown` receiver resolves.
-pub async fn checkpoint_loop(
-    _session_id: String,
-    worktree: PathBuf,
-    mut shutdown: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    // tokio::time::interval fires its first tick immediately. Burn it
-    // so the first checkpoint happens at +60s, not at startup (where
-    // the index is still empty and we'd commit nothing useful or
-    // race the agent's first writes).
-    interval.tick().await;
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                checkpoint(&worktree).await;
-                break;
-            }
-            _ = interval.tick() => {
-                checkpoint(&worktree).await;
-            }
-        }
-    }
-}
-
-/// Perform a single checkpoint: add -A and commit if there are staged changes.
-async fn checkpoint(worktree: &Path) {
-    // Add all changes
-    let add_output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .arg("add")
-        .arg("-A")
-        .output()
-        .await;
-    if let Err(e) = add_output {
-        eprintln!("checkpoint add failed: {e}");
-        return;
-    }
-
-    // Check if there are staged changes
-    let diff_output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .arg("diff")
-        .arg("--cached")
-        .arg("--quiet")
-        .output()
-        .await;
-    match diff_output {
-        Ok(out) => {
-            if out.status.code() == Some(0) {
-                // No changes staged
-                return;
-            }
-        }
-        Err(e) => {
-            eprintln!("checkpoint diff error: {e}");
-            return;
-        }
-    }
-
-    // Commit with timestamp
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let msg = format!("checkpoint: {}", timestamp);
-    let commit_output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .arg("commit")
-        .arg("--no-verify")
-        .arg("--no-gpg-sign")
-        .arg("-m")
-        .arg(&msg)
-        .output()
-        .await;
-    if let Err(e) = commit_output {
-        eprintln!("checkpoint commit failed: {e}");
-    }
-}
 
 // ===========================================================================
 // Tests

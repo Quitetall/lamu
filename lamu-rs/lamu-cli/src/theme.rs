@@ -152,6 +152,7 @@ impl Theme {
         Self::load(&chosen).unwrap_or_else(|| Self::load("lamu").unwrap_or_default())
     }
 
+    #[allow(dead_code)] // reserved API — list bundled theme names (test-covered)
     pub fn list_bundled() -> Vec<&'static str> {
         BUNDLED.iter().map(|(k, _)| *k).collect()
     }

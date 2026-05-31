@@ -6,7 +6,7 @@
 //! directly. This file is purely the implementation surface.
 
 use crate::server::LamuMcpServer;
-use lamu_core::backends::{make_backend, Backend, ChatMessage};
+use lamu_core::backends::{make_backend, Backend};
 use lamu_core::observability::{emit, new_trace_id, trace_id_from_traceparent};
 use lamu_core::queue::{QueueRequest, Strategy as QueueStrategy};
 use lamu_core::reasoning::get_extractor;

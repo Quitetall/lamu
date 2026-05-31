@@ -16,7 +16,6 @@ use crate::cloud_models::{self, CloudModel};
 use crate::favorites::Favorites;
 use crate::lamu_config::LamuConfig;
 use crate::mcp_servers::{self, McpServerEntry};
-use crate::theme::Theme;
 use anyhow::Result;
 
 #[derive(Debug)]
@@ -172,6 +171,7 @@ impl AppState {
     /// suffix + this docstring discourage production callers. Calling
     /// it from prod would just yield an empty dashboard.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn new_for_tests() -> Self {
         let mut list_state = ListState::default();
         list_state.select(None);

@@ -5,23 +5,20 @@
 //! Logs to stderr. Tools dispatched via `tools::*`.
 
 use anyhow::Result;
-use lamu_core::backends::{make_backend, Backend};
+use lamu_core::backends::Backend;
 use lamu_core::health::HealthRegistry;
-use lamu_core::observability::{emit, new_trace_id, trace_id_from_traceparent};
-use lamu_core::queue::{QueueRequest, RequestQueue, Strategy as QueueStrategy};
-use lamu_core::reasoning::get_extractor;
+use lamu_core::queue::{RequestQueue, Strategy as QueueStrategy};
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
-use lamu_core::types::{BackendType, Capability, ModelEntry};
+use lamu_core::types::ModelEntry;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 pub struct LamuMcpServer {
@@ -419,6 +416,7 @@ pub(crate) async fn handle_write_file(args: Value) -> String {
 mod tests {
     use super::*;
     use crate::handlers::parse_capability;
+    use lamu_core::types::Capability;
     use serde_json::json;
 
 

@@ -402,7 +402,7 @@ fn cmd_undo(session_id: Option<String>, yes: bool) -> Result<()> {
     let snap = match session_id {
         Some(id) => sandbox::snap::Snapshot::load(&id)?,
         None => {
-            let mut all = sandbox::snap::Snapshot::list()?;
+            let all = sandbox::snap::Snapshot::list()?;
             all.into_iter().next()
                 .ok_or_else(|| anyhow::anyhow!("no sessions captured yet"))?
         }

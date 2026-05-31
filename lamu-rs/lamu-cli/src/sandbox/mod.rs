@@ -1,19 +1,16 @@
 //! Sandboxing — defense in depth against prompt injection + agent
-//! mistakes. Four layers, each independent so the failure of any one
-//! doesn't bypass the others.
+//! mistakes. Independent layers, so the failure of any one doesn't
+//! bypass the others.
 //!
 //! 1. `snap`     — git snapshot at session start, `lamu undo` on exit.
 //! 2. `journal`  — every agent fs op recorded with before-bytes,
 //!                 `lamu rollback <session>` walks the journal in
 //!                 reverse and restores.
-//! 3. `gate`     — risky tool-call patterns (rm, dd, curl|sh, etc.)
-//!                 require user confirmation in the chat TUI.
-//! 4. `launcher` — `lamu agent <cmd>` wraps with bubblewrap (or
+//! 3. `launcher` — `lamu agent <cmd>` wraps with bubblewrap (or
 //!                 firejail), strict bind mounts, allow-listed network.
 //!
 //! All sandbox state lives at `~/.local/share/lamu/sandbox/`.
 
-pub mod gate;
 pub mod journal;
 pub mod launcher;
 pub mod preserve;

@@ -21,7 +21,7 @@ mod state;
 mod swap;
 
 pub use state::AppState;
-use settings::{first_run_checks, pick_editor, run_blocking, save_api_key, settings_file_path, spawn_detached};
+use settings::{first_run_checks, pick_editor, save_api_key, settings_file_path, spawn_detached};
 use swap::swap_to_model_if_needed;
 
 #[cfg(test)]
@@ -33,20 +33,15 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use lamu_core::config::registry_path;
-use lamu_core::registry::load_registry;
-use lamu_core::scheduler::VramScheduler;
-use lamu_core::types::{ModelEntry, VramBudget};
 use ratatui::backend::CrosstermBackend;
-use ratatui::widgets::ListState;
 use ratatui::Terminal;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cloud_models::{self, CloudModel};
 use crate::favorites::Favorites;
 use crate::lamu_config::LamuConfig;
-use crate::mcp_servers::{self, McpServerEntry, ProbeStatus};
+use crate::mcp_servers::{self, ProbeStatus};
 use crate::theme::Theme;
 
 const REFRESH_MS: u64 = 1000;
@@ -981,6 +976,7 @@ pub(super) fn which_exists(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamu_core::types::ModelEntry;
 
     #[test]
     fn truncate_keeps_short() {

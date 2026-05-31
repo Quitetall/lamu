@@ -22,27 +22,22 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde_json::Value;
 use std::io;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 mod markdown;
 mod render;
 mod state;
 
 pub use state::ChatTui;
-use render::{count_wrapped_rows, draw, next_char_boundary, prev_char_boundary};
+use render::{draw, next_char_boundary, prev_char_boundary};
 
 use crate::lamu_config::LamuConfig;
-use crate::providers::{self, Message, Provider, Role, StreamEvent, ToolCallRef};
-use crate::theme::{self, Theme};
+use crate::providers::{Message, Provider, StreamEvent};
+use crate::theme::Theme;
 
 pub(super) const API_KEY: &str = "sk-local";
 pub(super) const SPINNER_TICK_MS: u128 = 90;
@@ -505,6 +500,7 @@ fn handle_key(state: &mut ChatTui, key: KeyEvent) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Role;
 
     #[test]
     fn strip_think_simple() {

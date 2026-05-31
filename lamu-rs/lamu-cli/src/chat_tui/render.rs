@@ -9,7 +9,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::markdown::render_markdown;
 use super::{strip_rich_markup, ChatTui};
 use crate::theme;
 
