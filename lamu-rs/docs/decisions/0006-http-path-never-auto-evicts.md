@@ -1,0 +1,42 @@
+# ADR 0006: HTTP serving path never auto-evicts; eviction is an MCP-only operation
+
+## Status
+Accepted 2026-05-31
+
+## Context
+LAMU multiplexes several models across a single GPU's VRAM. The VRAM scheduler's `plan_load` (`lamu-core/src/scheduler.rs:198`) returns `(can_load, models_to_evict)`: when a new model doesn't fit but enough resident peers can be reclaimed, it returns a non-empty eviction list computed by `plan_eviction` (`scheduler.rs:167`, modality-tiered LRU). Two code paths can trigger a load:
+
+- The **MCP path** (`handle_load_model`, `lamu-mcp/src/handlers.rs:341`) retains each backend as an `Arc<Mutex<Box<dyn Backend>>>` in `st.backends`, so it owns the handle needed to call `Backend::unload()` for clean per-impl teardown (`handlers.rs:405-434`, bounded by a 30s timeout plus a 3s VRAM-settle sleep).
+- The **HTTP path** (`ensure_loaded` → `ensure_loaded_with`, `lamu-core/src/loader.rs:83`) drops the `Box<dyn Backend>` after spawn (`loader.rs:153`, `_backend`); the llama-server subprocess survives on its own and later requests proxy via `scheduler.get_loaded(name).port`. The HTTP path holds no backend handle, so it physically cannot call `unload()` on a peer to reclaim that peer's VRAM cleanly.
+
+Beyond the handle-ownership constraint, the HTTP endpoint binds `127.0.0.1` (ADR 0005) and is a shared serving surface: multiple unrelated clients (editors, scripts, the council in ADR 0008) hit `/v1/chat/completions` and `/v1/embeddings` concurrently. A chat request from one client must not be able to tear down a model another client is actively streaming from. This forced a decision about what an HTTP request does when its target model would require evicting a resident peer.
+
+## Decision
+On the HTTP serving path, a load that `plan_load` says requires evicting one or more resident peers is refused. `ensure_loaded_with` checks the eviction list inside the scheduler lock and, when it is non-empty, returns `Error::Config("loading '<name>' requires evicting <list>; HTTP path won't auto-evict — unload them via MCP first")` without spawning anything (`lamu-core/src/loader.rs:141-147`). The HTTP handler surfaces this as a `503 SERVICE_UNAVAILABLE` with the error text passed through verbatim (`lamu-api/src/openai_compat.rs:293-313`). Eviction therefore only ever happens through the MCP `load_model`/`unload_model` tools, which own the backend handles. The error message names MCP explicitly so the operator knows the exact recovery action; this is asserted by `ensure_loaded_refuses_eviction_required` (`loader.rs:384-409`), which checks both `"evict"` and `"MCP"` appear in the message and that the spawn closure ran zero times.
+
+## Rationale
+- **Least surprise on a shared endpoint.** The HTTP listener is a multi-client serving surface. Silently killing model B to satisfy a request for model A would terminate B mid-serve for a different, unsuspecting client. Refusing keeps the failure local to the request that can't be satisfied.
+- **Handle ownership makes auto-evict unsafe anyway.** The HTTP path drops backend handles by design (`loader.rs:153`); it cannot call `Backend::unload()` to reclaim a peer's VRAM the way MCP does (`handlers.rs:422-434`). Evicting from here would mean killing a subprocess out-of-band, bypassing the per-impl SIGTERM/cleanup semantics that live in the backend (ADR 0004).
+- **Eviction is a deliberate operator action, not a serving side effect.** MCP is the control plane; `load_model` already owns the atomic plan-reserve-evict sequence under one lock (`handlers.rs:358-416`). Concentrating eviction there keeps a single, auditable code path that does it correctly.
+- **Fail fast and explicit.** The check runs before any subprocess spawn and before `mark_loading`, so a refused request leaves the scheduler unchanged; the error string is actionable (it names the models to free and the tool to use). Tests confirm zero spawn attempts on refusal (`loader.rs:408`).
+- **VRAM-exhausted is a distinct, harsher failure.** When even eviction can't free enough (`plan_load` returns `(false, [])`), the HTTP path returns `Error::VramExhausted` (`loader.rs:135-140`); the eviction-refusal case is specifically "it would fit, but only by killing a peer."
+
+## Alternatives Considered
+- **Auto-evict on the HTTP path** — mirror MCP's behavior: pick LRU peers, unload them, spawn the new model. Rejected because the HTTP path holds no backend handle (`loader.rs:153` drops it), so it would have to kill subprocesses out-of-band, skipping `Backend::unload()` cleanup. Worse, it makes a routine `/v1/chat/completions` call capable of terminating a model another `127.0.0.1` client is mid-stream on — unbounded, surprising VRAM thrash on a shared endpoint with no operator in the loop.
+- **Queue / block until VRAM frees** — hold the request until a resident model goes idle and can be evicted, then proceed. Rejected: there is no idle signal that guarantees forward progress — a pinned or continuously-used peer (`scheduler.rs:173` skips pinned) means the request blocks indefinitely, tying up an HTTP connection and a slot in the single-flight `spawn_gate` mutex (`loader.rs:121`) with no timeout.
+- **503 with a generic "try again later"** — return `503` but tell the client to retry. Rejected as actively misleading: retrying changes nothing, because the resident peer won't leave on its own (the HTTP path never evicts). The chosen error instead names the exact models to free and the exact tool (`unload_model`) to free them — a deterministic recovery, not a busy-wait.
+
+## Consequences
+- A single-GPU deployment that over-subscribes VRAM cannot hot-swap models purely over HTTP. To serve a model that doesn't currently fit, an operator must first call MCP `unload_model` on a resident peer. This couples HTTP serving of large models to the MCP control plane (ADR 0001) rather than making the HTTP shim self-sufficient.
+- The eviction branch in `ensure_loaded_with` (`loader.rs:141-147`) is load-bearing: it is the only thing preventing the HTTP path from ever mutating peer state, and is pinned by `ensure_loaded_refuses_eviction_required`. Any future "let HTTP evict" feature must reckon with the dropped-handle design first.
+- The asymmetry between paths is permanent and must be documented for operators: `load_model` (MCP) evicts; `/v1/chat/completions` (HTTP) does not. A user who only ever talks HTTP will see `503` errors that they cannot resolve without learning the MCP side exists.
+- Upside: the HTTP serving surface has no authority to destroy resident state. A misbehaving or hostile-but-local HTTP client cannot evict models out from under other clients; the worst it can do is get its own request refused.
+- The error is `Error::Config`, which maps to `503` at the handler (`openai_compat.rs:306`). It shares that status code with genuine spawn failures, so clients can't distinguish "needs eviction" from "spawn crashed" by status alone — only by the message body.
+
+## Related Decisions
+ADR 0001 (MCP-first orchestration; HTTP as a thin compat shim — this is why eviction lives on the MCP control plane, not the serving shim), ADR 0003 (VRAM scheduler with modality-tiered eviction — supplies the `plan_load`/`plan_eviction` machinery whose eviction list this path refuses to act on), ADR 0004 (managed-subprocess backends — the per-impl `Backend::unload()` cleanup that only the handle-owning MCP path can invoke), ADR 0005 (bind `127.0.0.1` — establishes the HTTP endpoint as a shared local serving surface motivating least-surprise).
+
+## Validation
+- **Right if:** operators report no instances of an HTTP request unexpectedly killing a model another client was using, and the refusal error's recovery instruction (call `unload_model`) consistently resolves the situation on first try. The unit test `ensure_loaded_refuses_eviction_required` continues to pass, guaranteeing no spawn and an MCP-naming error on the eviction path.
+- **Wrong / revisit if:** a single dominant use case emerges where one HTTP client owns the GPU end-to-end (no concurrent peers), making the refusal pure friction — at which point a guarded opt-in auto-evict (e.g. a per-request header or a config flag, only when no other client is attached) might be warranted. Also revisit if the HTTP path is ever reworked to retain backend handles, which would remove the handle-ownership half of the rationale and leave only the least-surprise argument.
+
