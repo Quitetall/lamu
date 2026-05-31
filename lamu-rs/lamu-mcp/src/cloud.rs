@@ -428,6 +428,14 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         if let Some(k) = &api_key {
             req = req.bearer_auth(k);
         }
+        // OpenRouter's optional app-attribution headers (shown on their
+        // dashboard / leaderboards). Harmless to other OpenAI-compat hosts,
+        // but only send for openrouter to avoid surprising strict gateways.
+        if entry.provider == "openrouter" {
+            req = req
+                .header("HTTP-Referer", "https://github.com/Quitetall/lamu")
+                .header("X-Title", "LAMU");
+        }
         let resp = match req.json(&payload).send().await {
             Ok(r) => r,
             Err(e) => return format!("error: post {url}: {e}"),
