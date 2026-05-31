@@ -131,6 +131,9 @@ enum Command {
         /// `DEEPSEEK_API_KEY`. Omit to be prompted for all unset keys.
         provider: Option<String>,
     },
+    /// Hardware-aware model fit: show GPU VRAM + which registry models fit
+    /// now / after an unload / not at all, plus popular models by tier.
+    Cookbook,
 }
 
 #[tokio::main]
@@ -202,7 +205,89 @@ async fn main() -> Result<()> {
         Some(Command::CherryPick { session_id, glob }) => cmd_cherry_pick(&session_id, &glob),
         Some(Command::DropAgent { session_id }) => cmd_drop_agent(&session_id),
         Some(Command::Login { provider }) => cmd_login(provider),
+        Some(Command::Cookbook) => cmd_cookbook(),
     }
+}
+
+/// VRAM-fit bucket for a model of `vram` MB given `free`/`total` MB.
+#[derive(Debug, PartialEq, Eq)]
+enum Fit {
+    FitsNow,
+    AfterUnload,
+    TooBig,
+}
+
+impl Fit {
+    fn glyph(&self) -> &'static str {
+        match self {
+            Fit::FitsNow => "🟢",
+            Fit::AfterUnload => "🟡",
+            Fit::TooBig => "🔴",
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Fit::FitsNow => "fits now",
+            Fit::AfterUnload => "fits after unload",
+            Fit::TooBig => "too big",
+        }
+    }
+}
+
+fn fit_bucket(vram: u32, free: u32, total: u32) -> Fit {
+    if total == 0 {
+        return Fit::FitsNow; // unknown GPU (no NVML) — don't mislabel
+    }
+    if vram <= free {
+        Fit::FitsNow
+    } else if vram <= total {
+        Fit::AfterUnload
+    } else {
+        Fit::TooBig
+    }
+}
+
+/// (display name, ~Q4_K_M VRAM MB, HuggingFace GGUF repo) — a small static
+/// reference so `cookbook` can suggest downloads by tier. Examples, not
+/// exhaustive; `lamu pull <repo>` to grab one.
+const CURATED: &[(&str, u32, &str)] = &[
+    ("qwen3.5-4b", 3000, "Qwen/Qwen2.5-4B-Instruct-GGUF"),
+    ("mistral-small-24b", 14000, "bartowski/Mistral-Small-24B-Instruct-GGUF"),
+    ("qwen3.6-27b", 17000, "Qwen/Qwen3-27B-Instruct-GGUF"),
+    ("gemma-3-27b", 17000, "bartowski/gemma-3-27b-it-GGUF"),
+    ("llama-3.3-70b", 42000, "bartowski/Llama-3.3-70B-Instruct-GGUF"),
+];
+
+fn cmd_cookbook() -> Result<()> {
+    let sched = lamu_core::scheduler::VramScheduler::new();
+    let (used, total) = sched.query_vram();
+    let free = total.saturating_sub(used);
+    if total == 0 {
+        println!("GPU: no NVIDIA GPU detected via NVML (fit checks disabled).\n");
+    } else {
+        println!("GPU VRAM: {total} MB total · {free} MB free · {used} MB in use\n");
+    }
+
+    let entries =
+        lamu_core::registry::load_registry(&lamu_core::config::registry_path()).unwrap_or_default();
+    if entries.is_empty() {
+        println!("Registry empty — run `lamu scan` or `lamu pull <repo>`.");
+    } else {
+        let mut sorted = entries;
+        sorted.sort_by_key(|e| e.vram_mb);
+        println!("Registry models by fit:");
+        for e in &sorted {
+            let b = fit_bucket(e.vram_mb, free, total);
+            println!("  {} {:<30} {:>6} MB  {}", b.glyph(), e.name, e.vram_mb, b.label());
+        }
+    }
+
+    println!("\nPopular models by VRAM tier (~Q4_K_M; `lamu pull <repo>`):");
+    for (name, vram, repo) in CURATED {
+        let b = fit_bucket(*vram, free, total);
+        println!("  {} {:<22} ~{:>6} MB  {}", b.glyph(), name, vram, repo);
+    }
+    Ok(())
 }
 
 /// Interactive key entry → ~/.config/lamu/api-keys.env. Prompts for every
@@ -780,6 +865,16 @@ fn load_api_keys_env() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fit_bucket_tiers() {
+        // 24GB card, 10GB free.
+        assert_eq!(fit_bucket(8000, 10_000, 24_000), Fit::FitsNow);
+        assert_eq!(fit_bucket(17_000, 10_000, 24_000), Fit::AfterUnload);
+        assert_eq!(fit_bucket(42_000, 10_000, 24_000), Fit::TooBig);
+        // No NVML (total 0) → don't mislabel as too-big.
+        assert_eq!(fit_bucket(42_000, 0, 0), Fit::FitsNow);
+    }
 
     #[test]
     fn status_line_down_when_health_missing() {
