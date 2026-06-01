@@ -7,9 +7,10 @@ compiles, keeps `cargo test --workspace` green, and ships independently.**
 
 ## Landed so far (updated 2026-06-01)
 
-All three tracks' P1 + the buildable P2 work is merged on `main`; 547 tests
-pass, 0 warnings. Where the implementation deviates from the phase plan below,
-it's called out so this doc stays honest:
+Every buildable-today phase across all three tracks is now merged on `main`; 549
+tests pass, 0 warnings. Only hardware/condition-gated phases remain. Where the
+implementation deviates from the phase plan below, it's called out so this doc
+stays honest:
 
 - **Multi-GPU P1** (per-device scheduler + aggregate facades) — ✅ shipped.
 - **Multi-GPU P2** (placement + device-aware load) — ✅ shipped (`61eaa97`,
@@ -18,25 +19,36 @@ it's called out so this doc stays honest:
   per-device eviction landed in P1. Single-GPU byte-identical. Physical
   cross-card correctness is hardware-gated (no 2nd card yet).
 - **Multi-user P1** (key store + AuthMode + Principal) — ✅ shipped.
-- **Multi-user P2/P3** — ✅ shipped *together* (`717c3a4`, `0e1d66a`, `e33b6db`):
-  the per-request structured audit event (P2) **and** `quota.rs` token-bucket →
-  429 (P3, ahead of the plan's ordering). **Deferred from P2:** the bounded
-  Prometheus `user` label on `requests_total`/`tokens_generated_total` — the
-  tracing event already carries per-user attribution; the label ripples to every
-  counter call-site for low marginal value (tracked as P2b). **Not done from
-  P3:** the optional flagged priority-queue wrap of the forward path.
-- **Scale** — ✅ frontend integration matrix (P3-equivalent) + an in-process perf
-  benchmark shipped as ignore-gated test binaries (`b7569b7`, `d07833b`).
-  **Deviations:** the matrix is `lamu-api/tests/frontend_matrix.rs` (a Rust test
-  binary), not `loadtest/frontends.sh`; the perf harness is a plain in-process
-  tokio timer (`perf_bench.rs`), not `oha` against a real port, and there is no
-  committed `loadtest/baseline.json` yet. **Not done:** real-port `load_e2e.rs`
-  (P1), the `oha` external tool + baseline (P2 letter), CI hooks + scale ADR (P4).
+- **Multi-user P2 + P2b** — ✅ shipped (`717c3a4`, `e8ae97f`, `9904bec`): the
+  per-request structured audit event **and** the bounded Prometheus `user` label
+  on `requests_total`/`tokens_generated_total` (P2b — bound = {issued keys} ∪
+  {"anon"}).
+- **Multi-user P3** (quotas + fairness) — ✅ shipped (`717c3a4`…`e33b6db`,
+  `de6ebab`, `4b848c1`): `quota.rs` per-user token-bucket → 429 (with streaming
+  reserve), **and** the optional flag-gated priority-queue wrap
+  (`LAMU_PRIORITY_QUEUE=1`, default off, non-streaming forward only, acquired
+  after the load gate). Streaming priority is the documented limitation pending
+  stream-teeing.
+- **Scale P0/P1** — ✅ shipped. P0 concurrency units; P1 real-port `load_e2e.rs`
+  (concurrent same-model single-flight, mixed-surface, streaming-under-load,
+  eviction-refused) + shared `tests/common/mod.rs` serve harness (`9589fc0`,
+  `f00ebd0`), `just load`.
+- **Scale P3** (frontend matrix) — ✅ shipped as `lamu-api/tests/frontend_matrix.rs`
+  (`b7569b7`, `d07833b`); a Rust test binary rather than `loadtest/frontends.sh`.
+- **Scale P2 + P4** — ✅ shipped (`b8cd38a`, `7db1b0a`): the in-process
+  `perf_bench.rs` tripwire (P2 spirit) **plus** the external `oha` tier
+  (`loadtest/oha.sh` + `just bench-http`, P2 letter), and **ADR 0020** recording
+  the "HTTP has no request queue; single-flight is load-only" invariant + a
+  `.template` self-hosted-4090 nightly CI workflow (P4). **Deferred (needs a real
+  4090 run):** committing `loadtest/baseline.json` — the script refuses to
+  fabricate numbers. **Inert until a runner is registered:** the nightly CI
+  template.
 
-Remaining buildable-today work: the deferred Prometheus `user` label (MU P2b),
-the priority-queue wrap (MU P3), and the real-port/oha/CI scale phases (Scale
-P1/P2-letter/P4). Multi-GPU P3 (sharding) + P4 (cookbook multi-device) and
-Multi-user P4 (memory owner-scope) remain hardware/condition-gated as below.
+Remaining work is all hardware/condition-gated: Multi-GPU P3 (tensor-parallel
+sharding — needs a 2nd card) + P4 (cookbook multi-device & flip ADR 0014),
+Multi-user P4 (memory owner-scoping — only if a shared/HTTP memory service is
+built), and the deferred scale baseline + CI activation above. See each track
+below.
 
 ## Honest sizing first
 
