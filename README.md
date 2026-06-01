@@ -48,6 +48,7 @@ Full Ollama-shaped surface:
 | `lamu pull <id> [--quant Q4_K_M]` | Download a GGUF from HuggingFace; auto re-scan |
 | `lamu show <model>` | Print full registry entry as YAML |
 | `lamu rm <model>` | Remove from registry + delete file on disk |
+| `lamu use <model>` | Set the `main: true` default-alias target (substring match) |
 | `lamu list` / `lamu scan` | Re-discover models |
 | `lamu status` | VRAM + which port answers |
 | `lamu start` | MCP daemon on stdio (Claude Code) |
@@ -141,7 +142,7 @@ Three dialects on one port:
 | Anthropic | `/v1/messages` (SSE + `tool_use`) | Claude Code, Crush, Hermes |
 | Ollama | `/api/chat`, `/api/tags` (NDJSON) | AnythingLLM, Open WebUI (Ollama mode) |
 
-- **Default model** — the `config/models.yaml` entry with `main: true`; aliases `default`/`main`/`lamu` resolve there, so harnesses need no model name.
+- **Default model** — the `config/models.yaml` entry with `main: true`; aliases `default`/`main`/`lamu` resolve there, so harnesses need no model name. `lamu scan` auto-promotes the first model to `main` so a fresh registry is usable immediately; `lamu use <model>` re-points it (substring match) without hand-editing YAML.
 - **Auth** — off on a loopback bind; off-loopback (`LAMU_BIND_HOST=0.0.0.0`) requires a token (`lamu auth init`), ADR [0012](lamu-rs/docs/decisions/0012-minimal-bearer-auth.md). See API.md § Authentication.
 - **Extensions** — `enable_thinking: false` disables Qwen3.6 reasoning on all three surfaces; reasoning surfaces as `reasoning_content`. See API.md § LAMU extensions.
 - **Bifrost passthrough (optional)** — `LAMU_GATEWAY_URL=http://localhost:8080/v1` forwards chat completions through Bifrost (`just serve-bifrost`) for a unified cloud+local surface (~1.67% latency). Default off.
@@ -156,21 +157,24 @@ Registered harnesses live in `config/harnesses.yaml` (`just open [name]`, `just 
 `lamu scan` walks `~/models/`, parses GGUF headers, writes `config/models.yaml`:
 
 ```yaml
-- name: qwen3.6-27b-uncensored-heretic-v2-q4_k_m
-  path: ~/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
-  format: gguf
-  backend: llama_cpp
-  arch: qwen35
-  params_b: 27.6
-  quant: Q4_K_M
-  vram_mb: 17358
-  context_max: 262144
-  capabilities: [chat, code, reasoning, long_context]
-  reasoning_marker: { open_tag: "<think>", close_tag: "</think>", family: qwen35 }
-  speculative:
-    draft_path: ~/models/qwen3.6-dflash-gguf/dflash-3.6-q4km.gguf
-    method: dflash
-    draft_max: 8
+models:
+  qwen3.6-27b-uncensored-heretic-v2-q4_k_m:   # map key = model name
+    path: ~/models/qwen3.6-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen35
+    params_b: 27.6
+    quant: Q4_K_M
+    vram_mb: 17358
+    context_max: 131072
+    capabilities: [chat, code, reasoning, long_context]
+    status: recommended
+    main: true                                # the default-alias target (see `lamu use`)
+    reasoning_marker: { open_tag: "<think>", close_tag: "</think>", family: qwen35 }
+    speculative:
+      draft_path: ~/models/qwen3.6-27b-dflash-spiritbuun/dflash-draft-3.6-q4_k_m.gguf
+      method: dflash
+      draft_max: 8
 ```
 
 Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` — chosen per-entry. Adding a new backend is one file in `lamu-rs/lamu-core/src/backends/` (mirrored in `lamu/backends/`) plus one `make_backend` arm.
@@ -221,6 +225,7 @@ lamu               scan|status|start|serve|repl  # canonical
 - **Rust:** 1.85+ (edition 2024) — `cargo install` lands `lamu` at `~/.cargo/bin/lamu`.
 - **Python:** 3.12+ (only needed for the prototype + agents)
 - **Tools:** `just`, `cmake`, `git`, `uv`
+- **`lamu pull` only:** the HuggingFace Hub CLI on `$PATH` — `uv tool install huggingface-hub` (provides `hf`). Not needed if you place GGUFs in `~/models/` yourself and run `lamu scan`.
 
 ---
 

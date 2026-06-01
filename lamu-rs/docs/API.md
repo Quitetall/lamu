@@ -22,6 +22,7 @@ LAMU speaks three HTTP dialects at once — **OpenAI**, **Anthropic Messages**, 
 - [The model: backend orchestrator, bring-your-own-frontend](#the-model)
 - [Base URL & binding](#base-url--binding)
 - [Authentication](#authentication)
+  - [Per-user quotas & 429 (KeyStore only)](#per-user-quotas--429-keystore-only)
 - [LAMU extensions](#lamu-extensions)
 - [Endpoints](#endpoints)
   - [GET /health](#get-health)
@@ -88,26 +89,59 @@ shutdown on SIGINT/SIGTERM; an RAII pidfile at
 
 ## Authentication
 
-Single static **bearer token**, calibrated to a single-user, loopback-default
-threat model. No accounts, sessions, or per-token DB.
+Three auth backends, resolved **once** at startup and calibrated to a
+single-host, loopback-default threat model (the API key *is* the account, like
+OpenAI's `sk-...` — no passwords/sessions/TOTP). All routes **except `/health`
+and `/metrics`** sit behind the active backend.
 
-- **Auth OFF** when no token is configured — frictionless loopback (the common case).
-- **Auth ON** when a token is set: every route **except `/health` and `/metrics`**
-  requires `Authorization: Bearer <token>`.
-- Token resolution order: `LAMU_API_TOKEN` (trimmed, non-empty) →
-  `~/.config/lamu/api-token` (trimmed). Resolved **once** at startup.
-- Comparison is **constant-time** (`subtle::ConstantTimeEq`). It short-circuits on
-  length mismatch (token length is public by design).
+| Mode | Engaged when | Behaviour |
+|------|--------------|-----------|
+| **Off** | No `keys.db`, no token | Frictionless loopback — middleware is a no-op. The common case. |
+| **StaticToken** | `LAMU_API_TOKEN` set, or `~/.config/lamu/api-token` non-empty | One static bearer (ADR 0012). Constant-time (`subtle::ConstantTimeEq`) compare. |
+| **KeyStore** | `~/.config/lamu/keys.db` exists with **≥1 live key** | Per-user keys (ADR 0018) — `verify(token) → Principal` carrying `user` / `priority` / `daily_token_quota`. |
+
+**Precedence** (highest first): a `keys.db` with ≥1 active key → **KeyStore**;
+else a resolved token (`LAMU_API_TOKEN`, trimmed non-empty → `api-token`,
+trimmed) → **StaticToken**; else **Off**. An empty/unopenable `keys.db` degrades
+to the static/Off path (a corrupt store must not lock a loopback box out).
+
+**Off-loopback is gated.** Binding off-loopback (`LAMU_BIND_HOST=0.0.0.0`)
+with the resolved mode == **Off** is a startup **hard-fail** — `serve()` refuses
+to expose an unauthenticated API on the LAN. Configure StaticToken or KeyStore
+first, or set `LAMU_ALLOW_INSECURE=1` to override on purpose (logged loudly). An
+empty KeyStore counts as Off for this gate.
+
+**Enabling each mode:**
+
+```bash
+# StaticToken — one token (ADR 0012). Written 0600, printed ONCE.
+lamu auth init
+#   or, ephemeral:  export LAMU_API_TOKEN=…
+
+# KeyStore — per-user keys. Engages on the next `lamu serve` once ≥1 key exists.
+lamu auth issue --user alice                 # unlimited key
+lamu auth issue --user bob --quota 2000000   # 2M tokens/day (see Quotas below)
+lamu auth list                               # redacted roster (prefix + user + dates)
+lamu auth revoke lamu_a1b2c3d4               # immediate, by prefix
+```
+
+**Token format.** KeyStore mints `lamu_<64 hex>` (`lamu_` + 32 OS-random bytes,
+hex). Only its SHA-256 is stored — plaintext is shown ONCE by `lamu auth issue`
+and is unrecoverable; `lamu auth list` shows only the `lamu_########` prefix.
+StaticToken's value is whatever `lamu auth init` / `LAMU_API_TOKEN` supplies.
+
 - Header parse is lenient (RFC 7235): scheme is case-insensitive (`bearer` ok),
   whitespace tolerated, split on the first space. An empty presented token fails.
 
 ```bash
 curl http://127.0.0.1:8020/v1/models \
-  -H "Authorization: Bearer $LAMU_API_TOKEN"
+  -H "Authorization: Bearer $LAMU_API_TOKEN"   # or a lamu_<hex> KeyStore key
 ```
 
 **401 response** — surface-correct: Anthropic shape on `/v1/messages`, Ollama flat
-`{"error":"..."}` on `/api/*`, OpenAI shape elsewhere. OpenAI example:
+`{"error":"..."}` on `/api/*`, OpenAI shape elsewhere; always
+`WWW-Authenticate: Bearer`. Both authenticating modes share it (a wrong vs
+unknown key cost the same — no user-enumeration timing). OpenAI example:
 
 ```
 HTTP/1.1 401 Unauthorized
@@ -116,6 +150,48 @@ Content-Type: application/json
 
 {"error":{"message":"unauthorized","type":"invalid_request_error"}}
 ```
+
+### Per-user quotas & 429 (KeyStore only)
+
+A KeyStore key with a `daily_token_quota` (the `--quota` value) gets an
+in-memory **token bucket** sized to that daily limit, refilled linearly over a
+rolling 24h window. A key with no quota (the default), and **every StaticToken /
+Off request** (no `Principal`), is **unlimited** — quota machinery is a no-op,
+so the ADR-0012 path is byte-for-byte unaffected.
+
+- **Soft limit.** Admission is checked *before* forwarding; the completion's
+  actual token count is charged *after*. The prompt is not pre-charged, so
+  concurrent in-flight requests can overshoot the bucket — overshoot is bounded
+  by concurrency, and the next request after the charges settle is the one that
+  429s. A `--quota 0` key is a hard stop (always 429).
+- **Reset semantics.** Buckets are in-memory; a `lamu serve` restart refills
+  every bucket to full (fails open, toward availability — there is no durable
+  usage table; the structured tracing event is the audit trail).
+- **429 envelope** — surface-correct, mirroring the 401 shapes, with
+  `Retry-After: 3600`:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 3600
+Content-Type: application/json
+
+{"error":{"message":"daily token quota exhausted (limit <N>); retry after the bucket refills","type":"rate_limit_exceeded"}}
+```
+
+| Surface | 429 body |
+|---------|----------|
+| OpenAI (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) | `{"error":{"message":"…","type":"rate_limit_exceeded"}}` |
+| Anthropic (`/v1/messages`) | `{"type":"error","error":{"type":"rate_limit_error","message":"…"}}` |
+| Ollama (`/api/*`) | `{"error":"…"}` (flat string) |
+
+> **Streaming reserve caveat.** A streaming request (`stream:true` on
+> `/v1/chat/completions`, `/v1/messages`, `/api/chat`) is charged its **full
+> `max_tokens` ceiling up front** (defaulting to 16384 when `max_tokens` is
+> omitted), because the SSE/NDJSON generator returns before the real token count
+> is known. This is conservative — it never under-charges, but a short stream
+> over-debits, and a stream that then fails to load still spent the reservation.
+> Per-token reconciliation for streams is a tracked follow-up. Non-streaming
+> requests are charged the exact completion-token count.
 
 ---
 
@@ -556,8 +632,9 @@ Backend error line: `{"error":"backend: <e>"}`. Empty-backend gate line:
 |--------|------|
 | 200 | Success (all surfaces). Also used on `/v1/embeddings` passthrough where the backend's own status is forwarded (can be non-200). |
 | 400 | Malformed JSON body (axum default). |
-| 401 | Bad/missing bearer when a token is configured (all routes except `/health`, `/metrics`). |
+| 401 | Bad/missing bearer when StaticToken or KeyStore auth is active (all routes except `/health`, `/metrics`). |
 | 422 | JSON deserialization failure (missing `messages`, wrong types) — **axum default body, not a surface envelope** (see footguns). |
+| 429 | KeyStore-only: per-user daily token quota exhausted. Carries `Retry-After: 3600`; body is the surface-correct `rate_limit_*` envelope (see Authentication § Quotas). |
 | 500 | Internal: lost model after spawn; `LAMU_GATEWAY_URL` config error; Anthropic body-read error. |
 | 502 | Backend unreachable / bad JSON / `backend_returned_empty` / embeddings backend read fail. |
 | 503 | `gpu_locked` / `model_not_available` / `spawn_failed`. |
@@ -567,6 +644,9 @@ Envelope shapes by family:
   502/500 bodies omit `type`).
 - **Anthropic:** `{"type":"error","error":{"type":"...","message":"..."}}`.
 - **Ollama (its own errors):** flat `{"error":"<string>"}`.
+- **429 (quota):** OpenAI `type:"rate_limit_exceeded"`, Anthropic
+  `type:"rate_limit_error"`, Ollama flat `{"error":"<string>"}` — all with
+  `Retry-After: 3600`.
 
 > 4xx parse failures (400/422) do **not** use these envelopes — they are axum's
 > default `text/plain` prose. Do not assume `resp.json()` succeeds on a 4xx parse error.
