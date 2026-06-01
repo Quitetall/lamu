@@ -155,6 +155,12 @@ pub fn build_app(state: AppState) -> AxumRouter {
             state.clone(),
             crate::auth::require_bearer,
         ))
+        // CORS OUTERMOST (added last = wraps first): browser frontends'
+        // preflight OPTIONS is answered here before auth, and CORS headers
+        // land on every response incl. 401. Permissive (any origin/method/
+        // header, no credentials) — correct for a local backend whose auth
+        // is a Bearer header, not a cookie (ADR 0016).
+        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -353,6 +359,7 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
         data.push(json!({
             "id": name,
             "object": "model",
+            "created": 0, // OpenAI-shape field; LAMU doesn't track model ctime
             "owned_by": "local",
             "loaded": loaded,
             "params_b": entry.params_b,

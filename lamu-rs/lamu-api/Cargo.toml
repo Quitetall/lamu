@@ -26,6 +26,9 @@ nix = { version = "0.29", features = ["signal"] }
 dirs = "5"
 # Constant-time bearer-token compare (auth.rs). Already in the tree.
 subtle = "2"
+# CORS so browser-based frontends can call the API (ADR 0016). Already in
+# the tree via axum.
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

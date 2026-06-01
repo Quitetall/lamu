@@ -74,6 +74,11 @@ Default bind is **loopback**: `http://127.0.0.1:<port>`.
 `~/.config/lamu/api-token`). The explicit, loud escape hatch is
 `LAMU_ALLOW_INSECURE=1`. This is ADR 0012.
 
+**CORS** is permissive (any origin, any header, any method; no credentials) and
+sits outermost, so browser-based frontends — and their preflight `OPTIONS` —
+work even with a bearer token set (preflight is answered before auth). The
+Bearer token travels as a header, not a cookie, so `Allow-Origin: *` is safe.
+
 Other runtime facts: IPv4 socket with `SO_REUSEADDR`, backlog 1024; graceful
 shutdown on SIGINT/SIGTERM; an RAII pidfile at
 `$XDG_RUNTIME_DIR/lamu-serve-{port}.pid` (else `/tmp/...`); backend HTTP timeout

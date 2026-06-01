@@ -261,6 +261,27 @@ async fn auth_case_insensitive_scheme_accepted() {
 }
 
 #[tokio::test]
+async fn cors_preflight_allowed_pre_auth() {
+    // CORS is outermost: a browser preflight OPTIONS is answered before the
+    // bearer middleware, so browser frontends work even with a token set.
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/chat/completions")
+                .header("origin", "http://localhost:3000")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert!(resp.headers().contains_key("access-control-allow-origin"));
+}
+
+#[tokio::test]
 async fn auth_off_passes_without_bearer() {
     // make_state() has auth_token None → middleware is a no-op.
     let app = build_app(make_state());
