@@ -395,6 +395,17 @@ impl Backend for LlamaCppBackend {
                     }))
                     .send()
                     .await;
+                // Post-warmup liveness gate: a child that died DURING warmup
+                // (e.g. CUDA OOM on the first real decode) must FAIL the load,
+                // not be reported Ok. Otherwise confirm_loaded marks a corpse
+                // Loaded until the reconcile loop catches it seconds later.
+                if let Some(p) = self.proc.as_mut() {
+                    if let Ok(Some(status)) = p.try_wait() {
+                        return Err(Error::Backend(format!(
+                            "llama-server exited during warmup (port {port}, {status})"
+                        )));
+                    }
+                }
                 return Ok(pid);
             }
         }
