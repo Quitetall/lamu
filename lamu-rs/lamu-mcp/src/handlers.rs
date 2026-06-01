@@ -365,7 +365,7 @@ impl LamuMcpServer {
         // Also pick a name-resolution mode: exact match wins; otherwise
         // require unique substring match. Ambiguous matches return an
         // error rather than silently picking one.
-        let (entry, to_evict, evict_backends) = {
+        let (entry, to_evict, evict_targets) = {
             let mut st = self.state.lock();
 
             // 1. Resolve name: exact > unique-substring > error.
@@ -402,37 +402,70 @@ impl LamuMcpServer {
                 );
             }
 
-            // Mark loading INSIDE the lock so no concurrent caller picks
-            // up the same plan. evict_backends carries Arc<Mutex<Box<dyn
-            // Backend>>> handles we'll unload outside the state lock.
-            let mut evict_backends: Vec<(String, crate::server::BackendHandle)> = Vec::new();
+            // Reserve the incoming model's slot now (atomic plan-and-reserve so
+            // no concurrent caller picks up the same plan), but only CAPTURE the
+            // eviction targets — clone their handles, do NOT remove them or
+            // mark_unloaded yet. Each evictee's state is flipped only after its
+            // kill is VERIFIED below, so a failed eviction can never leave the
+            // scheduler believing freed VRAM while a backend still lives. The
+            // incoming entry is Loading meanwhile, which correctly blocks any
+            // concurrent load during the eviction window.
+            let mut evict_targets: Vec<(String, Option<crate::server::BackendHandle>, Option<u32>, u16)> = Vec::new();
             for evict_name in &evict {
-                if let Some(b) = st.backends.remove(evict_name) {
-                    evict_backends.push((evict_name.clone(), b));
-                }
-                st.scheduler.mark_unloaded(evict_name);
-                st.health.drop(evict_name);
+                let handle = st.backends.get(evict_name).cloned();
+                let (pid, port) = st.scheduler.get_loaded(evict_name)
+                    .map(|m| (m.pid, m.port))
+                    .unwrap_or((None, 0));
+                evict_targets.push((evict_name.clone(), handle, pid, port));
             }
             st.scheduler.mark_loading(entry.clone());
 
-            (entry, evict, evict_backends)
+            (entry, evict, evict_targets)
         };
 
-        // Phase 6.3: route eviction through Backend::unload so per-impl
-        // cleanup (megakernel/dflash sigterm semantics) lives in the
-        // backend, not lamu-mcp. The unload guard is bounded by a 30s
-        // timeout so a stuck backend can't hang the MCP server.
-        for (evict_name, backend_arc) in evict_backends {
-            let mut backend = backend_arc.lock().await;
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                backend.unload(),
-            ).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!("load_model: unload({}) errored: {}", evict_name, e),
-                Err(_) => warn!(
-                    "load_model: unload({}) timed out — leaving zombie", evict_name
-                ),
+        // VERIFIED eviction, outside the state lock. Route through
+        // Backend::unload (per-impl cleanup + group-kill + port-released check)
+        // when we hold the handle, else kill_pid_and_verify by (pid, port).
+        // mark_unloaded only AFTER a confirmed kill. If any eviction can't be
+        // confirmed, ABORT the load — un-reserve the incoming model and return
+        // an error — rather than spawn onto VRAM we failed to reclaim.
+        for (evict_name, handle, pid, port) in &evict_targets {
+            let killed: std::result::Result<(), String> = if let Some(backend_arc) = handle {
+                let mut backend = backend_arc.lock().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    backend.unload(),
+                ).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("backend unload failed: {e}")),
+                    Err(_) => Err("unload timed out after 30s".into()),
+                }
+            } else if let Some(pid) = pid {
+                lamu_core::backends::kill_pid_and_verify(*pid, *port)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                // No handle AND no pid (e.g. a scheduler entry already reaped
+                // out-of-band) — nothing identifiable to kill; treat as gone.
+                Ok(())
+            };
+            match killed {
+                Ok(()) => {
+                    let mut st = self.state.lock();
+                    st.backends.remove(evict_name);
+                    st.scheduler.mark_unloaded(evict_name);
+                    st.health.drop(evict_name);
+                }
+                Err(reason) => {
+                    // Roll back the reservation so the failed load doesn't leave
+                    // the incoming model stuck Loading.
+                    self.state.lock().scheduler.mark_unloaded(&entry.name);
+                    warn!("load_model: evict({}) failed: {}", evict_name, reason);
+                    return format!(
+                        "error: cannot load '{}' — failed to evict '{}' ({}); it may still hold VRAM. Retry, or unload it explicitly.",
+                        entry.name, evict_name, reason
+                    );
+                }
             }
         }
         // Settle period for VRAM to actually drop after kill.
