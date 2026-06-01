@@ -373,7 +373,32 @@ impl KeyStore {
     /// serializing every authenticated request through the connection mutex.
     pub fn verify(&self, token: &str) -> Option<Principal> {
         let hash = sha256_hex(token.trim());
-        self.cache.lock().get(&hash).cloned()
+        let principal = self.cache.lock().get(&hash).cloned()?;
+        // M7: the in-memory cache is per-process, but `lamu auth revoke` runs in
+        // a SEPARATE process and only writes keys.db + evicts its own throwaway
+        // cache — the live `serve` process's cache stayed stale, so a revoked
+        // token kept authenticating until restart. On a cache hit, confirm the
+        // row is still live with one indexed read (the few-machine-client threat
+        // model tolerates a SELECT per authenticated request; it's a read, not
+        // the per-request WRITE we deliberately avoid). If it was revoked out
+        // from under us, evict + reject so revocation is effective immediately.
+        let still_live = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT 1 FROM api_keys WHERE token_hash = ? AND revoked_at IS NULL",
+                [&hash],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap_or(None)
+            .is_some()
+        };
+        if still_live {
+            Some(principal)
+        } else {
+            self.cache.lock().remove(&hash);
+            None
+        }
     }
 
     /// Count of currently-live (non-revoked) keys. The off-loopback startup
@@ -428,6 +453,32 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         KeyStore::open(&path).unwrap()
+    }
+
+    #[test]
+    fn verify_reflects_cross_process_revoke() {
+        // M7: a revoke from a SEPARATE process (separate KeyStore handle on the
+        // same db file) must reject on the live handle immediately, not only at
+        // restart. The live handle's in-memory cache still holds the key, so
+        // verify must re-check the DB row.
+        let path = std::env::temp_dir().join(format!(
+            "lamu-keys-xproc-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let serve = KeyStore::open(&path).unwrap(); // live `serve` process
+        let token = serve.issue("alice").unwrap();
+        assert!(serve.verify(&token).is_some(), "fresh key must verify");
+        // A separate admin process revokes via its own handle on the same db.
+        let admin = KeyStore::open(&path).unwrap();
+        let prefix: String = token.chars().take(PREFIX_LEN).collect();
+        assert!(admin.revoke(&prefix).unwrap(), "revoke must affect a row");
+        // The live handle's cache still has it — verify must catch the DB revoke.
+        assert!(serve.verify(&token).is_none(),
+            "cross-process revoke must reject immediately on the live handle (M7)");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

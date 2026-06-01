@@ -62,6 +62,14 @@ pub(super) fn save_api_key(var_name: &str, key_val: &str) -> std::io::Result<std
         format!("{}{}\n", existing, new_line)
     };
     std::fs::write(&path, updated)?;
+    // M14: api-keys.env holds secrets — make it owner-only (0600). Without this
+    // a freshly-created file inherits the umask (typically 0644 = world/group
+    // readable), unlike the sibling cloud_config::save_api_key_env writer.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(path)
 }
 

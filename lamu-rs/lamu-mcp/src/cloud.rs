@@ -256,10 +256,13 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
     // `Bearer no-key-needed` works against permissive gateways but
     // signals a misconfiguration and breaks any gateway that validates.
     let api_key: Option<String> = match entry.api_key_env.as_deref() {
+        // m21: an exported-but-EMPTY key (`export KEY=`) must be treated as
+        // unset, not sent as a blank Bearer/x-api-key (which produces a
+        // confusing upstream 401). Mirror the TUI/config-layer filter.
         Some(env) => match std::env::var(env) {
-            Ok(k) => Some(k),
-            Err(_) => return format!(
-                "error: ${} is not set. Add it via `lamu` (press 'a' on the model row) or export it manually.",
+            Ok(k) if !k.trim().is_empty() => Some(k),
+            _ => return format!(
+                "error: ${} is not set (or empty). Add it via `lamu` (press 'a' on the model row) or export it manually.",
                 env
             ),
         },
