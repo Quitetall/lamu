@@ -8,7 +8,7 @@ pub mod llamacpp;
 pub mod megakernel;
 
 use crate::types::{BackendType, DevicePlacement, ModelEntry};
-use crate::Result;
+use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
 use serde_json::{json, Value};
@@ -148,6 +148,18 @@ pub(crate) fn harden_child_command(cmd: &mut tokio::process::Command) {
         // we fail the exec instead of spawning an immortal orphan.
         unsafe {
             cmd.pre_exec(|| {
+                // New session → the child leads its own process group. That
+                // makes `unload` able to signal the WHOLE group (negative pid)
+                // so a python server's forked workers / CUDA helper children
+                // die with it instead of leaking as VRAM-holding orphans. Only
+                // a group LEADER can be group-signalled safely; without setsid
+                // the child shares lamu's group and a group signal would hit
+                // lamu. setsid() is async-signal-safe. It fails (EPERM) only if
+                // the caller already leads a group — never true for a fresh
+                // fork — so a failure here is genuinely unexpected: surface it.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -166,38 +178,126 @@ pub(crate) fn harden_child_command(cmd: &mut tokio::process::Command) {
     let _ = cmd;
 }
 
-/// Graceful child shutdown: SIGTERM, wait up to 10s for the child to
-/// exit cleanly, fall back to SIGKILL if it ignores TERM. Used by every
-/// `Backend::unload` impl so server-side flushes (KV cache, log files,
-/// etc.) get a chance to run before we tear the process down.
-///
-/// Why 10s: llama-server typically exits in <1s; megakernel/dflash
-/// Python servers can take 2-5s to flush. 10s leaves margin without
-/// hanging the MCP server when a child genuinely refuses to die.
+/// True when `pid` leads its own process group (i.e. it was spawned with
+/// `setsid` via `harden_child_command`). ONLY a group leader may be safely
+/// signalled as a group (negative pid); a non-leader shares lamu's group, so
+/// a group signal there would take down lamu itself.
 #[cfg(unix)]
-pub async fn graceful_kill(child: &mut tokio::process::Child) {
-    use std::time::Duration;
-    if let Some(pid) = child.id() {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
-    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-        Ok(_) => {
-            tracing::debug!("graceful_kill: child exited cleanly after SIGTERM");
-        }
-        Err(_) => {
-            tracing::warn!("graceful_kill: 10s SIGTERM timeout, escalating to SIGKILL");
-            let _ = child.kill().await;
-        }
+fn is_group_leader(pid: u32) -> bool {
+    // getpgid(pid) == pid  ⟺  pid is the leader of its own group.
+    unsafe { libc::getpgid(pid as i32) == pid as i32 }
+}
+
+/// Send `sig` to the backend. When the child leads its own group (the normal
+/// case — `harden_child_command` setsids it) signal the WHOLE group via a
+/// negative pid so python workers / CUDA helper children die with it.
+/// Otherwise fall back to the single pid — NEVER signal a shared group.
+#[cfg(unix)]
+fn signal_backend(pid: u32, sig: nix::sys::signal::Signal) {
+    let target = if is_group_leader(pid) {
+        -(pid as i32) // whole process group
+    } else {
+        pid as i32 // single process — shared group, must not broadcast
+    };
+    if let Err(e) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), sig) {
+        // ESRCH (process already gone) is the common, harmless case — the
+        // subsequent child.wait() is the authority. Log at trace so a genuine
+        // EPERM stays visible without spamming routine teardown.
+        tracing::trace!(pid, ?sig, "signal_backend: kill returned {e}");
     }
 }
 
+/// True once nothing accepts a TCP connection on `127.0.0.1:port` — proof the
+/// backend's listening socket is released and no surviving child still holds
+/// it. Listening sockets don't linger in TIME_WAIT, so a dead server refuses
+/// connections within milliseconds; we poll briefly to absorb teardown lag.
+///
+/// Scope: this confirms the LISTENING SOCKET is gone. The preceding group
+/// SIGKILL is what actually reaps grandchildren — this is a secondary, end-to-
+/// end confirmation. It cannot see a process holding VRAM without a socket
+/// (already killed by the group signal) and conservatively treats an unrelated
+/// process that grabbed the same port in the teardown window as "still bound"
+/// (caller retries) rather than a false all-clear.
+#[cfg(unix)]
+async fn port_released(port: u16) -> bool {
+    use std::time::Duration;
+    for _ in 0..15 {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        {
+            // Handshake completed → something is still listening. Wait, retry.
+            Ok(Ok(_stream)) => tokio::time::sleep(Duration::from_millis(200)).await,
+            // Connection refused (Ok(Err)) or connect timed out (Err) → the
+            // listener is gone. On loopback a refusal is immediate; a timeout
+            // means unreachable, which for our purposes is "not bound".
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Graceful, VERIFIED child teardown: SIGTERM the backend's process group,
+/// wait up to 10s for the direct child to exit (reaping it — no zombie),
+/// escalate to a group SIGKILL + 5s wait if it ignores TERM, then confirm
+/// the port is released so a surviving grandchild can't keep holding VRAM.
+///
+/// Returns `Err` if the process won't die or the port stays bound — the
+/// caller MUST treat that as "still loaded" and NOT flip scheduler state,
+/// so we never report a model dead while its backend is alive. This is the
+/// load-bearing half of "model lifecycle is impossible to get wrong".
+///
+/// Why 10s: llama-server exits in <1s; megakernel/dflash/fish python servers
+/// can take 2-5s to flush. 10s leaves margin without hanging the caller when
+/// a child genuinely refuses to die.
+#[cfg(unix)]
+pub async fn graceful_kill(child: &mut tokio::process::Child, port: u16) -> Result<()> {
+    use std::time::Duration;
+    // We hold the unreaped Child for the whole function, so the kernel cannot
+    // recycle `pid` before our wait() below — the getpgid/kill in
+    // signal_backend are race-free with respect to PID reuse.
+    let pid = child.id();
+    if let Some(p) = pid {
+        signal_backend(p, nix::sys::signal::Signal::SIGTERM);
+    }
+    // child.wait() reaps the direct child; its return is authoritative proof
+    // that process exited (no PID-reuse ambiguity).
+    let reaped = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(_) => true,
+        Err(_) => {
+            tracing::warn!("graceful_kill: 10s SIGTERM timeout, escalating to SIGKILL");
+            if let Some(p) = pid {
+                signal_backend(p, nix::sys::signal::Signal::SIGKILL);
+            }
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .is_ok()
+        }
+    };
+    if !reaped {
+        return Err(Error::Backend(format!(
+            "backend pid {pid:?} survived SIGTERM+SIGKILL (15s) — refusing to report it dead"
+        )));
+    }
+    // Direct child reaped. Confirm no surviving grandchild still holds the
+    // port before the caller is allowed to mark the model unloaded.
+    if port != 0 && !port_released(port).await {
+        return Err(Error::Backend(format!(
+            "backend pid {pid:?} exited but port {port} is still bound — a child process survived the kill"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-pub async fn graceful_kill(child: &mut tokio::process::Child) {
-    // No SIGTERM on non-Unix; just kill.
-    let _ = child.kill().await;
+pub async fn graceful_kill(child: &mut tokio::process::Child, _port: u16) -> Result<()> {
+    // No SIGTERM/process groups on non-Unix; best-effort kill + reap.
+    child
+        .kill()
+        .await
+        .map_err(|e| Error::Backend(format!("kill: {e}")))
 }
 
 /// Last ~2 KiB of a captured backend log — surfaces WHY a python-server
@@ -265,5 +365,53 @@ mod tests {
         assert_eq!(o.min_p, Some(0.05));
         assert_eq!(o.repeat_penalty, Some(1.1));
         assert_eq!(o.enable_thinking, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harden_child_command_setsids_into_own_group() {
+        use std::time::Duration;
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        harden_child_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        // spawn() returns after fork; the child may still be in pre_exec
+        // running setsid, so poll briefly rather than racing it.
+        let mut leader = false;
+        for _ in 0..100 {
+            if is_group_leader(pid) {
+                leader = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(leader, "harden_child_command must setsid the child into its own process group");
+        let _ = graceful_kill(&mut child, 0).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_kill_reaps_sigterm_respecting_child() {
+        // `sleep` exits on SIGTERM, so graceful_kill should reap it well
+        // inside the 10s window and report Ok (port 0 → skip port check).
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60");
+        harden_child_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let r = graceful_kill(&mut child, 0).await;
+        assert!(r.is_ok(), "graceful_kill must reap a SIGTERM-respecting child: {r:?}");
+        // Reaped: the handle no longer refers to a live process.
+        assert!(matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_released_true_when_nothing_listening() {
+        // Bind then drop → the listening socket is gone → connections refused.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        assert!(port_released(port).await, "a port with no listener must read as released");
     }
 }

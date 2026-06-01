@@ -107,9 +107,11 @@ impl Backend for MegakernelBackend {
     }
 
     async fn unload(&mut self) -> Result<()> {
-        if let Some(mut p) = self.proc.take() {
-            crate::backends::graceful_kill(&mut p).await;
+        // Borrow (don't take) so a failed kill retains the handle for a retry.
+        if let Some(p) = self.proc.as_mut() {
+            crate::backends::graceful_kill(p, self.port).await?;
         }
+        self.proc = None;
         self.model_name.clear();
         Ok(())
     }

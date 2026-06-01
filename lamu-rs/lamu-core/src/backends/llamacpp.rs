@@ -404,9 +404,13 @@ impl Backend for LlamaCppBackend {
     }
 
     async fn unload(&mut self) -> Result<()> {
-        if let Some(mut p) = self.proc.take() {
-            crate::backends::graceful_kill(&mut p).await;
+        // Borrow (don't take) so a failed kill RETAINS the handle for a retry
+        // — graceful_kill returns Err only when the process is still alive, and
+        // we must not lose the means to kill it.
+        if let Some(p) = self.proc.as_mut() {
+            crate::backends::graceful_kill(p, self.port).await?;
         }
+        self.proc = None;
         self.model_name.clear();
         Ok(())
     }
