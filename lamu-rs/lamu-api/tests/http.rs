@@ -146,8 +146,7 @@ async fn metrics_counts_503() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     let bumped =
         text.contains(r#"lamu_requests_total{model="qwen35-27b",status="spawn_failed",user="anon"} 1"#)
-        || text.contains(r#"lamu_requests_total{model="qwen35-27b",status="no_candidate",user="anon"} 1"#)
-        || text.contains(r#"lamu_requests_total{model="qwen35-27b",status="no_backend",user="anon"} 1"#);
+        || text.contains(r#"lamu_requests_total{model="qwen35-27b",status="no_candidate",user="anon"} 1"#);
     assert!(bumped, "metrics body: {text}");
 }
 

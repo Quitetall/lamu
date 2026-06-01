@@ -224,6 +224,8 @@ mod tests {
         m.requests_total.with_label_values(&["m1", "ok", "anon"]).inc();
         m.requests_total.with_label_values(&["m1", "ok", "anon"]).inc_by(2);
         let text = String::from_utf8(m.render().0).unwrap();
+        // The prometheus crate renders labels in lexicographic order, which for
+        // {model, status, user} happens to match declaration order.
         assert!(text.contains(r#"lamu_requests_total{model="m1",status="ok",user="anon"} 3"#));
     }
 
