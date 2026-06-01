@@ -127,54 +127,27 @@ Reload Claude Code, then `/mcp` should show `local-llm` connected. Tools exposed
 
 ---
 
-## OpenAI HTTP
+## HTTP API
 
-`lamu serve` boots the FastAPI/axum compat layer. Drop-in for any OpenAI client.
+`lamu serve` exposes the local model pool over **OpenAI-, Anthropic-, and Ollama-compatible** HTTP — point whatever client you already use at it. LAMU is the backend orchestrator; the frontend is your choice of harness (ADR [0016](lamu-rs/docs/decisions/0016-backend-orchestrator-byo-frontend.md)).
 
-**Bifrost passthrough (optional):** Set `LAMU_GATEWAY_URL=http://localhost:8080/v1` and `lamu serve` forwards every chat completion through Bifrost (`just serve-bifrost`) instead of hitting the backend directly. Bifrost dispatches by `provider/model` id (e.g. `qwen/qwen3.6-27b-uncensored` → `:8020`, `dflash/luce-dflash` → `:8000`, `anthropic/claude-opus-4-7` → cloud). 1.67% latency cost, gain a unified cloud + local OpenAI surface plus Bifrost's logging/key-rotation. Default off; opt in when you want it.
+📖 **The authoritative API reference is [`lamu-rs/docs/API.md`](lamu-rs/docs/API.md)** — every endpoint with request/response shapes, streaming, auth, error envelopes, LAMU extensions, and per-frontend setup. This README is a summary; **API.md is the single source of truth.**
 
-Drop-in for any OpenAI client:
-
-```bash
-curl http://localhost:8020/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":1000,"stream":true}'
-```
-
-Streaming, models list, health — all standard. Reasoning is stripped from `content` and exposed in `reasoning_content` (Qwen extension).
-
-Observability:
-
-- `GET /metrics` — Prometheus text. `lamu_requests_total`, `lamu_request_duration_seconds`, `lamu_tokens_generated_total`, `lamu_vram_used_mb`, `lamu_queue_depth`, `lamu_backend_health_state`, `lamu_backend_restarts_total`.
-- `GET /health` — `{"status":"ok","models_loaded":N}` for liveness.
-- W3C `traceparent` on requests gets propagated through `lamu`'s structured event stream (mid-16 hex of the traceid as the internal trace_id).
-- `LAMU_EVENT_LOG=/path/to/jsonl` appends every event to a file alongside stderr.
-
----
-
-## Harnesses — point any client at lamu
-
-Lamu speaks three API flavors on the same port:
+Three dialects on one port:
 
 | Flavor | Routes | Clients |
 |--------|--------|---------|
-| OpenAI | `/v1/chat/completions`, `/v1/models` | Codex, Cursor, Aider, Continue, pi |
+| OpenAI | `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` | Codex, Cursor, Aider, Continue, Open WebUI |
 | Anthropic | `/v1/messages` (SSE + `tool_use`) | Claude Code, Crush, Hermes |
-| Ollama | `/api/chat`, `/api/tags` (NDJSON) | AnythingLLM, Open WebUI |
+| Ollama | `/api/chat`, `/api/tags` (NDJSON) | AnythingLLM, Open WebUI (Ollama mode) |
 
-The default model is whichever `config/models.yaml` entry has `main: true`. Aliases `default` / `main` / `lamu` all resolve there, so harnesses don't need a model name configured.
+- **Default model** — the `config/models.yaml` entry with `main: true`; aliases `default`/`main`/`lamu` resolve there, so harnesses need no model name.
+- **Auth** — off on a loopback bind; off-loopback (`LAMU_BIND_HOST=0.0.0.0`) requires a token (`lamu auth init`), ADR [0012](lamu-rs/docs/decisions/0012-minimal-bearer-auth.md). See API.md § Authentication.
+- **Extensions** — `enable_thinking: false` disables Qwen3.6 reasoning on all three surfaces; reasoning surfaces as `reasoning_content`. See API.md § LAMU extensions.
+- **Bifrost passthrough (optional)** — `LAMU_GATEWAY_URL=http://localhost:8080/v1` forwards chat completions through Bifrost (`just serve-bifrost`) for a unified cloud+local surface (~1.67% latency). Default off.
+- **Observability** — `GET /metrics` (Prometheus), `GET /health` (`{"status":"ok","models_loaded":N}`), W3C `traceparent` propagation, `LAMU_EVENT_LOG=<jsonl>`.
 
-Registered harnesses live in `config/harnesses.yaml`. Launch one with the right env wired up:
-
-```bash
-just open                # default (claude-code)
-just open codex          # named entry
-just open list           # show all configured harnesses
-```
-
-Per-harness API flavor + cmd + extra env is yaml-only — no rebuild to add a new one. Full reference: [`wiki/pages/harness-setup.md`](wiki/pages/harness-setup.md).
-
-Per-request `enable_thinking: false` turns off Qwen3.6 reasoning (works on all three surfaces + MCP `query` tool).
+Registered harnesses live in `config/harnesses.yaml` (`just open [name]`, `just open list`); per-harness setup: [`wiki/pages/harness-setup.md`](wiki/pages/harness-setup.md).
 
 ---
 
