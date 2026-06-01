@@ -1558,11 +1558,14 @@ async fn anthropic_messages(
         if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
             return over_quota("/v1/messages", limit);
         }
-        // Fail-open asymmetry vs chat_completions (which charges AFTER its
-        // model-resolve): the SSE generator resolves the model internally, so
-        // this reserve lands before we know the model loads. A stream that then
-        // fails to load still spends the reservation — conservative, and the
-        // common case loads. Reconciled by the stream-teeing follow-up.
+        // M6: resolve+load BEFORE charging the reserve, so a failed/unloadable
+        // model doesn't permanently burn a metered user's quota with no refund.
+        // resolve_and_ensure_loaded is idempotent — the stream fn below re-runs
+        // it and hits the loaded fast-path. On failure we return its error
+        // Response without charging.
+        if let Err(resp) = resolve_and_ensure_loaded(&state, req.model.as_deref()).await {
+            return resp;
+        }
         let reserve = req.max_tokens.unwrap_or_else(default_max_tokens) as u64;
         state.quota.charge(principal_ref, reserve);
         return stream_response_anthropic(state, messages, req.model.clone(),
@@ -2105,11 +2108,12 @@ async fn ollama_chat(
         if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
             return over_quota("/api/chat", limit);
         }
-        // Fail-open asymmetry vs chat_completions (which charges AFTER its
-        // model-resolve): the SSE generator resolves the model internally, so
-        // this reserve lands before we know the model loads. A stream that then
-        // fails to load still spends the reservation — conservative, and the
-        // common case loads. Reconciled by the stream-teeing follow-up.
+        // M6: resolve+load BEFORE charging the reserve (see anthropic path) so a
+        // failed/unloadable model doesn't burn a metered user's quota. The
+        // stream fn re-resolves and hits the loaded fast-path.
+        if let Err(resp) = resolve_and_ensure_loaded(&state, req.model.as_deref()).await {
+            return resp;
+        }
         let reserve = max_tokens.unwrap_or_else(default_max_tokens) as u64;
         state.quota.charge(principal_ref, reserve);
         return stream_response_ollama(state, messages, req.model.clone(),

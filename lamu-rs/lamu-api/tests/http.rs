@@ -567,17 +567,15 @@ async fn vram_exhausted_returns_503_with_retry_after() {
 }
 
 #[tokio::test]
-async fn streaming_reserves_max_tokens_then_429s_next_request() {
-    // Finding 1 (ADR 0018 review): a streaming request must DEPLETE the bucket
-    // — otherwise `stream: true` (Ollama's default) bypasses the quota. The
-    // ollama/anthropic streaming handlers reserve `max_tokens` up-front, before
-    // delegating to the SSE generator, so the charge lands even though the
-    // stream body is never polled here.
+async fn streaming_failed_load_does_not_burn_quota() {
+    // M6: a streaming request whose model can't load must NOT charge the
+    // reserve — the charge happens only AFTER a successful resolve. (Previously
+    // the reserve was charged in the handler before the SSE generator's resolve,
+    // so a metered user permanently lost max_tokens on every failed/unloadable
+    // stream with no refund.) Here qwen35-27b can't spawn (fake gguf), so
+    // frank's 50-token bucket must stay intact and a follow-up is NOT 429.
     let (st, token) = state_with_keystore("frank", Some(50));
     let app = build_app(st);
-    // Streaming /api/chat with num_predict=100 reserves 100 against the 50-token
-    // bucket → drains it negative. The response is a 200 NDJSON stream; the
-    // reserve already charged synchronously in the handler.
     let r1 = app.clone().oneshot(
         Request::builder()
             .method("POST")
@@ -587,11 +585,10 @@ async fn streaming_reserves_max_tokens_then_429s_next_request() {
             .body(Body::from(r#"{"model":"qwen35-27b","stream":true,"options":{"num_predict":100},"messages":[{"role":"user","content":"hi"}]}"#))
             .unwrap(),
     ).await.unwrap();
-    // r1 is admitted (not 429); its exact status (200 stream, or 503 when the
-    // fake gguf can't load) is irrelevant — the reserve charged in the handler
-    // before the SSE generator's own resolve step ran.
-    assert_ne!(r1.status(), StatusCode::TOO_MANY_REQUESTS, "first stream must be admitted");
-    // Any subsequent request for frank now hits the drained bucket → 429.
+    // The model fails to load → the request errors (503), reserve NOT charged.
+    assert_ne!(r1.status(), StatusCode::TOO_MANY_REQUESTS);
+    // frank's bucket is intact → a follow-up is admitted (503 for the same
+    // load failure), never 429.
     let r2 = app.oneshot(
         Request::builder()
             .method("POST")
@@ -601,7 +598,8 @@ async fn streaming_reserves_max_tokens_then_429s_next_request() {
             .body(Body::from(r#"{"model":"qwen35-27b","messages":[{"role":"user","content":"hi"}]}"#))
             .unwrap(),
     ).await.unwrap();
-    assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(r2.status(), StatusCode::TOO_MANY_REQUESTS,
+        "a failed streaming load must not have charged the quota (M6)");
 }
 
 #[tokio::test]
