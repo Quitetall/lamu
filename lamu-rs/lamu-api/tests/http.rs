@@ -88,6 +88,19 @@ async fn list_models_returns_registered_models() {
         .map(|m| m["id"].as_str().unwrap().to_string()).collect();
     assert!(names.contains(&"qwen35-27b".into()));
     assert!(names.contains(&"qwen35-0.8b".into()));
+
+    // Each model carries a modality (so a frontend can keep TTS/image models
+    // out of a chat dropdown) and a loaded flag (active vs inactive). qwen35-27b
+    // is an LLM and nothing is loaded in the test fixture.
+    let data = body["data"].as_array().unwrap();
+    let qwen = data.iter().find(|m| m["id"] == "qwen35-27b").unwrap();
+    assert_eq!(qwen["modality"], "llm", "LLM entry must report modality llm");
+    assert_eq!(qwen["loaded"], false, "nothing is loaded in the fixture");
+    for m in data {
+        let modality = m["modality"].as_str().expect("every model has a modality string");
+        assert!(["llm", "image", "tts"].contains(&modality), "unexpected modality: {modality}");
+        assert!(m["loaded"].is_boolean(), "every model has a boolean loaded flag");
+    }
 }
 
 #[tokio::test]
