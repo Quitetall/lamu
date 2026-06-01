@@ -90,11 +90,14 @@ impl QuotaManager {
     /// Pre-flight admission check for `principal`. `None` (StaticToken/Off —
     /// no Principal in extensions) or `Some(p)` with `daily_token_quota ==
     /// None` is UNLIMITED → always `Ok`. Otherwise refill the user's bucket
-    /// and admit iff > 0 tokens remain. We do NOT pre-charge here: the prompt
-    /// cost is unknown until the backend returns usage, so this is a
-    /// soft-gate (a single over-budget request may overshoot, then the next
-    /// `check` rejects). Matches the ADR's "in-memory token-bucket → 429 on
-    /// exhaustion" without needing tokenizer access in the gate.
+    /// and admit iff at least one whole token remains. We do NOT pre-charge
+    /// the prompt here (its cost is unknown until the backend returns usage),
+    /// so this is a soft-gate: any requests that pass `check` in the same
+    /// window before their `charge`s land may collectively overshoot — the
+    /// overshoot is bounded by concurrency, not by one request. Once all
+    /// charges settle, the next `check` rejects. Matches the ADR's "in-memory
+    /// token-bucket → 429 on exhaustion" without needing tokenizer access in
+    /// the gate.
     pub fn check(&self, principal: Option<&Principal>) -> QuotaCheck {
         let Some(p) = principal else { return QuotaCheck::Ok };
         let Some(quota) = p.daily_token_quota else {

@@ -607,6 +607,24 @@ async fn chat_completions(
     };
 
     if req.stream {
+        // Streaming charges up-front: the SSE generator returns before the
+        // token count is known, so reserve the requested generation ceiling
+        // (`max_tokens`) against the bucket now (conservative — never
+        // under-charges). Accurate per-token reconciliation for streams is a
+        // tracked follow-up (would tee the stream's token counter). ADR 0018 §4.
+        let reserve = req.max_tokens.unwrap_or_else(default_max_tokens) as u64;
+        state.quota.charge(principal_ref, reserve);
+        tracing::info!(
+            target: "lamu_audit",
+            user = user_label(principal_ref),
+            key_id = principal_ref.map(|p| p.key_id).unwrap_or(0),
+            model = %model_name,
+            route,
+            status = 200u16,
+            prompt_tokens = 0u64,
+            completion_tokens = reserve,
+            "stream served (reserved max_tokens)",
+        );
         return stream_response(state.client.clone(), backend_url, payload,
                                completion_id, created, model_name, marker).await
             .into_response();
@@ -1280,15 +1298,17 @@ async fn anthropic_messages(
     let oai_tools = req.tools.as_ref().map(|t| anthropic_tools_to_openai(t));
     let oai_tool_choice = req.tool_choice.as_ref().map(anthropic_tool_choice_to_openai);
 
-    // Pre-flight quota gate for the STREAMING anthropic path (the non-stream
-    // path inherits the gate from the delegated chat_completions call below).
-    {
+    if req.stream {
+        // Streaming-only quota handling (the non-stream path inherits the
+        // single gate + accurate charge from the delegated chat_completions
+        // call below). Pre-flight 429, then reserve max_tokens up-front
+        // (streams charge conservatively — see chat_completions). ADR 0018 §4.
         let principal_ref = principal.as_ref().map(|Extension(p)| p);
         if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
             return over_quota("/v1/messages", limit);
         }
-    }
-    if req.stream {
+        let reserve = req.max_tokens.unwrap_or_else(default_max_tokens) as u64;
+        state.quota.charge(principal_ref, reserve);
         return stream_response_anthropic(state, messages, req.model.clone(),
                                          req.max_tokens, req.temperature,
                                          req.top_k, req.top_p,
@@ -1787,13 +1807,17 @@ async fn ollama_chat(
         content: m.content.clone(),
     }).collect();
 
-    {
+    if stream_on {
+        // Streaming-only quota handling (the non-stream path inherits the
+        // single gate + accurate charge from the delegated chat_completions
+        // call below). Pre-flight 429, then reserve max_tokens up-front
+        // (streams charge conservatively — see chat_completions). ADR 0018 §4.
         let principal_ref = principal.as_ref().map(|Extension(p)| p);
         if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
             return over_quota("/api/chat", limit);
         }
-    }
-    if stream_on {
+        let reserve = max_tokens.unwrap_or_else(default_max_tokens) as u64;
+        state.quota.charge(principal_ref, reserve);
         return stream_response_ollama(state, messages, req.model.clone(),
                                       max_tokens, temperature,
                                       opts.top_k, opts.top_p,
