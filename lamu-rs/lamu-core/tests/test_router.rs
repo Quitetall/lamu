@@ -188,3 +188,27 @@ fn no_model_prefers_loaded_main_over_capability_match() {
     assert!(d.loaded);
     assert!(d.reason.contains("main"));
 }
+
+#[test]
+fn route_main_preference_respects_requested_capabilities() {
+    // M10: model=None + an explicit capability the loaded main LACKS must not be
+    // satisfied by the chat-only main — it falls through to capability routing.
+    let main = sample_entry("main-chat", true);
+    let entries = vec![main.clone()];
+    let mut sched = VramScheduler::new();
+    sched.set_total_mb_for_tests(24_000);
+    sched.register_loaded(main.clone(), Some(0), 8020, 8000); // main is LOADED
+    let router = Router::new(&sched, entries);
+
+    // No capability ask → prefer the loaded main.
+    let d = router.route(&sched, None, None, None);
+    assert_eq!(d.model_name, "main-chat");
+    assert!(d.loaded);
+
+    // Vision requested → the chat-only main must NOT be returned.
+    let d = router.route(&sched, None, Some(&[Capability::Vision]), None);
+    assert_ne!(d.model_name, "main-chat",
+        "a vision request must not be answered by a chat-only main (M10)");
+    assert!(d.model_name.is_empty(),
+        "no vision-capable model in registry → no candidate");
+}

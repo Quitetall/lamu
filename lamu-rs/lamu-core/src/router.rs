@@ -124,8 +124,14 @@ impl Router {
         // Lets external harnesses (Claude Code, Codex, Cursor, etc.)
         // call /v1/chat/completions with no model field and land on the
         // current main provider deterministically.
-        if model.is_none() {
-            if let Some(main_entry) = self.registry.values().find(|e| e.main) {
+        if model.is_none() && capabilities.map_or(true, |c| c.is_empty()) {
+            // M10: only prefer main when the caller asked for NO specific
+            // capabilities (the comment always intended this; the code used to
+            // ignore `required` and could route a vision/embedding request to a
+            // text-only main). M11: pick the lowest-name main deterministically
+            // (HashMap iteration order is random; the alias path already does
+            // this), so duplicate-main configs resolve stably across restarts.
+            if let Some(main_entry) = self.registry.values().filter(|e| e.main).min_by(|a, b| a.name.cmp(&b.name)) {
                 if is_usable(&main_entry.name) && scheduler.is_loaded(&main_entry.name) {
                     return RouteDecision {
                         model_name: main_entry.name.clone(),
@@ -175,8 +181,13 @@ impl Router {
             };
         }
 
-        // Sort: more capabilities first (negative len), then smaller VRAM
-        candidates.sort_by_key(|m| (-(m.capabilities.len() as i32), m.vram_mb));
+        // Sort: more capabilities first (negative len), then smaller VRAM, then
+        // name (m15: the final name tiebreak makes selection deterministic on
+        // equal (capability-count, vram) instead of HashMap-order-dependent).
+        candidates.sort_by(|a, b| {
+            (-(a.capabilities.len() as i32), a.vram_mb, &a.name)
+                .cmp(&(-(b.capabilities.len() as i32), b.vram_mb, &b.name))
+        });
         let best_entry = candidates[0];
 
         let (can_load, to_evict) = scheduler.plan_load(best_entry);
@@ -201,6 +212,12 @@ impl Router {
     }
 
     fn find_model(&self, name: &str) -> Option<&ModelEntry> {
+        // m16: an empty model string must not substring-match every entry (it
+        // would silently resolve `model:""` to an arbitrary model). Treat empty
+        // as no-match so the caller falls through to capability routing / 503.
+        if name.is_empty() {
+            return None;
+        }
         if let Some(e) = self.registry.get(name) {
             return Some(e);
         }
