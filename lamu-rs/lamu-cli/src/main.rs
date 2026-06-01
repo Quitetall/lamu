@@ -2,6 +2,7 @@
 
 mod chat_tui;
 mod cloud_models;
+mod cloud_sync;
 mod favorites;
 mod lamu_config;
 mod mcp_servers;
@@ -164,6 +165,11 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Cloud-model catalog: keep cloud-models.yaml current (ADR 0019).
+    Cloud {
+        #[command(subcommand)]
+        action: CloudAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -171,6 +177,24 @@ enum AuthAction {
     /// Mint a new API token, write it to ~/.config/lamu/api-token (chmod
     /// 0600), and print it once. Enables bearer auth on `lamu serve`.
     Init,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum CloudAction {
+    /// Refresh cloud-models.yaml from OpenRouter's catalog + each configured
+    /// provider's /v1/models (ADR 0019). Merge-preserving — keeps your
+    /// hand-set fields, adds new models, never deletes.
+    Sync {
+        /// Skip pinging each direct provider's /v1/models (OpenRouter only).
+        #[arg(long)]
+        no_ping: bool,
+        /// Skip the OpenRouter catalog pull (direct-provider pings only).
+        #[arg(long)]
+        no_openrouter: bool,
+        /// Show what would change without writing the file.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -260,6 +284,11 @@ async fn main() -> Result<()> {
             suggest,
         }),
         Some(Command::Auth { action }) => cmd_auth(action),
+        Some(Command::Cloud { action }) => match action {
+            CloudAction::Sync { no_ping, no_openrouter, dry_run } => {
+                cmd_cloud_sync(no_ping, no_openrouter, dry_run).await
+            }
+        },
     }
 }
 
@@ -410,6 +439,59 @@ fn cmd_auth(action: AuthAction) -> Result<()> {
     match action {
         AuthAction::Init => cmd_auth_init(),
     }
+}
+
+/// `lamu cloud sync` — refresh cloud-models.yaml from OpenRouter + per-provider
+/// /v1/models, merge-preserving (ADR 0019).
+async fn cmd_cloud_sync(no_ping: bool, no_openrouter: bool, dry_run: bool) -> Result<()> {
+    use lamu_providers::cloud_config;
+
+    let existing = cloud_config::load_or_empty();
+    let before = existing.len();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut discovered = Vec::new();
+
+    if !no_openrouter {
+        match cloud_sync::fetch_openrouter(&client).await {
+            Ok(v) => {
+                println!("OpenRouter catalog: {} models", v.len());
+                discovered.extend(v);
+            }
+            Err(e) => eprintln!("warning: OpenRouter fetch failed: {e}"),
+        }
+    }
+
+    if !no_ping {
+        for (provider, base_url, key_env) in cloud_sync::distinct_providers(&existing) {
+            let key = std::env::var(&key_env).unwrap_or_default();
+            if key.trim().is_empty() {
+                println!("  skip {provider}: {key_env} not set");
+                continue;
+            }
+            match cloud_sync::ping_provider(&client, &provider, &base_url, &key_env, key.trim()).await {
+                Ok(v) => {
+                    println!("  {provider}: {} models", v.len());
+                    discovered.extend(v);
+                }
+                Err(e) => eprintln!("  {provider} ping failed: {e}"),
+            }
+        }
+    }
+
+    let (merged, added, updated) = cloud_sync::merge(existing, discovered);
+    println!(
+        "merged: +{added} new, ~{updated} context-filled → {} total (was {before})",
+        merged.len()
+    );
+    if dry_run {
+        println!("(dry-run — cloud-models.yaml not written)");
+        return Ok(());
+    }
+    let path = cloud_config::save_models(&merged)?;
+    println!("wrote {}", path.display());
+    Ok(())
 }
 
 /// Mint a `lamu_<64-hex>` API token, write it to ~/.config/lamu/api-token at

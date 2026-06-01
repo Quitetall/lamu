@@ -212,6 +212,21 @@ pub fn load_or_empty() -> Vec<CloudModel> {
     }
 }
 
+/// Write the cloud-model list to `config_path()` as YAML, creating the parent
+/// dir. Used by `lamu cloud sync` to persist the merged catalog. Returns the
+/// path written.
+pub fn save_models(models: &[CloudModel]) -> std::io::Result<PathBuf> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let list = CloudModelList { models: models.to_vec() };
+    let yaml = serde_yaml::to_string(&list)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, yaml)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
