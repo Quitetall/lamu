@@ -153,11 +153,16 @@ async fn bench_read_path_oneshot() {
     }
     let wall = start.elapsed();
     report("read_path_oneshot", &mut lat_us, wall);
-    // sanity floor — if this regresses below ~1k req/s on any dev machine the
-    // read path grew a real bottleneck. Generous so the assert is signal, not
-    // flake.
+    // sanity floor — if this regresses below ~1k req/s the read path grew a real
+    // bottleneck. The floor is calibrated for --release; debug-build overhead can
+    // legitimately miss it (see file header), so the assert is release-only. In
+    // debug we only warn so the harness still works as a measurement tool.
     let rps = iters as f64 / wall.as_secs_f64();
-    assert!(rps > 1000.0, "read path throughput collapsed: {rps:.0} req/s");
+    if cfg!(debug_assertions) {
+        eprintln!("[read_path_oneshot] debug build — skipping {rps:.0} req/s floor assert (run --release to gate)");
+    } else {
+        assert!(rps > 1000.0, "read path throughput collapsed: {rps:.0} req/s (run with --release)");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -198,7 +203,12 @@ async fn bench_concurrent_read_path() {
             lat.lock().push(t0.elapsed().as_micros());
         }));
     }
-    futures_util::future::join_all(handles).await;
+    // Check every task: join_all returns Vec<Result<_, JoinError>> and a
+    // swallowed panic (e.g. a failed oneshot .unwrap()) would otherwise let the
+    // bench "pass" with fewer-than-`total` samples and bogus throughput.
+    for r in futures_util::future::join_all(handles).await {
+        r.expect("a concurrent bench task panicked");
+    }
     let wall = start.elapsed();
     let mut lat_us = Arc::try_unwrap(lat).unwrap().into_inner();
     report(
@@ -206,4 +216,12 @@ async fn bench_concurrent_read_path() {
         &mut lat_us,
         wall,
     );
+    // Same release-only floor as the single-threaded bench — guards against a
+    // concurrency/lock-contention regression going unnoticed.
+    let rps = total as f64 / wall.as_secs_f64();
+    if cfg!(debug_assertions) {
+        eprintln!("[concurrent_read_path] debug build — skipping {rps:.0} req/s floor assert (run --release to gate)");
+    } else {
+        assert!(rps > 1000.0, "concurrent read path throughput collapsed: {rps:.0} req/s (run with --release)");
+    }
 }

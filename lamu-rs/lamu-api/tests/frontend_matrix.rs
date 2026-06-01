@@ -221,8 +221,13 @@ async fn frontend_matrix_against_real_serve() {
         .build()
         .expect("client");
 
-    if !wait_for_health(&client, port, Duration::from_secs(30)).await {
-        panic!("frontend_matrix: /health never came up on :{port}");
+    // A cold 27B Q5_K_M load can take 60s+ on a laptop; default 90s, tunable.
+    let health_secs = std::env::var("LAMU_MATRIX_HEALTH_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    if !wait_for_health(&client, port, Duration::from_secs(health_secs)).await {
+        panic!("frontend_matrix: /health never came up on :{port} within {health_secs}s (set LAMU_MATRIX_HEALTH_SECS to extend)");
     }
     let base = format!("http://127.0.0.1:{port}");
     eprintln!("frontend_matrix: model '{model}' on :{port}");
