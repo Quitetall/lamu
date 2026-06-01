@@ -251,6 +251,19 @@ fn schema_index_repo() -> Value {
     })
 }
 
+fn schema_cookbook() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "use_case": {"type": "string", "description": "Score all models through one lens (general|coding|reasoning|chat|multimodal|embedding). Default: each model's inferred use-case."},
+            "quant": {"type": "string", "description": "Evaluate at this quant (e.g. Q4_K_M) instead of each model's native quant."},
+            "ctx": {"type": "integer", "description": "Context length to score at. Default: each model's context_max."},
+            "simulate_vram": {"type": "integer", "description": "Simulate a VRAM budget in MB instead of the detected GPU's."},
+            "top": {"type": "integer", "description": "Return only the top N by score."}
+        }
+    })
+}
+
 fn schema_train_from_conversations() -> Value {
     json!({
         "type": "object",
@@ -491,6 +504,10 @@ fn dispatch_search_repo(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_search_repo(args))
 }
 
+fn dispatch_cookbook(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::cookbook_tool::handle_cookbook(args))
+}
+
 fn dispatch_index_repo(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::cloud::handle_index_repo(args))
 }
@@ -666,6 +683,13 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Find code in the repository. Modes: 'auto' (ripgrep first, semantic fallback when OPENAI_API_KEY is set), 'ripgrep' (instant grep), 'semantic' (cosine-sim against the embedding index — `index_repo` builds it). Returns up to k hits with file:line + snippet. Useful for the orchestrator to populate the Tactical-tier `context` arg of cloud_query / review_commit.",
         schema_fn: schema_search_repo,
         handler: HandlerKind::Free(dispatch_search_repo),
+        cloud: false,
+    },
+    ToolDef {
+        name: "cookbook",
+        description: "Hardware-aware model-fit ranking (ADR 0015). For the detected GPU (or a simulated VRAM budget) rank the LOCAL registry's LLMs by predicted tok/s + VRAM fit, at the largest context that fits — MoE models scored on ACTIVE params. Returns JSON {gpu, vram_gb, models:[{name, fit_level, run_mode, quant, context, required_gb, tps_est, score, quality, speed, fit, context_score}]}. Lets the orchestrator pick a local model by predicted throughput instead of guessing. All args optional: use_case, quant, ctx, simulate_vram (MB), top.",
+        schema_fn: schema_cookbook,
+        handler: HandlerKind::Free(dispatch_cookbook),
         cloud: false,
     },
     ToolDef {
