@@ -56,11 +56,13 @@ grep -l 'Supersedes 0005' decisions/
 | [0009](./0009-confined-media-output-paths.md) | Confine media output paths to a per-modality dir | Accepted |
 | [0010](./0010-capability-modality-routing-embedding-never-chat-routed.md) | Route by capability subset AND modality; never chat-route embedding or non-LLM models | Accepted |
 | [0011](./0011-structural-untrusted-content-envelope.md) | Structural prompt-injection boundary — one untrusted-content envelope | Accepted |
-| [0012](./0012-minimal-bearer-auth.md) | Minimal single-token HTTP bearer auth for lamu-api | Accepted |
+| [0012](./0012-minimal-bearer-auth.md) | Minimal single-token HTTP bearer auth for lamu-api | Superseded by 0018 |
 | [0013](./0013-at-rest-key-encryption-deferred.md) | At-rest encryption of cloud keys / API token deferred | Accepted |
-| [0014](./0014-single-gpu-and-root-paths-intentional.md) | Single-GPU + ~/local-llm path assumptions are intentional | Accepted |
+| [0014](./0014-single-gpu-and-root-paths-intentional.md) | Single-GPU (superseded by 0017) + ~/local-llm paths (in force) | Partly superseded |
 | [0015](./0015-cookbook-roofline-scoring-engine.md) | Cookbook roofline + composite scoring engine (ported from hwfit) | Accepted |
 | [0016](./0016-backend-orchestrator-byo-frontend.md) | LAMU is a backend orchestrator; bring your own frontend via broad API compat | Accepted |
+| [0017](./0017-multi-gpu-device-pool.md) | Multi-GPU device pool + best-fit placement + opt-in tensor-parallel sharding | Accepted |
+| [0018](./0018-multi-user-per-token-identity.md) | Multi-user — per-token identity, per-user memory namespacing, quotas | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.

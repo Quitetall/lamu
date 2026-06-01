@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted 2026-05-31
+Accepted 2026-05-31 · **Superseded by [ADR 0018](./0018-multi-user-per-token-identity.md)** 2026-05-31 — the single static token survives as one auth mode within 0018's per-token-identity model.
 
 ## Context
 

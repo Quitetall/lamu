@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted 2026-05-31
+Accepted 2026-05-31 · single-GPU half **Superseded by [ADR 0017](./0017-multi-gpu-device-pool.md)** 2026-05-31 (the second-GPU trigger it named has arrived). The `~/local-llm` / `LAMU_ROOT` path half remains in force.
 
 ## Context
 
