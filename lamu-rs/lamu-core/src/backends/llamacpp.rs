@@ -458,6 +458,14 @@ impl Backend for LlamaCppBackend {
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;
+        // M12: surface a real backend HTTP error (context overflow, OOM) instead
+        // of letting its error body parse as a choices-less response and report
+        // the generic "missing choices[0].message".
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Backend(format!("backend HTTP {status}: {}", body.trim())));
+        }
         let data: Value = resp.json().await
             .map_err(|e| Error::Backend(format!("json: {}", e)))?;
         let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"))
@@ -486,6 +494,13 @@ impl Backend for LlamaCppBackend {
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;
+        // m11: a non-2xx body has no `data:` lines → without this the stream
+        // completes Ok with zero tokens (a silently-empty success). Fail loudly.
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Backend(format!("backend HTTP {status}: {}", body.trim())));
+        }
 
         let byte_stream = resp.bytes_stream();
         let line_stream = byte_stream

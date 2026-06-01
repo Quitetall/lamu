@@ -160,6 +160,11 @@ impl Backend for DflashBackend {
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Backend(format!("backend HTTP {status}: {}", body.trim())));
+        }
         let data: Value = resp.json().await
             .map_err(|e| Error::Backend(format!("json: {}", e)))?;
         let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"))
@@ -184,6 +189,11 @@ impl Backend for DflashBackend {
         let url = format!("http://localhost:{}/v1/chat/completions", self.port);
         let resp = self.client.post(&url).json(&payload).send().await
             .map_err(|e| Error::Backend(format!("http: {}", e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Backend(format!("backend HTTP {status}: {}", body.trim())));
+        }
 
         let byte_stream = resp.bytes_stream();
         let line_stream = byte_stream
