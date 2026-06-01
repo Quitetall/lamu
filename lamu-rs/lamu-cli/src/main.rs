@@ -191,6 +191,12 @@ enum AuthAction {
         /// Owner the key is attributed to (quota + audit principal).
         #[arg(long)]
         user: String,
+        /// Daily token quota for this key (omit = unlimited).
+        #[arg(long)]
+        quota: Option<u32>,
+        /// Queue priority for this key; higher runs first (default 0).
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
     },
     /// List keys in keys.db: prefix, user, created, status. Prefixes only —
     /// plaintext is never recoverable.
@@ -463,7 +469,7 @@ fn cmd_cookbook(opts: CookbookOpts) -> Result<()> {
 fn cmd_auth(action: AuthAction) -> Result<()> {
     match action {
         AuthAction::Init => cmd_auth_init(),
-        AuthAction::Issue { user } => cmd_auth_issue(&user),
+        AuthAction::Issue { user, quota, priority } => cmd_auth_issue(&user, priority, quota),
         AuthAction::List => cmd_auth_list(),
         AuthAction::Revoke { prefix } => cmd_auth_revoke(&prefix),
     }
@@ -471,12 +477,15 @@ fn cmd_auth(action: AuthAction) -> Result<()> {
 
 /// `lamu auth issue --user NAME` (ADR 0018): mint a per-user key into keys.db,
 /// print the plaintext ONCE (only its SHA-256 is stored).
-fn cmd_auth_issue(user: &str) -> Result<()> {
+fn cmd_auth_issue(user: &str, priority: i32, quota: Option<u32>) -> Result<()> {
     let store = lamu_api::keys::KeyStore::open_default()
         .map_err(|e| anyhow::anyhow!("open keys.db: {e}"))?;
-    let token = store.issue(user).map_err(|e| anyhow::anyhow!("issue key: {e}"))?;
+    let token = store
+        .issue_with(user, priority, quota)
+        .map_err(|e| anyhow::anyhow!("issue key: {e}"))?;
     let prefix: String = token.chars().take("lamu_".len() + 8).collect();
-    println!("Issued API key for user '{user}' (prefix {prefix}).");
+    let quota_str = quota.map_or_else(|| "unlimited".to_string(), |q| q.to_string());
+    println!("Issued API key for user '{user}' (prefix {prefix}, priority {priority}, quota {quota_str}).");
     println!("\n    {token}\n");
     println!("Shown ONCE — only its SHA-256 is stored. Clients send:");
     println!("    Authorization: Bearer {token}");
@@ -493,10 +502,22 @@ fn cmd_auth_list() -> Result<()> {
         println!("No API keys in keys.db. `lamu auth issue --user NAME` to create one.");
         return Ok(());
     }
-    println!("  {:<16} {:<16} {:>12}  status", "prefix", "user", "created(unix)");
+    println!(
+        "  {:<16} {:<16} {:>12}  {:<8} {:>8} {:>12} {:>12}",
+        "prefix", "user", "created(unix)", "status", "priority", "quota", "last-used"
+    );
     for k in keys {
         let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
-        println!("  {:<16} {:<16} {:>12}  {}", k.token_prefix, k.user, k.created_at, status);
+        let quota = k
+            .daily_token_quota
+            .map_or_else(|| "unlimited".to_string(), |q| q.to_string());
+        let last_used = k
+            .last_used_at
+            .map_or_else(|| "—".to_string(), |t| t.to_string());
+        println!(
+            "  {:<16} {:<16} {:>12}  {:<8} {:>8} {:>12} {:>12}",
+            k.token_prefix, k.user, k.created_at, status, k.priority, quota, last_used
+        );
     }
     Ok(())
 }

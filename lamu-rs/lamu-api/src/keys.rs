@@ -77,14 +77,20 @@ pub struct Principal {
 }
 
 /// A redacted key row for `lamu auth list`. NEVER carries the plaintext token
-/// or its hash — only the public prefix, the owner, and the lifecycle
-/// timestamps. `revoked_at` is `Some` once the key has been revoked.
+/// or its hash — only the public prefix, the owner, the lifecycle timestamps,
+/// and the quota/priority knobs. `revoked_at` is `Some` once the key has been
+/// revoked; `last_used_at` is `Some` once the key has authenticated a request
+/// (currently always `None` — the writeback is a P2 batched concern, see
+/// `verify`). `daily_token_quota` is `None` for an unlimited key.
 #[derive(Debug, Clone)]
 pub struct KeyInfo {
     pub user: String,
     pub token_prefix: String,
     pub created_at: i64,
     pub revoked_at: Option<i64>,
+    pub priority: i32,
+    pub daily_token_quota: Option<u32>,
+    pub last_used_at: Option<i64>,
 }
 
 /// Length of the displayed/stored token prefix (`lamu_` + 8 hex chars). Long
@@ -332,15 +338,20 @@ impl KeyStore {
     pub fn list(&self) -> Result<Vec<KeyInfo>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT user, token_prefix, created_at, revoked_at \
+            "SELECT user, token_prefix, created_at, revoked_at, \
+             priority, daily_token_quota, last_used_at \
              FROM api_keys ORDER BY created_at DESC, id DESC",
         )?;
         let mapped = stmt.query_map([], |r| {
+            let quota: Option<i64> = r.get(5)?;
             Ok(KeyInfo {
                 user: r.get(0)?,
                 token_prefix: r.get(1)?,
                 created_at: r.get(2)?,
                 revoked_at: r.get(3)?,
+                priority: r.get(4)?,
+                daily_token_quota: quota.and_then(|q| u32::try_from(q).ok()),
+                last_used_at: r.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -474,6 +485,29 @@ mod tests {
         ks.revoke(&prefix).unwrap();
         let infos = ks.list().unwrap();
         assert!(infos[0].revoked_at.is_some());
+    }
+
+    #[test]
+    fn list_surfaces_priority_quota_lastused() {
+        let ks = store();
+        // Default issue → priority 0, unlimited quota, never used.
+        ks.issue("plain").unwrap();
+        // issue_with → explicit priority + quota.
+        ks.issue_with("vip", 7, Some(250_000)).unwrap();
+
+        let infos = ks.list().unwrap();
+        assert_eq!(infos.len(), 2);
+        // Newest-first ordering: "vip" was issued last.
+        let vip = infos.iter().find(|k| k.user == "vip").unwrap();
+        assert_eq!(vip.priority, 7);
+        assert_eq!(vip.daily_token_quota, Some(250_000));
+        // last_used_at is not yet written back on verify (P2 batched concern).
+        assert_eq!(vip.last_used_at, None);
+
+        let plain = infos.iter().find(|k| k.user == "plain").unwrap();
+        assert_eq!(plain.priority, 0);
+        assert_eq!(plain.daily_token_quota, None);
+        assert_eq!(plain.last_used_at, None);
     }
 
     #[test]
