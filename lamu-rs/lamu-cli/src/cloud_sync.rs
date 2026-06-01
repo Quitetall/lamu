@@ -21,16 +21,20 @@ use std::collections::HashSet;
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
 #[derive(Deserialize)]
-struct ModelsResp {
-    #[serde(default)]
-    data: Vec<RawModel>,
-}
-
-#[derive(Deserialize)]
 struct RawModel {
     id: String,
     #[serde(default)]
     context_length: Option<u32>,
+}
+
+/// Parse a `{ "data": [ ... ] }` model-list body resiliently: one malformed
+/// entry (missing/odd `id`, etc.) is skipped, not fatal to the whole pull.
+/// Tolerates the array at `data` (OpenAI/OpenRouter/Anthropic all use it).
+fn parse_models(body: &serde_json::Value) -> Vec<RawModel> {
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().filter_map(|v| serde_json::from_value::<RawModel>(v.clone()).ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Pull the OpenRouter cross-provider catalog (no auth). Each id is
@@ -40,9 +44,8 @@ pub async fn fetch_openrouter(client: &reqwest::Client) -> Result<Vec<CloudModel
     if !resp.status().is_success() {
         anyhow::bail!("OpenRouter /models returned {}", resp.status());
     }
-    let body: ModelsResp = resp.json().await?;
-    Ok(body
-        .data
+    let body: serde_json::Value = resp.json().await?;
+    Ok(parse_models(&body)
         .into_iter()
         .map(|m| {
             let (provider, name) = m.id.split_once('/').unwrap_or(("openrouter", m.id.as_str()));
@@ -89,9 +92,8 @@ pub async fn ping_provider(
     if !resp.status().is_success() {
         anyhow::bail!("{provider} {url} returned {}", resp.status());
     }
-    let body: ModelsResp = resp.json().await?;
-    Ok(body
-        .data
+    let body: serde_json::Value = resp.json().await?;
+    Ok(parse_models(&body)
         .into_iter()
         .map(|m| CloudModel {
             name: m.id.clone(),

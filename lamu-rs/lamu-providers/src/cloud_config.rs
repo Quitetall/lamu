@@ -223,7 +223,13 @@ pub fn save_models(models: &[CloudModel]) -> std::io::Result<PathBuf> {
     let list = CloudModelList { models: models.to_vec() };
     let yaml = serde_yaml::to_string(&list)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, yaml)?;
+    // Atomic: write a sibling temp then rename over the target (atomic on
+    // POSIX, same dir). A crash mid-write can't leave a partial/empty catalog —
+    // which a later sync would otherwise read as "no existing models" and drop
+    // every hand-set entry.
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, yaml)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(path)
 }
 

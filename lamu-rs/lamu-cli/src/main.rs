@@ -489,6 +489,10 @@ async fn cmd_cloud_sync(no_ping: bool, no_openrouter: bool, dry_run: bool) -> Re
         println!("(dry-run — cloud-models.yaml not written)");
         return Ok(());
     }
+    if added == 0 && updated == 0 {
+        println!("no changes — cloud-models.yaml left untouched");
+        return Ok(());
+    }
     let path = cloud_config::save_models(&merged)?;
     println!("wrote {}", path.display());
     Ok(())
