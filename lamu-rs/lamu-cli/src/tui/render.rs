@@ -326,7 +326,7 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 let deployed = state.model_deployed(&e.name);
                 let glyph = if deployed { "●" } else if fav { "★" } else { " " };
                 let line = format!(
-                    "{} {:<7} {:<28}  {:>4}B  {:<6}  {:>5}  {:>9}  {:<18}  {}",
+                    "{} {:<11} {:<28}  {:>4}B  {:<6}  {:>5}  {:>9}  {:<18}  {}",
                     glyph,
                     "[LOCAL]",
                     truncate(&e.name, 28),
@@ -362,9 +362,9 @@ fn draw_models(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 // notes flow to the right. Column widths match local
                 // rows so the LOCAL/CLOUD blocks line up cleanly.
                 let line = format!(
-                    "{} {:<7} {:<28}  {:>5}  {:<6}  {:>5}  {:>9}  {:<18}  {}",
+                    "{} {:<11} {:<28}  {:>5}  {:<6}  {:>5}  {:>9}  {:<18}  {}",
                     glyph,
-                    "[CLOUD]",
+                    format!("[{}]", m.provider.to_uppercase()),
                     truncate(&id, 28),
                     "—",
                     "—",

@@ -381,6 +381,13 @@ impl AppState {
             if fa != fb {
                 return fb.cmp(&fa);
             }
+            // Group by provider first so the selector is separated into
+            // contiguous per-provider blocks (the row tag shows the provider),
+            // instead of one undifferentiated cloud list.
+            let prov = cloud_models[*a].provider.cmp(&cloud_models[*b].provider);
+            if prov != std::cmp::Ordering::Equal {
+                return prov;
+            }
             match sort {
                 SortKey::Default => cloud_models[*a]
                     .context_max
