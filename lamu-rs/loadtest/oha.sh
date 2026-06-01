@@ -55,6 +55,17 @@ if [[ -n "${LAMU_API_TOKEN:-}" ]]; then
   AUTH_ARGS=(-H "Authorization: Bearer ${LAMU_API_TOKEN}")
 fi
 
+# MODEL is interpolated RAW into the JSON bodies below (no jq dependency), so a
+# name containing a quote/backslash would emit malformed JSON. Reject anything
+# outside the safe set. Empty is fine — the server resolves a default model.
+if [[ -n "${MODEL}" && ! "${MODEL}" =~ ^[A-Za-z0-9_./:-]+$ ]]; then
+  echo "error: MODEL '${MODEL}' has characters outside [A-Za-z0-9_./:-]; refusing to build JSON unsafely" >&2
+  exit 2
+fi
+
+# NOTE: timing below uses `date +%s.%N` (GNU coreutils). On Linux this is fine;
+# on macOS install coreutils (`brew install coreutils`) or %N yields a literal N.
+
 mkdir -p "${OUTDIR:-/dev/null}" 2>/dev/null || true
 
 # Per-surface request body. temp 0 + tiny max_tokens for repeatable, fast load.
