@@ -1,0 +1,62 @@
+# TEMPLATE ONLY — NOT ACTIVE.
+# This repo has NO self-hosted runner registered, so this workflow is committed
+# with a `.template` suffix so GitHub will NOT schedule it. To activate: register
+# a self-hosted runner with labels [self-hosted, gpu, rtx4090], rename this file
+# to `scale-nightly.yml`, and confirm `lamu` + a GGUF + `oha` are present on the
+# runner. See docs/decisions/0020-scale-testing-strategy.md (tier 4 + Consequences).
+name: Scale nightly (self-hosted 4090) — TEMPLATE
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 08:00 UTC nightly
+  workflow_dispatch: {}   # manual trigger
+
+jobs:
+  gpu-scale:
+    name: GPU scale tiers (perf_bench + spec_e2e + frontend_matrix + oha)
+    # Requires a registered self-hosted runner with these labels. Absent today.
+    runs-on: [self-hosted, gpu, rtx4090]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build + install lamu (needed; e2e tiers skip if `lamu` off PATH)
+        working-directory: lamu-rs
+        run: cargo install --path lamu-cli --locked
+
+      - name: perf_bench (release — the rps>1000 floor only gates in release)
+        working-directory: lamu-rs
+        run: cargo test --release --test perf_bench -- --ignored --nocapture
+
+      - name: spec_e2e (real serve, three-surface contract)
+        working-directory: lamu-rs
+        run: cargo test --release --test spec_e2e -- --ignored --nocapture
+
+      - name: frontend_matrix (frontend call-shape matrix)
+        working-directory: lamu-rs
+        run: cargo test --release --test frontend_matrix -- --ignored --nocapture
+
+      - name: oha HTTP load baseline (warm serve, then ramped concurrency)
+        run: |
+          lamu serve --port 8020 &
+          SERVE_PID=$!
+          # wait for readiness, then warm one request before measuring.
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8020/v1/models && break; sleep 2; done
+          curl -sf -X POST http://127.0.0.1:8020/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8,"temperature":0}' || true
+          mkdir -p loadtest-out
+          LAMU_LOAD_OUT=loadtest-out just bench-http || true
+          kill "$SERVE_PID" 2>/dev/null || true
+
+      - name: Upload load results (human reviews before any baseline.json commit)
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-json
+          path: loadtest-out/
+        if: always()
+      # NOTE: this job NEVER auto-commits baseline.json. ADR 0020 defers the
+      # baseline until a human reviews a real 4090 run. No fabricated numbers.

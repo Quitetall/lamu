@@ -64,6 +64,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0017](./0017-multi-gpu-device-pool.md) | Multi-GPU device pool + best-fit placement + opt-in tensor-parallel sharding | Accepted |
 | [0018](./0018-multi-user-per-token-identity.md) | Multi-user — per-token identity, per-user memory namespacing, quotas | Accepted |
 | [0019](./0019-cloud-model-catalog-sync.md) | Cloud-model catalog auto-sync from OpenRouter + per-provider /v1/models | Accepted |
+| [0020](./0020-scale-testing-strategy.md) | Scale-testing strategy — ignore-gated harness tiers; HTTP has no request queue (single-flight is load-only) | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.

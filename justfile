@@ -279,6 +279,19 @@ bench-bifrost:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# HTTP load baseline (ADR 0020, tier 4). Needs a live `lamu serve` + a GPU +
+# `oha` (cargo install oha). NOT part of `cargo test`. HTTP has no request
+# queue — single-flight is load-only; a queue tail here is a regression.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# oha load test vs a running `lamu serve`. `just bench-http` → all surfaces on
+# :8020. `just bench-http http://127.0.0.1:8020 openai qwen35-27b` → one surface.
+[group: 'v3']
+bench-http base="http://127.0.0.1:8020" surface="all" model="":
+    bash {{root}}/lamu-rs/loadtest/oha.sh {{base}} {{surface}} "{{model}}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Legacy v1 — script-driven launchers. Preserved in legacy/.
 # Prefer `lamu` for new work. Kept for perf-table reproducibility and
 # DFlash/megakernel custom-server invocation.
