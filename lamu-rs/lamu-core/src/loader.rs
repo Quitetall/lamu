@@ -54,7 +54,7 @@ pub async fn spawn_one(
 pub fn pick_backend_port(
     scheduler: &VramScheduler,
     http_serve_port: Option<u16>,
-) -> u16 {
+) -> Option<u16> {
     let mut occupied: std::collections::HashSet<u16> = scheduler
         .loaded_models()
         .iter()
@@ -71,12 +71,13 @@ pub fn pick_backend_port(
         8002, 8003, 8004, 8005, 8006, 8007, 8008, 8009,
     ] {
         if !occupied.contains(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
-    // All slots taken — caller will likely fail to bind, but return
-    // something deterministic for the error path rather than panicking.
-    PORT_SIDECAR
+    // m10: all candidate ports occupied. Return None so the caller refuses the
+    // load cleanly instead of spawning onto an occupied port (bind failure /
+    // cross-model port aliasing).
+    None
 }
 
 /// HTTP-path spawn + register. Idempotent on concurrent same-name calls.
@@ -172,7 +173,11 @@ where
                 entry.name, evict
             )));
         }
-        let port = pick_backend_port(&sched, http_serve_port);
+        let Some(port) = pick_backend_port(&sched, http_serve_port) else {
+            return Err(Error::Backend(
+                "no free backend port available (all candidate ports 8000-8009 occupied)".into(),
+            ));
+        };
         sched.mark_loading(entry.clone());
         port
     };
@@ -350,7 +355,7 @@ mod tests {
     #[test]
     fn pick_backend_port_skips_http_listener() {
         let sched = VramScheduler::new();
-        let port = pick_backend_port(&sched, Some(PORT_MAIN));
+        let port = pick_backend_port(&sched, Some(PORT_MAIN)).expect("a free port exists");
         assert_ne!(port, PORT_MAIN);
     }
 
@@ -359,7 +364,7 @@ mod tests {
         let mut sched = VramScheduler::new();
         let e = fake_entry("a", 100);
         sched.register_loaded(e, None, PORT_MAIN, 100);
-        let port = pick_backend_port(&sched, None);
+        let port = pick_backend_port(&sched, None).expect("a free port exists");
         assert_ne!(port, PORT_MAIN);
     }
 
@@ -568,7 +573,8 @@ mod tests {
                 2 => Some(PORT_SIDECAR),
                 _ => Some(8002),
             };
-            let picked = pick_backend_port(&sched, http_port);
+            let picked = pick_backend_port(&sched, http_port)
+                .expect("≤7 occupied of 10 candidates → a free port always exists");
             proptest::prop_assert!(!occupied.contains(&picked),
                 "picked {picked} collides with occupied {:?}", occupied);
             if let Some(hp) = http_port {

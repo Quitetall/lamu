@@ -446,7 +446,13 @@ impl LamuMcpServer {
         let port: u16 = {
             let st = self.state.lock();
             lamu_core::loader::pick_backend_port(&st.scheduler, None)
-        };
+        }
+        // m10: refuse rather than spawn onto an occupied port when all candidate
+        // ports are taken. (This precedes mark_loading, so nothing to roll back.)
+        .unwrap_or(0);
+        if port == 0 {
+            return "error: no free backend port available (all candidate ports 8000-8009 occupied)".to_string();
+        }
 
         // Construct the right Backend for this entry. The Backend impl
         // owns spawn + health-poll + warmup — lamu-mcp doesn't manage
