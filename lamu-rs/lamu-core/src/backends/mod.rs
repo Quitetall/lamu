@@ -300,6 +300,61 @@ pub async fn graceful_kill(child: &mut tokio::process::Child, _port: u16) -> Res
         .map_err(|e| Error::Backend(format!("kill: {e}")))
 }
 
+/// Kill a backend we only know by `(pid, port)` — the HTTP serve path drops
+/// the `Box<dyn Backend>` after spawn (loader.rs), so when an operator later
+/// unloads such a model via MCP there is no `Child` handle to `wait()` on.
+///
+/// The PORT is the identity anchor, which makes this safe against PID reuse:
+/// we signal `pid` ONLY while the port is still bound (i.e. the backend is
+/// provably alive, so `pid` is still the backend — not a recycled, unrelated
+/// process). The instant the port goes silent we stop and report success; we
+/// never escalate to SIGKILL against a pid whose backend already died.
+///
+/// Returns Err if the port stays bound after SIGTERM+SIGKILL — caller MUST
+/// treat that as "still loaded".
+///
+/// Residual TOCTOU: between `port_released` returning false and the signal,
+/// the backend could die and `pid` be recycled. The window is microseconds
+/// AND, while the port is still bound, the backend is alive, so `pid` is the
+/// backend; a stray group-signal in that exact sliver lands on a not-yet-
+/// recycled pid and is harmless. Bounded but not zero — the handle path
+/// (graceful_kill, which wait()s an owned Child) is preferred when available.
+#[cfg(unix)]
+pub async fn kill_pid_and_verify(pid: u32, port: u16) -> Result<()> {
+    if port == 0 {
+        // No port to anchor on (a Loaded model always has a real port). We
+        // can't VERIFY death without it, so fail closed rather than report a
+        // kill we didn't confirm — the caller keeps the model marked loaded.
+        return Err(Error::Backend(
+            "cannot verify backend death without a port — refusing to report it killed".into(),
+        ));
+    }
+    // Already dead? Port silent ⇒ nothing to kill.
+    if port_released(port).await {
+        return Ok(());
+    }
+    // Port bound ⇒ backend alive ⇒ `pid` is the backend. SIGTERM the group.
+    signal_backend(pid, nix::sys::signal::Signal::SIGTERM);
+    if port_released(port).await {
+        return Ok(());
+    }
+    // Still bound ⇒ still alive ⇒ `pid` still valid. Escalate to group SIGKILL.
+    signal_backend(pid, nix::sys::signal::Signal::SIGKILL);
+    if port_released(port).await {
+        return Ok(());
+    }
+    Err(Error::Backend(format!(
+        "pid {pid}: port {port} still bound after SIGTERM+SIGKILL — backend would not die"
+    )))
+}
+
+#[cfg(not(unix))]
+pub async fn kill_pid_and_verify(_pid: u32, _port: u16) -> Result<()> {
+    Err(Error::Backend(
+        "kill_pid_and_verify unsupported on non-unix".into(),
+    ))
+}
+
 /// Last ~2 KiB of a captured backend log — surfaces WHY a python-server
 /// spawn failed (CUDA OOM, missing dep, bad checkpoint) in the error.
 /// Empty if unreadable. Shared by the fish_speech + comfyui backends.
@@ -413,5 +468,18 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         drop(l);
         assert!(port_released(port).await, "a port with no listener must read as released");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pid_and_verify_ok_when_port_already_silent() {
+        // Backend already gone (port silent): the port-anchor early return
+        // reports success WITHOUT signalling any pid — so a recycled/bogus pid
+        // is never touched.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let r = kill_pid_and_verify(999_999_999, port).await;
+        assert!(r.is_ok(), "silent port ⇒ already dead ⇒ Ok: {r:?}");
     }
 }
