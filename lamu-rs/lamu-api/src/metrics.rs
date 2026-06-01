@@ -52,7 +52,7 @@ impl LamuMetrics {
                 "lamu_requests_total",
                 "Number of /v1/chat/completions requests served, by model + status.",
             ),
-            &["model", "status"],
+            &["model", "status", "user"],
         )?;
         let request_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -69,7 +69,7 @@ impl LamuMetrics {
                 "lamu_tokens_generated_total",
                 "Tokens generated, by model + kind (content | reasoning).",
             ),
-            &["model", "kind"],
+            &["model", "kind", "user"],
         )?;
         let vram_used_mb = GaugeVec::new(
             Opts::new("lamu_vram_used_mb", "VRAM in use per loaded model (MB)."),
@@ -190,9 +190,9 @@ mod tests {
         let scheduler = VramScheduler::new();
         let mut health = HealthRegistry::new();
 
-        m.requests_total.with_label_values(&["x", "ok"]).inc();
+        m.requests_total.with_label_values(&["x", "ok", "anon"]).inc();
         m.request_duration_seconds.with_label_values(&["x", "total"]).observe(0.1);
-        m.tokens_generated_total.with_label_values(&["x", "content"]).inc();
+        m.tokens_generated_total.with_label_values(&["x", "content", "anon"]).inc();
         m.vram_used_mb.with_label_values(&["x"]).set(100.0);
         m.queue_depth.with_label_values(&["x"]).set(0);
         m.backend_restarts_total.with_label_values(&["x"]).inc();
@@ -221,10 +221,10 @@ mod tests {
     #[test]
     fn request_counter_increments() {
         let m = LamuMetrics::new().unwrap();
-        m.requests_total.with_label_values(&["m1", "ok"]).inc();
-        m.requests_total.with_label_values(&["m1", "ok"]).inc_by(2);
+        m.requests_total.with_label_values(&["m1", "ok", "anon"]).inc();
+        m.requests_total.with_label_values(&["m1", "ok", "anon"]).inc_by(2);
         let text = String::from_utf8(m.render().0).unwrap();
-        assert!(text.contains(r#"lamu_requests_total{model="m1",status="ok"} 3"#));
+        assert!(text.contains(r#"lamu_requests_total{model="m1",status="ok",user="anon"} 3"#));
     }
 
     #[test]

@@ -364,7 +364,7 @@ async fn resolve_and_ensure_loaded(
 
     if decision.model_name.is_empty() {
         state.metrics.requests_total
-            .with_label_values(&[model_req.unwrap_or("unknown"), "no_candidate"])
+            .with_label_values(&[model_req.unwrap_or("unknown"), "no_candidate", "anon"])
             .inc();
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
             "error": {
@@ -385,7 +385,7 @@ async fn resolve_and_ensure_loaded(
             Ok(_lm) => {}
             Err(e) => {
                 state.metrics.requests_total
-                    .with_label_values(&[&decision.model_name, "spawn_failed"])
+                    .with_label_values(&[&decision.model_name, "spawn_failed", "anon"])
                     .inc();
                 return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
                     "error": {
@@ -464,7 +464,7 @@ async fn chat_completions(
     // None-quota; 429 on an exhausted bucket. Audited as status=429.
     if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
         state.metrics.requests_total
-            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "quota_exceeded"])
+            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "quota_exceeded", user_label(principal_ref)])
             .inc();
         tracing::info!(
             target: "lamu_audit",
@@ -489,7 +489,7 @@ async fn chat_completions(
     // contending on internal state.
     if let Err(e) = lamu_core::scheduler_lock::check_unlocked() {
         state.metrics.requests_total
-            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "gpu_locked"])
+            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "gpu_locked", user_label(principal_ref)])
             .inc();
         let body = ErrorResponse {
             error: ErrorBody {
@@ -631,7 +631,7 @@ async fn chat_completions(
         Err(e) => {
             state.health.lock().get_or_create(&model_name).record_error(format!("{e}"));
             state.metrics.requests_total
-                .with_label_values(&[&model_name, "backend_error"])
+                .with_label_values(&[&model_name, "backend_error", user_label(principal_ref)])
                 .inc();
             return (StatusCode::BAD_GATEWAY,
                 Json(json!({"error": {"message": format!("Backend unreachable: {}", e)}}))).into_response();
@@ -643,7 +643,7 @@ async fn chat_completions(
         Err(e) => {
             state.health.lock().get_or_create(&model_name).record_error(format!("{e}"));
             state.metrics.requests_total
-                .with_label_values(&[&model_name, "backend_error"])
+                .with_label_values(&[&model_name, "backend_error", user_label(principal_ref)])
                 .inc();
             return (StatusCode::BAD_GATEWAY,
                 Json(json!({"error": {"message": format!("Bad JSON from backend: {}", e)}}))).into_response();
@@ -661,7 +661,7 @@ async fn chat_completions(
     // truth — the predicate is shared with the unit tests (no more drift).
     if is_empty_backend_response(&data) {
         state.metrics.requests_total
-            .with_label_values(&[&model_name, "backend_empty"])
+            .with_label_values(&[&model_name, "backend_empty", user_label(principal_ref)])
             .inc();
         return (StatusCode::BAD_GATEWAY, Json(json!({
             "error": {
@@ -715,7 +715,7 @@ async fn chat_completions(
     // Metrics: success path — match Python lamu/api/openai_compat.py.
     state.health.lock().get_or_create(&model_name).record_success();
     state.metrics.requests_total
-        .with_label_values(&[&model_name, "ok"])
+        .with_label_values(&[&model_name, "ok", user_label(principal_ref)])
         .inc();
     state.metrics.request_duration_seconds
         .with_label_values(&[&model_name, "total"])
@@ -723,7 +723,7 @@ async fn chat_completions(
     let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
     if completion_tokens > 0 {
         state.metrics.tokens_generated_total
-            .with_label_values(&[&model_name, "content"])
+            .with_label_values(&[&model_name, "content", user_label(principal_ref)])
             .inc_by(completion_tokens);
     }
     if !response["choices"][0]["message"]["reasoning_content"].is_null() {
@@ -731,7 +731,7 @@ async fn chat_completions(
             .as_str().map(|s| s.len() as u64 / 4).unwrap_or(0);
         if r > 0 {
             state.metrics.tokens_generated_total
-                .with_label_values(&[&model_name, "reasoning"])
+                .with_label_values(&[&model_name, "reasoning", user_label(principal_ref)])
                 .inc_by(r);
         }
     }
