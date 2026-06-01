@@ -187,13 +187,39 @@ where
         "loader: cold load starting (single-flight gate held until spawn returns)"
     );
 
+    // Cancellation-safety (B2): if this future is dropped while awaiting
+    // `spawn` (e.g. an HTTP client disconnects during the ~90s cold load),
+    // nothing past this point runs — so without a guard the `mark_loading`
+    // entry would linger forever, reserving `entry.vram_mb` and blocking
+    // eviction (it's never evictable while Loading). The guard rolls that
+    // back on Drop (cancel OR error) and is disarmed only after a successful
+    // confirm_loaded.
+    struct LoadRollback<'a> {
+        name: String,
+        scheduler: &'a Arc<Mutex<VramScheduler>>,
+        health: &'a Arc<Mutex<HealthRegistry>>,
+        armed: bool,
+    }
+    impl Drop for LoadRollback<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.scheduler.lock().mark_unloaded(&self.name);
+                HealthRegistry::drop(&mut self.health.lock(), &self.name);
+            }
+        }
+    }
+    let mut rollback = LoadRollback {
+        name: entry.name.clone(),
+        scheduler,
+        health,
+        armed: true,
+    };
+
     let (_backend, pid) = match spawn(entry.clone(), port).await {
         Ok(pair) => pair,
-        Err(e) => {
-            scheduler.lock().mark_unloaded(&entry.name);
-            HealthRegistry::drop(&mut health.lock(), &entry.name);
-            return Err(e);
-        }
+        // The guard's Drop performs the mark_unloaded + health cleanup on this
+        // early return, so no manual rollback here.
+        Err(e) => return Err(e),
     };
 
     let vram = {
@@ -211,6 +237,8 @@ where
             .cloned()
             .ok_or_else(|| Error::ModelNotFound(entry.name.clone()))?
     };
+    // Load committed: disarm the rollback so Drop is a no-op.
+    rollback.armed = false;
     health.lock().get_or_create(&entry.name).record_success();
     Ok(lm)
 }
@@ -487,6 +515,27 @@ mod tests {
         assert!(matches!(err, Error::Backend(_)));
         assert!(!sched.lock().is_loaded("m"),
             "scheduler must NOT carry a phantom Loading entry after spawn failure");
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_rolls_back_on_cancellation() {
+        // B2: dropping the load future mid-spawn (e.g. an HTTP client
+        // disconnects during the ~90s cold load) must NOT leave a stuck
+        // Loading entry reserving VRAM + blocking eviction forever.
+        let entry = fake_entry("m", 1000);
+        let entries = one_entry_registry(entry);
+        let (sched, health) = fresh_state(24_000);
+        let spawn = |_e: ModelEntry, _port: u16| {
+            Box::pin(async move {
+                // A cold load that never completes — the caller cancels first.
+                futures_util::future::pending::<Result<(Box<dyn Backend>, u32)>>().await
+            })
+        };
+        let fut = ensure_loaded_with("m", &entries, &sched, &health, None, spawn);
+        // Drive to the spawn await; the timeout firing drops `fut` (cancellation).
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
+        assert!(!sched.lock().is_loaded("m"),
+            "a cancelled cold load must roll back the Loading entry (B2)");
     }
 
     // ── Property tests ────────────────────────────────────────────────
