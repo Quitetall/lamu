@@ -362,7 +362,47 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
         }
     });
 
+    auto_promote_main(&mut discovered);
+
     Ok(discovered)
+}
+
+/// Ensure the registry has a default model so `model: "lamu"` / `"main"` /
+/// `"default"` (and the no-model preload) resolve to something after a bare
+/// `lamu scan`. If NO entry is already flagged `main`, promote exactly one —
+/// never overriding an operator's prior choice.
+///
+/// Pick: the largest-VRAM chat-capable LLM entry (ties broken by lowest name,
+/// matching the router's deterministic first-wins on duplicate mains).
+/// Non-LLM modalities (image/tts) and non-chat entries (embedding-only,
+/// undiscovered-backend safetensors) are never auto-promoted. An empty or
+/// chat-less registry is left untouched (no panic).
+///
+/// `cookbook::rank` would give a hardware-aware pick, but it needs a detected
+/// `Hardware`/`VramScheduler` that pure on-disk discovery has no business
+/// touching; the largest-VRAM chat entry is the lean, deterministic, I/O-free
+/// equivalent.
+fn auto_promote_main(entries: &mut [ModelEntry]) {
+    if entries.iter().any(|e| e.main) {
+        return;
+    }
+    let best = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.modality.is_llm() && e.capabilities.contains(&Capability::Chat))
+        .max_by(|(_, a), (_, b)| {
+            a.vram_mb
+                .cmp(&b.vram_mb)
+                .then_with(|| b.name.cmp(&a.name))
+        })
+        .map(|(i, _)| i);
+    if let Some(i) = best {
+        entries[i].main = true;
+        tracing::info!(
+            "scan: auto-promoted '{}' as the default model (main: true)",
+            entries[i].name
+        );
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -838,5 +878,66 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "tmp files must not survive success");
+    }
+
+    /// `sample_entry` builds a chat-capable LLM with main: false — exactly the
+    /// shape `scan_directory` emits, so these exercise the real promote path.
+    fn chat_entry(name: &str, vram_mb: u32) -> ModelEntry {
+        let mut e = sample_entry(name, Path::new("/models/x.gguf"));
+        e.vram_mb = vram_mb;
+        e
+    }
+
+    #[test]
+    fn auto_promote_picks_largest_vram_chat_entry_when_no_main() {
+        let mut entries = vec![
+            chat_entry("small", 4000),
+            chat_entry("large", 16000),
+            chat_entry("mid", 8000),
+        ];
+        auto_promote_main(&mut entries);
+        let mains: Vec<&str> = entries.iter().filter(|e| e.main).map(|e| e.name.as_str()).collect();
+        assert_eq!(mains, vec!["large"], "exactly one main, the largest-vram chat entry");
+    }
+
+    #[test]
+    fn auto_promote_leaves_existing_main_untouched() {
+        let mut a = chat_entry("alpha", 4000);
+        a.main = true; // operator already chose alpha
+        let mut entries = vec![a, chat_entry("bravo", 16000)];
+        auto_promote_main(&mut entries);
+        let mains: Vec<&str> = entries.iter().filter(|e| e.main).map(|e| e.name.as_str()).collect();
+        assert_eq!(mains, vec!["alpha"], "must never override an operator-set main");
+    }
+
+    #[test]
+    fn auto_promote_no_panic_on_empty_registry() {
+        let mut entries: Vec<ModelEntry> = vec![];
+        auto_promote_main(&mut entries); // must not panic
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn auto_promote_skips_non_chat_and_non_llm_entries() {
+        // An embedding-only LLM (no Chat cap) and a TTS modality entry must
+        // never be auto-promoted — leaves the registry main-less.
+        let mut emb = chat_entry("embed", 9000);
+        emb.capabilities = vec![Capability::Embedding];
+        let mut tts = chat_entry("voice", 12000);
+        tts.modality = crate::types::Modality::Tts;
+        tts.capabilities = vec![]; // tts carries no chat cap
+        let mut entries = vec![emb, tts];
+        auto_promote_main(&mut entries);
+        assert!(entries.iter().all(|e| !e.main), "no chat-capable LLM → nothing promoted");
+    }
+
+    #[test]
+    fn auto_promote_vram_tie_breaks_on_lowest_name() {
+        // Two chat entries, equal VRAM → deterministic pick (lowest name),
+        // matching the router's lowest-name resolution on duplicate mains.
+        let mut entries = vec![chat_entry("zulu", 8000), chat_entry("alpha", 8000)];
+        auto_promote_main(&mut entries);
+        let mains: Vec<&str> = entries.iter().filter(|e| e.main).map(|e| e.name.as_str()).collect();
+        assert_eq!(mains, vec!["alpha"]);
     }
 }

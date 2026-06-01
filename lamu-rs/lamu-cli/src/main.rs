@@ -75,6 +75,12 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Set the default model — the entry `model: "lamu"`/`"main"`/`"default"`
+    /// (and the no-model preload) resolves to. Clears `main` from all others.
+    Use {
+        /// Model name or substring. Resolved against the local registry.
+        model: String,
+    },
     /// List recent chat sessions (git snapshots).
     Sessions,
     /// Restore a session's git snapshot — undoes any changes since
@@ -275,6 +281,7 @@ async fn main() -> Result<()> {
         Some(Command::Pull { model, quant }) => cmd_pull(&model, &quant).await,
         Some(Command::Show { model }) => cmd_show(&model),
         Some(Command::Rm { model, yes }) => cmd_rm(&model, yes),
+        Some(Command::Use { model }) => cmd_use(&model),
         Some(Command::Sessions) => cmd_sessions(),
         Some(Command::Undo { session_id, yes }) => cmd_undo(session_id, yes),
         Some(Command::Rollback { session_id }) => cmd_rollback(&session_id),
@@ -1153,6 +1160,33 @@ fn cmd_rm(query: &str, yes: bool) -> Result<()> {
     let entries = scan_directory(&dir)?;
     write_registry(&entries, &registry_path())?;
     println!("  registry refreshed ({} models remaining)", entries.len());
+    Ok(())
+}
+
+/// Set the default model. Resolves `query` against the registry, sets
+/// `main: true` on exactly that entry and clears it from every other (the
+/// router resolves `lamu`/`main`/`default` first-wins, so exactly-one keeps
+/// it deterministic), then writes the registry back.
+fn cmd_use(query: &str) -> Result<()> {
+    let target = resolve_entry(query)?;
+    let mut entries = load_registry(&registry_path())?;
+    let mut found = false;
+    for e in &mut entries {
+        let is_target = e.name == target.name;
+        e.main = is_target;
+        found |= is_target;
+    }
+    if !found {
+        // resolve_entry already matched, so the name must be present; guard
+        // anyway against a registry that changed under us between the two
+        // loads — mirror the `lamu run` not-found phrasing.
+        anyhow::bail!(
+            "no model in registry matches '{}'. Run `lamu scan` or `lamu pull {}`.",
+            query, query
+        );
+    }
+    write_registry(&entries, &registry_path())?;
+    println!("Default model set to '{}' (model: \"lamu\" now resolves here).", target.name);
     Ok(())
 }
 
