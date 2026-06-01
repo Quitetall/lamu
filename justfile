@@ -95,6 +95,14 @@ test-gpu:
 test-rust:
     cd {{root}}/lamu-rs && cargo test --workspace
 
+# Ignore-gated real-port concurrent load harness (SCALE-TEST P1). Spawns one
+# real `lamu serve` per test and fans concurrency inside it. Skips cleanly when
+# `lamu` isn't on PATH / no model fits VRAM. Tune with LAMU_LOAD_CONCURRENCY,
+# LAMU_LOAD_HEALTH_SECS.
+[group: 'meta']
+load conc="8":
+    cd {{root}}/lamu-rs && LAMU_LOAD_CONCURRENCY={{conc}} cargo test --release --test load_e2e -- --ignored --nocapture
+
 # Cross-language MCP contract tests (Python ↔ Rust parity)
 [group: 'meta']
 test-contract:
