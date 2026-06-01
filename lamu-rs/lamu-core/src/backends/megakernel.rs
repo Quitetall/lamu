@@ -73,6 +73,7 @@ impl Backend for MegakernelBackend {
 
         let mut cmd = Command::new(&self.python_bin);
         cmd.arg(&self.server_script)
+            .arg("--host").arg(crate::config::backend_bind_host()) // M8: loopback by default
             .arg("--port").arg(port.to_string())
             .current_dir(&self.work_dir)
             .env("CUDA_VISIBLE_DEVICES", self.cuda_index.to_string())

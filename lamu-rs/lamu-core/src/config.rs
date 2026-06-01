@@ -109,6 +109,20 @@ pub const DEFAULT_MAX_TOKENS: u32 = 16384;
 pub fn gpu_index() -> u32 {
     parse_env_or("LAMU_GPU_INDEX", 0)
 }
+
+/// Host the spawned inference backends bind to (M8). Defaults to loopback
+/// `127.0.0.1` — matching lamu-api's bind default + the llama-server backend —
+/// so a backend is never reachable off-box unless the operator explicitly opts
+/// in via `LAMU_BIND_HOST=0.0.0.0` (the same env lamu-api's off-loopback auth
+/// gate keys on). Without this the Python servers (dflash/megakernel) defaulted
+/// to `0.0.0.0` with no auth.
+pub fn backend_bind_host() -> String {
+    std::env::var("LAMU_BIND_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_CTX_SIZE: u32 = 131072;
 

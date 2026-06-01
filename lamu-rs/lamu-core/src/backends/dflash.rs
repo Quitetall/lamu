@@ -82,6 +82,7 @@ impl Backend for DflashBackend {
 
         let mut cmd = Command::new(&self.python_bin);
         cmd.arg(&self.server_script)
+            .arg("--host").arg(crate::config::backend_bind_host()) // M8: loopback by default
             .arg("--port").arg(port.to_string())
             .arg("--max-ctx").arg("8192")
             .arg("--budget").arg("6")

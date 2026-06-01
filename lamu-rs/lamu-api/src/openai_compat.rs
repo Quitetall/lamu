@@ -641,9 +641,11 @@ async fn chat_completions(
                     "type": "config"}}))).into_response();
         }
         let trimmed = gw.trim_end_matches('/');
-        if let Some(model) = req.model.as_deref() {
-            payload["model"] = json!(model);
-        }
+        // m2: always carry a model so the gateway can route. When the client
+        // omitted `model` (resolved-default request), fall back to the resolved
+        // registry name instead of forwarding a model-less payload Bifrost can't
+        // dispatch.
+        payload["model"] = json!(req.model.as_deref().unwrap_or(&model_name));
         format!("{}/chat/completions", trimmed)
     } else {
         format!("http://localhost:{}/v1/chat/completions", port)
@@ -1467,6 +1469,10 @@ fn anthropic_message_to_openai(
                 let body = b.get("content").cloned().unwrap_or(Value::String("".into()));
                 let body_str = match &body {
                     Value::String(s) => s.clone(),
+                    // m3: Claude Code's standard tool_result content is an array
+                    // of text blocks — extract the text (like `system`) instead
+                    // of injecting the raw JSON array the model then has to parse.
+                    Value::Array(_) => anthropic_content_to_string(&body),
                     other => serde_json::to_string(other).unwrap_or_default(),
                 };
                 out.push(Message {
