@@ -747,6 +747,15 @@ async fn chat_completions(
     if !reasoning.is_empty() {
         message_obj["reasoning_content"] = Value::String(reasoning);
     }
+    // Preserve the backend's tool_calls verbatim (B1). Without this an OpenAI
+    // tool-calling client gets a response with no tool_calls, and the Anthropic
+    // bridge (anthropic_messages re-parses choices[0].message.tool_calls →
+    // tool_use blocks) always sees None and 502s tool-only turns.
+    if let Some(tc) = msg.and_then(|m| m.get("tool_calls")) {
+        if !tc.is_null() {
+            message_obj["tool_calls"] = tc.clone();
+        }
+    }
 
     let mut response = json!({
         "id": completion_id,
@@ -1035,10 +1044,22 @@ fn make_chunk(id: &str, created: u64, model: &str, content: &str) -> Value {
     })
 }
 
+/// Hex id of `len` chars from OS randomness (M3). The previous implementation
+/// truncated a timestamp's HIGH-order hex digits, which advance only ~every
+/// 65µs — so back-to-back calls (e.g. synthesizing two `toolu_` ids in one
+/// streamed response, which Anthropic requires to be unique) collided, and the
+/// ids were fully deterministic/predictable. getrandom is already a dependency.
 fn random_hex(len: usize) -> String {
-    use std::time::SystemTime;
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let mut s = format!("{:x}", nanos);
+    let mut bytes = vec![0u8; len.div_ceil(2)];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // getrandom failing is near-impossible on a server OS; fall back to a
+        // timestamp's LOW-order nibbles (the fast-changing ones) so ids still
+        // differ between calls rather than panicking the request.
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let hex = format!("{nanos:032x}");
+        return hex[hex.len() - len.min(hex.len())..].to_string();
+    }
+    let mut s: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     s.truncate(len);
     s
 }
@@ -1341,6 +1362,22 @@ pub(crate) fn anthropic_error_type(status: StatusCode) -> &'static str {
     }
 }
 
+/// Map an OpenAI `finish_reason` + whether tool_use blocks were emitted to an
+/// Anthropic `stop_reason` (M2). Without this, length-truncated completions
+/// (`finish_reason: "length"`) were silently reported as a clean `end_turn`,
+/// so clients couldn't tell a response was cut off at max_tokens.
+pub(crate) fn anthropic_stop_reason(finish_reason: &str, had_tool_use: bool) -> &'static str {
+    if had_tool_use {
+        "tool_use"
+    } else {
+        match finish_reason {
+            "length" => "max_tokens",
+            "stop_sequence" => "stop_sequence",
+            _ => "end_turn",
+        }
+    }
+}
+
 async fn anthropic_messages(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1479,6 +1516,12 @@ async fn anthropic_messages(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("lamu");
+    let oai_finish = oai_resp
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("stop");
     let usage = oai_resp.get("usage");
     let in_tokens = usage
         .and_then(|u| u.get("prompt_tokens"))
@@ -1527,7 +1570,7 @@ async fn anthropic_messages(
             }
         }))).into_response();
     }
-    let stop_reason = if had_tool_use { "tool_use" } else { "end_turn" };
+    let stop_reason = anthropic_stop_reason(oai_finish, had_tool_use);
 
     let anthro = json!({
         "id": format!("msg_{}", random_hex(12)),
@@ -1789,7 +1832,7 @@ async fn stream_response_anthropic(
             emitted_tools = true;
         }
 
-        let stop_reason = if emitted_tools { "tool_use" } else { "end_turn" };
+        let stop_reason = anthropic_stop_reason(&finish_reason, emitted_tools);
         let m_delta = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null},
@@ -1844,8 +1887,11 @@ struct OllamaOptions {
     min_p: Option<f32>,
     #[serde(default)]
     repeat_penalty: Option<f32>,
+    // Ollama's documented sentinels -1 (infinite) and -2 (fill context) are
+    // negative, so this MUST be i32 — `Option<u32>` 422'd the whole request
+    // (M4). Negatives are normalized to "no explicit cap" at the mapping site.
     #[serde(default)]
-    num_predict: Option<u32>,
+    num_predict: Option<i32>,
 }
 
 async fn ollama_tags(State(state): State<AppState>) -> impl IntoResponse {
@@ -1877,7 +1923,10 @@ async fn ollama_chat(
     // sampling profile merge downstream can distinguish omitted-vs-set.
     // The builtin default is applied as the final merge fallback in
     // chat_completions / stream_response_ollama.
-    let max_tokens = opts.num_predict;
+    // Normalize Ollama's num_predict: a negative sentinel (-1 infinite, -2
+    // fill-context) or 0 means "no explicit cap" → None, so the per-model
+    // profile / builtin default applies. Positive → the requested cap (M4).
+    let max_tokens: Option<u32> = opts.num_predict.and_then(|n| u32::try_from(n).ok()).filter(|&n| n > 0);
     let temperature = opts.temperature;
 
     let messages: Vec<Message> = req.messages.iter().map(|m| Message {
@@ -2136,6 +2185,46 @@ async fn stream_response_ollama(
 mod compat_tests {
     use super::*;
     use proptest::prelude::*;
+
+    // ── bug-hunt batch A regressions ────────────────────────────────
+
+    #[test]
+    fn anthropic_stop_reason_maps_length_to_max_tokens() {
+        // M2: a length-truncated completion must report max_tokens, not end_turn.
+        assert_eq!(anthropic_stop_reason("length", false), "max_tokens");
+        assert_eq!(anthropic_stop_reason("stop", false), "end_turn");
+        assert_eq!(anthropic_stop_reason("stop_sequence", false), "stop_sequence");
+        // tool_use wins regardless of finish_reason.
+        assert_eq!(anthropic_stop_reason("length", true), "tool_use");
+        assert_eq!(anthropic_stop_reason("stop", true), "tool_use");
+    }
+
+    #[test]
+    fn random_hex_is_random_and_unique() {
+        // M3: ids must not collide back-to-back (Anthropic requires unique
+        // tool_use ids) and must be the requested length of hex.
+        let a = random_hex(12);
+        let b = random_hex(12);
+        assert_eq!(a.len(), 12);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two consecutive ids must differ");
+        let many: std::collections::HashSet<_> = (0..1000).map(|_| random_hex(12)).collect();
+        assert!(many.len() >= 999, "1000 ids should be ~all distinct, got {}", many.len());
+    }
+
+    #[test]
+    fn ollama_num_predict_accepts_negative_sentinels() {
+        // M4: -1 (infinite) / -2 (fill-context) must deserialize, not 422.
+        for body in [
+            r#"{"model":"m","options":{"num_predict":-1},"messages":[]}"#,
+            r#"{"model":"m","options":{"num_predict":-2},"messages":[]}"#,
+            r#"{"model":"m","options":{"num_predict":256},"messages":[]}"#,
+        ] {
+            let req: OllamaChatRequest = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("must deserialize {body}: {e}"));
+            assert!(req.options.is_some());
+        }
+    }
 
     // ── enable_thinking serde plumbing ──────────────────────────────
 
