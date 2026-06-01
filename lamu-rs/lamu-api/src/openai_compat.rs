@@ -1,8 +1,10 @@
 //! OpenAI-compatible HTTP layer.
 //! Direct port of `lamu/api/openai_compat.py`.
 
+use crate::keys::Principal;
 use crate::metrics::LamuMetrics;
-use axum::extract::State;
+use crate::quota::{QuotaCheck, QuotaManager};
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
@@ -111,6 +113,36 @@ pub struct ChatRequest {
 fn default_max_tokens() -> u32 { 16384 }
 fn default_temperature() -> f32 { 0.7 }
 
+/// Bounded `user` label for the structured audit events. StaticToken/Off (no
+/// Principal) → "anon" so the field is always present and never leaks an
+/// unbounded identity. ADR 0018 §5.
+fn user_label(principal: Option<&Principal>) -> &str {
+    principal.map(|p| p.user.as_str()).unwrap_or("anon")
+}
+
+/// Surface-correct 429 envelope (mirrors `auth::unauthorized`'s per-surface
+/// shapes). Anthropic shape on /v1/messages, Ollama flat-string on /api/*,
+/// else the OpenAI shape. The `limit` is surfaced in the human message and a
+/// `Retry-After: 3600` hint is attached.
+fn over_quota(path: &str, limit: u32) -> Response {
+    let human = format!(
+        "daily token quota exhausted (limit {limit}); retry after the bucket refills"
+    );
+    let body = if path.starts_with("/v1/messages") {
+        Json(json!({"type":"error","error":{"type":"rate_limit_error","message": human}}))
+    } else if path.starts_with("/api/") {
+        Json(json!({"error": human}))
+    } else {
+        Json(json!({"error":{"message": human,"type":"rate_limit_exceeded"}}))
+    };
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "3600")],
+        body,
+    )
+        .into_response()
+}
+
 /// HTTP auth backend (ADR 0018, supersedes ADR 0012's single token).
 ///   * `Off`         — frictionless loopback; the middleware is a no-op.
 ///   * `StaticToken` — the resolved LAMU_API_TOKEN / api-token; the ADR-0012
@@ -145,6 +177,9 @@ pub struct AppState {
     /// path). `KeyStore` → per-token verify + Principal. Resolved once at
     /// `build_state`.
     pub auth: Arc<AuthMode>,
+    /// Per-user token-bucket quotas (ADR 0018 P2). Shared in-memory; a no-op
+    /// for StaticToken/Off (no Principal → unlimited).
+    pub quota: Arc<QuotaManager>,
 }
 
 pub fn build_app(state: AppState) -> AxumRouter {
@@ -215,7 +250,25 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 /// llama-server `--embedding`), and proxies the body to the backend's
 /// `/v1/embeddings`, passing the response through verbatim. Lets RAG
 /// front-ends point `EMBEDDING_URL` at `lamu serve`.
-async fn embeddings(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn embeddings(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let principal: Option<Principal> = principal.map(|Extension(p)| p);
+    let principal_ref = principal.as_ref();
+    if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
+        tracing::info!(
+            target: "lamu_audit",
+            user = user_label(principal_ref),
+            route = "/v1/embeddings",
+            status = 429u16,
+            prompt_tokens = 0u64,
+            completion_tokens = 0u64,
+            "request rejected: quota exceeded (limit {limit})",
+        );
+        return over_quota("/v1/embeddings", limit);
+    }
     let is_embed = |e: &ModelEntry| {
         e.capabilities.contains(&lamu_core::types::Capability::Embedding)
     };
@@ -399,8 +452,33 @@ struct ErrorBody<'a> {
 
 async fn chat_completions(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
+    // Unwrap the Extension newtype → Option<Principal>. None on StaticToken/Off.
+    let principal: Option<Principal> = principal.map(|Extension(p)| p);
+    let principal_ref = principal.as_ref();
+    let route = "/v1/chat/completions";
+
+    // Pre-flight quota gate (ADR 0018 §4). Unlimited for no-principal /
+    // None-quota; 429 on an exhausted bucket. Audited as status=429.
+    if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
+        state.metrics.requests_total
+            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "quota_exceeded"])
+            .inc();
+        tracing::info!(
+            target: "lamu_audit",
+            user = user_label(principal_ref),
+            model = req.model.as_deref().unwrap_or("unknown"),
+            route,
+            status = 429u16,
+            prompt_tokens = 0u64,
+            completion_tokens = 0u64,
+            "request rejected: quota exceeded (limit {limit})",
+        );
+        return over_quota(route, limit).into_response();
+    }
+
     let completion_id = format!("chatcmpl-{}", random_hex(12));
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let t_start = Instant::now();
@@ -645,6 +723,21 @@ async fn chat_completions(
         }
     }
 
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Debit the user's bucket by the tokens actually produced (ADR 0018 §4).
+    state.quota.charge(principal_ref, completion_tokens);
+    // Per-request audit event (ADR 0018 §5) — the durable who-did-what.
+    tracing::info!(
+        target: "lamu_audit",
+        user = user_label(principal_ref),
+        key_id = principal_ref.map(|p| p.key_id).unwrap_or(0),
+        model = %model_name,
+        route,
+        status = 200u16,
+        prompt_tokens,
+        completion_tokens,
+        "request served",
+    );
     Json(response).into_response()
 }
 
@@ -939,6 +1032,7 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
         metrics: Arc::new(metrics),
         http_port,
         auth: Arc::new(crate::auth::resolve_auth_mode()),
+        quota: Arc::new(QuotaManager::new()),
     })
 }
 
@@ -1158,6 +1252,7 @@ pub(crate) fn anthropic_error_type(status: StatusCode) -> &'static str {
 
 async fn anthropic_messages(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Json(req): Json<AnthropicRequest>,
 ) -> Response {
     // Translate to OpenAI-style messages. For multi-turn tool flows,
@@ -1185,6 +1280,14 @@ async fn anthropic_messages(
     let oai_tools = req.tools.as_ref().map(|t| anthropic_tools_to_openai(t));
     let oai_tool_choice = req.tool_choice.as_ref().map(anthropic_tool_choice_to_openai);
 
+    // Pre-flight quota gate for the STREAMING anthropic path (the non-stream
+    // path inherits the gate from the delegated chat_completions call below).
+    {
+        let principal_ref = principal.as_ref().map(|Extension(p)| p);
+        if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
+            return over_quota("/v1/messages", limit);
+        }
+    }
     if req.stream {
         return stream_response_anthropic(state, messages, req.model.clone(),
                                          req.max_tokens, req.temperature,
@@ -1209,7 +1312,7 @@ async fn anthropic_messages(
         tool_choice: oai_tool_choice,
     };
 
-    let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
+    let resp = chat_completions(State(state), principal, Json(oai_req)).await.into_response();
     let (parts, body) = resp.into_parts();
     if parts.status != StatusCode::OK {
         // Translate the delegated OpenAI-shaped error into Anthropic's
@@ -1667,6 +1770,7 @@ async fn ollama_tags(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn ollama_chat(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Json(req): Json<OllamaChatRequest>,
 ) -> Response {
     let stream_on = req.stream.unwrap_or(true);
@@ -1683,6 +1787,12 @@ async fn ollama_chat(
         content: m.content.clone(),
     }).collect();
 
+    {
+        let principal_ref = principal.as_ref().map(|Extension(p)| p);
+        if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
+            return over_quota("/api/chat", limit);
+        }
+    }
     if stream_on {
         return stream_response_ollama(state, messages, req.model.clone(),
                                       max_tokens, temperature,
@@ -1705,7 +1815,7 @@ async fn ollama_chat(
         tools: None,
         tool_choice: None,
     };
-    let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
+    let resp = chat_completions(State(state), principal, Json(oai_req)).await.into_response();
     let (parts, body) = resp.into_parts();
     if parts.status != StatusCode::OK {
         // Translate the delegated OpenAI-shaped error into Ollama's flat

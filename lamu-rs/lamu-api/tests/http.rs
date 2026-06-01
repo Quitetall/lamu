@@ -57,6 +57,7 @@ fn make_state() -> AppState {
         metrics: Arc::new(LamuMetrics::new().unwrap()),
         http_port: 8020,
         auth: Arc::new(AuthMode::Off), // auth off by default in route tests
+        quota: Arc::new(lamu_api::quota::QuotaManager::new()),
     }
 }
 
@@ -398,4 +399,136 @@ async fn auth_off_passes_without_bearer() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── per-user quota (ADR 0018 P2) ────────────────────────────────────
+
+use lamu_api::keys::KeyStore;
+
+/// Build state with a KeyStore auth backend holding a single key for `user`
+/// with `quota` daily tokens. Returns (state, plaintext_token).
+fn state_with_keystore(user: &str, quota: Option<u32>) -> (AppState, String) {
+    let path = std::env::temp_dir().join(format!(
+        "lamu-http-keys-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let ks = KeyStore::open(&path).unwrap();
+    let token = ks.issue_with(user, 0, quota).unwrap();
+    let mut st = make_state();
+    st.auth = Arc::new(AuthMode::KeyStore(Arc::new(ks)));
+    (st, token)
+}
+
+#[tokio::test]
+async fn quota_unlimited_key_is_not_rate_limited() {
+    // None quota → unlimited. With no loaded model the handler still reaches
+    // the 503 (no candidate) path, NOT a 429 — proving the gate admitted it.
+    let (st, token) = state_with_keystore("alice", None);
+    let app = build_app(st);
+    let resp = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"qwen35-27b","messages":[{"role":"user","content":"hi"}]}"#))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn quota_zero_key_is_429_openai_shape() {
+    // Zero daily quota → hard 429 before any routing, OpenAI envelope.
+    let (st, token) = state_with_keystore("bob", Some(0));
+    let app = build_app(st);
+    let resp = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"qwen35-27b","messages":[{"role":"user","content":"hi"}]}"#))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "3600");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+}
+
+#[tokio::test]
+async fn quota_zero_key_429_anthropic_shape() {
+    let (st, token) = state_with_keystore("carol", Some(0));
+    let app = build_app(st);
+    let resp = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"qwen35-27b","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "rate_limit_error");
+}
+
+#[tokio::test]
+async fn quota_zero_key_429_ollama_flat_shape() {
+    let (st, token) = state_with_keystore("dave", Some(0));
+    let app = build_app(st);
+    let resp = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/chat")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"qwen35-27b","stream":false,"messages":[{"role":"user","content":"hi"}]}"#))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v["error"].is_string(), "ollama error must be a flat string");
+}
+
+#[tokio::test]
+async fn static_token_path_never_429s_on_quota() {
+    // StaticToken carries NO Principal → unlimited. A right-bearer request
+    // with no loaded model returns 503 (no candidate), never 429.
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer lamu_secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"qwen35-27b","messages":[{"role":"user","content":"hi"}]}"#))
+            .unwrap(),
+    ).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn keystore_unknown_token_still_401() {
+    // Quota wiring must not weaken auth: an unknown bearer is 401, not 429.
+    let (st, _token) = state_with_keystore("eve", Some(100));
+    let app = build_app(st);
+    let resp = app.oneshot(
+        Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer lamu_unknown")
+            .body(Body::empty())
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

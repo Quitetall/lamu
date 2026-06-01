@@ -5,6 +5,7 @@ pub mod auth;
 pub mod keys;
 pub mod metrics;
 pub mod openai_compat;
+pub mod quota;
 
 use lamu_core::config::registry_path;
 use std::net::SocketAddr;
