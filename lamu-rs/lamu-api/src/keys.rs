@@ -118,6 +118,14 @@ fn default_db_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("cannot resolve config dir (~/.config)"))?
         .join("lamu");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    // 0700 the config dir so a directory listing can't even reveal that a key
+    // store exists (the keys.db itself is 0600; this closes the dir-listing
+    // enumeration channel). Best-effort.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     Ok(dir.join("keys.db"))
 }
 
@@ -193,7 +201,7 @@ impl KeyStore {
                     user: r.get(1)?,
                     key_id: r.get(2)?,
                     priority: r.get(3)?,
-                    daily_token_quota: quota.map(|q| q as u32),
+                    daily_token_quota: quota.and_then(|q| u32::try_from(q).ok()),
                 },
             ))
         })?;
@@ -288,20 +296,31 @@ impl KeyStore {
         if prefix.is_empty() {
             return Err(anyhow!("prefix is required"));
         }
-        let affected = {
+        // Hold the conn lock for the UPDATE *and* the hash-collect, then evict
+        // exactly those hashes from the cache. This is race-free + immediate:
+        // no full clear-then-reload (which would briefly 401 every live key),
+        // and the revoked hash is gone from the cache the instant we return.
+        let (affected, hashes): (usize, Vec<String>) = {
             let conn = self.conn.lock();
-            conn.execute(
-                "UPDATE api_keys SET revoked_at = ? \
-                 WHERE token_prefix = ? AND revoked_at IS NULL",
-                params![now_secs(), prefix],
-            )
-            .context("revoke api_key")?
+            let affected = conn
+                .execute(
+                    "UPDATE api_keys SET revoked_at = ? \
+                     WHERE token_prefix = ? AND revoked_at IS NULL",
+                    params![now_secs(), prefix],
+                )
+                .context("revoke api_key")?;
+            let mut stmt = conn.prepare("SELECT token_hash FROM api_keys WHERE token_prefix = ?")?;
+            let hashes = stmt
+                .query_map([prefix], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            (affected, hashes)
         };
         if affected > 0 {
-            // Rebuild the cache from the now-updated table so the revoked
-            // hash(es) are gone. Cheap (key count is tiny) and race-free vs.
-            // tracking which hash mapped to the prefix.
-            self.warm_cache()?;
+            let mut cache = self.cache.lock();
+            for h in &hashes {
+                cache.remove(h);
+            }
         }
         Ok(affected > 0)
     }
@@ -331,49 +350,19 @@ impl KeyStore {
         Ok(out)
     }
 
-    /// Verify a presented token. Hashes it (SHA-256) and looks the hash up in
-    /// the in-memory cache (which holds only live, non-revoked keys). On a hit
-    /// returns the [`Principal`] and updates `last_used_at` fire-and-forget; on
-    /// a miss computes a **dummy hash** of equal work so the miss path is not
-    /// measurably faster than the hit path (defeats user-enumeration timing,
-    /// ADR 0018 Rationale).
+    /// Verify a presented token: SHA-256 it and look the hash up in the
+    /// in-memory cache (live, non-revoked keys only — `revoke` evicts directly,
+    /// `issue` seeds). `Some(Principal)` on a hit, `None` otherwise.
     ///
-    /// Revoked keys never reach the cache (revoke calls `warm_cache`), so a
-    /// revoked token verifies as a miss → `None`.
+    /// No timing equalizer: the cache key IS the full SHA-256, so the lookup is
+    /// content-independent (no per-key oracle), and the HTTP response code (200
+    /// vs 401) already reveals validity — there is no separate username step to
+    /// enumerate, so a dummy hash would only be theater. No DB write on this hot
+    /// path either: `last_used_at` is a P2 (batched) concern, not worth
+    /// serializing every authenticated request through the connection mutex.
     pub fn verify(&self, token: &str) -> Option<Principal> {
-        let token = token.trim();
-        let hash = sha256_hex(token);
-
-        let principal = self.cache.lock().get(&hash).cloned();
-        match principal {
-            Some(p) => {
-                // Fire-and-forget last_used_at: a write hiccup must NOT fail an
-                // otherwise-valid auth. Best-effort UPDATE, errors only logged.
-                self.touch_last_used(&hash);
-                Some(p)
-            }
-            None => {
-                // Constant-work dummy hash so a miss is not faster than a hit —
-                // the cache lookup itself is the only data-dependent step, and
-                // it is O(1) on a hashed key either way. The std HashMap is not
-                // a timing oracle for the secret here (the hash is already the
-                // full SHA-256), but we keep the work symmetric on principle.
-                let _dummy = sha256_hex("lamu_dummy_miss_timing_equalizer");
-                None
-            }
-        }
-    }
-
-    /// Best-effort `last_used_at = now` for the row with this `token_hash`.
-    /// Errors are logged, never propagated — see [`KeyStore::verify`].
-    fn touch_last_used(&self, token_hash: &str) {
-        let conn = self.conn.lock();
-        if let Err(e) = conn.execute(
-            "UPDATE api_keys SET last_used_at = ? WHERE token_hash = ?",
-            params![now_secs(), token_hash],
-        ) {
-            tracing::debug!("keys: touch last_used_at failed: {e}");
-        }
+        let hash = sha256_hex(token.trim());
+        self.cache.lock().get(&hash).cloned()
     }
 
     /// Count of currently-live (non-revoked) keys. The off-loopback startup

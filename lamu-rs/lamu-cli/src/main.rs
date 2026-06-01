@@ -473,7 +473,7 @@ fn cmd_auth_issue(user: &str) -> Result<()> {
     println!("\n    {token}\n");
     println!("Shown ONCE — only its SHA-256 is stored. Clients send:");
     println!("    Authorization: Bearer {token}");
-    println!("`lamu serve` now uses keys.db (AuthMode::KeyStore). `lamu auth list` / `lamu auth revoke <prefix>` to manage.");
+    println!("Restart `lamu serve` to apply (auth mode is resolved at startup). `lamu auth list` / `lamu auth revoke <prefix>` to manage.");
     Ok(())
 }
 
