@@ -599,25 +599,36 @@ async fn p3_queue_none_when_flag_unset() {
 #[tokio::test]
 async fn p3_priority_orders_higher_first() {
     // Behavioral test of the exact queue config build_state uses
-    // (Strategy::Priority, concurrency 1) without needing a backend: a higher
-    // priority enqueued LATER must still be served before a lower one already
-    // waiting behind the single held slot.
+    // (Strategy::Priority, concurrency 1) without needing a backend: once the
+    // single slot is held, a higher-priority waiter is served before a lower
+    // one regardless of enqueue order. Synchronization is a Notify barrier (not
+    // sleeps) so the test is deterministic under CI load: we proceed only once
+    // the blocker has actually taken the slot, then hold it long enough for
+    // both waiters to enqueue before release.
     use lamu_core::queue::{QueueRequest, RequestQueue, Strategy};
     use std::time::Instant;
+    use tokio::sync::Notify;
     let q: Arc<RequestQueue<()>> = Arc::new(RequestQueue::new(Strategy::Priority, 1));
     let order = Arc::new(tokio::sync::Mutex::new(Vec::<&str>::new()));
+    let acquired = Arc::new(Notify::new()); // fired once the blocker holds the slot
+    let release = Arc::new(Notify::new()); // lets the blocker drop the slot
 
     let q1 = q.clone();
     let o1 = order.clone();
+    let acq = acquired.clone();
+    let rel = release.clone();
     let blocker = tokio::spawn(async move {
         let _g = q1
             .enqueue(QueueRequest { payload: (), priority: 0, enqueued_at: Instant::now(), origin: "blocker".into() })
             .await;
         o1.lock().await.push("block");
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        acq.notify_one(); // slot is now held
+        rel.notified().await; // wait until both waiters are enqueued
     });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    acquired.notified().await; // barrier: blocker holds the slot
 
+    // Both waiters enqueue while the slot is held; their relative enqueue order
+    // is irrelevant — Strategy::Priority must serve high (10) before low (1).
     let q2 = q.clone();
     let o2 = order.clone();
     let low = tokio::spawn(async move {
@@ -626,8 +637,6 @@ async fn p3_priority_orders_higher_first() {
             .await;
         o2.lock().await.push("low");
     });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
     let q3 = q.clone();
     let o3 = order.clone();
     let high = tokio::spawn(async move {
@@ -636,6 +645,13 @@ async fn p3_priority_orders_higher_first() {
             .await;
         o3.lock().await.push("high");
     });
+
+    // Deterministic: wait until BOTH waiters are actually pending behind the
+    // held slot (no timing guess), then release the blocker.
+    while q.depth().await < 2 {
+        tokio::task::yield_now().await;
+    }
+    release.notify_one();
 
     let _ = tokio::join!(blocker, low, high);
     assert_eq!(*order.lock().await, vec!["block", "high", "low"]);

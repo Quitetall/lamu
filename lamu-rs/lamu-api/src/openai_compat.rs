@@ -647,7 +647,7 @@ async fn chat_completions(
     let _g = if let Some(q) = state.priority_queue.as_ref() {
         Some(q.enqueue(QueueRequest {
             payload: (),
-            priority: principal_ref.map(|p| p.priority).unwrap_or(0),
+            priority: principal_ref.map_or(0, |p| p.priority),
             enqueued_at: Instant::now(),
             origin: user_label(principal_ref).to_string(),
         }).await)
