@@ -268,14 +268,21 @@ fn cmd_cookbook() -> Result<()> {
     let specs: Vec<cookbook::ModelSpec> = entries
         .iter()
         .filter(|e| e.modality.is_llm() && e.params_b > 0.0)
-        .map(|e| cookbook::ModelSpec {
-            name: e.name.clone(),
-            params_b: e.params_b,
-            active_params_b: e.params_b, // dense; MoE fidelity is Phase 2
-            is_moe: false,
-            quant: e.quant.clone(),
-            context_max: e.context_max,
-            use_case: infer_use_case(e),
+        .map(|e| {
+            // MoE fidelity: an `A<N>B` name marker (qwen3.6-35b-a3b → 3B
+            // active) or a `*moe*` arch flags a sparse model. Active params
+            // drive the roofline + KV; TOTAL params still drive VRAM.
+            let active = cookbook::active_params_from_name(&e.name);
+            let is_moe = active.is_some() || e.arch.to_ascii_lowercase().contains("moe");
+            cookbook::ModelSpec {
+                name: e.name.clone(),
+                params_b: e.params_b,
+                active_params_b: active.unwrap_or(e.params_b),
+                is_moe,
+                quant: e.quant.clone(),
+                context_max: e.context_max,
+                use_case: infer_use_case(e),
+            }
         })
         .collect();
 

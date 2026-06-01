@@ -476,6 +476,24 @@ pub fn score_model(spec: &ModelSpec, hw: &Hardware, use_case: &str, target_quant
     })
 }
 
+/// Active params (billions) parsed from an `A<N>B` name marker — the
+/// convention MoE models use (e.g. `qwen3.6-35b-a3b` → 3.0, `…-a22b` → 22.0).
+/// `None` when no marker is present (treat as dense → active == total). This
+/// is the lean signal LAMU has without a persisted active-param count; the
+/// roofline + KV use it, while VRAM still counts TOTAL params.
+pub fn active_params_from_name(name: &str) -> Option<f32> {
+    for tok in name.to_ascii_lowercase().split(['-', '_']) {
+        if let Some(mid) = tok.strip_prefix('a').and_then(|s| s.strip_suffix('b')) {
+            if let Ok(v) = mid.parse::<f32>() {
+                if v > 0.0 {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Score + rank a set of models, best composite first.
 pub fn rank(specs: &[ModelSpec], hw: &Hardware, use_case: &str, target_quant: Option<&str>) -> Vec<FitResult> {
     let mut out: Vec<FitResult> = specs
@@ -575,6 +593,26 @@ mod tests {
         let r = score_model(&spec, &rtx4090(), "general", Some("Q8_0")).unwrap();
         assert_ne!(r.fit_level, FitLevel::TooTight);
         assert_ne!(r.quant, "Q8_0"); // fell back to a smaller quant
+    }
+
+    #[test]
+    fn active_params_marker_parsed() {
+        assert_eq!(active_params_from_name("qwen3.6-35b-a3b-heretic"), Some(3.0));
+        assert_eq!(active_params_from_name("gemma-4-26b-a4b-it"), Some(4.0));
+        assert_eq!(active_params_from_name("qwen3-235b-a22b"), Some(22.0));
+        assert_eq!(active_params_from_name("qwen3.6-27b-uncensored"), None);
+        assert_eq!(active_params_from_name("gpt2-xl"), None);
+    }
+
+    #[test]
+    fn moe_active_params_speed_up_roofline() {
+        // 35B total but 3B active → roofline reads 3B/token, not 35B.
+        let mut moe = dense("q-35b-a3b", 35.0, "Q4_K_M", 8192, "general");
+        moe.active_params_b = 3.0;
+        moe.is_moe = true;
+        let dense_tps = estimate_tps(&dense("q-35b", 35.0, "Q4_K_M", 8192, "general"), "Q4_K_M", RunMode::Gpu, &rtx4090());
+        let moe_tps = estimate_tps(&moe, "Q4_K_M", RunMode::Gpu, &rtx4090());
+        assert!(moe_tps > dense_tps * 3.0, "moe {moe_tps} vs dense {dense_tps}");
     }
 
     #[test]
