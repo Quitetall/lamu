@@ -64,11 +64,19 @@ pub(super) fn save_api_key(var_name: &str, key_val: &str) -> std::io::Result<std
     std::fs::write(&path, updated)?;
     // M14: api-keys.env holds secrets — make it owner-only (0600). Without this
     // a freshly-created file inherits the umask (typically 0644 = world/group
-    // readable), unlike the sibling cloud_config::save_api_key_env writer.
+    // readable), unlike the sibling cloud_config::save_api_key_env writer. If
+    // chmod fails we must NOT leave a world-readable secret on disk: remove it
+    // and surface the error rather than silently downgrading the protection.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&path);
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("could not secure {} to 0600 ({e}); refusing to leave a world-readable key file", path.display()),
+            ));
+        }
     }
     Ok(path)
 }
