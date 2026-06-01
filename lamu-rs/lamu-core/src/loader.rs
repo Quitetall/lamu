@@ -26,6 +26,14 @@ use crate::scheduler::VramScheduler;
 use crate::types::{DevicePlacement, LoadedModel, ModelEntry, ModelState};
 use crate::{Error, Result};
 
+/// How long to wait after an auto-evict kill before re-planning, so NVML's
+/// used-VRAM reading reflects the freed memory. A fixed heuristic: llama-server
+/// releases VRAM on exit within ~1s, but NVML's per-process accounting can lag
+/// a beat; 3s is the same settle the MCP eviction path uses. The re-plan is
+/// conservative regardless — if usage hasn't dropped it returns VramExhausted
+/// rather than over-committing.
+const EVICT_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn spawn_gate() -> &'static AsyncMutex<()> {
     static GATE: OnceLock<AsyncMutex<()>> = OnceLock::new();
     GATE.get_or_init(|| AsyncMutex::new(()))
@@ -157,8 +165,15 @@ where
         return Err(Error::ModelNotFound(name.to_string()));
     };
 
-    let port = {
-        let mut sched = scheduler.lock();
+    // Plan the load. When it needs VRAM reclaimed: refuse by default (ADR
+    // 0006 — a shared endpoint must not surprise-kill a model another client
+    // uses), or, when LAMU_HTTP_AUTOEVICT is on (single-user desktop opt-in),
+    // capture the eviction targets and reclaim them with a VERIFIED kill before
+    // reserving. We only ever evict THIS scheduler's own resident models
+    // (handle-less HTTP spawns); VRAM held by another process (training / MCP)
+    // shows up only via NVML and is never an eviction candidate.
+    let evict_targets: Vec<(String, Option<u32>, u16)> = {
+        let sched = scheduler.lock();
         let (can, evict) = sched.plan_load(&entry);
         if !can {
             return Err(Error::VramExhausted {
@@ -166,12 +181,73 @@ where
                 have_mb: sched.available_mb(),
             });
         }
-        if !evict.is_empty() {
+        if evict.is_empty() {
+            Vec::new()
+        } else if !crate::config::http_autoevict() {
             return Err(Error::Config(format!(
                 "loading '{}' requires evicting {:?}; HTTP path won't auto-evict — \
-                 unload them via MCP first",
+                 set LAMU_HTTP_AUTOEVICT=1 to allow it, or unload them via MCP first",
                 entry.name, evict
             )));
+        } else {
+            evict
+                .iter()
+                .map(|n| {
+                    let (pid, port) =
+                        sched.get_loaded(n).map(|m| (m.pid, m.port)).unwrap_or((None, 0));
+                    (n.clone(), pid, port)
+                })
+                .collect()
+        }
+    };
+
+    // Verified eviction. The kill awaits run with NO scheduler lock held; the
+    // brief per-target mark_unloaded re-locks but never across an await. The
+    // global spawn_gate (held since the top of this fn) serializes every load
+    // in this process, so no concurrent ensure_loaded can race this eviction.
+    // mark_unloaded fires only AFTER kill_pid_and_verify confirms death — and
+    // we refuse the load rather than spawn onto VRAM we couldn't reclaim.
+    let mut already_evicted: Vec<&str> = Vec::new();
+    for (ev_name, ev_pid, ev_port) in &evict_targets {
+        let Some(pid) = ev_pid else {
+            // A Loaded model with no recorded pid (e.g. adopted via
+            // auto_register) — we cannot VERIFY a kill, so refuse rather than
+            // mark it unloaded and over-commit VRAM against a live process.
+            return Err(Error::Backend(format!(
+                "auto-evict of '{ev_name}': no pid recorded — unload it via MCP first"
+            )));
+        };
+        if let Err(e) = crate::backends::kill_pid_and_verify(*pid, *ev_port).await {
+            if !already_evicted.is_empty() {
+                tracing::warn!(
+                    evicted = ?already_evicted,
+                    "loader: auto-evict aborted mid-batch — listed models were already killed before '{}' failed; scheduler freed their VRAM",
+                    ev_name
+                );
+            }
+            return Err(Error::Backend(format!("auto-evict of '{ev_name}' failed: {e}")));
+        }
+        scheduler.lock().mark_unloaded(ev_name);
+        HealthRegistry::drop(&mut health.lock(), ev_name);
+        already_evicted.push(ev_name.as_str());
+        tracing::info!(model = %ev_name, "loader: auto-evicted to make room (LAMU_HTTP_AUTOEVICT)");
+    }
+    if !evict_targets.is_empty() {
+        // Let NVML's used-VRAM reading drop before we re-plan against it.
+        tokio::time::sleep(EVICT_SETTLE).await;
+    }
+
+    // Re-plan + reserve under the lock. After eviction the load must now fit;
+    // if a concurrent load raced in and took the freed room, surface it as
+    // VramExhausted rather than spawning into an over-committed device.
+    let port = {
+        let mut sched = scheduler.lock();
+        let (can, evict) = sched.plan_load(&entry);
+        if !can || !evict.is_empty() {
+            return Err(Error::VramExhausted {
+                need_mb: entry.vram_mb,
+                have_mb: sched.available_mb(),
+            });
         }
         let Some(port) = pick_backend_port(&sched, http_serve_port) else {
             return Err(Error::Backend(
@@ -257,6 +333,11 @@ mod tests {
     use futures_util::stream::Stream;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Serializes the two tests that read LAMU_HTTP_AUTOEVICT so one's env
+    /// mutation can't race the other (process-global env). No other loader
+    /// test reaches the eviction branch, so they don't need the lock.
+    static EVICT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn fake_entry(name: &str, vram: u32) -> ModelEntry {
         ModelEntry {
@@ -452,6 +533,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_loaded_refuses_eviction_required() {
+        let _g = EVICT_ENV_LOCK.lock().unwrap();
+        // SAFETY: lock held; the only other env reader (the autoevict test)
+        // is serialized behind the same lock.
+        unsafe { std::env::remove_var("LAMU_HTTP_AUTOEVICT"); }
         let occupier = fake_entry("occupier", 20_000);
         let new_entry = fake_entry("new", 10_000);  // forces evicting 'occupier'
         let mut entries = HashMap::new();
@@ -476,6 +561,47 @@ mod tests {
         assert!(msg.contains("evict"), "error must mention eviction: {msg}");
         assert!(msg.contains("MCP"), "error must direct user to MCP: {msg}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_autoevicts_when_enabled() {
+        let _g = EVICT_ENV_LOCK.lock().unwrap();
+        // SAFETY: lock held; serialized against the refuses test above.
+        unsafe { std::env::set_var("LAMU_HTTP_AUTOEVICT", "1"); }
+
+        // Occupier on a CLOSED port → kill_pid_and_verify sees the port silent
+        // and confirms death immediately (no real process is signalled).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let occupier = fake_entry("occupier", 20_000);
+        let new_entry = fake_entry("new", 10_000); // forces evicting 'occupier'
+        let mut entries = HashMap::new();
+        entries.insert(occupier.name.clone(), occupier.clone());
+        entries.insert(new_entry.name.clone(), new_entry);
+        let (sched, health) = fresh_state(24_000);
+        sched.lock().register_loaded(occupier, Some(987654), dead_port, 20_000);
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let spawn = |e: ModelEntry, port: u16| {
+            let calls = calls.clone();
+            let e = e.clone();
+            Box::pin(async move {
+                let mut b = FakeBackend::new(calls);
+                let pid = b.load(&e, port).await?;
+                Ok::<_, Error>((Box::new(b) as Box<dyn Backend>, pid))
+            })
+        };
+        let lm = ensure_loaded_with("new", &entries, &sched, &health, None, spawn)
+            .await
+            .expect("autoevict should reclaim VRAM and load 'new'");
+        unsafe { std::env::remove_var("LAMU_HTTP_AUTOEVICT"); }
+
+        assert_eq!(lm.entry.name, "new");
+        assert!(sched.lock().is_loaded("new"), "new model loaded after auto-evict");
+        assert!(!sched.lock().is_loaded("occupier"), "occupier was auto-evicted");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one spawn — the new model");
     }
 
     #[tokio::test]

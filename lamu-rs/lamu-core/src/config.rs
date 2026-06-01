@@ -123,6 +123,46 @@ pub fn backend_bind_host() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
+
+/// Whether the HTTP serve path may auto-evict its OWN resident models to make
+/// room for an on-demand load. OFF by default (ADR 0006): on a shared GPU a
+/// request must never surprise-kill a model another client uses, and lamu must
+/// never touch VRAM it didn't allocate (e.g. a training job). A single-user
+/// desktop (Odysseus) opts in with `LAMU_HTTP_AUTOEVICT=1` so selecting an
+/// inactive model just loads it instead of returning 503. Accepts 1/true/yes/on
+/// (case-insensitive); anything else (incl. unset) is false.
+pub fn http_autoevict() -> bool {
+    env_truthy(&std::env::var("LAMU_HTTP_AUTOEVICT").unwrap_or_default())
+}
+
+/// Parse a boolean-ish env value: 1/true/yes/on (case-insensitive) → true,
+/// everything else (incl. empty) → false. Pure so it's testable without
+/// mutating process-global env (which races across the test runner).
+fn env_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(test)]
+mod autoevict_tests {
+    use super::env_truthy;
+
+    #[test]
+    fn env_truthy_accepts_canonical_true_values() {
+        for v in ["1", "true", "TRUE", "yes", "On", "  on  "] {
+            assert!(env_truthy(v), "{v:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn env_truthy_rejects_everything_else() {
+        for v in ["", "0", "false", "no", "off", "2", "enabled", "y"] {
+            assert!(!env_truthy(v), "{v:?} should be falsey");
+        }
+    }
+}
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_CTX_SIZE: u32 = 131072;
 
