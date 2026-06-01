@@ -16,6 +16,7 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let state = openai_compat::build_state(&registry_path(), port)?;
     openai_compat::auto_register(&state).await;
     spawn_main_preload(state.clone());
+    spawn_reconcile_loop(&state);
     // Resolve auth once: the value the middleware will enforce (in state.auth)
     // is the same one the off-loopback gate checks below. KeyStore counts as
     // "configured" ONLY with ≥1 active key — an empty store off-loopback must
@@ -255,6 +256,32 @@ fn spawn_main_preload(state: openai_compat::AppState) {
             ),
         }
     });
+}
+
+/// Spawn the liveness reconciliation loop (lamu-core). Every
+/// `LAMU_RECONCILE_SECS` (default 7) it probes each `Loaded` model and
+/// `mark_unloaded`s any whose backend is dead — so `/health` and
+/// `/v1/models` can never report a phantom-loaded model that crashed,
+/// got OOM-killed, or was torn down out-of-band. Set the env to `0` to
+/// disable (e.g. a deterministic test harness that asserts raw state).
+fn spawn_reconcile_loop(state: &openai_compat::AppState) {
+    let secs = std::env::var("LAMU_RECONCILE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(lamu_core::reconcile::DEFAULT_INTERVAL_SECS);
+    if secs == 0 {
+        tracing::info!("reconcile: disabled (LAMU_RECONCILE_SECS=0)");
+        return;
+    }
+    let scheduler = state.scheduler.clone();
+    let health = state.health.clone();
+    let client = state.client.clone();
+    tokio::spawn(lamu_core::reconcile::run_reconcile_loop(
+        scheduler,
+        health,
+        client,
+        std::time::Duration::from_secs(secs),
+    ));
 }
 
 #[cfg(test)]
