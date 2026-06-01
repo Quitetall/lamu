@@ -519,10 +519,12 @@ impl LamuMcpServer {
             None => return "error: missing 'name' argument".into(),
         };
 
-        // Resolve under lock, take the Child handle out, release lock,
-        // THEN wait. Avoids holding the parking_lot lock across an
-        // await point.
-        let dead = {
+        // Resolve target + capture (pid, port) + TAKE the backend handle under
+        // the lock — but do NOT mark_unloaded yet. The scheduler state is
+        // flipped ONLY after the kill is verified, so we never report a model
+        // dead while its backend is still alive (the "LAMU said qwen3.6 was
+        // dead, it was not" bug). Lock is released before any await.
+        let (target, backend, pid, port) = {
             let mut st = self.state.lock();
             let target: Option<String> = st.scheduler.loaded_models().iter()
                 .find(|m| m.entry.name.contains(&name) || name.contains(m.entry.name.as_str()))
@@ -530,24 +532,67 @@ impl LamuMcpServer {
             let Some(target) = target else {
                 return format!("Model '{}' not loaded.", name);
             };
+            let (pid, port) = st.scheduler.get_loaded(&target)
+                .map(|m| (m.pid, m.port))
+                .unwrap_or((None, 0));
             let backend = st.backends.remove(&target);
-            st.scheduler.mark_unloaded(&target);
-            st.health.drop(&target);
-            (target, backend)
+            (target, backend, pid, port)
         };
-        let (target, backend) = dead;
-        if let Some(backend_arc) = backend {
+
+        // Kill + verify OUTSIDE the lock. Two paths:
+        //  - MCP-spawned: we retained the Backend handle → unload() group-kills,
+        //    reaps, and confirms the port released.
+        //  - HTTP-spawned (preload / serve on-demand): the handle was dropped,
+        //    so kill by the recorded (pid, port), port-anchored.
+        // NOTE: a concurrent unload of the same model is benign — the loser's
+        // backends.remove returns None, falls to the port-anchored pid kill,
+        // sees the port already released, and returns Ok; mark_unloaded is
+        // idempotent. Borrow the handle (as_ref) so the owned `backend` stays
+        // available to re-insert on failure without an extra Arc clone.
+        let kill_result: std::result::Result<(), String> = if let Some(backend_arc) = backend.as_ref() {
             let mut b = backend_arc.lock().await;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 b.unload(),
             ).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!("unload({}): backend errored: {}", target, e),
-                Err(_) => warn!("unload({}): timeout — leaving zombie", target),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(format!("backend unload failed: {e}")),
+                Err(_) => Err("unload timed out after 30s".into()),
+            }
+        } else if let Some(pid) = pid {
+            lamu_core::backends::kill_pid_and_verify(pid, port)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            // No handle AND no pid — nothing identifiable to kill. Warn so the
+            // operator sees the state was cleared without a process kill.
+            warn!("unload({}): no backend handle and no pid — clearing state without a process kill", target);
+            Ok(())
+        };
+
+        match kill_result {
+            Ok(()) => {
+                let mut st = self.state.lock();
+                st.scheduler.mark_unloaded(&target);
+                st.health.drop(&target);
+                format!("Unloaded '{}'. VRAM freed.", target)
+            }
+            Err(reason) => {
+                // Could NOT confirm death: keep the model marked loaded and
+                // restore its handle so it stays controllable / routable. A
+                // retry (or the reconcile loop, once the process truly dies)
+                // will reconcile the state.
+                if let Some(h) = backend {
+                    self.state.lock().backends.insert(target.clone(), h);
+                }
+                warn!("unload({}): {}", target, reason);
+                format!(
+                    "error: unload('{}') could not confirm the backend died ({}). \
+                     Left marked loaded — the process may still hold VRAM; retry unload.",
+                    target, reason
+                )
             }
         }
-        format!("Unloaded '{}'. VRAM freed.", target)
     }
 
     pub(crate) fn handle_vram_status(&self) -> String {
