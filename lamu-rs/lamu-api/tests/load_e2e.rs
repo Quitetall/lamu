@@ -40,6 +40,7 @@ fn health_secs() -> u64 {
     std::env::var("LAMU_LOAD_HEALTH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1) // 0 → immediate-fail trap; clamp like concurrency()
         .unwrap_or(90)
 }
 
@@ -200,6 +201,7 @@ async fn mixed_surface_concurrent() {
                 .post(format!("{base}/api/chat"))
                 .json(&serde_json::json!({
                     "model": model, "stream": false,
+                    "options": {"num_predict": 64},
                     "messages": [{"role": "user", "content": "reply with just ok"}],
                     "enable_thinking": false,
                 }))
@@ -317,6 +319,7 @@ async fn streaming_under_load() {
                         .post(format!("{base}/api/chat"))
                         .json(&serde_json::json!({
                             "model": model, "stream": true,
+                            "options": {"num_predict": 64},
                             "enable_thinking": false,
                             "messages": [{"role": "user", "content": "reply with just ok"}],
                         }))
