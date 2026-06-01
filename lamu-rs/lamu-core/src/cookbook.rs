@@ -126,7 +126,8 @@ pub enum Backend {
     CpuArm,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunMode {
     Gpu,
     CpuOffload,
@@ -134,7 +135,8 @@ pub enum RunMode {
     NoFit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FitLevel {
     Perfect,
     Good,
@@ -166,7 +168,7 @@ pub struct ModelSpec {
     pub use_case: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FitResult {
     pub name: String,
     pub fit_level: FitLevel,
@@ -494,11 +496,22 @@ pub fn active_params_from_name(name: &str) -> Option<f32> {
     None
 }
 
-/// Score + rank a set of models, best composite first.
-pub fn rank(specs: &[ModelSpec], hw: &Hardware, use_case: &str, target_quant: Option<&str>) -> Vec<FitResult> {
+/// Score + rank a set of models, best composite first. Each model is scored
+/// at its OWN inferred `use_case` (weights + speed/context targets), unless
+/// `use_case_override` forces one lens for all (e.g. "rank my models for
+/// coding"). `target_quant` overrides the per-model native quant.
+pub fn rank(
+    specs: &[ModelSpec],
+    hw: &Hardware,
+    use_case_override: Option<&str>,
+    target_quant: Option<&str>,
+) -> Vec<FitResult> {
     let mut out: Vec<FitResult> = specs
         .iter()
-        .filter_map(|s| score_model(s, hw, use_case, target_quant))
+        .filter_map(|s| {
+            let uc = use_case_override.unwrap_or(s.use_case.as_str());
+            score_model(s, hw, uc, target_quant)
+        })
         .collect();
     out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     out
@@ -621,7 +634,7 @@ mod tests {
             dense("small-1b", 1.0, "Q4_K_M", 4096, "general"),
             dense("mid-13b", 13.0, "Q4_K_M", 8192, "general"),
         ];
-        let ranked = rank(&specs, &rtx4090(), "general", None);
+        let ranked = rank(&specs, &rtx4090(), None, None);
         assert_eq!(ranked.len(), 2);
         assert!(ranked[0].score >= ranked[1].score);
     }

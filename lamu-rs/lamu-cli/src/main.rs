@@ -131,9 +131,33 @@ enum Command {
         /// `DEEPSEEK_API_KEY`. Omit to be prompted for all unset keys.
         provider: Option<String>,
     },
-    /// Hardware-aware model fit: show GPU VRAM + which registry models fit
-    /// now / after an unload / not at all, plus popular models by tier.
-    Cookbook,
+    /// Hardware-aware model fit: rank registry LLMs by predicted throughput +
+    /// VRAM fit on the detected GPU (roofline scorer, ADR 0015).
+    Cookbook {
+        /// Score every model through one use-case lens
+        /// (general|coding|reasoning|chat|multimodal|embedding). Default:
+        /// each model's own inferred use-case.
+        #[arg(long)]
+        use_case: Option<String>,
+        /// Evaluate at this quant (e.g. Q4_K_M) instead of each model's native.
+        #[arg(long)]
+        quant: Option<String>,
+        /// Context length to score at. Default: each model's context_max.
+        #[arg(long)]
+        ctx: Option<u32>,
+        /// Simulate a different VRAM budget (MB) — "what could I run on a 48 GB card?".
+        #[arg(long)]
+        simulate_vram: Option<u32>,
+        /// Show only the top N results.
+        #[arg(long)]
+        top: Option<usize>,
+        /// Emit JSON (FitResult array) instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Also score a curated set of models you could `lamu pull`.
+        #[arg(long)]
+        suggest: bool,
+    },
     /// Manage the optional HTTP API bearer token (ADR 0012). Auth is off on a
     /// loopback bind; a token is required to bind off-loopback.
     Auth {
@@ -218,7 +242,23 @@ async fn main() -> Result<()> {
         Some(Command::CherryPick { session_id, glob }) => cmd_cherry_pick(&session_id, &glob),
         Some(Command::DropAgent { session_id }) => cmd_drop_agent(&session_id),
         Some(Command::Login { provider }) => cmd_login(provider),
-        Some(Command::Cookbook) => cmd_cookbook(),
+        Some(Command::Cookbook {
+            use_case,
+            quant,
+            ctx,
+            simulate_vram,
+            top,
+            json,
+            suggest,
+        }) => cmd_cookbook(CookbookOpts {
+            use_case,
+            quant,
+            ctx,
+            simulate_vram,
+            top,
+            json,
+            suggest,
+        }),
         Some(Command::Auth { action }) => cmd_auth(action),
     }
 }
@@ -246,13 +286,94 @@ fn infer_use_case(e: &lamu_core::types::ModelEntry) -> String {
     }
 }
 
-fn cmd_cookbook() -> Result<()> {
-    use lamu_core::cookbook::{self, Backend, FitLevel, Hardware};
+struct CookbookOpts {
+    use_case: Option<String>,
+    quant: Option<String>,
+    ctx: Option<u32>,
+    simulate_vram: Option<u32>,
+    top: Option<usize>,
+    json: bool,
+    suggest: bool,
+}
+
+/// Build a cookbook ModelSpec from a registry entry. MoE fidelity: an `A<N>B`
+/// name marker (qwen3.6-35b-a3b → 3B active) or a `*moe*` arch flags a sparse
+/// model — active params drive the roofline + KV; TOTAL params still drive VRAM.
+fn entry_to_spec(e: &lamu_core::types::ModelEntry, ctx_override: Option<u32>) -> lamu_core::cookbook::ModelSpec {
+    let active = lamu_core::cookbook::active_params_from_name(&e.name);
+    let is_moe = active.is_some() || e.arch.to_ascii_lowercase().contains("moe");
+    lamu_core::cookbook::ModelSpec {
+        name: e.name.clone(),
+        params_b: e.params_b,
+        active_params_b: active.unwrap_or(e.params_b),
+        is_moe,
+        quant: e.quant.clone(),
+        context_max: ctx_override.unwrap_or(e.context_max),
+        use_case: infer_use_case(e),
+    }
+}
+
+/// Curated "you could pull this" set for `--suggest` (name, total B, quant,
+/// ctx, is_moe, active B, repo). Tiny + hand-picked — not an HF mirror.
+const CURATED: &[(&str, f32, &str, u32, bool, f32, &str)] = &[
+    ("qwen3-4b", 4.0, "Q4_K_M", 32768, false, 4.0, "Qwen/Qwen3-4B-Instruct-GGUF"),
+    ("mistral-small-24b", 24.0, "Q4_K_M", 32768, false, 24.0, "bartowski/Mistral-Small-24B-Instruct-2501-GGUF"),
+    ("qwen3-30b-a3b", 30.0, "Q4_K_M", 32768, true, 3.0, "Qwen/Qwen3-30B-A3B-GGUF"),
+    ("llama-3.3-70b", 70.0, "Q4_K_M", 8192, false, 70.0, "bartowski/Llama-3.3-70B-Instruct-GGUF"),
+    ("qwen3-235b-a22b", 235.0, "Q4_K_M", 32768, true, 22.0, "Qwen/Qwen3-235B-A22B-GGUF"),
+];
+
+fn cmd_cookbook(opts: CookbookOpts) -> Result<()> {
+    use lamu_core::cookbook::{self, Backend, FitLevel, Hardware, ModelSpec};
 
     let sched = lamu_core::scheduler::VramScheduler::new();
     let (used, total) = sched.query_vram();
     let gpu_name = sched.gpu_name();
-    if total == 0 {
+
+    // --simulate-vram overrides the detected card's budget.
+    let vram_mb = opts.simulate_vram.unwrap_or(total);
+    let hw = Hardware {
+        gpu_name: gpu_name.clone(),
+        gpu_vram_gb: vram_mb as f32 / 1024.0,
+        avail_ram_gb: 0.0, // GPU-only budget
+        backend: Backend::Cuda,
+    };
+
+    let entries =
+        lamu_core::registry::load_registry(&lamu_core::config::registry_path()).unwrap_or_default();
+    let mut specs: Vec<ModelSpec> = entries
+        .iter()
+        .filter(|e| e.modality.is_llm() && e.params_b > 0.0)
+        .map(|e| entry_to_spec(e, opts.ctx))
+        .collect();
+
+    if opts.suggest {
+        for (name, pb, q, ctx, is_moe, active, _repo) in CURATED {
+            specs.push(ModelSpec {
+                name: format!("{name}  (pull)"),
+                params_b: *pb,
+                active_params_b: *active,
+                is_moe: *is_moe,
+                quant: opts.quant.clone().unwrap_or_else(|| q.to_string()),
+                context_max: opts.ctx.unwrap_or(*ctx),
+                use_case: "general".to_string(),
+            });
+        }
+    }
+
+    let mut ranked = cookbook::rank(&specs, &hw, opts.use_case.as_deref(), opts.quant.as_deref());
+    if let Some(n) = opts.top {
+        ranked.truncate(n);
+    }
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&ranked)?);
+        return Ok(());
+    }
+
+    if let Some(sim) = opts.simulate_vram {
+        println!("Simulating {:.1} GB VRAM\n", sim as f32 / 1024.0);
+    } else if total == 0 {
         println!("GPU: no NVIDIA GPU detected via NVML — throughput uses the CPU fallback.\n");
     } else {
         println!(
@@ -263,43 +384,10 @@ fn cmd_cookbook() -> Result<()> {
         );
     }
 
-    let entries =
-        lamu_core::registry::load_registry(&lamu_core::config::registry_path()).unwrap_or_default();
-    let specs: Vec<cookbook::ModelSpec> = entries
-        .iter()
-        .filter(|e| e.modality.is_llm() && e.params_b > 0.0)
-        .map(|e| {
-            // MoE fidelity: an `A<N>B` name marker (qwen3.6-35b-a3b → 3B
-            // active) or a `*moe*` arch flags a sparse model. Active params
-            // drive the roofline + KV; TOTAL params still drive VRAM.
-            let active = cookbook::active_params_from_name(&e.name);
-            let is_moe = active.is_some() || e.arch.to_ascii_lowercase().contains("moe");
-            cookbook::ModelSpec {
-                name: e.name.clone(),
-                params_b: e.params_b,
-                active_params_b: active.unwrap_or(e.params_b),
-                is_moe,
-                quant: e.quant.clone(),
-                context_max: e.context_max,
-                use_case: infer_use_case(e),
-            }
-        })
-        .collect();
-
-    if specs.is_empty() {
-        println!("No LLM models in the registry — run `lamu scan` or `lamu pull <repo>`.");
+    if ranked.is_empty() {
+        println!("No LLM models — run `lamu scan`, `lamu pull <repo>`, or pass --suggest.");
         return Ok(());
     }
-
-    // GPU-only budget (Phase 1): rank by what runs on the card itself, with
-    // throughput-aware scoring rather than a fits/doesn't bucket.
-    let hw = Hardware {
-        gpu_name,
-        gpu_vram_gb: total as f32 / 1024.0,
-        avail_ram_gb: 0.0,
-        backend: Backend::Cuda,
-    };
-    let ranked = cookbook::rank(&specs, &hw, "general", None);
 
     println!("  {:<30} {:>16} {:>9} {:>8} {:>6}", "model", "quant@ctx", "VRAM", "tok/s~", "score");
     for r in &ranked {
@@ -314,7 +402,7 @@ fn cmd_cookbook() -> Result<()> {
             glyph, r.name, qc, r.required_gb, r.tps_est, r.score
         );
     }
-    println!("\n🟢 fits comfortably · 🟡 marginal · 🔴 won't fit on this GPU");
+    println!("\n🟢 fits comfortably · 🟡 marginal · 🔴 won't fit");
     Ok(())
 }
 
