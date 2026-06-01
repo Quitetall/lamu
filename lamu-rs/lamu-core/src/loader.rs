@@ -177,6 +177,16 @@ where
         port
     };
 
+    // Cold load: holds the process-global single-flight gate for the
+    // duration of `spawn` (up to ~90s for a large GGUF). Concurrent
+    // `ensure_loaded` calls for OTHER models that fit are serialized behind
+    // this — intentional VRAM/port safety on a single card, but otherwise
+    // invisible. Log it so a slow first-touch is explainable in the journal.
+    tracing::info!(
+        model = %entry.name, port, vram_mb = entry.vram_mb,
+        "loader: cold load starting (single-flight gate held until spawn returns)"
+    );
+
     let (_backend, pid) = match spawn(entry.clone(), port).await {
         Ok(pair) => pair,
         Err(e) => {

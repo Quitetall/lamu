@@ -394,6 +394,25 @@ async fn resolve_and_ensure_loaded(
             Some(state.http_port),
         ).await {
             Ok(_lm) => {}
+            // VRAM capacity: this is a transient "no room right now" — the
+            // request never queued, it was refused immediately by the
+            // scheduler (loader plan_load). Tell the client it's worth a
+            // retry once a model frees up, rather than a bare 503.
+            Err(e @ lamu_core::Error::VramExhausted { .. }) => {
+                state.metrics.requests_total
+                    .with_label_values(&[&decision.model_name, "vram_exhausted", "anon"])
+                    .inc();
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(axum::http::header::RETRY_AFTER, "10")],
+                    Json(json!({
+                        "error": {
+                            "message": format!("Failed to load '{}': {}", decision.model_name, e),
+                            "type": "vram_exhausted",
+                        }
+                    })),
+                ).into_response());
+            }
             Err(e) => {
                 state.metrics.requests_total
                     .with_label_values(&[&decision.model_name, "spawn_failed", "anon"])

@@ -147,7 +147,8 @@ async fn metrics_counts_503() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     let bumped =
         text.contains(r#"lamu_requests_total{model="qwen35-27b",status="spawn_failed",user="anon"} 1"#)
-        || text.contains(r#"lamu_requests_total{model="qwen35-27b",status="no_candidate",user="anon"} 1"#);
+        || text.contains(r#"lamu_requests_total{model="qwen35-27b",status="no_candidate",user="anon"} 1"#)
+        || text.contains(r#"lamu_requests_total{model="qwen35-27b",status="vram_exhausted",user="anon"} 1"#);
     assert!(bumped, "metrics body: {text}");
 }
 
@@ -516,6 +517,30 @@ async fn static_token_path_never_429s_on_quota() {
     ).await.unwrap();
     assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn vram_exhausted_returns_503_with_retry_after() {
+    // Force the scheduler below any model's footprint so resolve_and_ensure_loaded
+    // hits VramExhausted (deterministic regardless of the host GPU). The 503 must
+    // carry Retry-After:10 + type vram_exhausted so a client backs off + retries
+    // rather than seeing a bare 503 / hanging.
+    let st = make_state();
+    st.scheduler.lock().set_total_mb_for_tests(1000); // < qwen35-27b's 18000mb
+    let app = build_app(st);
+    let resp = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"qwen35-27b","messages":[{"role":"user","content":"hi"}]}"#))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("10"));
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["type"], "vram_exhausted");
 }
 
 #[tokio::test]
