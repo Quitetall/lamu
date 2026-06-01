@@ -96,7 +96,19 @@ impl LamuMcpServer {
             queue_strategy,
             queue_concurrency,
             routing_mode: Arc::new(AsyncMutex::new(
-                std::env::var("LAMU_ROUTING_MODE").unwrap_or_else(|_| "auto".to_string())
+                // m22: validate the env value. Consumers match EXACTLY
+                // "local-only"/"cloud-only"; a typo like "local_only" stored
+                // verbatim would enforce NEITHER restriction (silent auto-like)
+                // while routing_status printed the bogus mode. Fall back to auto.
+                match std::env::var("LAMU_ROUTING_MODE").as_deref() {
+                    Ok("local-only") => "local-only".to_string(),
+                    Ok("cloud-only") => "cloud-only".to_string(),
+                    Ok("auto") | Err(_) => "auto".to_string(),
+                    Ok(other) => {
+                        eprintln!("lamu-mcp: LAMU_ROUTING_MODE='{other}' invalid (expected auto|local-only|cloud-only); using auto");
+                        "auto".to_string()
+                    }
+                }
             )),
         })
     }

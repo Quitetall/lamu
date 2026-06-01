@@ -278,7 +278,10 @@ impl LamuMcpServer {
         );
 
         if text.trim().is_empty() {
-            format!("[Model thinking truncated — reasoning: {} chars]", reasoning.len())
+            // m19: prefix with `error:` so tools_call flags isError=true — a
+            // truncated-mid-think no-answer must not be treated as a real
+            // candidate by the council quorum / judge (mirrors the cloud fix).
+            format!("error: model thinking truncated with no answer — reasoning: {} chars", reasoning.len())
         } else {
             text
         }
@@ -755,6 +758,10 @@ impl LamuMcpServer {
                 "include_reasoning": include_reasoning,
             });
             if let Some(te) = thinking_enabled_arg {
+                // m18: local handle_query reads `enable_thinking` (the cloud path
+                // reads `thinking_enabled`). Set BOTH so a per-task toggle works
+                // regardless of which backend the task routes to.
+                inner_args["enable_thinking"] = te.clone();
                 inner_args["thinking_enabled"] = te;
             }
 

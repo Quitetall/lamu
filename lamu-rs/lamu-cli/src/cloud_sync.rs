@@ -48,10 +48,18 @@ pub async fn fetch_openrouter(client: &reqwest::Client) -> Result<Vec<CloudModel
     Ok(parse_models(&body)
         .into_iter()
         .map(|m| {
-            let (provider, name) = m.id.split_once('/').unwrap_or(("openrouter", m.id.as_str()));
+            // The id's prefix (e.g. `anthropic/`) is just OpenRouter's vendor
+            // NAMESPACE, not the transport. M13: provider MUST be "openrouter"
+            // for every OpenRouter-synced row — base_url + key are OpenRouter, so
+            // the wire format is OpenAI-compat Bearer to openrouter/v1 with the
+            // full provider/name model_id. Keying provider off the prefix made
+            // `anthropic/*` rows send Anthropic x-api-key + /v1/messages to
+            // OpenRouter, which always failed. The prefix is preserved in name +
+            // model_id for display/routing.
+            let (_vendor, name) = m.id.split_once('/').unwrap_or(("openrouter", m.id.as_str()));
             CloudModel {
                 name: name.to_string(),
-                provider: provider.to_string(),
+                provider: "openrouter".to_string(),
                 model_id: Some(m.id.clone()), // openrouter wants the full provider/name id
                 context_max: m.context_length.unwrap_or(0),
                 notes: "via openrouter (auto-synced)".to_string(),
