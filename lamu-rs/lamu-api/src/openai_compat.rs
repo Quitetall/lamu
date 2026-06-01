@@ -1186,9 +1186,12 @@ async fn anthropic_messages(
         let msg = serde_json::from_slice::<Value>(&bytes)
             .ok()
             .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
+                let err = v.get("error")?;
+                // OpenAI shape {error:{message}} OR a flat {error:"..."} (some
+                // proxies/Ollama-ish backends) — don't surface a raw JSON blob.
+                err.get("message")
                     .and_then(|m| m.as_str())
+                    .or_else(|| err.as_str())
                     .map(String::from)
             })
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
