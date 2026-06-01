@@ -41,6 +41,14 @@ pub struct LamuMetrics {
     /// Standalone counter — increments on every /metrics scrape so we can
     /// detect that the endpoint is actually being polled.
     pub scrapes_total: IntCounter,
+
+    // ── refresh-bookkeeping for event counters / gauge cleanup ──────────
+    // refresh() is the only place with the health + scheduler snapshot, so the
+    // event-style counters are derived there by diffing against the previous
+    // snapshot (M16), and stale per-model gauge series are removed (m24).
+    prev_restarts: parking_lot::Mutex<std::collections::HashMap<String, u32>>,
+    prev_quarantined: parking_lot::Mutex<std::collections::HashSet<String>>,
+    prev_gauge_models: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl LamuMetrics {
@@ -132,6 +140,9 @@ impl LamuMetrics {
             backend_restarts_total,
             backend_quarantined_total,
             scrapes_total,
+            prev_restarts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            prev_quarantined: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            prev_gauge_models: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -162,6 +173,51 @@ impl LamuMetrics {
                     .with_label_values(&[name.as_str()])
                     .set(*depth);
             }
+        }
+
+        // M16: derive the two event counters by diffing against the previous
+        // snapshot (refresh is the only place with the health view). Restarts:
+        // inc by the positive delta of the supervisor's restart_attempts (it
+        // resets to 0 on recovery, so a negative delta contributes 0). Quarantines:
+        // inc once per NEW entry into the Quarantined state.
+        {
+            let mut prev = self.prev_restarts.lock();
+            for (name, h) in health.all() {
+                let was = prev.get(name).copied().unwrap_or(0);
+                if h.restart_attempts > was {
+                    self.backend_restarts_total
+                        .with_label_values(&[name.as_str()])
+                        .inc_by((h.restart_attempts - was) as u64);
+                }
+                prev.insert(name.clone(), h.restart_attempts);
+            }
+        }
+        {
+            let cur: std::collections::HashSet<String> = health
+                .all()
+                .iter()
+                .filter(|(_, h)| matches!(h.state, lamu_core::health::HealthState::Quarantined))
+                .map(|(n, _)| n.clone())
+                .collect();
+            let mut prev = self.prev_quarantined.lock();
+            for name in cur.difference(&prev) {
+                self.backend_quarantined_total.with_label_values(&[name.as_str()]).inc();
+            }
+            *prev = cur;
+        }
+
+        // m24: drop per-model gauge series for models no longer loaded, so an
+        // unloaded model's vram_used_mb / queue_depth don't render their stale
+        // last value forever.
+        {
+            let current: std::collections::HashSet<String> =
+                budget.loaded_models.iter().map(|(n, _)| n.clone()).collect();
+            let mut prev = self.prev_gauge_models.lock();
+            for stale in prev.difference(&current) {
+                let _ = self.vram_used_mb.remove_label_values(&[stale.as_str()]);
+                let _ = self.queue_depth.remove_label_values(&[stale.as_str()]);
+            }
+            *prev = current;
         }
     }
 
@@ -262,5 +318,61 @@ mod tests {
         let mut h = BackendHealth::new("m");
         h.force_quarantine("x");
         assert_eq!(health_to_numeric(h.state), -1);
+    }
+
+    #[test]
+    fn refresh_increments_restart_and_quarantine_counters() {
+        // M16: the two _total counters are derived in refresh() by diffing the
+        // health snapshot. A quarantined backend with restart_attempts must move
+        // them off zero (they used to render 0 forever).
+        let m = LamuMetrics::new().unwrap();
+        let scheduler = VramScheduler::new();
+        let mut health = HealthRegistry::new();
+        {
+            let h = health.get_or_create("b");
+            h.restart_attempts = 2;
+            h.force_quarantine("crash loop");
+        }
+        m.refresh(&scheduler, &health, None);
+        assert_eq!(m.backend_restarts_total.with_label_values(&["b"]).get(), 2);
+        assert_eq!(m.backend_quarantined_total.with_label_values(&["b"]).get(), 1);
+        // Idempotent: a second refresh with no new events must not double-count.
+        m.refresh(&scheduler, &health, None);
+        assert_eq!(m.backend_restarts_total.with_label_values(&["b"]).get(), 2);
+        assert_eq!(m.backend_quarantined_total.with_label_values(&["b"]).get(), 1);
+    }
+
+    #[test]
+    fn refresh_removes_stale_gauge_series_on_unload() {
+        // m24: a model's vram_used_mb series must not linger at its last value
+        // after the model unloads.
+        let m = LamuMetrics::new().unwrap();
+        let mut scheduler = VramScheduler::new();
+        scheduler.set_total_mb_for_tests(24000);
+        let entry = lamu_core::types::ModelEntry {
+            name: "ghost".into(),
+            path: std::path::PathBuf::from("/tmp/ghost.gguf"),
+            format: lamu_core::types::ModelFormat::Gguf,
+            backend: lamu_core::types::BackendType::LlamaCpp,
+            arch: "qwen35".into(), params_b: 1.0, quant: "Q4".into(),
+            vram_mb: 8000, context_max: 4096,
+            capabilities: vec![lamu_core::types::Capability::Chat],
+            reasoning_marker: None, speculative: None, sampling: None,
+            pinned: false, main: false, notes: String::new(),
+            status: lamu_core::types::ModelStatus::default(),
+            modality: lamu_core::types::Modality::Llm,
+        };
+        scheduler.register_loaded(entry, Some(1), 8020, 8000);
+        m.refresh(&scheduler, &health_reg(), None);
+        assert!(String::from_utf8(m.render().0).unwrap().contains(r#"lamu_vram_used_mb{model="ghost"}"#));
+        // Unload → next refresh drops the stale series.
+        scheduler.mark_unloaded("ghost");
+        m.refresh(&scheduler, &health_reg(), None);
+        assert!(!String::from_utf8(m.render().0).unwrap().contains(r#"lamu_vram_used_mb{model="ghost"}"#),
+            "unloaded model's gauge series must be removed (m24)");
+    }
+
+    fn health_reg() -> HealthRegistry {
+        HealthRegistry::new()
     }
 }
