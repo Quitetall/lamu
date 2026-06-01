@@ -85,6 +85,7 @@ fn make_state() -> AppState {
         http_port: 8020,
         auth: Arc::new(AuthMode::Off),
         quota: Arc::new(lamu_api::quota::QuotaManager::new()),
+        priority_queue: None, // P3 OFF — keep the perf baseline byte-identical
     }
 }
 

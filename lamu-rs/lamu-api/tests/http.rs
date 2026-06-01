@@ -58,6 +58,7 @@ fn make_state() -> AppState {
         http_port: 8020,
         auth: Arc::new(AuthMode::Off), // auth off by default in route tests
         quota: Arc::new(lamu_api::quota::QuotaManager::new()),
+        priority_queue: None, // P3 OFF in route tests → byte-identical path
     }
 }
 
@@ -568,4 +569,74 @@ async fn keystore_unknown_token_still_401() {
             .unwrap(),
     ).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── P3: optional per-user priority queue (LAMU_PRIORITY_QUEUE) ───────────
+
+#[tokio::test]
+async fn p3_queue_none_when_flag_unset() {
+    // make_state() leaves priority_queue None; the route path must be the
+    // pre-P3 path. With no model loaded we still reach the 503 branch (proving
+    // the request flowed through chat_completions unchanged — the queue branch
+    // was a not-taken `if let Some`, no hang, no 500).
+    let st = make_state();
+    assert!(st.priority_queue.is_none(), "P3 must be OFF by default");
+    let app = build_app(st);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"qwen35-27b","stream":false,"messages":[{"role":"user","content":"hi"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn p3_priority_orders_higher_first() {
+    // Behavioral test of the exact queue config build_state uses
+    // (Strategy::Priority, concurrency 1) without needing a backend: a higher
+    // priority enqueued LATER must still be served before a lower one already
+    // waiting behind the single held slot.
+    use lamu_core::queue::{QueueRequest, RequestQueue, Strategy};
+    use std::time::Instant;
+    let q: Arc<RequestQueue<()>> = Arc::new(RequestQueue::new(Strategy::Priority, 1));
+    let order = Arc::new(tokio::sync::Mutex::new(Vec::<&str>::new()));
+
+    let q1 = q.clone();
+    let o1 = order.clone();
+    let blocker = tokio::spawn(async move {
+        let _g = q1
+            .enqueue(QueueRequest { payload: (), priority: 0, enqueued_at: Instant::now(), origin: "blocker".into() })
+            .await;
+        o1.lock().await.push("block");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let q2 = q.clone();
+    let o2 = order.clone();
+    let low = tokio::spawn(async move {
+        let _g = q2
+            .enqueue(QueueRequest { payload: (), priority: 1, enqueued_at: Instant::now(), origin: "low".into() })
+            .await;
+        o2.lock().await.push("low");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let q3 = q.clone();
+    let o3 = order.clone();
+    let high = tokio::spawn(async move {
+        let _g = q3
+            .enqueue(QueueRequest { payload: (), priority: 10, enqueued_at: Instant::now(), origin: "high".into() })
+            .await;
+        o3.lock().await.push("high");
+    });
+
+    let _ = tokio::join!(blocker, low, high);
+    assert_eq!(*order.lock().await, vec!["block", "high", "low"]);
 }

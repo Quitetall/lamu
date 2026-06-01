@@ -13,6 +13,7 @@ use axum::Router as AxumRouter;
 use futures_util::stream::Stream;
 use lamu_core::health::HealthRegistry;
 use lamu_core::reasoning::get_extractor;
+use lamu_core::queue::{QueueRequest, RequestQueue, Strategy as QueueStrategy};
 use lamu_core::registry::load_registry;
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
@@ -180,6 +181,16 @@ pub struct AppState {
     /// Per-user token-bucket quotas (ADR 0018 P2). Shared in-memory; a no-op
     /// for StaticToken/Off (no Principal → unlimited).
     pub quota: Arc<QuotaManager>,
+    /// OPTIONAL per-user priority queue on the HTTP forward path (ADR 0018 P3).
+    /// `None` (default) → the forward path is byte-identical to pre-P3: no
+    /// acquire/release, no extra await. `Some(_)` only when LAMU_PRIORITY_QUEUE=1,
+    /// built in `build_state`. Keyed on `Principal.priority` (higher served
+    /// first; ties FIFO). Wraps ONLY the non-streaming backend POST in
+    /// `chat_completions`, acquired AFTER the model is resolved + loaded — never
+    /// around `ensure_loaded` (single-flight load would deadlock against a full
+    /// queue) and never around an SSE stream (a long-lived generator would pin a
+    /// concurrency slot for the whole response). See the P3 spec §6.
+    pub priority_queue: Option<Arc<RequestQueue<()>>>,
 }
 
 pub fn build_app(state: AppState) -> AxumRouter {
@@ -625,6 +636,25 @@ async fn chat_completions(
             .into_response();
     }
 
+    // ── P3: optional per-user priority queue (LAMU_PRIORITY_QUEUE=1) ──────
+    // Acquire AFTER resolve_and_ensure_loaded (so load never blocks behind a
+    // full queue → no single-flight deadlock) and only on the non-streaming
+    // path (the stream branch returned above; a live SSE generator must not
+    // pin a slot). `None` → byte-identical to pre-P3 (no await, no guard).
+    // The guard is held across the backend POST + JSON read and dropped at
+    // function exit (incl. every early `return`), freeing the slot. The `_g`
+    // binding name is load-bearing — `let _ =` would drop it immediately.
+    let _g = if let Some(q) = state.priority_queue.as_ref() {
+        Some(q.enqueue(QueueRequest {
+            payload: (),
+            priority: principal_ref.map(|p| p.priority).unwrap_or(0),
+            enqueued_at: Instant::now(),
+            origin: user_label(principal_ref).to_string(),
+        }).await)
+    } else {
+        None
+    };
+
     // Non-streaming
     let resp = match state.client.post(&backend_url).json(&payload).send().await {
         Ok(r) => r,
@@ -1036,6 +1066,31 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
         .build()?;
     let metrics = LamuMetrics::new()
         .map_err(|e| anyhow::anyhow!("prometheus init: {e}"))?;
+    // P3: build the priority queue ONLY when explicitly opted in. Default OFF
+    // → None → the forward path stays byte-identical. Strategy + concurrency
+    // env parse mirrors lamu-mcp (LAMU_QUEUE_STRATEGY / LAMU_QUEUE_CONCURRENCY)
+    // so operators get one mental model. Concurrency defaults to 1 here (the
+    // point is to serialize/order contention by priority); the dispatcher task
+    // is spawned by RequestQueue::new, which requires we're already on the
+    // tokio runtime — build_state runs inside `lamu serve`'s async main.
+    let priority_queue = if std::env::var("LAMU_PRIORITY_QUEUE").as_deref() == Ok("1") {
+        let strategy = match std::env::var("LAMU_QUEUE_STRATEGY").as_deref() {
+            Ok("lifo") => QueueStrategy::Lifo,
+            Ok("fifo") => QueueStrategy::Fifo,
+            // Default to Priority when the queue is enabled — the whole point
+            // of P3 is per-user priority. (lamu-mcp defaults to Fifo; we
+            // diverge intentionally because the flag's name says "priority".)
+            _ => QueueStrategy::Priority,
+        };
+        let concurrency: usize = std::env::var("LAMU_QUEUE_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+        Some(Arc::new(RequestQueue::<()>::new(strategy, concurrency)))
+    } else {
+        None
+    };
     Ok(AppState {
         scheduler: Arc::new(Mutex::new(scheduler)),
         router: Arc::new(Mutex::new(router)),
@@ -1046,6 +1101,7 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
         http_port,
         auth: Arc::new(crate::auth::resolve_auth_mode()),
         quota: Arc::new(QuotaManager::new()),
+        priority_queue,
     })
 }
 
