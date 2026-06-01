@@ -1089,6 +1089,102 @@ fn make_chunk(id: &str, created: u64, model: &str, content: &str) -> Value {
     })
 }
 
+/// Streaming reasoning-tag stripper (M5). Mirrors the inline `<think>`/`</think>`
+/// state machine in `stream_response` (the OpenAI path) so the Ollama + Anthropic
+/// streaming generators don't leak a thinking-capable model's chain-of-thought
+/// into the visible message — vanilla Ollama/Anthropic clients can't send the
+/// lamu-only `enable_thinking:false` opt-out, so streaming would otherwise dump
+/// raw `<think>…</think>` to the user. `push` returns the visible (non-reasoning)
+/// text for a token; `finish` flushes any safe-to-emit tail at stream end.
+struct ReasoningStripper {
+    open_tag: String,
+    close_tag: String,
+    pending: String,
+    in_reasoning: bool,
+    reasoning_done: bool,
+}
+
+impl ReasoningStripper {
+    fn new(marker: Option<&ReasoningMarker>) -> Self {
+        ReasoningStripper {
+            open_tag: marker.map(|m| m.open_tag.clone()).unwrap_or_else(|| "<think>".to_string()),
+            close_tag: marker.map(|m| m.close_tag.clone()).unwrap_or_else(|| "</think>".to_string()),
+            pending: String::new(),
+            in_reasoning: false,
+            reasoning_done: false,
+        }
+    }
+
+    /// Feed one content token; return the visible text to emit (may be empty
+    /// while buffering or while inside a reasoning block).
+    fn push(&mut self, token: &str) -> String {
+        let mut out = String::new();
+        self.pending.push_str(token);
+        // Loop so a single token carrying a whole `<think>…</think>answer`
+        // block transitions open→close→done in one call (the inline OpenAI
+        // version only does one transition per token; this is strictly more
+        // robust). Each branch either `continue`s after a state change or
+        // `break`s when it must wait for more bytes.
+        loop {
+            if !self.in_reasoning && !self.reasoning_done {
+                if let Some(idx) = self.pending.find(self.open_tag.as_str()) {
+                    self.in_reasoning = true;
+                    let pre = self.pending[..idx].to_string();
+                    self.pending = self.pending[idx + self.open_tag.len()..].to_string();
+                    if !pre.is_empty() {
+                        out.push_str(&pre);
+                    }
+                    continue; // pending may already hold the close tag
+                } else if self.pending.len() > self.open_tag.len() * 3 {
+                    // No open tag after ~3×tag bytes → no reasoning block;
+                    // flush + stream straight through from here.
+                    self.reasoning_done = true;
+                    out.push_str(&self.pending);
+                    self.pending.clear();
+                }
+                break;
+            } else if self.in_reasoning && !self.reasoning_done {
+                if let Some(idx) = self.pending.find(self.close_tag.as_str()) {
+                    self.reasoning_done = true;
+                    self.in_reasoning = false;
+                    self.pending = self.pending[idx + self.close_tag.len()..].to_string();
+                    continue; // emit the post-</think> tail via the done branch
+                }
+                // close_tag may be split across tokens — keep only the trailing
+                // close_tag.len()-1 bytes so a split tag still matches next token;
+                // the rest is reasoning content we drop. (char-boundary-safe.)
+                let keep = self.close_tag.len().saturating_sub(1);
+                if self.pending.len() > keep {
+                    let mut cut = self.pending.len() - keep;
+                    while cut < self.pending.len() && !self.pending.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    self.pending.drain(..cut);
+                }
+                break;
+            } else {
+                // reasoning_done → everything buffered is visible.
+                if !self.pending.is_empty() {
+                    out.push_str(&self.pending);
+                    self.pending.clear();
+                }
+                break;
+            }
+        }
+        out
+    }
+
+    /// Flush at stream end: emit buffered visible text only if we're not still
+    /// mid-reasoning (an unclosed think block must not leak).
+    fn finish(&mut self) -> String {
+        if !self.pending.trim().is_empty() && !self.in_reasoning {
+            std::mem::take(&mut self.pending)
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// Hex id of `len` chars from OS randomness (M3). The previous implementation
 /// truncated a timestamp's HIGH-order hex digits, which advance only ~every
 /// 65µs — so back-to-back calls (e.g. synthesizing two `toolu_` ids in one
@@ -1661,7 +1757,7 @@ async fn stream_response_anthropic(
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
 ) -> Response {
-    let (port, model_name, _marker, sampling) = match resolve_and_ensure_loaded(
+    let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
     ).await {
@@ -1750,6 +1846,10 @@ async fn stream_response_anthropic(
         // Last finish_reason seen in the stream — drives the empty-backend
         // gate at close. Empty = stream closed without one.
         let mut finish_reason = String::new();
+        // M5: strip <think>…</think> reasoning out of the visible text_delta
+        // stream so a thinking-on model doesn't dump chain-of-thought to
+        // vanilla Anthropic clients that can't send enable_thinking:false.
+        let mut stripper = ReasoningStripper::new(marker.as_ref());
 
         use futures_util::stream::StreamExt;
         'read: while let Some(chunk_res) = byte_stream.next().await {
@@ -1768,16 +1868,21 @@ async fn stream_response_anthropic(
                 }
                 let delta = choice.and_then(|c| c.get("delta"));
 
-                // Text token → text_delta on the index-0 text block.
+                // Text token → text_delta on the index-0 text block, with
+                // reasoning stripped (M5). out_tokens counts raw generation;
+                // only the visible (post-strip) text is emitted.
                 if let Some(token) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
                     if !token.is_empty() {
                         out_tokens += 1;
-                        let d = json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type":"text_delta","text": token}
-                        });
-                        yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+                        let visible = stripper.push(token);
+                        if !visible.is_empty() {
+                            let d = json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type":"text_delta","text": visible}
+                            });
+                            yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+                        }
                     }
                 }
 
@@ -1822,6 +1927,18 @@ async fn stream_response_anthropic(
             let m_stop = json!({"type":"message_stop"});
             yield Ok(Event::default().event("message_stop").data(m_stop.to_string()));
             return;
+        }
+
+        // Flush any buffered visible text the stripper held (short tagless
+        // outputs, or text after </think>) before closing the text block (M5).
+        let tail = stripper.finish();
+        if !tail.is_empty() {
+            let d = json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type":"text_delta","text": tail}
+            });
+            yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
         }
 
         // Close the index-0 text block.
@@ -2112,7 +2229,7 @@ async fn stream_response_ollama(
     repeat_penalty: Option<f32>,
     enable_thinking: Option<bool>,
 ) -> Response {
-    let (port, model_name, _marker, sampling) = match resolve_and_ensure_loaded(
+    let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
     ).await {
@@ -2157,6 +2274,10 @@ async fn stream_response_ollama(
         let mut out_tokens: u64 = 0;
         // Empty-backend gate state (mirrors the non-streaming 502).
         let mut finish_reason = String::new();
+        // M5: strip <think>…</think> out of the visible NDJSON content so a
+        // thinking-on model's chain-of-thought doesn't leak to vanilla Ollama
+        // clients (Open WebUI / AnythingLLM stream by default).
+        let mut stripper = ReasoningStripper::new(marker.as_ref());
 
         use futures_util::stream::StreamExt;
         'read: while let Some(chunk_res) = byte_stream.next().await {
@@ -2179,14 +2300,27 @@ async fn stream_response_ollama(
                 else { continue };
                 if token.is_empty() { continue; }
                 out_tokens += 1;
+                let visible = stripper.push(token);
+                if visible.is_empty() { continue; }
                 let chunk = json!({
                     "model": model_name,
                     "created_at": rfc3339_now(),
-                    "message": {"role":"assistant","content": token},
+                    "message": {"role":"assistant","content": visible},
                     "done": false,
                 });
                 yield Ok(format!("{}\n", chunk).into_bytes());
             }
+        }
+        // Flush any buffered visible text before the final done:true line (M5).
+        let tail = stripper.finish();
+        if !tail.is_empty() {
+            let chunk = json!({
+                "model": model_name,
+                "created_at": rfc3339_now(),
+                "message": {"role":"assistant","content": tail},
+                "done": false,
+            });
+            yield Ok(format!("{}\n", chunk).into_bytes());
         }
 
         // Single close path for both [DONE] and bare socket close (the
@@ -2255,6 +2389,30 @@ mod compat_tests {
         assert_ne!(a, b, "two consecutive ids must differ");
         let many: std::collections::HashSet<_> = (0..1000).map(|_| random_hex(12)).collect();
         assert!(many.len() >= 999, "1000 ids should be ~all distinct, got {}", many.len());
+    }
+
+    #[test]
+    fn reasoning_stripper_removes_think_blocks() {
+        // M5: <think>…</think> must not reach visible output; the answer after
+        // </think> must survive (even split across tokens).
+        let drive = |tokens: &[&str]| -> String {
+            let mut s = ReasoningStripper::new(None);
+            let mut out = String::new();
+            for t in tokens {
+                out.push_str(&s.push(t));
+            }
+            out.push_str(&s.finish());
+            out
+        };
+        // whole-block then answer
+        assert_eq!(drive(&["<think>secret reasoning</think>the answer"]), "the answer");
+        // split across tokens (open, body, close, answer)
+        assert_eq!(drive(&["<th", "ink>plan", " more plan</thi", "nk>visible"]), "visible");
+        // no reasoning at all → passthrough (short tagless output flushed at end)
+        assert_eq!(drive(&["ok"]), "ok");
+        assert_eq!(drive(&["hello ", "world this is a longer answer"]), "hello world this is a longer answer");
+        // unclosed think block must NOT leak its content
+        assert_eq!(drive(&["<think>still thinking and never closed"]), "");
     }
 
     #[test]
