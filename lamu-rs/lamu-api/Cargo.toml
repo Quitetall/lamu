@@ -29,6 +29,13 @@ subtle = "2"
 # CORS so browser-based frontends can call the API (ADR 0016). Already in
 # the tree via axum.
 tower-http = { version = "0.6", features = ["cors"] }
+# Per-token key store (keys.rs, ADR 0018 P1). rusqlite bundled = no system
+# libsqlite3, matching lamu-mcp; sha2 hashes the stored tokens; getrandom
+# mints them (same generator as `lamu auth init`). All three already resolved
+# in Cargo.lock (rusqlite 0.32.1, sha2 0.10.9, getrandom 0.2.17).
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+getrandom = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

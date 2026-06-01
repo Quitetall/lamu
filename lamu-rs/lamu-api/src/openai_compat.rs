@@ -111,6 +111,20 @@ pub struct ChatRequest {
 fn default_max_tokens() -> u32 { 16384 }
 fn default_temperature() -> f32 { 0.7 }
 
+/// HTTP auth backend (ADR 0018, supersedes ADR 0012's single token).
+///   * `Off`         — frictionless loopback; the middleware is a no-op.
+///   * `StaticToken` — the resolved LAMU_API_TOKEN / api-token; the ADR-0012
+///                     path, byte-identical (constant-time compare).
+///   * `KeyStore`    — per-user `keys.db`; `verify(token) -> Principal`.
+/// `StaticToken` stays the default so every 0012 deployment is unchanged;
+/// `KeyStore` engages only when `keys.db` exists.
+#[derive(Clone)]
+pub enum AuthMode {
+    Off,
+    StaticToken(String),
+    KeyStore(std::sync::Arc<crate::keys::KeyStore>),
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub scheduler: Arc<Mutex<VramScheduler>>,
@@ -126,10 +140,11 @@ pub struct AppState {
     /// `lamu_core::loader::ensure_loaded` so spawned backends don't try
     /// to bind the same port we already own.
     pub http_port: u16,
-    /// Optional bearer token (ADR 0012). `None` → auth off (frictionless
-    /// loopback). `Some` → every route except /health + /metrics requires
-    /// `Authorization: Bearer <token>`. Resolved once at `build_state`.
-    pub auth_token: Arc<Option<String>>,
+    /// Auth backend (ADR 0018). `Off` → frictionless loopback. `StaticToken`
+    /// → every route except /health + /metrics requires the bearer (0012
+    /// path). `KeyStore` → per-token verify + Principal. Resolved once at
+    /// `build_state`.
+    pub auth: Arc<AuthMode>,
 }
 
 pub fn build_app(state: AppState) -> AxumRouter {
@@ -923,7 +938,7 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
         health: Arc::new(Mutex::new(HealthRegistry::new())),
         metrics: Arc::new(metrics),
         http_port,
-        auth_token: Arc::new(crate::auth::resolve_token()),
+        auth: Arc::new(crate::auth::resolve_auth_mode()),
     })
 }
 

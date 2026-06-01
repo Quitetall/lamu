@@ -4,7 +4,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lamu_api::metrics::LamuMetrics;
-use lamu_api::openai_compat::{build_app, AppState};
+use lamu_api::openai_compat::{build_app, AppState, AuthMode};
 use lamu_core::health::HealthRegistry;
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
@@ -56,7 +56,7 @@ fn make_state() -> AppState {
         health: Arc::new(Mutex::new(HealthRegistry::new())),
         metrics: Arc::new(LamuMetrics::new().unwrap()),
         http_port: 8020,
-        auth_token: Arc::new(None), // auth off by default in route tests
+        auth: Arc::new(AuthMode::Off), // auth off by default in route tests
     }
 }
 
@@ -215,7 +215,7 @@ async fn unknown_route_404() {
 
 fn state_with_token(tok: &str) -> AppState {
     let mut st = make_state();
-    st.auth_token = Arc::new(Some(tok.to_string()));
+    st.auth = Arc::new(AuthMode::StaticToken(tok.to_string()));
     st
 }
 

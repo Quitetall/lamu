@@ -2,6 +2,7 @@
 //! Direct port of `lamu/api/openai_compat.py`.
 
 pub mod auth;
+pub mod keys;
 pub mod metrics;
 pub mod openai_compat;
 
@@ -14,10 +15,15 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let state = openai_compat::build_state(&registry_path(), port)?;
     openai_compat::auto_register(&state).await;
     spawn_main_preload(state.clone());
-    // Resolve auth once: the value the middleware will enforce (in
-    // state.auth_token) is the same one the off-loopback gate checks below.
-    // Avoids a second resolve_token() read (and the startup TOCTOU it'd open).
-    let auth_configured = state.auth_token.is_some();
+    // Resolve auth once: the value the middleware will enforce (in state.auth)
+    // is the same one the off-loopback gate checks below. KeyStore counts as
+    // "configured" ONLY with ≥1 active key — an empty store off-loopback must
+    // still hard-fail like no-token (ADR 0018).
+    let auth_configured = match state.auth.as_ref() {
+        openai_compat::AuthMode::Off => false,
+        openai_compat::AuthMode::StaticToken(_) => true,
+        openai_compat::AuthMode::KeyStore(ks) => ks.has_active_key(),
+    };
     let app = openai_compat::build_app(state);
 
     // Default to LOCALHOST — the OpenAI-compat API is unauthenticated, so it

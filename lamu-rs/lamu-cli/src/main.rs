@@ -174,9 +174,27 @@ enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 enum AuthAction {
-    /// Mint a new API token, write it to ~/.config/lamu/api-token (chmod
-    /// 0600), and print it once. Enables bearer auth on `lamu serve`.
+    /// Single-token mode (ADR 0012): mint ONE static token to
+    /// ~/.config/lamu/api-token (0600), printed once. The default
+    /// AuthMode::StaticToken.
     Init,
+    /// Multi-user mode (ADR 0018): issue a per-user API key into keys.db. The
+    /// plaintext lamu_<64hex> is shown ONCE (only its SHA-256 is stored).
+    /// Engages AuthMode::KeyStore on the next `lamu serve`.
+    Issue {
+        /// Owner the key is attributed to (quota + audit principal).
+        #[arg(long)]
+        user: String,
+    },
+    /// List keys in keys.db: prefix, user, created, status. Prefixes only —
+    /// plaintext is never recoverable.
+    List,
+    /// Revoke a key by its prefix (from `lamu auth list`). Immediate — stops
+    /// authenticating on the next request.
+    Revoke {
+        /// Key prefix as shown by `lamu auth list` (e.g. lamu_a1b2c3d4).
+        prefix: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -438,7 +456,54 @@ fn cmd_cookbook(opts: CookbookOpts) -> Result<()> {
 fn cmd_auth(action: AuthAction) -> Result<()> {
     match action {
         AuthAction::Init => cmd_auth_init(),
+        AuthAction::Issue { user } => cmd_auth_issue(&user),
+        AuthAction::List => cmd_auth_list(),
+        AuthAction::Revoke { prefix } => cmd_auth_revoke(&prefix),
     }
+}
+
+/// `lamu auth issue --user NAME` (ADR 0018): mint a per-user key into keys.db,
+/// print the plaintext ONCE (only its SHA-256 is stored).
+fn cmd_auth_issue(user: &str) -> Result<()> {
+    let store = lamu_api::keys::KeyStore::open_default()
+        .map_err(|e| anyhow::anyhow!("open keys.db: {e}"))?;
+    let token = store.issue(user).map_err(|e| anyhow::anyhow!("issue key: {e}"))?;
+    let prefix: String = token.chars().take("lamu_".len() + 8).collect();
+    println!("Issued API key for user '{user}' (prefix {prefix}).");
+    println!("\n    {token}\n");
+    println!("Shown ONCE — only its SHA-256 is stored. Clients send:");
+    println!("    Authorization: Bearer {token}");
+    println!("`lamu serve` now uses keys.db (AuthMode::KeyStore). `lamu auth list` / `lamu auth revoke <prefix>` to manage.");
+    Ok(())
+}
+
+/// `lamu auth list` — redacted roster from keys.db (never plaintext).
+fn cmd_auth_list() -> Result<()> {
+    let store = lamu_api::keys::KeyStore::open_default()
+        .map_err(|e| anyhow::anyhow!("open keys.db: {e}"))?;
+    let keys = store.list().map_err(|e| anyhow::anyhow!("list keys: {e}"))?;
+    if keys.is_empty() {
+        println!("No API keys in keys.db. `lamu auth issue --user NAME` to create one.");
+        return Ok(());
+    }
+    println!("  {:<16} {:<16} {:>12}  status", "prefix", "user", "created(unix)");
+    for k in keys {
+        let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
+        println!("  {:<16} {:<16} {:>12}  {}", k.token_prefix, k.user, k.created_at, status);
+    }
+    Ok(())
+}
+
+/// `lamu auth revoke <prefix>` — immediate revocation by prefix.
+fn cmd_auth_revoke(prefix: &str) -> Result<()> {
+    let store = lamu_api::keys::KeyStore::open_default()
+        .map_err(|e| anyhow::anyhow!("open keys.db: {e}"))?;
+    if store.revoke(prefix).map_err(|e| anyhow::anyhow!("revoke key: {e}"))? {
+        println!("Revoked key {prefix} — it stops authenticating immediately.");
+    } else {
+        println!("No active key with prefix '{prefix}' (already revoked or unknown).");
+    }
+    Ok(())
 }
 
 /// `lamu cloud sync` — refresh cloud-models.yaml from OpenRouter + per-provider
