@@ -82,7 +82,7 @@ pub fn build_llama_spawn(
                 "--ctx-size".into(),
                 ctx.clamp(512, 8192).to_string(),
             ],
-            envs: vec![("CUDA_VISIBLE_DEVICES".into(), "0".into())],
+            envs: vec![("CUDA_VISIBLE_DEVICES".into(), crate::config::gpu_index().to_string())],
         });
     }
 
@@ -157,7 +157,7 @@ pub fn build_llama_spawn(
 
     Ok(LlamaSpawn {
         args,
-        envs: vec![("CUDA_VISIBLE_DEVICES".into(), "0".into())],
+        envs: vec![("CUDA_VISIBLE_DEVICES".into(), crate::config::gpu_index().to_string())],
     })
 }
 

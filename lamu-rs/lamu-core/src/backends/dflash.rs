@@ -83,7 +83,7 @@ impl Backend for DflashBackend {
             .arg("--target").arg(&entry.path)
             .arg("--draft").arg(&spec.draft_path)
             .current_dir(&self.work_dir)
-            .env("CUDA_VISIBLE_DEVICES", "0")
+            .env("CUDA_VISIBLE_DEVICES", crate::config::gpu_index().to_string())
             .env("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());

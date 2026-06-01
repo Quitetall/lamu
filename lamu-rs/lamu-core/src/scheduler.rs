@@ -16,13 +16,18 @@ pub struct VramScheduler {
     loaded: HashMap<String, LoadedModel>,
     total_mb: u32,
     nvml: Option<Nvml>,
+    /// CUDA device this scheduler monitors (LAMU_GPU_INDEX, default 0). Multi-
+    /// GPU P0 (ADR 0017) — backends spawn on the same index. Per-device pools
+    /// build on top of this in later phases.
+    device_index: u32,
 }
 
 impl VramScheduler {
     pub fn new() -> Self {
         let nvml = Nvml::init().ok();
+        let device_index = crate::config::gpu_index();
         let total_mb = nvml.as_ref()
-            .and_then(|n| n.device_by_index(0).ok())
+            .and_then(|n| n.device_by_index(device_index).ok())
             .and_then(|d| d.memory_info().ok())
             .map(|info| (info.total / (1024 * 1024)) as u32)
             .unwrap_or(0);
@@ -32,6 +37,7 @@ impl VramScheduler {
             loaded: HashMap::new(),
             total_mb,
             nvml,
+            device_index,
         }
     }
 
@@ -42,7 +48,7 @@ impl VramScheduler {
     pub fn gpu_name(&self) -> Option<String> {
         self.nvml
             .as_ref()
-            .and_then(|n| n.device_by_index(0).ok())
+            .and_then(|n| n.device_by_index(self.device_index).ok())
             .and_then(|d| d.name().ok())
     }
 
@@ -82,7 +88,7 @@ impl VramScheduler {
         let Some(nvml) = &self.nvml else {
             return (0, 0);
         };
-        let Ok(device) = nvml.device_by_index(0) else {
+        let Ok(device) = nvml.device_by_index(self.device_index) else {
             return (0, 0);
         };
         let Ok(info) = device.memory_info() else {
@@ -98,7 +104,7 @@ impl VramScheduler {
         let Some(nvml) = &self.nvml else {
             return vec![];
         };
-        let Ok(device) = nvml.device_by_index(0) else {
+        let Ok(device) = nvml.device_by_index(self.device_index) else {
             return vec![];
         };
         let Ok(procs) = device.running_compute_processes() else {

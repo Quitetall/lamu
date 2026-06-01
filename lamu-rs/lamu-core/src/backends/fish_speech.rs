@@ -124,7 +124,7 @@ impl Backend for FishSpeechBackend {
             .arg("--workers")
             .arg("1")
             .current_dir(repo)
-            .env("CUDA_VISIBLE_DEVICES", "0")
+            .env("CUDA_VISIBLE_DEVICES", crate::config::gpu_index().to_string())
             .stdout(Stdio::null())
             .stderr(stderr_sink);
         crate::backends::harden_child_command(&mut cmd);

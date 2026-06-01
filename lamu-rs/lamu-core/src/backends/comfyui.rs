@@ -85,7 +85,7 @@ impl Backend for ComfyUIBackend {
             .arg("--port")
             .arg(port.to_string())
             .current_dir(comfy)
-            .env("CUDA_VISIBLE_DEVICES", "0")
+            .env("CUDA_VISIBLE_DEVICES", crate::config::gpu_index().to_string())
             .stdout(Stdio::null())
             .stderr(stderr_sink);
         crate::backends::harden_child_command(&mut cmd);

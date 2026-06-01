@@ -69,7 +69,7 @@ impl Backend for MegakernelBackend {
         cmd.arg(&self.server_script)
             .arg("--port").arg(port.to_string())
             .current_dir(&self.work_dir)
-            .env("CUDA_VISIBLE_DEVICES", "0")
+            .env("CUDA_VISIBLE_DEVICES", crate::config::gpu_index().to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         crate::backends::harden_child_command(&mut cmd);

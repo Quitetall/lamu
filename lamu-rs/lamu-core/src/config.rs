@@ -99,6 +99,16 @@ pub const PORT_DFLASH: u16 = 8000;
 
 pub const VRAM_RESERVED_MB: u32 = 1500;
 pub const DEFAULT_MAX_TOKENS: u32 = 16384;
+
+/// Which CUDA device LAMU uses (NVML monitoring + backend `CUDA_VISIBLE_DEVICES`).
+/// `LAMU_GPU_INDEX`, default 0. The single-card zero-config path is unchanged
+/// (0 → device 0 → `CUDA_VISIBLE_DEVICES=0`, byte-identical to before). This is
+/// the ADR-0014-named seam and multi-GPU P0 (ADR 0017); full per-device
+/// placement builds on top of it. Pin a specific card with e.g.
+/// `LAMU_GPU_INDEX=1`.
+pub fn gpu_index() -> u32 {
+    parse_env_or("LAMU_GPU_INDEX", 0)
+}
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_CTX_SIZE: u32 = 131072;
 
