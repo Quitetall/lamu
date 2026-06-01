@@ -612,19 +612,14 @@ async fn chat_completions(
         // (`max_tokens`) against the bucket now (conservative — never
         // under-charges). Accurate per-token reconciliation for streams is a
         // tracked follow-up (would tee the stream's token counter). ADR 0018 §4.
+        // (admission was already gated by the pre-flight check at the top of
+        // this fn — it precedes this branch for both stream + non-stream.)
         let reserve = req.max_tokens.unwrap_or_else(default_max_tokens) as u64;
         state.quota.charge(principal_ref, reserve);
-        tracing::info!(
-            target: "lamu_audit",
-            user = user_label(principal_ref),
-            key_id = principal_ref.map(|p| p.key_id).unwrap_or(0),
-            model = %model_name,
-            route,
-            status = 200u16,
-            prompt_tokens = 0u64,
-            completion_tokens = reserve,
-            "stream served (reserved max_tokens)",
-        );
+        // No audit event here: the stream hasn't run, so status/tokens aren't
+        // known. The accurate streaming audit + per-token reconciliation lands
+        // with the stream-teeing follow-up; emitting a premature status=200
+        // would lie when the backend then fails. ADR 0018 §5.
         return stream_response(state.client.clone(), backend_url, payload,
                                completion_id, created, model_name, marker).await
             .into_response();
@@ -1307,6 +1302,11 @@ async fn anthropic_messages(
         if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
             return over_quota("/v1/messages", limit);
         }
+        // Fail-open asymmetry vs chat_completions (which charges AFTER its
+        // model-resolve): the SSE generator resolves the model internally, so
+        // this reserve lands before we know the model loads. A stream that then
+        // fails to load still spends the reservation — conservative, and the
+        // common case loads. Reconciled by the stream-teeing follow-up.
         let reserve = req.max_tokens.unwrap_or_else(default_max_tokens) as u64;
         state.quota.charge(principal_ref, reserve);
         return stream_response_anthropic(state, messages, req.model.clone(),
@@ -1816,6 +1816,11 @@ async fn ollama_chat(
         if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
             return over_quota("/api/chat", limit);
         }
+        // Fail-open asymmetry vs chat_completions (which charges AFTER its
+        // model-resolve): the SSE generator resolves the model internally, so
+        // this reserve lands before we know the model loads. A stream that then
+        // fails to load still spends the reservation — conservative, and the
+        // common case loads. Reconciled by the stream-teeing follow-up.
         let reserve = max_tokens.unwrap_or_else(default_max_tokens) as u64;
         state.quota.charge(principal_ref, reserve);
         return stream_response_ollama(state, messages, req.model.clone(),
