@@ -1693,7 +1693,20 @@ async fn ollama_chat(
     let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
     let (parts, body) = resp.into_parts();
     if parts.status != StatusCode::OK {
-        return (parts.status, body).into_response();
+        // Translate the delegated OpenAI-shaped error into Ollama's flat
+        // {"error":"..."} so /api/chat clients parse it correctly.
+        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+        let msg = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                let err = v.get("error")?;
+                err.get("message")
+                    .and_then(|m| m.as_str())
+                    .or_else(|| err.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
+        return (parts.status, Json(json!({ "error": msg }))).into_response();
     }
     let body_bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
         Ok(b) => b,

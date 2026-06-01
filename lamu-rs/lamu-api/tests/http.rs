@@ -261,6 +261,29 @@ async fn auth_case_insensitive_scheme_accepted() {
 }
 
 #[tokio::test]
+async fn ollama_delegated_503_uses_flat_error() {
+    // /api/chat (stream:false) with no model → 503 → flat Ollama {"error":"..."}.
+    let app = build_app(make_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"qwen35-27b","stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v["error"].as_str().is_some_and(|m| !m.is_empty())); // flat string, not nested
+}
+
+#[tokio::test]
 async fn messages_delegated_503_uses_anthropic_envelope() {
     // No model loaded → /v1/messages delegates to chat_completions (503), and
     // the delegated OpenAI-shaped error must be translated to the Anthropic

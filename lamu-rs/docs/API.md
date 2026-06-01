@@ -613,11 +613,11 @@ model actually backs the request. If running off-loopback, configure the token f
    inbound. New (outbound) tool calls are structured.
 8. **Validation errors (400/422) are not surface envelopes** — they are axum's
    default `text/plain` prose. `resp.json()` on a parse-failure 4xx throws.
-9. **Remaining error-envelope gaps:** `/v1/messages` operational errors and 401s
-   are now surface-correct (Anthropic envelope / path-aware). Still imperfect:
-   Ollama `/api/chat` passes some delegated errors through in the OpenAI shape
-   rather than flat `{"error":"..."}`, and validation 4xx (next item) remains
-   axum's default. (Tracked.)
+9. **Remaining error-envelope gaps:** delegated operational errors are now
+   surface-correct on all three families — OpenAI native, Anthropic envelope
+   (`/v1/messages`), Ollama flat `{"error":"..."}` (`/api/chat`) — and 401s are
+   path-aware. Still imperfect: validation 4xx (next item) is axum's default
+   `text/plain`, and mid-stream errors vary in shape (flat vs object). (Tracked.)
 10. **Synthetic timings on Ollama/Anthropic.** Ollama duration fields are 0;
     Anthropic streamed `output_tokens` is a per-delta count. Only the OpenAI surface
     passes the backend's real `usage`/`timings`.
