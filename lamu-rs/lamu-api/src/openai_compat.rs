@@ -2176,12 +2176,17 @@ async fn ollama_chat(
     let usage = oai.get("usage");
     let in_tok = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
     let out_tok = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+    // m5: map the backend finish_reason into Ollama's done_reason ("length" on
+    // truncation) instead of hardcoding "stop".
+    let oai_finish = oai.get("choices").and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()).unwrap_or("stop");
+    let done_reason = if oai_finish == "length" { "length" } else { "stop" };
 
     let ollama = json!({
         "model": model,
         "created_at": rfc3339_now(),
         "message": {"role":"assistant","content": content},
-        "done_reason": "stop",
+        "done_reason": done_reason,
         "done": true,
         "total_duration": 0,
         "load_duration": 0,
@@ -2341,11 +2346,14 @@ async fn stream_response_ollama(
             yield Ok(format!("{}\n", err).into_bytes());
             return;
         }
+        // m5: report truncation honestly — Ollama's done_reason is "length" when
+        // the backend hit the token cap, else "stop" (was hardcoded "stop").
+        let done_reason = if finish_reason == "length" { "length" } else { "stop" };
         let final_obj = json!({
             "model": model_name,
             "created_at": rfc3339_now(),
             "message": {"role":"assistant","content":""},
-            "done_reason":"stop",
+            "done_reason": done_reason,
             "done": true,
             "total_duration": 0,
             "load_duration": 0,
