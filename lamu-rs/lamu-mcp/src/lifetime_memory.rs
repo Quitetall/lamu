@@ -764,6 +764,11 @@ EXISTING facts the new fact makes OUTDATED — same subject with a \
 conflicting value (e.g. NEW 'lives in SF' vs EXISTING 'lives in NYC', or \
 NEW 'uses Rust' vs EXISTING 'uses Go'). Do NOT flag facts that are merely \
 related, additional, or compatible — only direct contradictions/updates. \
+Each EXISTING fact is annotated with its source (e.g. user-stated, \
+extracted, tool-ingested). Be MORE conservative about marking a \
+user-stated fact outdated than a tool-ingested or model-derived one — \
+require a clear, direct conflict, since the human's own statement \
+outranks an inferred one. \
 Reply with ONLY a JSON object {\"outdated\": [<id>, ...]} listing the ids \
 of the EXISTING facts the new fact supersedes; empty list if none.";
 
@@ -826,7 +831,7 @@ pub async fn reconcile_memory(new_id: i64, new_text: &str) -> Result<usize> {
     }
     let listing = candidates
         .iter()
-        .map(|h| format!("[{}] {}", h.id, h.text))
+        .map(|h| format!("[{}] (source: {}) {}", h.id, h.source.as_deref().unwrap_or("unknown"), h.text))
         .collect::<Vec<_>>()
         .join("\n");
     // The recalled neighbors are the attack vector (a poisoned fact could tell
