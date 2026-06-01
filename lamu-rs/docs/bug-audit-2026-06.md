@@ -4,38 +4,43 @@ Full-tool adversarial bug hunt: 16 finder surfaces → dedup → refute-by-defau
 **57 candidates → 51 confirmed (42 after de-dup) → 6 refuted.** Severity is the verifier's
 corrected severity. Items marked ✅ FIXED have landed; the rest are open, ranked by impact.
 
-## FIXED (landed, ~7e15247 → 7456d10)
+## FIXED — 38 of 42 (all blockers + all 16 majors + 20 of 24 minors)
 
 Blockers: **B1** tool_calls passthrough, **B2** cancellation-safe ensure_loaded.
-Majors: **M1** backend-status propagation, **M2** anthropic stop_reason,
+Majors (all 16): **M1** backend-status propagation, **M2** anthropic stop_reason,
 **M3** random_hex→getrandom, **M4** ollama num_predict negative, **M5** strip
 `<think>` from ollama/anthropic streams, **M6** charge stream reserve after
-resolve, **M7** immediate cross-process revoke, **M9** per-device eviction
-deficit, **M10** router capability bypass, **M11** deterministic main, **M13**
-OpenRouter provider label, **M14** api-keys.env 0600, **M15** model-label
-cardinality clamp.
-Minors: **m8** dedup GPU indices, **m9** cross-device placement remove, **m15**
-router tie determinism, **m16** empty-model match, **m18** parallel_query
-thinking key, **m19** truncated-thinking error flag, **m21** MCP empty-key
-reject, **m22** routing-mode validation.
+resolve, **M7** immediate cross-process revoke, **M8** python backends bind
+loopback, **M9** per-device eviction deficit, **M10** router capability bypass,
+**M11** deterministic main, **M12** backend generate() status, **M13** OpenRouter
+provider label, **M14** api-keys.env 0600, **M15** model-label cardinality clamp,
+**M16** restart/quarantine counters wired.
+Minors (20): m1 embeddings charged, m2 gateway model, m3 anthropic tool_result
+array, m5 ollama done_reason, m8 dedup GPU indices, m9 cross-device placement
+remove, m10 port-exhaustion Option, m11 Backend::stream status, m12 GGUF
+ftype→quant table, m13 write_atomic dir fsync, m14 GPU_INDEX parse, m15 router
+tie determinism, m16 empty-model match, m18 parallel_query thinking key, m19
+truncated-thinking error flag, m20 media symlink canonicalization, m21 MCP
+empty-key reject, m22 routing-mode validation, m23 failure-metric attribution,
+m24 gauge series leak.
 
 Plus a separate `feat`: the TUI model selector is now grouped by provider.
 
-## OPEN (remaining)
+## OPEN — 4 minors (low-value / design-nuanced)
 
-- **M8** (major, DEFERRED) dflash/megakernel bind 0.0.0.0 — fix needs the
-  out-of-repo Python servers to accept `--host`; coordinated Python+Rust change.
-- **M12** (major, latent) Backend trait generate() ignores HTTP status (no live
-  caller today).
-- **M16** (major) backend_restarts_total / backend_quarantined_total never
-  incremented — needs supervisor + quarantine hooks.
-- Minors still open: m1 embeddings uncharged, m2 gateway model omitted, m3
-  anthropic tool_result array, m4 reserve vs eff_max_tokens, m5 ollama
-  done_reason, m6 openai short-output buffering, m7 /metrics auth/user-label,
-  m10 port-exhaustion return, m11 Backend::stream status, m12 GGUF ftype→quant
-  table, m13 write_atomic dir fsync, m14 LAMU_GPU_INDEX parse divergence, m17
-  non-TTY REPL key/provider, m20 media symlink canonicalization, m23 early-fail
-  user attribution, m24 gauge series leak on unload.
+- **m4** streaming quota reserve uses raw `max_tokens`, not the resolved/locked
+  sampler-profile `eff_max_tokens` (minor billing precision when a profile
+  overrides the cap).
+- **m6** OpenAI streaming buffers ≤21-char outputs until end-of-stream (a tiny
+  tagless reply arrives in one final chunk; touches the reasoning-tag state
+  machine — deferred to avoid regressing the untested OpenAI stream).
+- **m7** `/metrics` is unauthenticated (standard for Prometheus) and carries the
+  `user` label, so off-loopback it exposes the key roster. Design call: requiring
+  auth breaks scrapers, dropping the label undoes P2b — recommend firewalling
+  `/metrics` off-loopback, or a future `LAMU_METRICS_USER_LABEL=0` opt-out.
+- **m17** non-TTY `lamu repl <url>` fallback sends `Bearer sk-local` + OpenAI
+  wire-format, ignoring a resolved cloud key/provider (niche: piped REPL against
+  a cloud URL with a config api_key).
 
 | Sev | File:line | Bug | Trigger |
 |-----|-----------|-----|---------|
