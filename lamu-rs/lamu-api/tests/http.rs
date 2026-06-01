@@ -165,6 +165,43 @@ async fn chat_completions_validation_error() {
     assert!(resp.status().is_client_error() || resp.status() == StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_no_deadlock() {
+    // Scale-test P1 (ADR 0017 roadmap): 300 concurrent requests across surfaces
+    // hammer the shared AppState (parking_lot scheduler/router/health locks).
+    // Asserts no deadlock (whole batch inside a timeout) + every response is a
+    // sane status — the safety net for the multi-user/multi-GPU concurrency work.
+    // Read-path endpoints only — they all contend the shared scheduler /
+    // health / metrics locks, which is what we're stress-testing. The chat
+    // spawn path is the e2e test's job (spec_e2e), not a lock test.
+    let app = build_app(make_state());
+    let mut handles = Vec::new();
+    for i in 0..300 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let uri = match i % 3 {
+                0 => "/health",
+                1 => "/v1/models",
+                _ => "/metrics",
+            };
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures_util::future::join_all(handles),
+    )
+    .await
+    .expect("concurrent HTTP batch deadlocked / timed out");
+    for r in results {
+        let st = r.expect("request task panicked");
+        assert!(st.is_success(), "read endpoint failed under concurrency: {st}");
+    }
+}
+
 #[tokio::test]
 async fn unknown_route_404() {
     let app = build_app(make_state());
