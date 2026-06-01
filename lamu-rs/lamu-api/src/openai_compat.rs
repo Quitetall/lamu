@@ -347,6 +347,18 @@ async fn embeddings(
                         .into_response();
                 }
             };
+            // m1: meter embeddings — the quota was CHECKED at entry but never
+            // CHARGED, so a metered key got unlimited embeddings. Charge the
+            // backend-reported prompt_tokens (best-effort; 0 if absent/non-JSON).
+            if status.is_success() {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    let toks = v.get("usage")
+                        .and_then(|u| u.get("prompt_tokens"))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    state.quota.charge(principal_ref, toks);
+                }
+            }
             let mut resp = (status, bytes).into_response();
             resp.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
@@ -365,6 +377,7 @@ async fn embeddings(
 async fn resolve_and_ensure_loaded(
     state: &AppState,
     model_req: Option<&str>,
+    principal: Option<&Principal>, // m23: attribute failure-path metrics to the real user
 ) -> std::result::Result<(u16, String, Option<ReasoningMarker>, Option<SamplingProfile>), Response> {
     let decision = {
         let scheduler = state.scheduler.lock();
@@ -375,7 +388,7 @@ async fn resolve_and_ensure_loaded(
 
     if decision.model_name.is_empty() {
         state.metrics.requests_total
-            .with_label_values(&[model_req.filter(|m| state.entries.contains_key(*m)).unwrap_or("unregistered"), "no_candidate", "anon"])
+            .with_label_values(&[model_req.filter(|m| state.entries.contains_key(*m)).unwrap_or("unregistered"), "no_candidate", user_label(principal)])
             .inc();
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
             "error": {
@@ -410,7 +423,7 @@ async fn resolve_and_ensure_loaded(
             // retry once a model frees up, rather than a bare 503.
             Err(e @ lamu_core::Error::VramExhausted { .. }) => {
                 state.metrics.requests_total
-                    .with_label_values(&[metric_model, "vram_exhausted", "anon"])
+                    .with_label_values(&[metric_model, "vram_exhausted", user_label(principal)])
                     .inc();
                 // Retry-After is a fixed policy constant: the scheduler refuses
                 // immediately (no queue), so ~10s is a reasonable "a model may
@@ -428,7 +441,7 @@ async fn resolve_and_ensure_loaded(
             }
             Err(e) => {
                 state.metrics.requests_total
-                    .with_label_values(&[metric_model, "spawn_failed", "anon"])
+                    .with_label_values(&[metric_model, "spawn_failed", user_label(principal)])
                     .inc();
                 return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
                     "error": {
@@ -551,6 +564,7 @@ async fn chat_completions(
     let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         req.model.as_deref(),
+        principal_ref,
     ).await {
         Ok(t) => t,
         Err(resp) => return resp,
@@ -1569,7 +1583,7 @@ async fn anthropic_messages(
         // resolve_and_ensure_loaded is idempotent — the stream fn below re-runs
         // it and hits the loaded fast-path. On failure we return its error
         // Response without charging.
-        if let Err(resp) = resolve_and_ensure_loaded(&state, req.model.as_deref()).await {
+        if let Err(resp) = resolve_and_ensure_loaded(&state, req.model.as_deref(), principal_ref).await {
             return resp;
         }
         let reserve = req.max_tokens.unwrap_or_else(default_max_tokens) as u64;
@@ -1769,6 +1783,7 @@ async fn stream_response_anthropic(
     let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
+        None, // stream fns have no Principal; failure metrics attribute to "anon"
     ).await {
         Ok(t) => t,
         Err(resp) => return resp,
@@ -2117,7 +2132,7 @@ async fn ollama_chat(
         // M6: resolve+load BEFORE charging the reserve (see anthropic path) so a
         // failed/unloadable model doesn't burn a metered user's quota. The
         // stream fn re-resolves and hits the loaded fast-path.
-        if let Err(resp) = resolve_and_ensure_loaded(&state, req.model.as_deref()).await {
+        if let Err(resp) = resolve_and_ensure_loaded(&state, req.model.as_deref(), principal_ref).await {
             return resp;
         }
         let reserve = max_tokens.unwrap_or_else(default_max_tokens) as u64;
@@ -2247,6 +2262,7 @@ async fn stream_response_ollama(
     let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
+        None, // stream fns have no Principal; failure metrics attribute to "anon"
     ).await {
         Ok(t) => t,
         Err(resp) => return resp,
