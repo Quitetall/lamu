@@ -1107,6 +1107,21 @@ fn anthropic_message_to_openai(
     }
 }
 
+/// Map an HTTP status to the Anthropic error `type` so /v1/messages errors
+/// use the envelope Claude clients expect.
+pub(crate) fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
 async fn anthropic_messages(
     State(state): State<AppState>,
     Json(req): Json<AnthropicRequest>,
@@ -1163,8 +1178,28 @@ async fn anthropic_messages(
     let resp = chat_completions(State(state), Json(oai_req)).await.into_response();
     let (parts, body) = resp.into_parts();
     if parts.status != StatusCode::OK {
-        // Pass error envelope through (already JSON).
-        return (parts.status, body).into_response();
+        // Translate the delegated OpenAI-shaped error into Anthropic's
+        // envelope so /v1/messages clients (Claude Code) get a shape they can
+        // parse — passing the OpenAI {error:{message,type}} through verbatim
+        // would surface as an unparseable error on this surface.
+        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+        let msg = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
+        return (
+            parts.status,
+            Json(json!({
+                "type": "error",
+                "error": { "type": anthropic_error_type(parts.status), "message": msg }
+            })),
+        )
+            .into_response();
     }
     let body_bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
         Ok(b) => b,

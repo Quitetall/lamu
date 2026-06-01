@@ -106,7 +106,8 @@ curl http://127.0.0.1:8020/v1/models \
   -H "Authorization: Bearer $LAMU_API_TOKEN"
 ```
 
-**401 response** (same shape on every surface today — see [footguns](#footguns)):
+**401 response** — surface-correct: Anthropic shape on `/v1/messages`, Ollama flat
+`{"error":"..."}` on `/api/*`, OpenAI shape elsewhere. OpenAI example:
 
 ```
 HTTP/1.1 401 Unauthorized
@@ -468,9 +469,10 @@ streamed `output_tokens` is a naive per-delta count, not the backend tokenizer c
 | 500 | `{"type":"error","error":{"type":"internal","message":"body read: <e>"}}` |
 | 502 | `{"type":"error","error":{"type":"bad_response","message":"json: <e>"}}` |
 
-> Caveat: delegated operational errors (gpu_locked / no-model / spawn_failed /
-> backend-unreachable) are currently passed through in the **OpenAI** envelope shape,
-> not the Anthropic one. See [footguns](#footguns).
+> Delegated operational errors (gpu_locked / no-model / spawn_failed /
+> backend-unreachable) are translated into the **Anthropic** error envelope
+> (`{"type":"error","error":{"type":"...","message":"..."}}`) on this surface,
+> with the `type` mapped from the HTTP status.
 
 ---
 
@@ -611,9 +613,11 @@ model actually backs the request. If running off-loopback, configure the token f
    inbound. New (outbound) tool calls are structured.
 8. **Validation errors (400/422) are not surface envelopes** — they are axum's
    default `text/plain` prose. `resp.json()` on a parse-failure 4xx throws.
-9. **Error-envelope drift:** Anthropic `/v1/messages` returns the OpenAI envelope
-   for delegated operational errors; Ollama `/api/chat` likewise; auth 401 is OpenAI
-   shape on every surface. (Tracked for cleanup.)
+9. **Remaining error-envelope gaps:** `/v1/messages` operational errors and 401s
+   are now surface-correct (Anthropic envelope / path-aware). Still imperfect:
+   Ollama `/api/chat` passes some delegated errors through in the OpenAI shape
+   rather than flat `{"error":"..."}`, and validation 4xx (next item) remains
+   axum's default. (Tracked.)
 10. **Synthetic timings on Ollama/Anthropic.** Ollama duration fields are 0;
     Anthropic streamed `output_tokens` is a per-delta count. Only the OpenAI surface
     passes the backend's real `usage`/`timings`.

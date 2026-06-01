@@ -261,6 +261,27 @@ async fn auth_case_insensitive_scheme_accepted() {
 }
 
 #[tokio::test]
+async fn auth_401_uses_anthropic_envelope_on_messages() {
+    let app = build_app(state_with_token("lamu_secret"));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "authentication_error");
+}
+
+#[tokio::test]
 async fn cors_preflight_allowed_pre_auth() {
     // CORS is outermost: a browser preflight OPTIONS is answered before the
     // bearer middleware, so browser frontends work even with a token set.

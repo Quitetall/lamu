@@ -80,13 +80,20 @@ pub async fn require_bearer(State(st): State<AppState>, req: Request, next: Next
     if ok {
         next.run(req).await
     } else {
-        // OpenAI error-envelope shape so compat clients surface it correctly.
+        // Surface-correct 401 envelope so the calling frontend can parse it:
+        // Anthropic shape on /v1/messages, Ollama flat-string on /api/*, else
+        // the OpenAI shape.
+        let body = if path.starts_with("/v1/messages") {
+            Json(json!({"type": "error", "error": {"type": "authentication_error", "message": "unauthorized"}}))
+        } else if path.starts_with("/api/") {
+            Json(json!({"error": "unauthorized"}))
+        } else {
+            Json(json!({"error": {"message": "unauthorized", "type": "invalid_request_error"}}))
+        };
         (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
-            Json(json!({
-                "error": { "message": "unauthorized", "type": "invalid_request_error" }
-            })),
+            body,
         )
             .into_response()
     }
