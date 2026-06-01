@@ -520,6 +520,29 @@ async fn static_token_path_never_429s_on_quota() {
 }
 
 #[tokio::test]
+async fn junk_model_name_never_becomes_a_metric_label() {
+    // M15: a client-supplied model that isn't in the registry must NOT mint a
+    // Prometheus series (unbounded-cardinality / memory DoS). The failure
+    // branch labels it "unregistered" instead of echoing the raw string.
+    let probe = "junk-cardinality-probe-zzz-12345";
+    let app = build_app(make_state());
+    let _ = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"model":"{probe}","messages":[{{"role":"user","content":"hi"}}]}}"#)))
+            .unwrap(),
+    ).await.unwrap();
+    let m = app.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .await.unwrap();
+    let bytes = axum::body::to_bytes(m.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!text.contains(probe), "raw client model name leaked into a metric label: cardinality DoS");
+    assert!(text.contains(r#"model="unregistered""#), "unregistered models must collapse to the bounded label");
+}
+
+#[tokio::test]
 async fn vram_exhausted_returns_503_with_retry_after() {
     // Force the scheduler below any model's footprint so resolve_and_ensure_loaded
     // hits VramExhausted (deterministic regardless of the host GPU). The 503 must

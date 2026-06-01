@@ -375,7 +375,7 @@ async fn resolve_and_ensure_loaded(
 
     if decision.model_name.is_empty() {
         state.metrics.requests_total
-            .with_label_values(&[model_req.unwrap_or("unknown"), "no_candidate", "anon"])
+            .with_label_values(&[model_req.filter(|m| state.entries.contains_key(*m)).unwrap_or("unregistered"), "no_candidate", "anon"])
             .inc();
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
             "error": {
@@ -386,6 +386,16 @@ async fn resolve_and_ensure_loaded(
     }
 
     if !decision.loaded {
+        // M15: clamp the metric label to a registered name. router's find_model
+        // substring fallback can echo an unregistered string into model_name,
+        // and ensure_loaded then fails ModelNotFound → spawn_failed; without
+        // this clamp a junk client model would mint an unbounded Prometheus
+        // series. The response body keeps the real name for the human message.
+        let metric_model: &str = if state.entries.contains_key(&decision.model_name) {
+            decision.model_name.as_str()
+        } else {
+            "unregistered"
+        };
         match lamu_core::loader::ensure_loaded(
             &decision.model_name,
             state.entries.as_ref(),
@@ -400,7 +410,7 @@ async fn resolve_and_ensure_loaded(
             // retry once a model frees up, rather than a bare 503.
             Err(e @ lamu_core::Error::VramExhausted { .. }) => {
                 state.metrics.requests_total
-                    .with_label_values(&[&decision.model_name, "vram_exhausted", "anon"])
+                    .with_label_values(&[metric_model, "vram_exhausted", "anon"])
                     .inc();
                 // Retry-After is a fixed policy constant: the scheduler refuses
                 // immediately (no queue), so ~10s is a reasonable "a model may
@@ -418,7 +428,7 @@ async fn resolve_and_ensure_loaded(
             }
             Err(e) => {
                 state.metrics.requests_total
-                    .with_label_values(&[&decision.model_name, "spawn_failed", "anon"])
+                    .with_label_values(&[metric_model, "spawn_failed", "anon"])
                     .inc();
                 return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
                     "error": {
@@ -497,7 +507,7 @@ async fn chat_completions(
     // None-quota; 429 on an exhausted bucket. Audited as status=429.
     if let QuotaCheck::Exhausted { limit } = state.quota.check(principal_ref) {
         state.metrics.requests_total
-            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "quota_exceeded", user_label(principal_ref)])
+            .with_label_values(&[req.model.as_deref().filter(|m| state.entries.contains_key(*m)).unwrap_or("unregistered"), "quota_exceeded", user_label(principal_ref)])
             .inc();
         tracing::info!(
             target: "lamu_audit",
@@ -522,7 +532,7 @@ async fn chat_completions(
     // contending on internal state.
     if let Err(e) = lamu_core::scheduler_lock::check_unlocked() {
         state.metrics.requests_total
-            .with_label_values(&[req.model.as_deref().unwrap_or("unknown"), "gpu_locked", user_label(principal_ref)])
+            .with_label_values(&[req.model.as_deref().filter(|m| state.entries.contains_key(*m)).unwrap_or("unregistered"), "gpu_locked", user_label(principal_ref)])
             .inc();
         let body = ErrorResponse {
             error: ErrorBody {
@@ -689,6 +699,41 @@ async fn chat_completions(
                 Json(json!({"error": {"message": format!("Backend unreachable: {}", e)}}))).into_response();
         }
     };
+
+    // M1: propagate a real backend HTTP error instead of parsing the error body
+    // as a (choices-less) completion and reporting a generic 502
+    // backend_returned_empty. A 400 "maximum context length…" must reach the
+    // client as a 400 with the backend's message — not a retriable 502 that
+    // drives Claude Code into a retry storm. (reqwest returns Ok for 4xx/5xx.)
+    let backend_status = resp.status();
+    if !backend_status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message").and_then(|m| m.as_str()).or_else(|| e.as_str()))
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| body.trim().to_string());
+        state.health.lock().get_or_create(&model_name).record_error(msg.clone());
+        state.metrics.requests_total
+            .with_label_values(&[&model_name, "backend_error", user_label(principal_ref)])
+            .inc();
+        // Pass the backend's status through when it's a client-side 4xx (the
+        // caller should fix the request); collapse 5xx to 502 (gateway).
+        let out_status = if backend_status.is_client_error() {
+            backend_status
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return (out_status, Json(json!({
+            "error": {
+                "message": format!("backend on :{port}: {msg}"),
+                "type": "backend_error",
+            }
+        }))).into_response();
+    }
 
     let data: Value = match resp.json().await {
         Ok(v) => v,
