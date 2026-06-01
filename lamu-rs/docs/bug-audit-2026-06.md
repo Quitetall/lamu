@@ -4,9 +4,38 @@ Full-tool adversarial bug hunt: 16 finder surfaces → dedup → refute-by-defau
 **57 candidates → 51 confirmed (42 after de-dup) → 6 refuted.** Severity is the verifier's
 corrected severity. Items marked ✅ FIXED have landed; the rest are open, ranked by impact.
 
-Fixed so far (commits 7e15247, 66f8b08): B1 tool_calls passthrough, M2 anthropic stop_reason,
-M3 random_hex→getrandom, M4 ollama num_predict negative, M1 backend-status propagation,
-M15 model-label cardinality clamp.
+## FIXED (landed, ~7e15247 → 7456d10)
+
+Blockers: **B1** tool_calls passthrough, **B2** cancellation-safe ensure_loaded.
+Majors: **M1** backend-status propagation, **M2** anthropic stop_reason,
+**M3** random_hex→getrandom, **M4** ollama num_predict negative, **M5** strip
+`<think>` from ollama/anthropic streams, **M6** charge stream reserve after
+resolve, **M7** immediate cross-process revoke, **M9** per-device eviction
+deficit, **M10** router capability bypass, **M11** deterministic main, **M13**
+OpenRouter provider label, **M14** api-keys.env 0600, **M15** model-label
+cardinality clamp.
+Minors: **m8** dedup GPU indices, **m9** cross-device placement remove, **m15**
+router tie determinism, **m16** empty-model match, **m18** parallel_query
+thinking key, **m19** truncated-thinking error flag, **m21** MCP empty-key
+reject, **m22** routing-mode validation.
+
+Plus a separate `feat`: the TUI model selector is now grouped by provider.
+
+## OPEN (remaining)
+
+- **M8** (major, DEFERRED) dflash/megakernel bind 0.0.0.0 — fix needs the
+  out-of-repo Python servers to accept `--host`; coordinated Python+Rust change.
+- **M12** (major, latent) Backend trait generate() ignores HTTP status (no live
+  caller today).
+- **M16** (major) backend_restarts_total / backend_quarantined_total never
+  incremented — needs supervisor + quarantine hooks.
+- Minors still open: m1 embeddings uncharged, m2 gateway model omitted, m3
+  anthropic tool_result array, m4 reserve vs eff_max_tokens, m5 ollama
+  done_reason, m6 openai short-output buffering, m7 /metrics auth/user-label,
+  m10 port-exhaustion return, m11 Backend::stream status, m12 GGUF ftype→quant
+  table, m13 write_atomic dir fsync, m14 LAMU_GPU_INDEX parse divergence, m17
+  non-TTY REPL key/provider, m20 media symlink canonicalization, m23 early-fail
+  user attribution, m24 gauge series leak on unload.
 
 | Sev | File:line | Bug | Trigger |
 |-----|-----------|-----|---------|

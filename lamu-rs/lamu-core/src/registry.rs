@@ -175,19 +175,31 @@ fn parse_gguf_meta(path: &Path) -> Result<GgufMeta> {
 fn detect_quant(meta: &GgufMeta, filename: &str) -> String {
     // GGUF metadata file_type
     if let Some(ft) = meta.file_type {
+        // m12: corrected against llama.cpp's LLAMA_FTYPE enum. 19/20/21 were
+        // mislabeled (Q2_K/Q3_K_S/Q3_K_M) — they are IQ2_XXS/IQ2_XS/Q2_K_S; and
+        // 3/8/9/10-13 (Q4_1, Q5_0/1, Q2_K, Q3_K_S/M/L) were missing entirely
+        // (those fell through to the filename guess). Version-variable IQ types
+        // ≥22 are intentionally left to the filename fallback.
         let name = match ft {
             0 => Some("F32"),
             1 => Some("F16"),
             2 => Some("Q4_0"),
+            3 => Some("Q4_1"),
             7 => Some("Q8_0"),
+            8 => Some("Q5_0"),
+            9 => Some("Q5_1"),
+            10 => Some("Q2_K"),
+            11 => Some("Q3_K_S"),
+            12 => Some("Q3_K_M"),
+            13 => Some("Q3_K_L"),
             14 => Some("Q4_K_S"),
             15 => Some("Q4_K_M"),
             16 => Some("Q5_K_S"),
             17 => Some("Q5_K_M"),
             18 => Some("Q6_K"),
-            19 => Some("Q2_K"),
-            20 => Some("Q3_K_S"),
-            21 => Some("Q3_K_M"),
+            19 => Some("IQ2_XXS"),
+            20 => Some("IQ2_XS"),
+            21 => Some("Q2_K_S"),
             _ => None,
         };
         if let Some(n) = name {
@@ -583,6 +595,15 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
+    }
+    // m13: fsync the parent directory so the rename's directory entry is durable
+    // across a power loss (the atomicity of rename guarantees no torn file, but
+    // not that the rename itself survives a crash). Best-effort like the file
+    // sync above — tmpfs/FUSE may not support it.
+    if let Some(parent) = dest.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }
