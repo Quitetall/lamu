@@ -186,3 +186,23 @@ fn placement_of_absent_is_none() {
     let s = VramScheduler::new();
     assert!(s.placement_of("never-loaded").is_none());
 }
+
+#[test]
+fn plan_load_uses_per_device_deficit_not_aggregate() {
+    // M9: two 24GB cards each holding a 20GB model → 4GB free each, 8GB
+    // aggregate. A new 6GB model fits on NEITHER card as-is, but evicting one
+    // card's model makes room. The old aggregate deficit (6 - 8 = 0) evicted
+    // nothing and wrongly refused; the per-device deficit (6 - 4 = 2) evicts.
+    let mut s = VramScheduler::new();
+    s.set_devices_for_tests(&[(24000, "a"), (24000, "b")]);
+    let big1 = mk_entry("big1", 20000, Modality::Llm);
+    let big2 = mk_entry("big2", 20000, Modality::Llm);
+    s.register_loaded(big1.clone(), Some(1), 8001, 20000);
+    s.register_loaded(big2.clone(), Some(2), 8002, 20000);
+
+    let newcomer = mk_entry("newcomer", 6000, Modality::Llm);
+    let (can_load, to_evict) = s.plan_load(&newcomer);
+    assert!(can_load, "must be loadable by evicting one card's model (M9)");
+    assert!(!to_evict.is_empty(), "must plan an eviction, not refuse with empty");
+    assert_eq!(to_evict.len(), 1, "evicting one 20GB model frees enough on the target");
+}

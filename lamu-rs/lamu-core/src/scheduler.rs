@@ -59,13 +59,19 @@ impl VramScheduler {
             return Vec::new();
         };
         let count = nvml.device_count().unwrap_or(0);
-        let indices: Vec<u32> = if let Ok(v) = std::env::var("LAMU_GPU_INDEX") {
+        let mut indices: Vec<u32> = if let Ok(v) = std::env::var("LAMU_GPU_INDEX") {
             v.trim().parse::<u32>().ok().into_iter().collect()
         } else if let Ok(list) = std::env::var("LAMU_GPU_INDICES") {
             list.split(',').filter_map(|s| s.trim().parse::<u32>().ok()).collect()
         } else {
             (0..count).collect()
         };
+        // m8: dedup so `LAMU_GPU_INDICES=0,0` doesn't build two DeviceBudgets for
+        // one physical card (which would double-count its VRAM and over-commit it).
+        {
+            let mut seen = std::collections::HashSet::new();
+            indices.retain(|i| seen.insert(*i));
+        }
         indices
             .into_iter()
             .filter(|i| *i < count)
@@ -272,6 +278,12 @@ impl VramScheduler {
         let dev = self.placement_for(vram_actual_mb).min(self.devices.len() - 1);
         let nvml_index = self.devices[dev].index;
         let name = entry.name.clone();
+        // m9: drop any prior placement of this model on ANY device before
+        // inserting, so re-registering a model whose device changed doesn't
+        // leave a stale entry double-counting its VRAM across two devices.
+        for d in &mut self.devices {
+            d.loaded.remove(&name);
+        }
         let model = LoadedModel {
             entry,
             state: ModelState::Loaded,
@@ -327,13 +339,24 @@ impl VramScheduler {
     /// enough. (P1 evicts globally; placement-aware per-target-device eviction
     /// is P2.)
     pub fn plan_eviction(&self, needed_mb: u32) -> Vec<String> {
+        self.plan_eviction_on(None, needed_mb)
+    }
+
+    /// Eviction plan to free `needed_mb`, optionally restricted to a single
+    /// `device` (M9). `None` = across all devices (the global P1 behavior).
+    /// Modality-tiered LRU (non-LLM image/tts before LLMs, LRU within tier),
+    /// skips pinned. Returns names in eviction order, or empty if it can't free
+    /// enough on the chosen scope.
+    fn plan_eviction_on(&self, device: Option<usize>, needed_mb: u32) -> Vec<String> {
         if needed_mb == 0 {
             return vec![];
         }
         let mut evictable: Vec<&LoadedModel> = self
             .devices
             .iter()
-            .flat_map(|d| d.loaded.values())
+            .enumerate()
+            .filter(|(i, _)| device.map_or(true, |d| *i == d))
+            .flat_map(|(_, d)| d.loaded.values())
             .filter(|m| !m.entry.pinned && m.state == ModelState::Loaded)
             .collect();
         evictable.sort_by_key(|m| (m.entry.modality.is_llm(), m.last_used));
@@ -350,9 +373,15 @@ impl VramScheduler {
         vec![]
     }
 
-    /// Plan loading. Returns (can_load, models_to_evict). Single-device: a
-    /// model either fits or we evict LRU to fit. (P2 makes the deficit + the
-    /// eviction target a specific device.)
+    /// Plan loading. Returns (can_load, models_to_evict).
+    ///
+    /// M9: a model must fit on ONE device, so when no device fits as-is we
+    /// compute the deficit against the TARGET device (the most-free one), NOT
+    /// the aggregate free across devices, and scope eviction to that device.
+    /// Using the aggregate (the old behavior) could refuse a load that one
+    /// device's eviction would satisfy, or evict on the wrong card. On a single
+    /// GPU the target IS the only device and the aggregate equals its free, so
+    /// this is byte-identical to before.
     pub fn plan_load(&self, entry: &ModelEntry) -> (bool, Vec<String>) {
         if self.is_loaded(&entry.name) {
             return (true, vec![]);
@@ -360,8 +389,12 @@ impl VramScheduler {
         if self.can_fit(entry) {
             return (true, vec![]);
         }
-        let deficit = entry.vram_mb.saturating_sub(self.available_mb());
-        let to_evict = self.plan_eviction(deficit);
+        let Some(target) = self.most_available() else {
+            return (false, vec![]);
+        };
+        let target_free = self.device_available(&self.devices[target]);
+        let deficit = entry.vram_mb.saturating_sub(target_free);
+        let to_evict = self.plan_eviction_on(Some(target), deficit);
         if to_evict.is_empty() {
             return (false, vec![]);
         }
@@ -378,6 +411,10 @@ impl VramScheduler {
         self.ensure_one_device();
         let dev = self.placement_for(entry.vram_mb).min(self.devices.len() - 1);
         let nvml_index = self.devices[dev].index;
+        // m9: clear any prior placement on any device first (see register_loaded).
+        for d in &mut self.devices {
+            d.loaded.remove(&entry.name);
+        }
         let model = LoadedModel {
             entry: entry.clone(),
             state: ModelState::Loading,
