@@ -59,8 +59,12 @@ impl VramScheduler {
             return Vec::new();
         };
         let count = nvml.device_count().unwrap_or(0);
-        let mut indices: Vec<u32> = if let Ok(v) = std::env::var("LAMU_GPU_INDEX") {
-            v.trim().parse::<u32>().ok().into_iter().collect()
+        let mut indices: Vec<u32> = if std::env::var("LAMU_GPU_INDEX").is_ok() {
+            // m14: an unparseable LAMU_GPU_INDEX must NOT yield an empty device
+            // list (scheduler manages 0 GPUs → refuses every load) while the
+            // backends fall back to crate::config::gpu_index()'s default of 0 and
+            // run on device 0. Use the SAME validated parse so both agree.
+            vec![crate::config::gpu_index()]
         } else if let Ok(list) = std::env::var("LAMU_GPU_INDICES") {
             list.split(',').filter_map(|s| s.trim().parse::<u32>().ok()).collect()
         } else {

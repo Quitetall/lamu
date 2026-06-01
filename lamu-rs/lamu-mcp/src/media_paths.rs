@@ -40,7 +40,27 @@ pub(crate) fn resolve_confined_output_path(
                     dir.display()
                 ));
             }
-            Ok(dir.join(pb))
+            let candidate = dir.join(pb);
+            // m20: the `..`/absolute check above doesn't catch a SYMLINK
+            // component (e.g. `link/x.png` where `link` → /etc). Canonicalize
+            // the target's parent (the file itself may not exist yet) and the
+            // confined root, and require containment — mirroring handle_write_file.
+            let root = dir
+                .canonicalize()
+                .map_err(|e| format!("error: canonicalize confined dir {}: {e}", dir.display()))?;
+            let parent = candidate.parent().unwrap_or(&dir);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("error: create output parent dir: {e}"))?;
+            let real_parent = parent
+                .canonicalize()
+                .map_err(|e| format!("error: canonicalize output parent: {e}"))?;
+            if !real_parent.starts_with(&root) {
+                return Err(format!(
+                    "error: output_path escapes the confined dir {} (symlink?): got '{p}'",
+                    dir.display()
+                ));
+            }
+            Ok(candidate)
         }
         _ => {
             let stamp = std::time::SystemTime::now()
