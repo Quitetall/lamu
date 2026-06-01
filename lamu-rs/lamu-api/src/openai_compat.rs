@@ -480,12 +480,24 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
             Capability::LongContext => "long_context",
             Capability::Embedding => "embedding",
         }).collect();
+        // Per-model modality so ANY frontend can tell chat LLMs apart from
+        // media models (a fish-speech TTS / ComfyUI image model must not show
+        // up in a chat-model dropdown). Non-breaking: vanilla OpenAI clients
+        // ignore the extra field. `loaded` (above) is the active/inactive
+        // signal — now trustworthy via the reconcile loop — so a frontend can
+        // mark which models are live vs will-load-on-first-use.
+        let modality = match entry.modality {
+            lamu_core::types::Modality::Llm => "llm",
+            lamu_core::types::Modality::Image => "image",
+            lamu_core::types::Modality::Tts => "tts",
+        };
         data.push(json!({
             "id": name,
             "object": "model",
             "created": 0, // OpenAI-shape field; LAMU doesn't track model ctime
             "owned_by": "local",
             "loaded": loaded,
+            "modality": modality,
             "params_b": entry.params_b,
             "vram_mb": entry.vram_mb,
             "capabilities": caps,
