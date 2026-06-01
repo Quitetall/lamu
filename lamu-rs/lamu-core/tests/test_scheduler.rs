@@ -125,3 +125,64 @@ fn register_and_evict() {
         eprintln!("Plan {}: can={} evict={:?}", small.name, can, evict);
     }
 }
+
+// ── device placement (ADR 0017 P2) ──────────────────────────────────
+
+#[test]
+fn placement_of_records_device_index_multi_gpu() {
+    use lamu_core::types::DevicePlacement;
+    let mut s = VramScheduler::new();
+    s.set_devices_for_tests(&[(24000, "small"), (48000, "big")]);
+    // best-fit puts a 10GB model on the roomier card (index 1).
+    let m1 = mk_entry("m1", 10000, Modality::Llm);
+    s.register_loaded(m1.clone(), Some(1), 8001, m1.vram_mb);
+    assert_eq!(s.device_of_for_tests("m1"), Some(1));
+    assert_eq!(
+        s.placement_of("m1"),
+        Some(DevicePlacement::Single(1)),
+        "placement_of must report the same NVML index the scheduler placed on"
+    );
+    // a smaller model — assert against actual placement, not a guess.
+    let m2 = mk_entry("m2", 1000, Modality::Llm);
+    s.register_loaded(m2.clone(), Some(2), 8002, m2.vram_mb);
+    let want = DevicePlacement::Single(s.device_of_for_tests("m2").unwrap());
+    assert_eq!(s.placement_of("m2"), Some(want));
+}
+
+#[test]
+fn placement_of_single_gpu_is_index_zero() {
+    use lamu_core::types::DevicePlacement;
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(24000); // one synthetic device, index 0
+    let m = mk_entry("solo", 8000, Modality::Llm);
+    s.register_loaded(m.clone(), Some(1), 8020, m.vram_mb);
+    assert_eq!(
+        s.placement_of("solo"),
+        Some(DevicePlacement::Single(0)),
+        "single-GPU placement must be Single(0) — byte-identical to pre-P2"
+    );
+}
+
+#[test]
+fn mark_loading_records_placement_before_confirm() {
+    use lamu_core::types::DevicePlacement;
+    let mut s = VramScheduler::new();
+    s.set_devices_for_tests(&[(24000, "a"), (48000, "b")]);
+    let e = mk_entry("pending", 12000, Modality::Llm);
+    s.mark_loading(e.clone());
+    // placement is fixed at mark_loading time (loader reads it pre-spawn).
+    assert_eq!(s.placement_of("pending"), Some(DevicePlacement::Single(1)));
+    // confirm_loaded must NOT move the placement.
+    s.confirm_loaded("pending", 4242, 8001, 12000).unwrap();
+    assert_eq!(
+        s.placement_of("pending"),
+        Some(DevicePlacement::Single(1)),
+        "confirm_loaded must preserve the device chosen at mark_loading"
+    );
+}
+
+#[test]
+fn placement_of_absent_is_none() {
+    let s = VramScheduler::new();
+    assert!(s.placement_of("never-loaded").is_none());
+}

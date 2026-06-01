@@ -5,7 +5,7 @@
 
 use crate::backends::{Backend, ChatMessage};
 use crate::scheduler::VramScheduler;
-use crate::types::ModelEntry;
+use crate::types::{DevicePlacement, ModelEntry};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::{Stream, StreamExt};
@@ -25,6 +25,7 @@ pub struct MegakernelBackend {
     port: u16,
     model_name: String,
     client: reqwest::Client,
+    cuda_index: u32,
 }
 
 impl MegakernelBackend {
@@ -42,12 +43,17 @@ impl MegakernelBackend {
             port: 0,
             model_name: String::new(),
             client,
+            cuda_index: crate::config::gpu_index(),
         })
     }
 }
 
 #[async_trait]
 impl Backend for MegakernelBackend {
+    fn set_device(&mut self, placement: DevicePlacement) {
+        self.cuda_index = placement.primary_index();
+    }
+
     async fn load(&mut self, entry: &ModelEntry, port: u16) -> Result<u32> {
         self.port = port;
         self.model_name = entry.name.clone();
@@ -69,7 +75,7 @@ impl Backend for MegakernelBackend {
         cmd.arg(&self.server_script)
             .arg("--port").arg(port.to_string())
             .current_dir(&self.work_dir)
-            .env("CUDA_VISIBLE_DEVICES", crate::config::gpu_index().to_string())
+            .env("CUDA_VISIBLE_DEVICES", self.cuda_index.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         crate::backends::harden_child_command(&mut cmd);

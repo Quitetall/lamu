@@ -23,7 +23,7 @@ use crate::backends::{make_backend, Backend};
 use crate::config::{PORT_MAIN, PORT_SIDECAR};
 use crate::health::HealthRegistry;
 use crate::scheduler::VramScheduler;
-use crate::types::{LoadedModel, ModelEntry, ModelState};
+use crate::types::{DevicePlacement, LoadedModel, ModelEntry, ModelState};
 use crate::{Error, Result};
 
 fn spawn_gate() -> &'static AsyncMutex<()> {
@@ -31,11 +31,19 @@ fn spawn_gate() -> &'static AsyncMutex<()> {
     GATE.get_or_init(|| AsyncMutex::new(()))
 }
 
-/// Spawn a single backend on `port`. Pure primitive — caller is
-/// responsible for scheduler bookkeeping. Returns the backend trait
-/// object plus the spawned subprocess PID.
-pub async fn spawn_one(entry: &ModelEntry, port: u16) -> Result<(Box<dyn Backend>, u32)> {
+/// Spawn a single backend on `port`, pinned to `placement` (ADR 0017
+/// P2). Pure primitive — caller is responsible for scheduler
+/// bookkeeping. `set_device` runs before `load` so the spawned child's
+/// `CUDA_VISIBLE_DEVICES` matches the scheduler's placement; on a
+/// single-GPU rig `placement` is `Single(0)` and this is byte-identical
+/// to before. Returns the backend trait object plus the subprocess PID.
+pub async fn spawn_one(
+    entry: &ModelEntry,
+    port: u16,
+    placement: DevicePlacement,
+) -> Result<(Box<dyn Backend>, u32)> {
     let mut backend = make_backend(entry)?;
+    backend.set_device(placement);
     let pid = backend.load(entry, port).await?;
     Ok((backend, pid))
 }
@@ -87,9 +95,22 @@ pub async fn ensure_loaded(
     health: &Arc<Mutex<HealthRegistry>>,
     http_serve_port: Option<u16>,
 ) -> Result<LoadedModel> {
+    let sched_for_spawn = scheduler.clone();
     ensure_loaded_with(
         name, entries, scheduler, health, http_serve_port,
-        |entry, port| async move { spawn_one(&entry, port).await },
+        move |entry, port| {
+            let sched = sched_for_spawn.clone();
+            async move {
+                // Placement was recorded by the in-gate `mark_loading`
+                // before this closure runs; default to Single(0) if the
+                // entry somehow isn't tracked (single-GPU: always 0).
+                let placement = sched
+                    .lock()
+                    .placement_of(&entry.name)
+                    .unwrap_or_default();
+                spawn_one(&entry, port, placement).await
+            }
+        },
     ).await
 }
 

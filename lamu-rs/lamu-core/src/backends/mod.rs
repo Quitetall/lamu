@@ -7,7 +7,7 @@ pub mod fish_speech;
 pub mod llamacpp;
 pub mod megakernel;
 
-use crate::types::{BackendType, ModelEntry};
+use crate::types::{BackendType, DevicePlacement, ModelEntry};
 use crate::Result;
 use async_trait::async_trait;
 use futures_util::stream::Stream;
@@ -54,6 +54,16 @@ pub struct GenerateOpts {
 pub trait Backend: Send + Sync {
     /// Load model. Returns PID.
     async fn load(&mut self, entry: &ModelEntry, port: u16) -> Result<u32>;
+
+    /// Pin this backend's next spawn to a specific GPU placement (ADR 0017
+    /// P2). Backends that spawn a CUDA child override this to set
+    /// `CUDA_VISIBLE_DEVICES` to the placement's primary NVML index. The
+    /// loader calls it AFTER the scheduler picks a device and BEFORE
+    /// `load`, so the child process lands on the placed card. Default is a
+    /// no-op for CPU/proxy backends. `Sharded` is treated as its primary
+    /// index for now (single-device spawn); true multi-device split is a
+    /// later phase.
+    fn set_device(&mut self, _placement: DevicePlacement) {}
 
     /// Stop process and free VRAM.
     async fn unload(&mut self) -> Result<()>;

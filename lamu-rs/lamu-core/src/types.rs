@@ -65,6 +65,41 @@ impl Modality {
     }
 }
 
+/// Where a loaded model physically lives across the managed GPU pool
+/// (ADR 0017 P2). `Single(idx)` pins the whole model to one NVML device
+/// index — the only variant the backends thread through today. `Sharded`
+/// reserves the wire format for tensor/layer-split across several devices;
+/// P2 records it but backends treat it as Single-on-first-index (TODO:
+/// real multi-device split needs `--tensor-split` / `--split-mode`).
+///
+/// `Default == Single(0)` so every existing `LoadedModel` / serialized
+/// blob with no `device:` key deserializes to "device 0", byte-identical
+/// to the pre-P2 single-GPU path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePlacement {
+    Single(u32),
+    Sharded(Vec<u32>),
+}
+
+impl Default for DevicePlacement {
+    fn default() -> Self {
+        DevicePlacement::Single(0)
+    }
+}
+
+impl DevicePlacement {
+    /// The NVML index a single-device spawn should target. For `Single`
+    /// it's the index; for `Sharded` it's the first member (P2 placeholder
+    /// until real sharding lands). Empty `Sharded` → 0.
+    pub fn primary_index(&self) -> u32 {
+        match self {
+            DevicePlacement::Single(i) => *i,
+            DevicePlacement::Sharded(v) => v.first().copied().unwrap_or(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelState {
     Unloaded,
@@ -357,6 +392,11 @@ pub struct LoadedModel {
     pub port: u16,
     pub vram_actual_mb: u32,
     pub last_used: Instant,
+    /// GPU placement the scheduler chose (ADR 0017 P2) — NVML index
+    /// via `DevicePlacement`. `Default` is `Single(0)`, so the
+    /// single-GPU path is unchanged. Read by the loader to call
+    /// `Backend::set_device` before spawn.
+    pub device: DevicePlacement,
 }
 
 /// Result of router's model selection. Used by plan_query dry-run.
@@ -423,6 +463,29 @@ pub struct VramBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_placement_default_is_single_zero() {
+        assert_eq!(DevicePlacement::default(), DevicePlacement::Single(0));
+    }
+
+    #[test]
+    fn device_placement_primary_index() {
+        assert_eq!(DevicePlacement::Single(3).primary_index(), 3);
+        assert_eq!(DevicePlacement::Sharded(vec![2, 5, 7]).primary_index(), 2);
+        assert_eq!(DevicePlacement::Sharded(vec![]).primary_index(), 0);
+    }
+
+    #[test]
+    fn device_placement_serde_round_trips() {
+        let s = DevicePlacement::Single(1);
+        let j = serde_json::to_string(&s).unwrap();
+        assert_eq!(j, r#"{"single":1}"#);
+        assert_eq!(serde_json::from_str::<DevicePlacement>(&j).unwrap(), s);
+        let sh = DevicePlacement::Sharded(vec![0, 1]);
+        let jj = serde_json::to_string(&sh).unwrap();
+        assert_eq!(serde_json::from_str::<DevicePlacement>(&jj).unwrap(), sh);
+    }
 
     #[test]
     fn capability_round_trips_through_serde() {

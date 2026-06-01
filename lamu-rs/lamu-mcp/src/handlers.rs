@@ -457,10 +457,12 @@ impl LamuMcpServer {
                 return format!("error: make_backend: {}", e);
             }
         };
-        {
+        let placement = {
             let mut st = self.state.lock();
             st.scheduler.mark_loading(entry.clone());
-        }
+            st.scheduler.placement_of(&entry.name).unwrap_or_default()
+        };
+        backend.set_device(placement);
 
         let pid = match backend.load(&entry, port).await {
             Ok(pid) => pid,

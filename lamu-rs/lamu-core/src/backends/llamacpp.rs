@@ -4,7 +4,7 @@
 use crate::backends::{Backend, ChatMessage};
 use crate::config::llama_bin;
 use crate::scheduler::VramScheduler;
-use crate::types::ModelEntry;
+use crate::types::{DevicePlacement, ModelEntry};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::{Stream, StreamExt};
@@ -56,6 +56,7 @@ pub fn build_llama_spawn(
     port: u16,
     supports_ngram: bool,
     bin: &std::path::Path,
+    cuda_index: u32,
 ) -> Result<LlamaSpawn> {
     // Set-but-unparseable warns (was silently u32::MAX = unbounded ctx).
     let ctx_cap = crate::config::parse_env_or("LAMU_DEFAULT_CTX", u32::MAX);
@@ -82,7 +83,7 @@ pub fn build_llama_spawn(
                 "--ctx-size".into(),
                 ctx.clamp(512, 8192).to_string(),
             ],
-            envs: vec![("CUDA_VISIBLE_DEVICES".into(), crate::config::gpu_index().to_string())],
+            envs: vec![("CUDA_VISIBLE_DEVICES".into(), cuda_index.to_string())],
         });
     }
 
@@ -157,7 +158,7 @@ pub fn build_llama_spawn(
 
     Ok(LlamaSpawn {
         args,
-        envs: vec![("CUDA_VISIBLE_DEVICES".into(), crate::config::gpu_index().to_string())],
+        envs: vec![("CUDA_VISIBLE_DEVICES".into(), cuda_index.to_string())],
     })
 }
 
@@ -292,6 +293,7 @@ pub struct LlamaCppBackend {
     port: u16,
     model_name: String,
     client: reqwest::Client,
+    cuda_index: u32,
 }
 
 impl LlamaCppBackend {
@@ -308,6 +310,7 @@ impl LlamaCppBackend {
             port: 0,
             model_name: String::new(),
             client,
+            cuda_index: crate::config::gpu_index(),
         })
     }
 
@@ -329,6 +332,10 @@ impl LlamaCppBackend {
 
 #[async_trait]
 impl Backend for LlamaCppBackend {
+    fn set_device(&mut self, placement: DevicePlacement) {
+        self.cuda_index = placement.primary_index();
+    }
+
     async fn load(&mut self, entry: &ModelEntry, port: u16) -> Result<u32> {
         self.port = port;
         self.model_name = entry.name.clone();
@@ -341,7 +348,7 @@ impl Backend for LlamaCppBackend {
         }
 
         let supports_ngram = detect_ngram_support(&self.bin_path).await;
-        let spawn = build_llama_spawn(entry, port, supports_ngram, &self.bin_path)?;
+        let spawn = build_llama_spawn(entry, port, supports_ngram, &self.bin_path, self.cuda_index)?;
 
         let mut cmd = Command::new(&self.bin_path);
         cmd.args(&spawn.args);
@@ -533,6 +540,14 @@ impl LlamaCppBackend {
 }
 
 #[cfg(test)]
+impl LlamaCppBackend {
+    /// White-box accessor for the device-placement tests (ADR 0017 P2).
+    pub(crate) fn cuda_index_for_tests(&self) -> u32 {
+        self.cuda_index
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{BackendType, Capability, ModelFormat};
@@ -582,7 +597,7 @@ mod tests {
         let mut e = dummy_entry("nomic-bert", 8192);
         e.capabilities = vec![Capability::Embedding];
         let spawn =
-            build_llama_spawn(&e, 8030, false, std::path::Path::new("/usr/bin/llama-server"))
+            build_llama_spawn(&e, 8030, false, std::path::Path::new("/usr/bin/llama-server"), 0)
                 .unwrap();
         assert!(spawn.args.iter().any(|a| a == "--embedding"), "args: {:?}", spawn.args);
         assert!(spawn.args.windows(2).any(|w| w[0] == "--pooling" && w[1] == "mean"));
@@ -596,7 +611,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         let entry = dummy_entry("llama", 8192);
-        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server")).unwrap();
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         let joined = s.args.join(" ");
         assert!(joined.contains("--host 127.0.0.1"), "{joined}");
         assert!(joined.contains("--cache-type-k q8_0"), "{joined}");
@@ -616,7 +631,7 @@ mod tests {
         clear_env();
         unsafe { std::env::set_var("LAMU_KV", "garbage"); }
         let entry = dummy_entry("llama", 8192);
-        let r = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"));
+        let r = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0);
         clear_env();
         assert!(matches!(r, Err(Error::Backend(_))), "expected Backend err, got {:?}", r);
     }
@@ -627,7 +642,7 @@ mod tests {
         clear_env();
         unsafe { std::env::set_var("LAMU_DEFAULT_CTX", "4096"); }
         let entry = dummy_entry("llama", 131072);
-        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server")).unwrap();
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         clear_env();
         assert!(s.args.join(" ").contains("--ctx-size 4096"));
     }
@@ -637,7 +652,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         let entry = dummy_entry("qwen3", 32768);
-        let s = build_llama_spawn(&entry, 8020, true, std::path::Path::new("/usr/bin/llama-server")).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         let joined = s.args.join(" ");
         assert!(joined.contains("--spec-type ngram-mod"));
         assert!(joined.contains("--spec-ngram-mod-n-match 24"));
@@ -648,7 +663,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         let entry = dummy_entry("llama", 8192);
-        let s = build_llama_spawn(&entry, 8020, true, std::path::Path::new("/usr/bin/llama-server")).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         assert!(!s.args.join(" ").contains("--spec-type"));
     }
 
@@ -775,7 +790,7 @@ mod tests {
         let bee_path = PathBuf::from(
             "/home/u/local-llm/beellama.cpp/build/bin/llama-server"
         );
-        let s = build_llama_spawn(&entry, 8020, true, &bee_path).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, &bee_path, 0).unwrap();
         let joined = s.args.join(" ");
         assert!(joined.contains("--spec-dflash-default"), "{joined}");
         assert!(joined.contains(&format!("-md {}", real_path.display())), "{joined}");
@@ -795,7 +810,7 @@ mod tests {
         let entry = dummy_entry_with_spec("qwen35", real_path);
         // Not under the beellama.cpp tree → not bee.
         let vanilla = PathBuf::from("/usr/bin/llama-server");
-        let s = build_llama_spawn(&entry, 8020, true, &vanilla).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, &vanilla, 0).unwrap();
         let joined = s.args.join(" ");
         assert!(!joined.contains("--spec-dflash-default"), "{joined}");
         // Default KV stays at q8_0 (no bee → no auto-turbo).
@@ -810,7 +825,7 @@ mod tests {
         let bee_path = PathBuf::from(
             "/home/u/local-llm/beellama.cpp/build/bin/llama-server"
         );
-        let s = build_llama_spawn(&entry, 8020, false, &bee_path).unwrap();
+        let s = build_llama_spawn(&entry, 8020, false, &bee_path, 0).unwrap();
         let joined = s.args.join(" ");
         assert!(!joined.contains("--spec-dflash-default"), "{joined}");
         // No DFlash → KV stays at the default q8_0.
@@ -827,7 +842,7 @@ mod tests {
         let bee_path = PathBuf::from(
             "/home/u/local-llm/beellama.cpp/build/bin/llama-server"
         );
-        let s = build_llama_spawn(&entry, 8020, true, &bee_path).unwrap();
+        let s = build_llama_spawn(&entry, 8020, true, &bee_path, 0).unwrap();
         clear_env();
         let joined = s.args.join(" ");
         // LAMU_KV=f16 must win even when bee+DFlash would auto-upgrade.
@@ -843,9 +858,31 @@ mod tests {
         clear_env();
         unsafe { std::env::set_var("LAMU_KV", "turbo3_tcq"); }
         let entry = dummy_entry("llama", 8192);
-        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server")).unwrap();
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         clear_env();
         let joined = s.args.join(" ");
         assert!(joined.contains("--cache-type-k turbo3_tcq"), "{joined}");
+    }
+
+    #[test]
+    fn build_llama_spawn_honors_explicit_cuda_index() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let entry = dummy_entry("llama", 8192);
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 2).unwrap();
+        assert_eq!(s.envs, vec![("CUDA_VISIBLE_DEVICES".into(), "2".into())],
+            "explicit cuda_index must drive CUDA_VISIBLE_DEVICES");
+    }
+
+    #[test]
+    fn set_device_changes_spawn_target_index() {
+        use crate::types::DevicePlacement;
+        // load() is never called, so the bin path need not exist.
+        let mut b = LlamaCppBackend::new(Some(std::path::PathBuf::from("/usr/bin/llama-server"))).unwrap();
+        b.set_device(DevicePlacement::Single(3));
+        assert_eq!(b.cuda_index_for_tests(), 3, "set_device(Single) sets the stored index");
+        // Sharded collapses to its primary index for the single-device spawn.
+        b.set_device(DevicePlacement::Sharded(vec![1, 2]));
+        assert_eq!(b.cuda_index_for_tests(), 1, "set_device(Sharded) uses the primary index");
     }
 }

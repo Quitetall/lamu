@@ -80,7 +80,9 @@ pub(super) fn swap_to_model_if_needed(entry: &ModelEntry) -> Result<()> {
     // lamu-mcp's build_spawn_cmd. Picking up validated LAMU_KV + ngram-mod
     // detection that the local copy here was missing.
     let supports_ngram = lamu_core::backends::llamacpp::detect_ngram_support_blocking(&bin);
-    let spawn = lamu_core::backends::llamacpp::build_llama_spawn(entry, 8020, supports_ngram, &bin)?;
+    let spawn = lamu_core::backends::llamacpp::build_llama_spawn(
+        entry, 8020, supports_ngram, &bin, lamu_core::config::gpu_index(),
+    )?;
 
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(&spawn.args);

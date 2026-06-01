@@ -10,7 +10,7 @@
 //!
 //! Uses NVML (nvml-wrapper) instead of an nvidia-smi subprocess.
 
-use crate::types::{DeviceVram, LoadedModel, ModelEntry, ModelState, VramBudget};
+use crate::types::{DevicePlacement, DeviceVram, LoadedModel, ModelEntry, ModelState, VramBudget};
 use crate::{Error, Result};
 use nvml_wrapper::Nvml;
 use std::collections::HashMap;
@@ -270,6 +270,7 @@ impl VramScheduler {
     ) -> &LoadedModel {
         self.ensure_one_device();
         let dev = self.placement_for(vram_actual_mb).min(self.devices.len() - 1);
+        let nvml_index = self.devices[dev].index;
         let name = entry.name.clone();
         let model = LoadedModel {
             entry,
@@ -278,6 +279,7 @@ impl VramScheduler {
             port,
             vram_actual_mb,
             last_used: Instant::now(),
+            device: DevicePlacement::Single(nvml_index),
         };
         self.devices[dev].loaded.insert(name.clone(), model);
         self.devices[dev].loaded.get(&name).expect("just inserted")
@@ -300,6 +302,14 @@ impl VramScheduler {
 
     pub fn get_loaded(&self, name: &str) -> Option<&LoadedModel> {
         self.devices.iter().find_map(|d| d.loaded.get(name))
+    }
+
+    /// The GPU placement recorded for `name` (ADR 0017 P2), or `None` if
+    /// not loaded/loading. The loader reads this between `mark_loading`
+    /// and `Backend::load` to thread the chosen NVML index into the spawn
+    /// via `Backend::set_device`.
+    pub fn placement_of(&self, name: &str) -> Option<DevicePlacement> {
+        self.get_loaded(name).map(|m| m.device.clone())
     }
 
     pub fn loaded_models(&self) -> Vec<&LoadedModel> {
@@ -367,6 +377,7 @@ impl VramScheduler {
     pub fn mark_loading(&mut self, entry: ModelEntry) {
         self.ensure_one_device();
         let dev = self.placement_for(entry.vram_mb).min(self.devices.len() - 1);
+        let nvml_index = self.devices[dev].index;
         let model = LoadedModel {
             entry: entry.clone(),
             state: ModelState::Loading,
@@ -374,6 +385,7 @@ impl VramScheduler {
             port: 0,
             vram_actual_mb: entry.vram_mb,
             last_used: Instant::now(),
+            device: DevicePlacement::Single(nvml_index),
         };
         self.devices[dev].loaded.insert(entry.name, model);
     }
