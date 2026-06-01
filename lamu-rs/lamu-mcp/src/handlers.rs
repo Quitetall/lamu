@@ -554,6 +554,18 @@ impl LamuMcpServer {
                 lines.push(format!("  {}: {} MB", name, vram));
             }
         }
+        // Diagnose VRAM held by processes lamu didn't spawn (training, other
+        // tools) — explains a low `available_mb`. lamu never kills these.
+        let orphans = st.scheduler.orphan_pids();
+        if !orphans.is_empty() {
+            let held: u32 = orphans.iter().map(|(_, mb)| *mb).sum();
+            lines.push(format!(
+                "Held by non-lamu processes ({held} MB — training / other tools; lamu won't touch them):"
+            ));
+            for (pid, mb) in &orphans {
+                lines.push(format!("  pid {pid}: {mb} MB"));
+            }
+        }
         lines.join("\n")
     }
 

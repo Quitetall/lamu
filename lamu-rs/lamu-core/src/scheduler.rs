@@ -113,6 +113,22 @@ impl VramScheduler {
         }).collect()
     }
 
+    /// GPU compute PIDs holding VRAM that lamu did NOT spawn — i.e. not in the
+    /// scheduler's loaded set. These explain why `available_mb` can be lower
+    /// than the loaded models account for (the `max(registered, actual)` guard).
+    /// DIAGNOSTIC ONLY: lamu never kills them. A legitimate non-lamu GPU job
+    /// (model training, another tool) is indistinguishable from a true leak
+    /// here, so surfacing them lets the operator decide rather than risking a
+    /// kill of their own work.
+    pub fn orphan_pids(&self) -> Vec<(u32, u32)> {
+        let mine: std::collections::HashSet<u32> =
+            self.loaded.values().filter_map(|m| m.pid).collect();
+        self.query_gpu_pids()
+            .into_iter()
+            .filter(|(pid, _)| !mine.contains(pid))
+            .collect()
+    }
+
     pub fn budget(&self) -> VramBudget {
         let (used_mb, total_mb) = self.query_vram();
         let loaded_pairs: Vec<(String, u32)> = self.loaded.iter()
