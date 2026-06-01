@@ -395,7 +395,19 @@ pub struct QueryResult {
     pub finish_reason: String,
 }
 
-/// Snapshot of VRAM allocation.
+/// Per-GPU VRAM snapshot (multi-GPU, ADR 0017). `available_mb` already nets
+/// out the per-device reserve + the larger of registered/NVML-actual usage.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceVram {
+    pub index: u32,
+    pub name: String,
+    pub total_mb: u32,
+    pub used_mb: u32,
+    pub available_mb: u32,
+}
+
+/// Snapshot of VRAM allocation. Scalar fields are aggregates across all
+/// devices (single-GPU → the one device); `per_device` is the breakdown.
 #[derive(Debug, Clone, Serialize)]
 pub struct VramBudget {
     pub total_mb: u32,
@@ -403,6 +415,9 @@ pub struct VramBudget {
     pub free_mb: u32,
     pub loaded_models: Vec<(String, u32)>,
     pub available_mb: u32,
+    /// Per-GPU breakdown (ADR 0017). Empty on the pre-multi-GPU path.
+    #[serde(default)]
+    pub per_device: Vec<DeviceVram>,
 }
 
 #[cfg(test)]

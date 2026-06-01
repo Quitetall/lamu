@@ -190,6 +190,7 @@ impl AppState {
                 free_mb: 0,
                 loaded_models: Vec::new(),
                 available_mb: 0,
+                per_device: Vec::new(),
             },
             gpu_available: false,
             gpu_reason: None,

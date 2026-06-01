@@ -1,9 +1,16 @@
-//! VRAM Budget Scheduler — bin-packing for GPU model management.
-//! Direct port of `lamu/core/scheduler.py`.
+//! VRAM Budget Scheduler — per-device bin-packing for GPU model management.
 //!
-//! Uses NVML (nvidia-ml-rs) instead of nvidia-smi subprocess.
+//! Multi-GPU (ADR 0017): the scheduler holds a `Vec<DeviceBudget>`. A
+//! single-GPU rig is a one-element Vec, and every scalar method below is an
+//! **aggregate facade** that reduces to the prior single-pool behavior
+//! byte-for-byte. Device selection honors `LAMU_GPU_INDEX` (pin one) /
+//! `LAMU_GPU_INDICES` (subset), else all visible devices. Placement-aware
+//! physical load (threading the chosen device into the backend spawn) is the
+//! next phase; P1 establishes the per-device bookkeeping + best-fit placement.
+//!
+//! Uses NVML (nvml-wrapper) instead of an nvidia-smi subprocess.
 
-use crate::types::{LoadedModel, ModelEntry, ModelState, VramBudget};
+use crate::types::{DeviceVram, LoadedModel, ModelEntry, ModelState, VramBudget};
 use crate::{Error, Result};
 use nvml_wrapper::Nvml;
 use std::collections::HashMap;
@@ -11,141 +18,246 @@ use std::time::Instant;
 
 const VRAM_RESERVED_MB: u32 = 1500;
 
+/// One GPU: NVML index, total VRAM, per-context reserve, and the models placed
+/// on it. The reserve is charged **per device** because CUDA driver/context
+/// overhead is incurred once per device (intentionally slightly more
+/// conservative than charging it once globally).
+pub struct DeviceBudget {
+    pub index: u32,
+    pub name: String,
+    pub total_mb: u32,
+    pub reserved_mb: u32,
+    pub loaded: HashMap<String, LoadedModel>,
+}
+
+impl DeviceBudget {
+    fn registered_mb(&self) -> u32 {
+        self.loaded
+            .values()
+            .map(|m| m.vram_actual_mb)
+            .fold(0u32, |a, v| a.saturating_add(v))
+    }
+}
+
 pub struct VramScheduler {
-    reserved_mb: u32,
-    loaded: HashMap<String, LoadedModel>,
-    total_mb: u32,
+    devices: Vec<DeviceBudget>,
     nvml: Option<Nvml>,
-    /// CUDA device this scheduler monitors (LAMU_GPU_INDEX, default 0). Multi-
-    /// GPU P0 (ADR 0017) — backends spawn on the same index. Per-device pools
-    /// build on top of this in later phases.
-    device_index: u32,
 }
 
 impl VramScheduler {
     pub fn new() -> Self {
         let nvml = Nvml::init().ok();
-        let device_index = crate::config::gpu_index();
-        let total_mb = nvml.as_ref()
-            .and_then(|n| n.device_by_index(device_index).ok())
-            .and_then(|d| d.memory_info().ok())
-            .map(|info| (info.total / (1024 * 1024)) as u32)
-            .unwrap_or(0);
+        let devices = Self::enumerate_devices(nvml.as_ref());
+        Self { devices, nvml }
+    }
 
-        Self {
-            reserved_mb: VRAM_RESERVED_MB,
-            loaded: HashMap::new(),
-            total_mb,
-            nvml,
-            device_index,
+    /// Which NVML indices to manage: `LAMU_GPU_INDEX` pins exactly one;
+    /// `LAMU_GPU_INDICES` is a comma list; else every visible device. No NVML
+    /// → empty (a `set_*_for_tests` helper fills it for unit tests).
+    fn enumerate_devices(nvml: Option<&Nvml>) -> Vec<DeviceBudget> {
+        let Some(nvml) = nvml else {
+            return Vec::new();
+        };
+        let count = nvml.device_count().unwrap_or(0);
+        let indices: Vec<u32> = if let Ok(v) = std::env::var("LAMU_GPU_INDEX") {
+            v.trim().parse::<u32>().ok().into_iter().collect()
+        } else if let Ok(list) = std::env::var("LAMU_GPU_INDICES") {
+            list.split(',').filter_map(|s| s.trim().parse::<u32>().ok()).collect()
+        } else {
+            (0..count).collect()
+        };
+        indices
+            .into_iter()
+            .filter(|i| *i < count)
+            .filter_map(|i| {
+                let d = nvml.device_by_index(i).ok()?;
+                let total_mb = d
+                    .memory_info()
+                    .ok()
+                    .map(|m| (m.total / (1024 * 1024)) as u32)
+                    .unwrap_or(0);
+                let name = d.name().ok().unwrap_or_else(|| format!("gpu{i}"));
+                Some(DeviceBudget {
+                    index: i,
+                    name,
+                    total_mb,
+                    reserved_mb: VRAM_RESERVED_MB,
+                    loaded: HashMap::new(),
+                })
+            })
+            .collect()
+    }
+
+    // ── per-device internals ─────────────────────────────────────────────
+
+    fn nvml_used_mb(&self, index: u32) -> u32 {
+        self.nvml
+            .as_ref()
+            .and_then(|n| n.device_by_index(index).ok())
+            .and_then(|d| d.memory_info().ok())
+            .map(|m| (m.used / (1024 * 1024)) as u32)
+            .unwrap_or(0)
+    }
+
+    fn nvml_pids(&self, index: u32) -> Vec<(u32, u32)> {
+        let Some(nvml) = &self.nvml else {
+            return vec![];
+        };
+        let Ok(d) = nvml.device_by_index(index) else {
+            return vec![];
+        };
+        let Ok(procs) = d.running_compute_processes() else {
+            return vec![];
+        };
+        procs
+            .into_iter()
+            .filter_map(|p| {
+                let mem = match p.used_gpu_memory {
+                    nvml_wrapper::enums::device::UsedGpuMemory::Used(b) => Some((b / (1024 * 1024)) as u32),
+                    _ => None,
+                }?;
+                Some((p.pid, mem))
+            })
+            .collect()
+    }
+
+    /// Free VRAM on one device: total − max(registered-here, NVML-actual-here)
+    /// − reserve. The `max` guard means an orphan server (or a peer process)
+    /// can't be handed out as free VRAM.
+    fn device_available(&self, dev: &DeviceBudget) -> u32 {
+        let used = dev.registered_mb().max(self.nvml_used_mb(dev.index));
+        dev.total_mb.saturating_sub(used).saturating_sub(dev.reserved_mb)
+    }
+
+    fn device_holding(&self, name: &str) -> Option<usize> {
+        self.devices.iter().position(|d| d.loaded.contains_key(name))
+    }
+
+    /// Device with the most available VRAM that fits `need_mb` (best-fit);
+    /// None if no single device fits.
+    fn best_fit(&self, need_mb: u32) -> Option<usize> {
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, self.device_available(d)))
+            .filter(|(_, avail)| *avail >= need_mb)
+            .max_by_key(|(_, avail)| *avail)
+            .map(|(i, _)| i)
+    }
+
+    fn most_available(&self) -> Option<usize> {
+        self.devices
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, d)| self.device_available(d))
+            .map(|(i, _)| i)
+    }
+
+    /// Where a NEW model goes: best-fit, else most-available, else device 0.
+    /// `register_loaded`/`mark_loading` record reality so they never reject —
+    /// they always land on *some* device.
+    fn placement_for(&self, need_mb: u32) -> usize {
+        if self.devices.is_empty() {
+            return 0;
+        }
+        self.best_fit(need_mb).or_else(|| self.most_available()).unwrap_or(0)
+    }
+
+    fn ensure_one_device(&mut self) {
+        if self.devices.is_empty() {
+            self.devices.push(DeviceBudget {
+                index: 0,
+                name: "gpu0".into(),
+                total_mb: 0,
+                reserved_mb: VRAM_RESERVED_MB,
+                loaded: HashMap::new(),
+            });
         }
     }
 
-    pub fn total_mb(&self) -> u32 { self.total_mb }
+    // ── scalar facades (single-GPU → identical to the old single pool) ────
 
-    /// GPU product name from NVML (e.g. "NVIDIA GeForce RTX 4090"), or None
-    /// when NVML is unavailable. Feeds the cookbook's bandwidth lookup.
+    pub fn total_mb(&self) -> u32 {
+        self.devices.iter().map(|d| d.total_mb).fold(0u32, |a, v| a.saturating_add(v))
+    }
+
+    /// First device's product name (feeds the cookbook bandwidth lookup). On a
+    /// single-GPU rig this is the one card; multi-GPU per-device names live in
+    /// `budget().per_device`.
     pub fn gpu_name(&self) -> Option<String> {
-        self.nvml
-            .as_ref()
-            .and_then(|n| n.device_by_index(self.device_index).ok())
-            .and_then(|d| d.name().ok())
+        self.devices.first().map(|d| d.name.clone())
     }
 
     pub fn available_mb(&self) -> u32 {
-        // Use the bigger of (sum of scheduler-registered models) vs
-        // (actual NVML-reported usage). Otherwise an orphan llama-server
-        // that lamu didn't spawn would get reported as free VRAM, and
-        // plan_load() would hand out a model that doesn't fit.
-        let registered: u32 = self.loaded.values()
-            .map(|m| m.vram_actual_mb)
-            .fold(0u32, |acc, v| acc.saturating_add(v));
-        let (actual_used, _) = self.query_vram();
-        let used = registered.max(actual_used);
-        self.total_mb.saturating_sub(used).saturating_sub(self.reserved_mb)
+        self.devices.iter().map(|d| self.device_available(d)).fold(0u32, |a, v| a.saturating_add(v))
     }
 
-    /// True when NVML is reachable and reports a non-zero total. Mirrors
-    /// the Python `gpu_available` property.
     pub fn gpu_available(&self) -> bool {
-        self.nvml.is_some() && self.total_mb > 0
+        self.nvml.is_some() && self.total_mb() > 0
     }
 
-    /// Human-readable reason when the GPU is in unavailable state. None
-    /// means healthy. Mirrors Python `gpu_unavailable_reason`.
     pub fn gpu_unavailable_reason(&self) -> Option<&str> {
         if self.gpu_available() {
             None
         } else if self.nvml.is_none() {
             Some("nvml unavailable (driver missing or no CUDA device)")
         } else {
-            Some("nvml reports total_mb=0 (no device 0?)")
+            Some("nvml reports no usable device VRAM")
         }
     }
 
-    /// Query current VRAM usage from NVML. Returns (used_mb, total_mb).
+    /// Aggregate (used_mb, total_mb) across all managed devices.
     pub fn query_vram(&self) -> (u32, u32) {
-        let Some(nvml) = &self.nvml else {
-            return (0, 0);
-        };
-        let Ok(device) = nvml.device_by_index(self.device_index) else {
-            return (0, 0);
-        };
-        let Ok(info) = device.memory_info() else {
-            return (0, 0);
-        };
-        let used = (info.used / (1024 * 1024)) as u32;
-        let total = (info.total / (1024 * 1024)) as u32;
-        (used, total)
+        let used = self
+            .devices
+            .iter()
+            .map(|d| self.nvml_used_mb(d.index))
+            .fold(0u32, |a, v| a.saturating_add(v));
+        (used, self.total_mb())
     }
 
-    /// Query GPU processes. Returns [(pid, used_mb), ...].
+    /// Union of GPU compute PIDs across all managed devices.
     pub fn query_gpu_pids(&self) -> Vec<(u32, u32)> {
-        let Some(nvml) = &self.nvml else {
-            return vec![];
-        };
-        let Ok(device) = nvml.device_by_index(self.device_index) else {
-            return vec![];
-        };
-        let Ok(procs) = device.running_compute_processes() else {
-            return vec![];
-        };
-        procs.into_iter().filter_map(|p| {
-            let mem = match p.used_gpu_memory {
-                nvml_wrapper::enums::device::UsedGpuMemory::Used(b) => Some((b / (1024 * 1024)) as u32),
-                _ => None,
-            }?;
-            Some((p.pid, mem))
-        }).collect()
+        self.devices.iter().flat_map(|d| self.nvml_pids(d.index)).collect()
     }
 
-    /// GPU compute PIDs holding VRAM that lamu did NOT spawn — i.e. not in the
-    /// scheduler's loaded set. These explain why `available_mb` can be lower
-    /// than the loaded models account for (the `max(registered, actual)` guard).
-    /// DIAGNOSTIC ONLY: lamu never kills them. A legitimate non-lamu GPU job
-    /// (model training, another tool) is indistinguishable from a true leak
-    /// here, so surfacing them lets the operator decide rather than risking a
-    /// kill of their own work.
+    /// GPU PIDs holding VRAM that lamu did NOT spawn (not in any device's
+    /// loaded set). DIAGNOSTIC ONLY — lamu never kills them (a legit non-lamu
+    /// GPU job is indistinguishable from a leak).
     pub fn orphan_pids(&self) -> Vec<(u32, u32)> {
-        let mine: std::collections::HashSet<u32> =
-            self.loaded.values().filter_map(|m| m.pid).collect();
-        self.query_gpu_pids()
-            .into_iter()
-            .filter(|(pid, _)| !mine.contains(pid))
-            .collect()
+        let mine: std::collections::HashSet<u32> = self
+            .devices
+            .iter()
+            .flat_map(|d| d.loaded.values().filter_map(|m| m.pid))
+            .collect();
+        self.query_gpu_pids().into_iter().filter(|(pid, _)| !mine.contains(pid)).collect()
     }
 
     pub fn budget(&self) -> VramBudget {
         let (used_mb, total_mb) = self.query_vram();
-        let loaded_pairs: Vec<(String, u32)> = self.loaded.iter()
-            .map(|(name, m)| (name.clone(), m.vram_actual_mb))
+        let loaded_models: Vec<(String, u32)> = self
+            .devices
+            .iter()
+            .flat_map(|d| d.loaded.iter().map(|(n, m)| (n.clone(), m.vram_actual_mb)))
+            .collect();
+        let per_device = self
+            .devices
+            .iter()
+            .map(|d| DeviceVram {
+                index: d.index,
+                name: d.name.clone(),
+                total_mb: d.total_mb,
+                used_mb: d.registered_mb().max(self.nvml_used_mb(d.index)),
+                available_mb: self.device_available(d),
+            })
             .collect();
         VramBudget {
             total_mb,
             used_mb,
             free_mb: total_mb.saturating_sub(used_mb),
-            loaded_models: loaded_pairs,
+            loaded_models,
             available_mb: self.available_mb(),
+            per_device,
         }
     }
 
@@ -156,76 +268,81 @@ impl VramScheduler {
         port: u16,
         vram_actual_mb: u32,
     ) -> &LoadedModel {
+        self.ensure_one_device();
+        let dev = self.placement_for(vram_actual_mb).min(self.devices.len() - 1);
+        let name = entry.name.clone();
         let model = LoadedModel {
-            entry: entry.clone(),
+            entry,
             state: ModelState::Loaded,
             pid,
             port,
             vram_actual_mb,
             last_used: Instant::now(),
         };
-        self.loaded.insert(entry.name.clone(), model);
-        self.loaded.get(&entry.name).expect("just inserted")
+        self.devices[dev].loaded.insert(name.clone(), model);
+        self.devices[dev].loaded.get(&name).expect("just inserted")
     }
 
     pub fn mark_used(&mut self, name: &str) {
-        if let Some(m) = self.loaded.get_mut(name) {
-            m.last_used = Instant::now();
+        for d in &mut self.devices {
+            if let Some(m) = d.loaded.get_mut(name) {
+                m.last_used = Instant::now();
+                return;
+            }
         }
     }
 
     pub fn is_loaded(&self, name: &str) -> bool {
-        matches!(
-            self.loaded.get(name).map(|m| m.state),
-            Some(ModelState::Loaded)
-        )
+        self.devices
+            .iter()
+            .any(|d| matches!(d.loaded.get(name).map(|m| m.state), Some(ModelState::Loaded)))
     }
 
     pub fn get_loaded(&self, name: &str) -> Option<&LoadedModel> {
-        self.loaded.get(name)
+        self.devices.iter().find_map(|d| d.loaded.get(name))
     }
 
     pub fn loaded_models(&self) -> Vec<&LoadedModel> {
-        self.loaded.values().collect()
+        self.devices.iter().flat_map(|d| d.loaded.values()).collect()
     }
 
+    /// True when some single device can fit `entry` right now (best-fit).
     pub fn can_fit(&self, entry: &ModelEntry) -> bool {
-        entry.vram_mb <= self.available_mb()
+        self.best_fit(entry.vram_mb).is_some()
     }
 
-    /// Determine which models to evict to free `needed_mb`.
-    /// Returns model names in LRU order (oldest first), skips pinned.
+    /// Determine which models to evict to free `needed_mb`. Modality-tiered
+    /// LRU across ALL devices (non-LLM image/tts before LLMs, LRU within tier),
+    /// skips pinned. Returns names in eviction order, or empty if it can't free
+    /// enough. (P1 evicts globally; placement-aware per-target-device eviction
+    /// is P2.)
     pub fn plan_eviction(&self, needed_mb: u32) -> Vec<String> {
         if needed_mb == 0 {
             return vec![];
         }
-
-        let mut evictable: Vec<(&String, &LoadedModel)> = self.loaded.iter()
-            .filter(|(_, m)| !m.entry.pinned && m.state == ModelState::Loaded)
+        let mut evictable: Vec<&LoadedModel> = self
+            .devices
+            .iter()
+            .flat_map(|d| d.loaded.values())
+            .filter(|m| !m.entry.pinned && m.state == ModelState::Loaded)
             .collect();
-        // Modality-tiered LRU: evict non-LLM (image/tts) models BEFORE
-        // LLMs, LRU within each tier. `is_llm()` is false (sorts first) for
-        // image/tts, true (sorts last) for LLMs. So a heavy idle TTS model
-        // is reclaimed ahead of an active chat LLM, and loading the ~16GB
-        // S2-Pro evicts other modalities + idle LLMs as needed without
-        // disturbing a recently-used LLM until it's the only option.
-        evictable.sort_by_key(|(_, m)| (m.entry.modality.is_llm(), m.last_used));
+        evictable.sort_by_key(|m| (m.entry.modality.is_llm(), m.last_used));
 
         let mut to_evict = vec![];
         let mut freed: u32 = 0;
-        for (name, m) in evictable {
-            to_evict.push(name.clone());
+        for m in evictable {
+            to_evict.push(m.entry.name.clone());
             freed = freed.saturating_add(m.vram_actual_mb);
             if freed >= needed_mb {
                 return to_evict;
             }
         }
-
-        // Can't free enough
         vec![]
     }
 
-    /// Plan loading. Returns (can_load, models_to_evict).
+    /// Plan loading. Returns (can_load, models_to_evict). Single-device: a
+    /// model either fits or we evict LRU to fit. (P2 makes the deficit + the
+    /// eviction target a specific device.)
     pub fn plan_load(&self, entry: &ModelEntry) -> (bool, Vec<String>) {
         if self.is_loaded(&entry.name) {
             return (true, vec![]);
@@ -233,7 +350,6 @@ impl VramScheduler {
         if self.can_fit(entry) {
             return (true, vec![]);
         }
-
         let deficit = entry.vram_mb.saturating_sub(self.available_mb());
         let to_evict = self.plan_eviction(deficit);
         if to_evict.is_empty() {
@@ -243,10 +359,14 @@ impl VramScheduler {
     }
 
     pub fn mark_unloaded(&mut self, name: &str) {
-        self.loaded.remove(name);
+        for d in &mut self.devices {
+            d.loaded.remove(name);
+        }
     }
 
     pub fn mark_loading(&mut self, entry: ModelEntry) {
+        self.ensure_one_device();
+        let dev = self.placement_for(entry.vram_mb).min(self.devices.len() - 1);
         let model = LoadedModel {
             entry: entry.clone(),
             state: ModelState::Loading,
@@ -255,17 +375,16 @@ impl VramScheduler {
             vram_actual_mb: entry.vram_mb,
             last_used: Instant::now(),
         };
-        self.loaded.insert(entry.name, model);
+        self.devices[dev].loaded.insert(entry.name, model);
     }
 
-    pub fn confirm_loaded(
-        &mut self,
-        name: &str,
-        pid: u32,
-        port: u16,
-        vram_actual_mb: u32,
-    ) -> Result<()> {
-        let m = self.loaded.get_mut(name)
+    pub fn confirm_loaded(&mut self, name: &str, pid: u32, port: u16, vram_actual_mb: u32) -> Result<()> {
+        let dev = self
+            .device_holding(name)
+            .ok_or_else(|| Error::ModelNotFound(name.to_string()))?;
+        let m = self.devices[dev]
+            .loaded
+            .get_mut(name)
             .ok_or_else(|| Error::ModelNotFound(name.to_string()))?;
         m.state = ModelState::Loaded;
         m.pid = Some(pid);
@@ -277,23 +396,48 @@ impl VramScheduler {
 }
 
 impl Default for VramScheduler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VramScheduler {
-    /// **Test fixture only.** Override the GPU's total VRAM AND null out
-    /// NVML so `available_mb` derives usage entirely from `register_loaded`
-    /// state. Production code reads NVML at construction time; this exists
-    /// because dev-machine GPU contention otherwise leaks into unit tests
-    /// (e.g. a real `lamu serve` holding 22 GB makes plan_load reject
-    /// every synthetic test entry as VRAM-exhausted).
-    ///
-    /// Marked `pub` because integration tests under `lamu-core/tests/`
-    /// build as separate crates — `#[cfg(test)]` here would scope it to
-    /// the lib's own unit tests only. Don't call this from production
-    /// code.
+    /// **Test fixture only.** Replace the device pool with a single synthetic
+    /// device of `mb` total VRAM and null out NVML, so `available_mb` derives
+    /// usage entirely from `register_loaded` state. Production reads NVML at
+    /// construction; this exists because dev-machine GPU contention otherwise
+    /// leaks into unit tests. `pub` (not `#[cfg(test)]`) because integration
+    /// tests under `lamu-core/tests/` build as separate crates.
     pub fn set_total_mb_for_tests(&mut self, mb: u32) {
-        self.total_mb = mb;
+        self.set_devices_for_tests(&[(mb, "test-gpu")]);
+    }
+
+    /// **Test fixture only.** Replace the pool with N synthetic devices
+    /// `(total_mb, name)` and null out NVML — for multi-GPU placement/eviction
+    /// unit tests on a single-GPU (or no-GPU) box.
+    pub fn set_devices_for_tests(&mut self, specs: &[(u32, &str)]) {
         self.nvml = None;
+        self.devices = specs
+            .iter()
+            .enumerate()
+            .map(|(i, (total, name))| DeviceBudget {
+                index: i as u32,
+                name: (*name).to_string(),
+                total_mb: *total,
+                reserved_mb: VRAM_RESERVED_MB,
+                loaded: HashMap::new(),
+            })
+            .collect();
+    }
+
+    /// **Test fixture only.** NVML index of the device currently holding
+    /// `name`, for placement assertions.
+    pub fn device_of_for_tests(&self, name: &str) -> Option<u32> {
+        self.device_holding(name).map(|i| self.devices[i].index)
+    }
+
+    /// **Test fixture only.** Number of managed devices.
+    pub fn device_count_for_tests(&self) -> usize {
+        self.devices.len()
     }
 }

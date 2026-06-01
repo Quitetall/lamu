@@ -66,6 +66,40 @@ fn vram_query() {
 }
 
 #[test]
+fn multi_device_best_fit_placement() {
+    // Two synthetic GPUs (24 GB + 48 GB). ADR 0017 P1: best-fit places a model
+    // on the device with the most available VRAM that fits it.
+    let mut s = VramScheduler::new();
+    s.set_devices_for_tests(&[(24000, "small"), (48000, "big")]);
+    assert_eq!(s.device_count_for_tests(), 2);
+
+    // m1 fits both → most-available device (big, index 1).
+    let m1 = mk_entry("m1", 10000, Modality::Llm);
+    s.register_loaded(m1.clone(), Some(1), 8001, m1.vram_mb);
+    assert_eq!(s.device_of_for_tests("m1"), Some(1), "best-fit picks the roomier card");
+
+    // m2 (30 GB) now fits only the big card (small free=22500, big free=36500).
+    let m2 = mk_entry("m2", 30000, Modality::Llm);
+    assert!(s.can_fit(&m2));
+    s.register_loaded(m2.clone(), Some(2), 8002, m2.vram_mb);
+    assert_eq!(s.device_of_for_tests("m2"), Some(1));
+
+    // Aggregate available = small(24000-1500) + big(48000-1500-10000-30000).
+    assert_eq!(s.available_mb(), 22500 + 6500);
+    assert_eq!(s.budget().per_device.len(), 2, "per-device breakdown present");
+}
+
+#[test]
+fn multi_device_can_fit_is_per_device_not_summed() {
+    let mut s = VramScheduler::new();
+    s.set_devices_for_tests(&[(24000, "a"), (24000, "b")]);
+    // 40 GB model: summed free (2×22500=45000) ≥ 40000, but NO single device
+    // fits — can_fit must be false (a non-shardable model needs one card).
+    let huge = mk_entry("huge", 40000, Modality::Llm);
+    assert!(!s.can_fit(&huge), "must not claim fit by summing across devices");
+}
+
+#[test]
 fn register_and_evict() {
     let models_dir = PathBuf::from(std::env::var("HOME").unwrap()).join("models");
     if !models_dir.exists() {
