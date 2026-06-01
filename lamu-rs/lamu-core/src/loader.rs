@@ -95,15 +95,21 @@ pub async fn ensure_loaded(
     health: &Arc<Mutex<HealthRegistry>>,
     http_serve_port: Option<u16>,
 ) -> Result<LoadedModel> {
+    // Clone for the async spawn closure; `scheduler` itself moves into
+    // `ensure_loaded_with` below.
     let sched_for_spawn = scheduler.clone();
     ensure_loaded_with(
         name, entries, scheduler, health, http_serve_port,
         move |entry, port| {
             let sched = sched_for_spawn.clone();
             async move {
-                // Placement was recorded by the in-gate `mark_loading`
-                // before this closure runs; default to Single(0) if the
-                // entry somehow isn't tracked (single-GPU: always 0).
+                // `ensure_loaded_with` records placement via `mark_loading`
+                // inside its VRAM gate before invoking this closure, so
+                // `placement_of` is normally `Some`. `unwrap_or_default()` →
+                // `Single(0)` is the safe fallback (and the single-GPU value).
+                // The lock is taken and dropped on this line — the owned
+                // `DevicePlacement` outlives the guard, so nothing is held
+                // across the `spawn_one` await.
                 let placement = sched
                     .lock()
                     .placement_of(&entry.name)
