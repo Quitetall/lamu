@@ -402,6 +402,9 @@ async fn resolve_and_ensure_loaded(
                 state.metrics.requests_total
                     .with_label_values(&[&decision.model_name, "vram_exhausted", "anon"])
                     .inc();
+                // Retry-After is a fixed policy constant: the scheduler refuses
+                // immediately (no queue), so ~10s is a reasonable "a model may
+                // free up" hint, not a value derived from the error.
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     [(axum::http::header::RETRY_AFTER, "10")],

@@ -183,7 +183,7 @@ where
     // this — intentional VRAM/port safety on a single card, but otherwise
     // invisible. Log it so a slow first-touch is explainable in the journal.
     tracing::info!(
-        model = %entry.name, port, vram_mb = entry.vram_mb,
+        model = %entry.name, port, required_vram_mb = entry.vram_mb,
         "loader: cold load starting (single-flight gate held until spawn returns)"
     );
 
