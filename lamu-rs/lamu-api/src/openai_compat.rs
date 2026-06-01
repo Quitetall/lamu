@@ -547,20 +547,13 @@ async fn chat_completions(
     let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
     let raw_content = msg.and_then(|m| m.get("content")).and_then(|v| v.as_str()).unwrap_or("");
     let reasoning_content = msg.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).unwrap_or("");
-    let has_tool_calls = msg.and_then(|m| m.get("tool_calls"))
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
     let raw_finish = data.get("choices").and_then(|c| c.get(0))
         .and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()).unwrap_or("");
 
-    // 502 when the backend gave us a structurally-empty response: no
-    // content, no reasoning, no tool calls, AND no recognized finish
-    // reason. Distinguishes silent backend failure from a legitimate
-    // empty completion (which always carries a finish_reason).
-    if msg.is_none()
-        || (raw_content.is_empty() && reasoning_content.is_empty() && !has_tool_calls
-            && !matches!(raw_finish, "stop" | "length" | "tool_calls" | "content_filter"))
-    {
+    // 502 when the backend gave us a structurally-empty response (no content,
+    // reasoning, tool calls, or recognized finish reason). Single source of
+    // truth — the predicate is shared with the unit tests (no more drift).
+    if is_empty_backend_response(&data) {
         state.metrics.requests_total
             .with_label_values(&[&model_name, "backend_empty"])
             .inc();
@@ -831,6 +824,32 @@ fn finish_reason_of(val: &Value) -> Option<&str> {
 fn streaming_backend_empty(any_output: bool, finish_reason: &str) -> bool {
     !any_output
         && !matches!(finish_reason, "stop" | "length" | "tool_calls" | "content_filter")
+}
+
+/// Non-streaming 502 gate predicate: true when the backend's response is
+/// structurally empty — no content, no reasoning, no tool calls, AND no
+/// recognized finish reason (a legitimately-empty completion always carries
+/// one). The single source of truth for the gate; the production handler and
+/// the unit tests both call this (was a hand-synced copy — drift hazard).
+pub(crate) fn is_empty_backend_response(data: &Value) -> bool {
+    let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
+    let raw_content = msg.and_then(|m| m.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+    let reasoning = msg.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).unwrap_or("");
+    let has_tool_calls = msg
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let raw_finish = data
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    msg.is_none()
+        || (raw_content.is_empty()
+            && reasoning.is_empty()
+            && !has_tool_calls
+            && !matches!(raw_finish, "stop" | "length" | "tool_calls" | "content_filter"))
 }
 
 fn make_chunk(id: &str, created: u64, model: &str, content: &str) -> Value {
@@ -2190,29 +2209,9 @@ mod compat_tests {
 
     // ── 502 backend_returned_empty gate ─────────────────────────────
     //
-    // The gate fires when content + reasoning_content + tool_calls are
-    // all empty AND finish_reason isn't a recognized terminator.
-    //
-    // KEEP IN SYNC WITH `chat_completions` in this file (search for
-    // "backend_returned_empty"). The helper below is a verbatim mirror
-    // of the production predicate; changing one without the other
-    // leaves the test passing while the real gate diverges. Until the
-    // predicate gets extracted into a shared `pub(crate)` function,
-    // the discipline is: every edit to the production expression
-    // must edit this mirror too.
-
-    fn is_empty_backend_response(data: &Value) -> bool {
-        let msg = data.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
-        let raw_content = msg.and_then(|m| m.get("content")).and_then(|v| v.as_str()).unwrap_or("");
-        let reasoning = msg.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).unwrap_or("");
-        let has_tool_calls = msg.and_then(|m| m.get("tool_calls"))
-            .and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
-        let raw_finish = data.get("choices").and_then(|c| c.get(0))
-            .and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()).unwrap_or("");
-        msg.is_none()
-            || (raw_content.is_empty() && reasoning.is_empty() && !has_tool_calls
-                && !matches!(raw_finish, "stop" | "length" | "tool_calls" | "content_filter"))
-    }
+    // These exercise the production predicate `super::is_empty_backend_response`
+    // directly (no mirror) — the gate decision can no longer drift from the
+    // tests, since both call the one shared fn.
 
     #[test]
     fn gate_fires_when_choices_missing() {
