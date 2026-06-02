@@ -47,6 +47,10 @@ pub struct RequestQueue<T> {
 
 impl<T: Send + 'static> RequestQueue<T> {
     pub fn new(strategy: Strategy, concurrency: usize) -> Self {
+        // Defense-in-depth: 0 permits is never valid for a serializing queue —
+        // the dispatcher could never hand out a permit and every enqueue would
+        // block forever. Clamp so a 0 from any caller can't silently wedge.
+        let concurrency = concurrency.max(1);
         let inner = Arc::new(Inner {
             strategy,
             pending: Mutex::new(VecDeque::new()),
@@ -130,6 +134,24 @@ impl Drop for QueueGuard {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn zero_concurrency_is_clamped_not_wedged() {
+        // concurrency 0 must NOT build a 0-permit semaphore (would block every
+        // enqueue forever). Clamped to 1 → enqueue completes promptly.
+        let q: Arc<RequestQueue<u32>> = Arc::new(RequestQueue::new(Strategy::Fifo, 0));
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            q.enqueue(QueueRequest {
+                payload: 1,
+                priority: 0,
+                enqueued_at: Instant::now(),
+                origin: "test".into(),
+            }),
+        )
+        .await;
+        assert!(guard.is_ok(), "0-concurrency queue must clamp to 1, not deadlock the enqueue");
+    }
 
     #[tokio::test]
     async fn fifo_serial() {

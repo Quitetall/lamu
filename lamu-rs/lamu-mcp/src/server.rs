@@ -84,8 +84,12 @@ impl LamuMcpServer {
             Ok("priority") => QueueStrategy::Priority,
             _ => QueueStrategy::Fifo,
         };
+        // `.filter(|&n| n >= 1)`: LAMU_QUEUE_CONCURRENCY=0 parses to Some(0),
+        // which unwrap_or(1) does NOT override — it would build a 0-permit
+        // Semaphore and every local query would block forever with no error.
+        // (The HTTP path already guards this the same way.)
         let queue_concurrency: usize = std::env::var("LAMU_QUEUE_CONCURRENCY")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            .ok().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(1);
 
         let server = Self {
             state: Arc::new(Mutex::new(ServerState {
