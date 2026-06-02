@@ -528,27 +528,66 @@ impl LamuMcpServer {
             }
         };
 
-        // Healthy + warmed up by the time backend.load returned. Confirm
-        // load + insert into backends map.
+        // Re-check the cloud-only gate: it may have flipped during the
+        // multi-second spawn (set_routing_mode cloud-only drains backends +
+        // frees VRAM). If so, tear the just-spawned server back down instead of
+        // committing it — otherwise it orphans the VRAM cloud-only promised to
+        // free, and unload_model can't reach it (it searches loaded_models).
+        // Read the gate into a bool so the routing_mode guard is RELEASED before
+        // the (up-to-30s) unload await — otherwise we'd hold the very lock that
+        // set_routing_mode(cloud-only) needs to drain, deadlocking it.
+        let routing_cloud_only = self.routing_mode.lock().await.as_str() == "cloud-only";
+        if routing_cloud_only {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), backend.unload()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("load_model: cloud-only teardown unload('{}') errored: {}", entry.name, e),
+                Err(_) => warn!("load_model: cloud-only teardown unload('{}') timed out — process may survive", entry.name),
+            }
+            let mut st = self.state.lock();
+            st.scheduler.mark_unloaded(&entry.name);
+            st.health.drop(&entry.name);
+            return format!(
+                "error: cannot load '{}' — routing flipped to cloud-only during the load; the spawned server was torn back down",
+                entry.name
+            );
+        }
+
+        // Healthy + warmed up by the time backend.load returned. Confirm +
+        // insert ATOMICALLY (one lock) so a query can't observe loaded-without-
+        // a-backend. confirm_loaded fails IFF the entry was concurrently
+        // mark_unloaded (an eviction or a cloud-only drain that raced our
+        // mark_loading) — then DON'T insert; hand the backend back to be torn
+        // down, so a confirm-failure can't orphan a live server holding the
+        // VRAM the scheduler now believes is free. (Was `let _ = confirm_loaded`
+        // + unconditional insert → exactly that orphan.)
         let vram = {
             let st = self.state.lock();
             let pids = st.scheduler.query_gpu_pids();
-            pids.iter()
-                .find(|(p, _)| *p == pid)
-                .map(|(_, m)| *m)
-                .unwrap_or(entry.vram_mb)
+            pids.iter().find(|(p, _)| *p == pid).map(|(_, m)| *m).unwrap_or(entry.vram_mb)
         };
-        {
+        let orphan: Option<Box<dyn Backend>> = {
             let mut st = self.state.lock();
-            // Insert into the backends map BEFORE confirm_loaded.
-            // Once Backend::generate is wired in (next step), a query
-            // arriving between confirm_loaded and backends.insert would
-            // see the scheduler say "loaded" but find no backend in the
-            // map. Doing both inside one lock acquisition with the
-            // insert first removes the race entirely.
-            st.backends.insert(entry.name.clone(), Arc::new(AsyncMutex::new(backend)));
-            let _ = st.scheduler.confirm_loaded(&entry.name, pid, port, vram);
-            st.health.get_or_create(&entry.name).record_success();
+            if st.scheduler.confirm_loaded(&entry.name, pid, port, vram).is_ok() {
+                st.backends.insert(entry.name.clone(), Arc::new(AsyncMutex::new(backend)));
+                st.health.get_or_create(&entry.name).record_success();
+                None
+            } else {
+                Some(backend)
+            }
+        };
+        if let Some(mut orphan) = orphan {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), orphan.unload()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("load_model: orphan teardown unload('{}') errored: {}", entry.name, e),
+                Err(_) => warn!("load_model: orphan teardown unload('{}') timed out — process may survive", entry.name),
+            }
+            let mut st = self.state.lock();
+            st.scheduler.mark_unloaded(&entry.name);
+            st.health.drop(&entry.name);
+            return format!(
+                "error: '{}' was concurrently evicted (e.g. set_routing_mode cloud-only) during the load; the spawned server was torn back down",
+                entry.name
+            );
         }
         let evict_msg = if to_evict.is_empty() {
             String::new()
