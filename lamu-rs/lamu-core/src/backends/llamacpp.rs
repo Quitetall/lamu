@@ -60,7 +60,17 @@ pub fn build_llama_spawn(
 ) -> Result<LlamaSpawn> {
     // Set-but-unparseable warns (was silently u32::MAX = unbounded ctx).
     let ctx_cap = crate::config::parse_env_or("LAMU_DEFAULT_CTX", u32::MAX);
-    let ctx = entry.context_max.min(ctx_cap);
+    // context_max == 0 means the GGUF carried no context_length (ADR 0021:
+    // "unknown" — never a fabricated number). Don't emit `--ctx-size 0`: its
+    // "use the model's trained ctx" meaning is llama.cpp-version-dependent and
+    // unverified on this build (#166). Fall back to the configured cap, or a
+    // safe 4096 floor when no cap is set, so a spawn always has an explicit
+    // window. The occupancy layer still reports context_max==0 as unknown.
+    let ctx = if entry.context_max == 0 {
+        if ctx_cap == u32::MAX { 4096 } else { ctx_cap }
+    } else {
+        entry.context_max.min(ctx_cap)
+    };
 
     // Embedding models serve via llama-server `--embedding` with mean
     // pooling (OpenAI-compat /v1/embeddings + /embedding) — none of the
@@ -456,7 +466,7 @@ impl Backend for LlamaCppBackend {
             .client
             .post(&url)
             .json(&json!({ "content": text }))
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .map_err(|e| Error::Backend(format!("tokenize http: {}", e)))?;
@@ -715,6 +725,32 @@ mod tests {
         assert!(joined.contains("--cache-reuse 256"), "{joined}");
         assert!(!joined.contains("--spec-type"), "{joined}");
         assert_eq!(s.envs, vec![("CUDA_VISIBLE_DEVICES".into(), "0".into())]);
+    }
+
+    #[test]
+    fn build_llama_spawn_unknown_ctx_falls_back_not_zero() {
+        // context_max == 0 (GGUF had no context_length). Must NOT emit
+        // `--ctx-size 0` (version-dependent); falls back to a safe 4096 floor
+        // when no LAMU_DEFAULT_CTX cap is set (ADR 0021 C1 review fix).
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let entry = dummy_entry("llama", 0);
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
+        let joined = s.args.join(" ");
+        assert!(joined.contains("--ctx-size 4096"), "{joined}");
+        assert!(!joined.contains("--ctx-size 0"), "{joined}");
+    }
+
+    #[test]
+    fn build_llama_spawn_unknown_ctx_uses_cap_when_set() {
+        // With a cap set, unknown ctx takes the cap rather than the 4096 floor.
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe { std::env::set_var("LAMU_DEFAULT_CTX", "16384"); }
+        let entry = dummy_entry("llama", 0);
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
+        clear_env();
+        assert!(s.args.join(" ").contains("--ctx-size 16384"));
     }
 
     #[test]

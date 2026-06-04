@@ -124,21 +124,23 @@ fn parse_gguf_meta(path: &Path) -> Result<GgufMeta> {
                 }
                 // `{arch}.context_length` — suffix-match because key order vs
                 // `general.architecture` is not guaranteed. UINT32 is the
-                // common encoding.
-                if key.ends_with(".context_length") {
+                // common encoding. `v > 0` (0 is treated as absent, uniform
+                // with the INT32/UINT64 arms) and `is_none()` (first-wins, so
+                // the result is deterministic regardless of KV order).
+                if key.ends_with(".context_length") && v > 0 && meta.n_ctx_train.is_none() {
                     meta.n_ctx_train = Some(v);
                 }
             }
             5 => {
                 let v = r.read_i32::<LittleEndian>()?;
-                if key.ends_with(".context_length") && v > 0 {
+                if key.ends_with(".context_length") && v > 0 && meta.n_ctx_train.is_none() {
                     meta.n_ctx_train = Some(v as u32);
                 }
             }
             6 => { let _ = r.read_f32::<LittleEndian>()?; }
             10 => {
                 let v = r.read_u64::<LittleEndian>()?;
-                if key.ends_with(".context_length") {
+                if key.ends_with(".context_length") && v > 0 && meta.n_ctx_train.is_none() {
                     meta.n_ctx_train = Some(v.min(u32::MAX as u64) as u32);
                 }
             }
