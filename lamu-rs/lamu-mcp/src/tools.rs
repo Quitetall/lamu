@@ -118,6 +118,20 @@ fn schema_context_status() -> Value {
     })
 }
 
+fn schema_compact_context() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "messages": {"type": "array", "items": {"type": "object"}, "description": "The conversation message list ({role, content}) to compact. Required for stateless mode."},
+            "keep_recent": {"type": "integer", "default": 6, "description": "Number of most-recent turns to preserve verbatim (includes the latest user turn). Leading system turns are always preserved too."},
+            "model": {"type": "string", "default": "mimo-v2.5", "description": "Cloud model used to summarize the stale middle."},
+            "confirm": {"type": "boolean", "default": false, "description": "false = dry-run plan only (no model call, no mutation). true = perform the compaction."},
+            "max_summary_tokens": {"type": "integer", "default": 1024}
+        },
+        "required": ["messages"]
+    })
+}
+
 fn schema_cloud_query() -> Value {
     json!({
         "type": "object",
@@ -449,6 +463,10 @@ fn dispatch_context_status<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn
     Box::pin(s.handle_context_status(args))
 }
 
+fn dispatch_compact_context<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_compact_context(args))
+}
+
 fn dispatch_scan<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
     let r = s.handle_scan();
     Box::pin(async move { r })
@@ -613,6 +631,13 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Report un-fakeable context occupancy for a loaded model (ADR 0021): tokens vs the engine's BOOTED window, counted by the engine tokenizer — not the model's self-report. Pass `text` to measure a specific prompt; advises when to call compact_context. No LLM loaded → honest 'cold', never a fabricated number.",
         schema_fn: schema_context_status,
         handler: HandlerKind::Stateful(dispatch_context_status),
+        cloud: false,
+    },
+    ToolDef {
+        name: "compact_context",
+        description: "Compact a conversation to free context (ADR 0021): preserves the leading system turns + the last `keep_recent` turns verbatim, summarizes only the stale middle via the cloud model, returns the shrunk `messages`. Two-phase: dry-run plan unless confirm:true. Stateless — never mutates; the agent resends the returned messages. cloud=false: it self-routes its own cloud_query for the summary.",
+        schema_fn: schema_compact_context,
+        handler: HandlerKind::Stateful(dispatch_compact_context),
         cloud: false,
     },
     ToolDef {
