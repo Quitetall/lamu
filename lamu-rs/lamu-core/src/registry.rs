@@ -50,6 +50,11 @@ struct GgufMeta {
     file_type: Option<u32>,
     n_tensors: u64,
     file_size_mb: u32,
+    /// The model's trained context length, read from the GGUF
+    /// `{arch}.context_length` key. `None` if the key is absent. This is the
+    /// engine-truth denominator for context-occupancy (ADR 0021) — never the
+    /// fabricated 131072 the scan used before.
+    n_ctx_train: Option<u32>,
 }
 
 /// Parse minimal GGUF metadata. Reads only what we need for scan.
@@ -117,10 +122,26 @@ fn parse_gguf_meta(path: &Path) -> Result<GgufMeta> {
                 if key == "general.file_type" {
                     meta.file_type = Some(v);
                 }
+                // `{arch}.context_length` — suffix-match because key order vs
+                // `general.architecture` is not guaranteed. UINT32 is the
+                // common encoding.
+                if key.ends_with(".context_length") {
+                    meta.n_ctx_train = Some(v);
+                }
             }
-            5 => { let _ = r.read_i32::<LittleEndian>()?; }
+            5 => {
+                let v = r.read_i32::<LittleEndian>()?;
+                if key.ends_with(".context_length") && v > 0 {
+                    meta.n_ctx_train = Some(v as u32);
+                }
+            }
             6 => { let _ = r.read_f32::<LittleEndian>()?; }
-            10 => { let _ = r.read_u64::<LittleEndian>()?; }
+            10 => {
+                let v = r.read_u64::<LittleEndian>()?;
+                if key.ends_with(".context_length") {
+                    meta.n_ctx_train = Some(v.min(u32::MAX as u64) as u32);
+                }
+            }
             7 => { let mut b = [0u8; 1]; r.read_exact(&mut b)?; }
             9 => {
                 let arr_type = r.read_u32::<LittleEndian>()?;
@@ -325,7 +346,13 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             .cloned()
             .unwrap_or_else(|| vec![Capability::Chat]);
 
-        let context_max = 131072u32;
+        // ADR 0021: use the engine-truth trained context from GGUF, NOT a
+        // fabricated 131072. `0` = unknown (matches the safetensors path and
+        // cookbook fallback); at spawn, `--ctx-size 0` makes llama.cpp use the
+        // model's own trained context rather than a guess. context_max also
+        // feeds `--ctx-size` (llamacpp.rs:63), so this corrects both the
+        // occupancy denominator and the launched context window.
+        let context_max = meta.n_ctx_train.unwrap_or(0);
         if context_max > 65536 {
             capabilities.push(Capability::LongContext);
         }
@@ -638,6 +665,60 @@ pub fn load_registry(path: &Path) -> Result<Vec<ModelEntry>> {
 mod tests {
     use super::*;
     use crate::types::ModelStatus;
+
+    /// Build a minimal valid GGUF header with the given KV pairs in-memory.
+    /// `arch` becomes `general.architecture`; `ctx` (if Some) becomes
+    /// `{arch}.context_length` as a UINT32 (the common encoding).
+    fn make_gguf(arch: &str, ctx: Option<u32>) -> Vec<u8> {
+        fn put_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        let mut g = Vec::new();
+        g.extend_from_slice(GGUF_MAGIC);
+        g.extend_from_slice(&3u32.to_le_bytes()); // version
+        g.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+        let n_kv: u64 = if ctx.is_some() { 2 } else { 1 };
+        g.extend_from_slice(&n_kv.to_le_bytes());
+        // general.architecture (val_type 8 = STRING)
+        put_str(&mut g, "general.architecture");
+        g.extend_from_slice(&8u32.to_le_bytes());
+        put_str(&mut g, arch);
+        // {arch}.context_length (val_type 4 = UINT32)
+        if let Some(c) = ctx {
+            put_str(&mut g, &format!("{arch}.context_length"));
+            g.extend_from_slice(&4u32.to_le_bytes());
+            g.extend_from_slice(&c.to_le_bytes());
+        }
+        g
+    }
+
+    fn write_gguf(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.gguf");
+        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn parse_gguf_meta_reads_real_context_length() {
+        let (_d, path) = write_gguf(&make_gguf("llama", Some(32768)));
+        let meta = parse_gguf_meta(&path).unwrap();
+        assert_eq!(meta.arch, "llama");
+        // The engine-truth denominator — NOT the fabricated 131072 (ADR 0021).
+        assert_eq!(meta.n_ctx_train, Some(32768));
+    }
+
+    #[test]
+    fn parse_gguf_meta_absent_context_length_is_none() {
+        let (_d, path) = write_gguf(&make_gguf("qwen3", None));
+        let meta = parse_gguf_meta(&path).unwrap();
+        assert_eq!(meta.arch, "qwen3");
+        // Unknown stays None → context_max 0 → spawn defers to the engine,
+        // never a guessed number.
+        assert_eq!(meta.n_ctx_train, None);
+    }
 
     fn sample_entry(name: &str, path: &Path) -> ModelEntry {
         ModelEntry {

@@ -102,6 +102,18 @@ pub trait Backend: Send + Sync {
 
     fn port(&self) -> u16;
     fn model_name(&self) -> &str;
+
+    /// Count tokens in `text` using the BACKEND's own tokenizer — the engine's
+    /// out-of-band accounting, which the generating model cannot fabricate
+    /// (ADR 0021). Default: unsupported (proxy/CPU/TTS/image backends).
+    /// `LlamaCppBackend` implements it via `POST /tokenize`. Returns the exact
+    /// token count; callers divide by the model's real `n_ctx_train` for an
+    /// un-fakeable context-occupancy ratio.
+    async fn tokenize_count(&self, _text: &str) -> Result<u32> {
+        Err(crate::Error::Backend(
+            "tokenize_count unsupported by this backend".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

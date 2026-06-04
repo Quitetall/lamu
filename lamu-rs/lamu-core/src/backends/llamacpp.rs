@@ -330,6 +330,17 @@ impl LlamaCppBackend {
     }
 }
 
+/// Parse a llama-server `POST /tokenize` response into a token count.
+/// Shape: `{"tokens":[id, ...]}` (ids are ints, or `{id, piece}` objects when
+/// `with_pieces` is set — we only count length). Returns `None` if there is no
+/// `tokens` array. Factored out so the count logic is unit-testable without a
+/// live server.
+fn parse_tokenize_count(v: &Value) -> Option<u32> {
+    v.get("tokens")
+        .and_then(|t| t.as_array())
+        .map(|a| a.len() as u32)
+}
+
 #[async_trait]
 impl Backend for LlamaCppBackend {
     fn set_device(&mut self, placement: DevicePlacement) {
@@ -434,6 +445,34 @@ impl Backend for LlamaCppBackend {
         else { return false; };
         let Ok(json) = resp.json::<Value>().await else { return false; };
         json.get("status").and_then(|v| v.as_str()) == Some("ok")
+    }
+
+    async fn tokenize_count(&self, text: &str) -> Result<u32> {
+        // POST /tokenize → {"tokens":[id, ...]}. The count is computed by the
+        // engine's tokenizer, out-of-band from the model's reply stream, so it
+        // cannot be fabricated by the generating model (ADR 0021).
+        let url = format!("http://localhost:{}/tokenize", self.port);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&json!({ "content": text }))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| Error::Backend(format!("tokenize http: {}", e)))?;
+        if !resp.status().is_success() {
+            return Err(Error::Backend(format!(
+                "tokenize status {} (port {})",
+                resp.status(),
+                self.port
+            )));
+        }
+        let json = resp
+            .json::<Value>()
+            .await
+            .map_err(|e| Error::Backend(format!("tokenize decode: {}", e)))?;
+        parse_tokenize_count(&json)
+            .ok_or_else(|| Error::Backend("tokenize: response has no `tokens` array".into()))
     }
 
     async fn generate(
@@ -582,6 +621,29 @@ mod tests {
     use super::*;
     use crate::types::{BackendType, Capability, ModelFormat};
     use std::sync::Mutex;
+
+    #[test]
+    fn parse_tokenize_count_counts_ids() {
+        let v = serde_json::json!({ "tokens": [1, 2, 3, 4, 5] });
+        assert_eq!(parse_tokenize_count(&v), Some(5));
+    }
+
+    #[test]
+    fn parse_tokenize_count_empty_is_zero() {
+        let v = serde_json::json!({ "tokens": [] });
+        assert_eq!(parse_tokenize_count(&v), Some(0));
+    }
+
+    #[test]
+    fn parse_tokenize_count_missing_array_is_none() {
+        // No `tokens` key, or wrong type → None (caller surfaces an error
+        // rather than fabricating a count).
+        assert_eq!(parse_tokenize_count(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_tokenize_count(&serde_json::json!({ "tokens": 5 })),
+            None
+        );
+    }
 
     // Tests in this mod read/write LAMU_* env vars. They are
     // process-local but thread-shared, so cargo test's default
