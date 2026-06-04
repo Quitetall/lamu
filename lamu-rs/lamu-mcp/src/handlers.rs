@@ -675,7 +675,13 @@ impl LamuMcpServer {
             let resolved = match &model_arg {
                 Some(name) => match st.scheduler.get_loaded(name) {
                     Some(m) if m.port != 0 => Ok((name.clone(), m.port, m.entry.context_max)),
-                    _ => Err(json!({
+                    // Loaded but no HTTP port (non-llama backend) — honest that
+                    // it IS loaded, just not tokenizable, not "cold".
+                    Some(_) => Err(json!({
+                        "model": name, "loaded": true, "source": "no_engine",
+                        "advice": "model loaded but exposes no tokenizer endpoint",
+                    }).to_string()),
+                    None => Err(json!({
                         "model": name, "loaded": false, "source": "cold",
                         "advice": "model not loaded — load it or omit `model`",
                     }).to_string()),
@@ -735,7 +741,9 @@ impl LamuMcpServer {
         out["model"] = json!(name);
         out["loaded"] = json!(true);
         out["source"] = json!(if tokens.is_some() { "tokenize" } else { "no_input" });
-        serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+        // Compact, like the early-return error paths above — one format for the
+        // consumer's parser. (to_string on a Value is infallible.)
+        out.to_string()
     }
 
     pub(crate) async fn handle_queue_status(&self) -> String {
@@ -1022,6 +1030,8 @@ fn ctx_near_full_threshold() -> f64 {
 /// 0 = unknown).
 fn context_status_fields(tokens: Option<u32>, n_ctx: u32, context_max: u32, threshold: f64) -> Value {
     let mut v = match tokens {
+        // None (no text) OR a degenerate n_ctx == 0 (defensive — the real
+        // effective_ctx_size never returns 0) → unmeasured, never divide.
         None => json!({
             "tokens": Value::Null,
             "n_ctx": n_ctx,
@@ -1029,6 +1039,14 @@ fn context_status_fields(tokens: Option<u32>, n_ctx: u32, context_max: u32, thre
             "near_full": false,
             "headroom_tokens": Value::Null,
             "advice": "window reported; pass `text` to measure occupancy",
+        }),
+        Some(_) if n_ctx == 0 => json!({
+            "tokens": tokens,
+            "n_ctx": 0,
+            "occupancy_ratio": Value::Null,
+            "near_full": false,
+            "headroom_tokens": Value::Null,
+            "advice": "no context window known — cannot measure occupancy",
         }),
         Some(t) => {
             let ratio = t as f64 / n_ctx as f64;
@@ -1061,12 +1079,21 @@ mod context_status_tests {
     use super::*;
 
     #[test]
-    fn fields_unmeasured_reports_window_only() {
+    fn fields_unmeasured_reports_window_and_trained_max() {
         let v = context_status_fields(None, 8192, 32768, 0.85);
         assert!(v["occupancy_ratio"].is_null());
         assert_eq!(v["near_full"], false);
         assert_eq!(v["n_ctx"], 8192);
         assert_eq!(v["n_ctx_train"], 32768);
+    }
+
+    #[test]
+    fn fields_zero_window_is_unmeasured_not_divide() {
+        // Defensive: a 0 window (never produced by effective_ctx_size) must not
+        // divide — report unmeasured, no inf/NaN ratio.
+        let v = context_status_fields(Some(1000), 0, 0, 0.85);
+        assert!(v["occupancy_ratio"].is_null());
+        assert_eq!(v["near_full"], false);
     }
 
     #[test]
