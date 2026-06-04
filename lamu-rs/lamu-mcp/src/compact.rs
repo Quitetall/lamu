@@ -7,13 +7,15 @@
 //! stored cloud_query conversation with append-only supersede markers.
 
 use crate::server::LamuMcpServer;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 /// In-flight persist compactions keyed by conversation_id — at most one per id,
 /// so two concurrent compactions can't both summarize-and-supersede the same
-/// conversation (ADR 0021 C5).
+/// conversation (ADR 0021 C5). parking_lot::Mutex so a panic can't poison it
+/// into a permanent feature outage.
 static COMPACTING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// RAII release of the per-conversation compaction lock (drops on any return,
@@ -21,9 +23,7 @@ static COMPACTING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::ne
 struct CompactGuard(String);
 impl Drop for CompactGuard {
     fn drop(&mut self) {
-        if let Ok(mut g) = COMPACTING.lock() {
-            g.remove(&self.0);
-        }
+        COMPACTING.lock().remove(&self.0);
     }
 }
 
@@ -100,7 +100,7 @@ impl LamuMcpServer {
         // (rewrite-in-place via append-only supersede markers). Stateless
         // message-list mode is the default below.
         if let Some(cid) = args.get("conversation_id").and_then(|v| v.as_str()) {
-            return self.compact_persist(cid.to_string(), args.clone()).await;
+            return self.compact_persist(cid, &args).await;
         }
 
         let messages: Vec<Value> = match args.get("messages").and_then(|m| m.as_array()) {
@@ -211,24 +211,22 @@ impl LamuMcpServer {
     /// conversation. Append-only — originals are never deleted; a supersede
     /// marker hides the summarized range on recall. Serialized per
     /// conversation_id; the lock releases on every return path.
-    pub(crate) async fn compact_persist(&self, cid: String, args: Value) -> String {
+    pub(crate) async fn compact_persist(&self, cid: &str, args: &Value) -> String {
+        // `_guard` is a NAMED binding (not bare `_`), so the CompactGuard lives
+        // to the end of this fn — reserving cid across the summarize `.await` in
+        // _inner. Only the short parking_lot guard `g` is released after insert.
         let _guard = {
-            let mut g = match COMPACTING.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    return json!({"compacted": false, "error": "compaction lock poisoned"}).to_string()
-                }
-            };
-            if !g.insert(cid.clone()) {
+            let mut g = COMPACTING.lock();
+            if !g.insert(cid.to_string()) {
                 return json!({
                     "compacted": false,
                     "error": "a compaction is already in progress for this conversation"
                 })
                 .to_string();
             }
-            CompactGuard(cid.clone())
+            CompactGuard(cid.to_string())
         };
-        self.compact_persist_inner(&cid, &args).await
+        self.compact_persist_inner(cid, args).await
     }
 
     async fn compact_persist_inner(&self, cid: &str, args: &Value) -> String {
@@ -322,10 +320,16 @@ impl LamuMcpServer {
         // audit/undo. Nothing is deleted or overwritten.
         let md = json!({"kind": "compaction_summary", "supersedes": [lo, hi]}).to_string();
         let content = format!("[compacted summary of turns {lo}-{hi}]\n{summary}");
+        // role "system": renders as a labelled context block, and if this
+        // conversation is later stateless-compacted, a leading system turn is
+        // preserved verbatim (correct — the summary is load-bearing context).
         if let Err(e) = mem.append_turn(cid, "system", &content, Some(&md)) {
             return json!({"compacted": false, "error": format!("append failed: {e}")}).to_string();
         }
-        let after_turns = mem.recall(cid, 0).map(|t| t.len()).unwrap_or(0);
+        // After: the preserved tail + the 1 new summary (middle now hidden).
+        // Computed directly — avoids a redundant recall and the silent after=0
+        // a transient second-read error would otherwise report on success.
+        let after_turns = turns.len() - middle.len() + 1;
         json!({
             "compacted": true, "persisted": true, "conversation_id": cid,
             "superseded_idx_range": [lo, hi],
