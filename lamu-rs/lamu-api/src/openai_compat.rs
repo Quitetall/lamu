@@ -895,14 +895,15 @@ async fn chat_completions(
 }
 
 /// ADR 0021: the near-full occupancy threshold. `LAMU_CTX_NEAR_FULL` in (0, 1],
-/// default 0.85.
-fn ctx_near_full_threshold() -> f64 {
+/// default 0.85. Read once per process — config doesn't change without a
+/// restart, so a per-request env parse on the hot path is wasted work.
+static CTX_NEAR_FULL: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
     std::env::var("LAMU_CTX_NEAR_FULL")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0 && *v <= 1.0)
         .unwrap_or(0.85)
-}
+});
 
 /// ADR 0021: build the un-fakeable `context_window` block for a response
 /// `usage`. `prompt_tokens` is the ENGINE's own count of the prompt it ingested
@@ -913,8 +914,13 @@ fn ctx_near_full_threshold() -> f64 {
 /// `prompt_tokens == 0` (backend returned no usage) → honest "unknown", never a
 /// fabricated ratio.
 fn build_context_window(prompt_tokens: u64, context_max: u32) -> Value {
+    // NOTE (deferred, ADR 0021 follow-up): effective_ctx_size re-reads
+    // LAMU_DEFAULT_CTX here rather than the value captured at spawn. Correct as
+    // long as the env is unchanged since the server booted (the convention —
+    // changing it requires a restart to re-spawn anyway). A spawn-time cache on
+    // LoadedModel would close the residual TOCTOU.
     let n_ctx = lamu_core::backends::llamacpp::effective_ctx_size(context_max);
-    context_window_value(prompt_tokens, n_ctx, context_max, ctx_near_full_threshold())
+    context_window_value(prompt_tokens, n_ctx, context_max, *CTX_NEAR_FULL)
 }
 
 /// Pure core of the `context_window` block (no env / no engine reads) so the
@@ -962,6 +968,9 @@ fn augment_usage_with_context(response: &mut Value, prompt_tokens: u64, context_
             obj.insert("context_window".to_string(), cw);
         }
         None => {
+            // Rare: backend returned no `usage` object (error path). We only
+            // have the context_window to add; the absent prompt/completion
+            // counts were never present to preserve.
             response["usage"] = json!({ "context_window": cw });
         }
     }
@@ -1846,6 +1855,8 @@ async fn anthropic_messages(
     });
     // ADR 0021: same un-fakeable context-occupancy block, additive inside the
     // Anthropic usage object (Claude-style clients ignore the extra key).
+    // `oai_model` (the resolved/internal model name) is the correct key —
+    // `entries` is keyed by internal name, not the client's requested alias.
     let ctx_max = entries.get(oai_model).map(|e| e.context_max).unwrap_or(0);
     anthro["usage"]["context_window"] = build_context_window(in_tokens, ctx_max);
     (StatusCode::OK, Json(anthro)).into_response()
