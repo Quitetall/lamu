@@ -8,6 +8,24 @@
 
 use crate::server::LamuMcpServer;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
+/// In-flight persist compactions keyed by conversation_id — at most one per id,
+/// so two concurrent compactions can't both summarize-and-supersede the same
+/// conversation (ADR 0021 C5).
+static COMPACTING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// RAII release of the per-conversation compaction lock (drops on any return,
+/// including the early-return error paths and a panic).
+struct CompactGuard(String);
+impl Drop for CompactGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = COMPACTING.lock() {
+            g.remove(&self.0);
+        }
+    }
+}
 
 /// Compaction-specific summary prompt. Deliberately NOT the cross-session
 /// `EXTRACTION_PROMPT` (which drops transient/in-flight state) — a
@@ -78,6 +96,13 @@ impl LamuMcpServer {
     /// verbatim, summarizes the middle via the cloud model, returns the shrunk
     /// `messages`. Never mutates anything (the persist path is C5).
     pub(crate) async fn handle_compact_context(&self, args: Value) -> String {
+        // C5 persist path: a conversation_id targets the stored cloud_query log
+        // (rewrite-in-place via append-only supersede markers). Stateless
+        // message-list mode is the default below.
+        if let Some(cid) = args.get("conversation_id").and_then(|v| v.as_str()) {
+            return self.compact_persist(cid.to_string(), args.clone()).await;
+        }
+
         let messages: Vec<Value> = match args.get("messages").and_then(|m| m.as_array()) {
             Some(a) if !a.is_empty() => a.clone(),
             _ => {
@@ -178,6 +203,135 @@ impl LamuMcpServer {
             "summarized_middle_turns": middle.len(),
             "preserved": {"head_system": head.len(), "tail_recent": tail.len()},
             "note": "approx_tokens is a char/4 estimate; call context_status with the returned messages for the engine-truth count",
+        })
+        .to_string()
+    }
+
+    /// ADR 0021 C5: persist-mode compaction of the stored cloud_query
+    /// conversation. Append-only — originals are never deleted; a supersede
+    /// marker hides the summarized range on recall. Serialized per
+    /// conversation_id; the lock releases on every return path.
+    pub(crate) async fn compact_persist(&self, cid: String, args: Value) -> String {
+        let _guard = {
+            let mut g = match COMPACTING.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    return json!({"compacted": false, "error": "compaction lock poisoned"}).to_string()
+                }
+            };
+            if !g.insert(cid.clone()) {
+                return json!({
+                    "compacted": false,
+                    "error": "a compaction is already in progress for this conversation"
+                })
+                .to_string();
+            }
+            CompactGuard(cid.clone())
+        };
+        self.compact_persist_inner(&cid, &args).await
+    }
+
+    async fn compact_persist_inner(&self, cid: &str, args: &Value) -> String {
+        let keep_recent = args.get("keep_recent").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+        let model = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mimo-v2.5")
+            .to_string();
+        let confirm = args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+        let max_summary_tokens = args
+            .get("max_summary_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024);
+
+        let mem = match crate::memory::shared() {
+            Ok(m) => m,
+            Err(e) => {
+                return json!({"compacted": false, "error": format!("memory unavailable: {e}")})
+                    .to_string()
+            }
+        };
+        // Fresh read (already supersede-filtered). BOTH dry-run and confirm read
+        // here, so confirm computes the range from a CURRENT view: any turn
+        // appended after a dry-run gets a higher idx, lands in the preserved
+        // tail, and is never superseded (TOCTOU-safe without a long-held lock).
+        let turns = match mem.recall(cid, 0) {
+            Ok(t) => t,
+            Err(e) => {
+                return json!({"compacted": false, "error": format!("recall failed: {e}")})
+                    .to_string()
+            }
+        };
+        if turns.len() <= keep_recent {
+            return json!({
+                "compacted": false, "conversation_id": cid,
+                "reason": "nothing to compact — conversation has <= keep_recent turns",
+                "turns": turns.len(),
+            })
+            .to_string();
+        }
+        let split = turns.len() - keep_recent;
+        let middle = &turns[..split];
+        let lo = middle.first().map(|t| t.idx).unwrap_or(0);
+        let hi = middle.last().map(|t| t.idx).unwrap_or(0);
+        let before_tokens = (turns.iter().map(|t| t.content.len()).sum::<usize>() / 4) as u64;
+
+        if !confirm {
+            return json!({
+                "dry_run": true, "conversation_id": cid,
+                "before": {"turns": turns.len(), "approx_tokens": before_tokens},
+                "plan": {
+                    "summarize_middle_turns": middle.len(),
+                    "preserve_tail_turns": keep_recent,
+                    "supersede_idx_range": [lo, hi],
+                },
+                "note": "append-only persist (originals kept on disk); call again with confirm:true",
+            })
+            .to_string();
+        }
+
+        if self.routing_mode.lock().await.as_str() == "local-only" {
+            return json!({
+                "compacted": false,
+                "error": "routing mode is 'local-only' — compaction summary needs the cloud model. Dry-run still works; or set_routing_mode(mode='auto').",
+            })
+            .to_string();
+        }
+
+        let middle_text = middle
+            .iter()
+            .map(|t| format!("{}: {}", t.role, t.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let summary = crate::cloud::handle_cloud_query(json!({
+            "model": model,
+            "system": SUMMARIZATION_PROMPT,
+            "prompt": middle_text,
+            "max_tokens": max_summary_tokens,
+            "temperature": 0.3,
+            "ephemeral": true,
+        }))
+        .await;
+        if summary.starts_with("error:") || summary.trim().is_empty() {
+            return json!({"compacted": false, "error": format!("summarization failed: {summary}")})
+                .to_string();
+        }
+
+        // Append-only: write the summary as a new turn carrying the supersede
+        // marker. recall now hides idx [lo,hi]; the originals stay on disk for
+        // audit/undo. Nothing is deleted or overwritten.
+        let md = json!({"kind": "compaction_summary", "supersedes": [lo, hi]}).to_string();
+        let content = format!("[compacted summary of turns {lo}-{hi}]\n{summary}");
+        if let Err(e) = mem.append_turn(cid, "system", &content, Some(&md)) {
+            return json!({"compacted": false, "error": format!("append failed: {e}")}).to_string();
+        }
+        let after_turns = mem.recall(cid, 0).map(|t| t.len()).unwrap_or(0);
+        json!({
+            "compacted": true, "persisted": true, "conversation_id": cid,
+            "superseded_idx_range": [lo, hi],
+            "summarized_turns": middle.len(),
+            "before_turns": turns.len(), "after_turns": after_turns,
+            "note": "append-only — originals remain on disk; recall now hides the superseded range. Nothing was deleted.",
         })
         .to_string()
     }

@@ -122,13 +122,13 @@ fn schema_compact_context() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "messages": {"type": "array", "items": {"type": "object"}, "description": "The conversation message list ({role, content}) to compact. Required for stateless mode."},
+            "messages": {"type": "array", "items": {"type": "object"}, "description": "STATELESS mode: the conversation message list ({role, content}) to compact. Returns the shrunk list; nothing is mutated."},
+            "conversation_id": {"type": "string", "description": "PERSIST mode: compact the stored cloud_query conversation with this id in place (append-only supersede marker; originals kept on disk). Provide either `messages` OR `conversation_id`."},
             "keep_recent": {"type": "integer", "default": 6, "description": "Number of most-recent turns to preserve verbatim (includes the latest user turn). Leading system turns are always preserved too."},
             "model": {"type": "string", "default": "mimo-v2.5", "description": "Cloud model used to summarize the stale middle."},
             "confirm": {"type": "boolean", "default": false, "description": "false = dry-run plan only (no model call, no mutation). true = perform the compaction."},
             "max_summary_tokens": {"type": "integer", "default": 1024}
-        },
-        "required": ["messages"]
+        }
     })
 }
 
@@ -635,7 +635,7 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "compact_context",
-        description: "Compact a conversation to free context (ADR 0021): preserves the leading system turns + the last `keep_recent` turns verbatim, summarizes only the stale middle via the cloud model, returns the shrunk `messages`. Two-phase: dry-run plan unless confirm:true. Stateless — never mutates; the agent resends the returned messages. cloud=false: it self-routes its own cloud_query for the summary.",
+        description: "Compact a conversation to free context (ADR 0021): preserves the leading system turns + the last `keep_recent` turns verbatim, summarizes only the stale middle via the cloud model. STATELESS (`messages`) returns the shrunk list for the agent to resend; PERSIST (`conversation_id`) rewrites the stored cloud_query log in place via an append-only supersede marker (originals kept on disk; recall hides the range). Two-phase: dry-run plan unless confirm:true. cloud=false: it self-routes its own cloud_query for the summary and self-refuses under local-only.",
         schema_fn: schema_compact_context,
         handler: HandlerKind::Stateful(dispatch_compact_context),
         cloud: false,

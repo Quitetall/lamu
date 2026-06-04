@@ -247,8 +247,41 @@ impl Memory {
         for row in rows {
             out.push(row?);
         }
-        Ok(out)
+        Ok(apply_supersedes(out))
     }
+}
+
+/// ADR 0021 C5: hide turns superseded by a compaction summary. A summary turn
+/// carries metadata `{"kind":"compaction_summary","supersedes":[lo,hi]}`; every
+/// turn whose `idx` falls in any such range is dropped. The summary itself is
+/// appended AFTER its range so it keeps a higher idx and survives — and is
+/// dropped only if a LATER summary supersedes it, which is exactly right for
+/// re-compaction. No markers present → returns the input unchanged (the
+/// overwhelming-majority path: zero allocation beyond the scan, zero behavior
+/// change for non-compacted conversations).
+fn apply_supersedes(turns: Vec<Turn>) -> Vec<Turn> {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for t in &turns {
+        if let Some(md) = &t.metadata {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(md) {
+                if v.get("kind").and_then(|k| k.as_str()) == Some("compaction_summary") {
+                    if let (Some(lo), Some(hi)) = (
+                        v.get("supersedes").and_then(|s| s.get(0)).and_then(|x| x.as_i64()),
+                        v.get("supersedes").and_then(|s| s.get(1)).and_then(|x| x.as_i64()),
+                    ) {
+                        ranges.push((lo, hi));
+                    }
+                }
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return turns;
+    }
+    turns
+        .into_iter()
+        .filter(|t| !ranges.iter().any(|(lo, hi)| t.idx >= *lo && t.idx <= *hi))
+        .collect()
 }
 
 /// Process-wide instance pointing at the production data dir.
@@ -400,6 +433,50 @@ pub fn render_for_context(turns: &[Turn]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(idx: i64, meta: Option<&str>) -> Turn {
+        Turn { idx, role: "user".into(), content: format!("t{idx}"), ts: 0, metadata: meta.map(String::from) }
+    }
+
+    #[test]
+    fn apply_supersedes_noop_without_markers() {
+        let t = vec![turn(0, None), turn(1, None), turn(2, None)];
+        assert_eq!(apply_supersedes(t).len(), 3);
+    }
+
+    #[test]
+    fn apply_supersedes_hides_range_keeps_summary() {
+        // summary at idx 5 supersedes [1,3]; originals 1,2,3 hidden, 0/4/5 kept.
+        let md = r#"{"kind":"compaction_summary","supersedes":[1,3]}"#;
+        let t = vec![turn(0, None), turn(1, None), turn(2, None), turn(3, None), turn(4, None), turn(5, Some(md))];
+        let idxs: Vec<i64> = apply_supersedes(t).into_iter().map(|x| x.idx).collect();
+        assert_eq!(idxs, vec![0, 4, 5]);
+    }
+
+    #[test]
+    fn apply_supersedes_recompaction_drops_old_summary() {
+        // S1@5 supersedes [1,3]; S2@7 supersedes [1,5] → S1 (idx5) now hidden.
+        let s1 = r#"{"kind":"compaction_summary","supersedes":[1,3]}"#;
+        let s2 = r#"{"kind":"compaction_summary","supersedes":[1,5]}"#;
+        let t = vec![turn(0, None), turn(4, None), turn(5, Some(s1)), turn(6, None), turn(7, Some(s2))];
+        let idxs: Vec<i64> = apply_supersedes(t).into_iter().map(|x| x.idx).collect();
+        assert_eq!(idxs, vec![0, 6, 7]);
+    }
+
+    #[test]
+    fn recall_applies_supersedes_end_to_end() {
+        let (_d, mem) = fresh();
+        for i in 0..5 {
+            mem.append_turn("c", "user", &format!("turn{i}"), None).unwrap();
+        }
+        // Supersede the first 3 (idx 0..=2) with a summary turn.
+        let md = r#"{"kind":"compaction_summary","supersedes":[0,2]}"#;
+        mem.append_turn("c", "system", "[summary]", Some(md)).unwrap();
+        let got = mem.recall("c", 0).unwrap();
+        // 5 originals + 1 summary = 6 rows on disk; recall hides idx 0,1,2 → 3.
+        let idxs: Vec<i64> = got.iter().map(|t| t.idx).collect();
+        assert_eq!(idxs, vec![3, 4, 5]);
+    }
 
     fn fresh() -> (tempfile::TempDir, Memory) {
         let dir = tempfile::tempdir().unwrap();
