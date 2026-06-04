@@ -1,0 +1,4 @@
+results/
+tier2/results/
+__pycache__/
+*.pyc

@@ -1,0 +1,12 @@
+# Prompt variants under test. Each maps a name -> a file (relative to this dir).
+# The eval runs the task suite once per variant and compares pass-rates, so you
+# can answer: which form of the standard actually changes behavior?
+#   baseline         — minimal control (does the prompt help AT ALL?)
+#   behavioral_core  — the tight ~procedural subset (best standing system prompt?)
+#   operational_full — the whole agent bible (does the extra length help or dilute?)
+#   checklist        — only the pre-flight gate (is a gate enough?)
+variants:
+  baseline: prompts/baseline.txt
+  behavioral_core: prompts/behavioral_core.md
+  operational_full: ../AGENTIC_BIBLE.md
+  checklist: prompts/checklist.md
