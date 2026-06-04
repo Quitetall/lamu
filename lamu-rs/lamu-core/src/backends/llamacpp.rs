@@ -369,6 +369,40 @@ fn parse_tokenize_count(v: &Value) -> Option<u32> {
         .map(|a| a.len() as u32)
 }
 
+/// POST llama-server `/tokenize` at `http://localhost:{port}` and return the
+/// engine's exact token count for `text`. Shared by `Backend::tokenize_count`
+/// and the MCP `context_status` tool (ADR 0021): the count is the engine
+/// tokenizer's, out-of-band from the model's reply, so the generating model
+/// cannot fabricate it. 15s timeout; a failure surfaces as an error (callers
+/// degrade to "unknown", never a wrong number).
+pub async fn tokenize_count_at(
+    client: &reqwest::Client,
+    port: u16,
+    text: &str,
+) -> Result<u32> {
+    let url = format!("http://localhost:{}/tokenize", port);
+    let resp = client
+        .post(&url)
+        .json(&json!({ "content": text }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| Error::Backend(format!("tokenize http: {}", e)))?;
+    if !resp.status().is_success() {
+        return Err(Error::Backend(format!(
+            "tokenize status {} (port {})",
+            resp.status(),
+            port
+        )));
+    }
+    let json = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| Error::Backend(format!("tokenize decode: {}", e)))?;
+    parse_tokenize_count(&json)
+        .ok_or_else(|| Error::Backend("tokenize: response has no `tokens` array".into()))
+}
+
 #[async_trait]
 impl Backend for LlamaCppBackend {
     fn set_device(&mut self, placement: DevicePlacement) {
@@ -476,31 +510,7 @@ impl Backend for LlamaCppBackend {
     }
 
     async fn tokenize_count(&self, text: &str) -> Result<u32> {
-        // POST /tokenize → {"tokens":[id, ...]}. The count is computed by the
-        // engine's tokenizer, out-of-band from the model's reply stream, so it
-        // cannot be fabricated by the generating model (ADR 0021).
-        let url = format!("http://localhost:{}/tokenize", self.port);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&json!({ "content": text }))
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| Error::Backend(format!("tokenize http: {}", e)))?;
-        if !resp.status().is_success() {
-            return Err(Error::Backend(format!(
-                "tokenize status {} (port {})",
-                resp.status(),
-                self.port
-            )));
-        }
-        let json = resp
-            .json::<Value>()
-            .await
-            .map_err(|e| Error::Backend(format!("tokenize decode: {}", e)))?;
-        parse_tokenize_count(&json)
-            .ok_or_else(|| Error::Backend("tokenize: response has no `tokens` array".into()))
+        tokenize_count_at(&self.client, self.port, text).await
     }
 
     async fn generate(

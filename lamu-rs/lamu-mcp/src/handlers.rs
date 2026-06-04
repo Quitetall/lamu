@@ -658,6 +658,86 @@ impl LamuMcpServer {
         lines.join("\n")
     }
 
+    /// ADR 0021: report un-fakeable context occupancy for a loaded model.
+    /// Resolves the target (explicit `model`, or the single loaded LLM) and —
+    /// if `text` is given — tokenizes it via the engine's /tokenize to compute
+    /// occupancy against the booted window. No LLM loaded / engine unreachable →
+    /// honest "cold"/"tokenize_failed", never a fabricated number.
+    pub(crate) async fn handle_context_status(&self, args: Value) -> String {
+        let model_arg = args.get("model").and_then(|v| v.as_str()).map(str::to_string);
+        let text = args.get("text").and_then(|v| v.as_str()).map(str::to_string);
+
+        // One short lock: clone the client + resolve (name, port, context_max).
+        // The /tokenize await below runs with NO lock held.
+        let (client, resolved): (reqwest::Client, Result<(String, u16, u32), String>) = {
+            let st = self.state.lock();
+            let client = st.client.clone();
+            let resolved = match &model_arg {
+                Some(name) => match st.scheduler.get_loaded(name) {
+                    Some(m) if m.port != 0 => Ok((name.clone(), m.port, m.entry.context_max)),
+                    _ => Err(json!({
+                        "model": name, "loaded": false, "source": "cold",
+                        "advice": "model not loaded — load it or omit `model`",
+                    }).to_string()),
+                },
+                None => {
+                    let llms: Vec<_> = st
+                        .scheduler
+                        .loaded_models()
+                        .into_iter()
+                        .filter(|m| m.entry.modality.is_llm() && m.port != 0)
+                        .collect();
+                    match llms.len() {
+                        0 => Err(json!({
+                            "loaded": false, "source": "cold",
+                            "advice": "no LLM loaded — load one or pass `model`",
+                        }).to_string()),
+                        1 => Ok((
+                            llms[0].entry.name.clone(),
+                            llms[0].port,
+                            llms[0].entry.context_max,
+                        )),
+                        _ => Err(json!({
+                            "loaded": true, "source": "ambiguous",
+                            "loaded_models": llms.iter().map(|m| m.entry.name.clone()).collect::<Vec<_>>(),
+                            "advice": "multiple LLMs loaded — pass `model`",
+                        }).to_string()),
+                    }
+                }
+            };
+            (client, resolved)
+        };
+        let (name, port, context_max) = match resolved {
+            Ok(t) => t,
+            Err(early) => return early,
+        };
+
+        // Measure if text given; otherwise report the window only.
+        let tokens = match &text {
+            Some(t) => {
+                match lamu_core::backends::llamacpp::tokenize_count_at(&client, port, t).await {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        return json!({
+                            "model": name, "loaded": true, "source": "tokenize_failed",
+                            "error": e.to_string(),
+                            "advice": "engine /tokenize unreachable — try again",
+                        })
+                        .to_string();
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let n_ctx = lamu_core::backends::llamacpp::effective_ctx_size(context_max);
+        let mut out = context_status_fields(tokens, n_ctx, context_max, ctx_near_full_threshold());
+        out["model"] = json!(name);
+        out["loaded"] = json!(true);
+        out["source"] = json!(if tokens.is_some() { "tokenize" } else { "no_input" });
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+    }
+
     pub(crate) async fn handle_queue_status(&self) -> String {
         let strategy = match self.queue_strategy {
             QueueStrategy::Fifo => "fifo",
@@ -921,5 +1001,96 @@ impl LamuMcpServer {
             "Scanned {}: {} models found. Registry updated.",
             st.models_dir.display(), entries.len()
         )
+    }
+}
+
+/// ADR 0021 near-full threshold for the MCP surface. `LAMU_CTX_NEAR_FULL` in
+/// (0, 1], default 0.85. (Small intentional mirror of the lamu-api reader —
+/// avoids a cross-crate config dependency for one constant.)
+fn ctx_near_full_threshold() -> f64 {
+    std::env::var("LAMU_CTX_NEAR_FULL")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.85)
+}
+
+/// Pure core of `context_status`: build the occupancy fields from a measured
+/// token count (no engine / no env reads, so it is unit-testable). `tokens =
+/// None` → the window is reported but occupancy is left unmeasured. `n_ctx` is
+/// the booted window (denominator); `context_max` is the trained max (info,
+/// 0 = unknown).
+fn context_status_fields(tokens: Option<u32>, n_ctx: u32, context_max: u32, threshold: f64) -> Value {
+    let mut v = match tokens {
+        None => json!({
+            "tokens": Value::Null,
+            "n_ctx": n_ctx,
+            "occupancy_ratio": Value::Null,
+            "near_full": false,
+            "headroom_tokens": Value::Null,
+            "advice": "window reported; pass `text` to measure occupancy",
+        }),
+        Some(t) => {
+            let ratio = t as f64 / n_ctx as f64;
+            let headroom = (n_ctx as i64 - t as i64).max(0);
+            let advice = if ratio >= 0.92 {
+                "compact strongly recommended"
+            } else if ratio >= threshold {
+                "consider compact_context"
+            } else {
+                "ok"
+            };
+            json!({
+                "tokens": t,
+                "n_ctx": n_ctx,
+                "occupancy_ratio": (ratio * 1000.0).round() / 1000.0,
+                "near_full": ratio >= threshold,
+                "headroom_tokens": headroom,
+                "advice": advice,
+            })
+        }
+    };
+    if context_max > 0 {
+        v["n_ctx_train"] = json!(context_max);
+    }
+    v
+}
+
+#[cfg(test)]
+mod context_status_tests {
+    use super::*;
+
+    #[test]
+    fn fields_unmeasured_reports_window_only() {
+        let v = context_status_fields(None, 8192, 32768, 0.85);
+        assert!(v["occupancy_ratio"].is_null());
+        assert_eq!(v["near_full"], false);
+        assert_eq!(v["n_ctx"], 8192);
+        assert_eq!(v["n_ctx_train"], 32768);
+    }
+
+    #[test]
+    fn fields_near_full_advises_compact() {
+        // 7500 / 8192 ≈ 0.916 → ≥ 0.85 but < 0.92 → "consider".
+        let v = context_status_fields(Some(7500), 8192, 32768, 0.85);
+        assert_eq!(v["near_full"], true);
+        assert_eq!(v["advice"], "consider compact_context");
+        assert_eq!(v["headroom_tokens"], 8192 - 7500);
+    }
+
+    #[test]
+    fn fields_overflow_strongly_recommends_and_omits_unknown_train() {
+        // 8000 / 8192 ≈ 0.977 → ≥ 0.92. context_max 0 → no n_ctx_train field.
+        let v = context_status_fields(Some(8000), 8192, 0, 0.85);
+        assert_eq!(v["advice"], "compact strongly recommended");
+        assert!(v.get("n_ctx_train").is_none());
+        assert_eq!(v["headroom_tokens"], 192);
+    }
+
+    #[test]
+    fn fields_low_fill_ok() {
+        let v = context_status_fields(Some(500), 8192, 8192, 0.85);
+        assert_eq!(v["advice"], "ok");
+        assert_eq!(v["near_full"], false);
     }
 }

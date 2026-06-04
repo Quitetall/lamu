@@ -108,6 +108,16 @@ fn schema_named_only() -> Value {
     })
 }
 
+fn schema_context_status() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "model": {"type": "string", "description": "Loaded model to measure. Default: the single loaded LLM (errors asking which if more than one is loaded)."},
+            "text": {"type": "string", "description": "Optional prompt text to tokenize via the engine for an EXACT occupancy reading. Omit to report just the model's booted context window."}
+        }
+    })
+}
+
 fn schema_cloud_query() -> Value {
     json!({
         "type": "object",
@@ -435,6 +445,10 @@ fn dispatch_vram_status<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn F
     Box::pin(async move { r })
 }
 
+fn dispatch_context_status<'a>(s: &'a LamuMcpServer, args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(s.handle_context_status(args))
+}
+
 fn dispatch_scan<'a>(s: &'a LamuMcpServer, _args: Value) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
     let r = s.handle_scan();
     Box::pin(async move { r })
@@ -592,6 +606,13 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Show current VRAM allocation.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_vram_status),
+        cloud: false,
+    },
+    ToolDef {
+        name: "context_status",
+        description: "Report un-fakeable context occupancy for a loaded model (ADR 0021): tokens vs the engine's BOOTED window, counted by the engine tokenizer — not the model's self-report. Pass `text` to measure a specific prompt; advises when to call compact_context. No LLM loaded → honest 'cold', never a fabricated number.",
+        schema_fn: schema_context_status,
+        handler: HandlerKind::Stateful(dispatch_context_status),
         cloud: false,
     },
     ToolDef {
