@@ -60,7 +60,12 @@ fn render_turns(turns: &[Value]) -> String {
         .iter()
         .map(|m| {
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            // Non-string content (multimodal arrays/objects) is JSON-serialized
+            // rather than dropped, so its text survives into the summary.
+            let content = m
+                .get("content")
+                .map(|c| c.as_str().map(String::from).unwrap_or_else(|| c.to_string()))
+                .unwrap_or_default();
             format!("{role}: {content}")
         })
         .collect::<Vec<_>>()
@@ -107,6 +112,10 @@ impl LamuMcpServer {
         }
 
         if !confirm {
+            // Rough post-compaction estimate: preserved head+tail verbatim plus
+            // the summary capped at max_summary_tokens. The savings is the whole
+            // point of a dry-run, so surface it.
+            let est_after = estimate_tokens(&head) + estimate_tokens(&tail) + max_summary_tokens;
             return json!({
                 "dry_run": true,
                 "before": {"turns": messages.len(), "approx_tokens": before_tokens},
@@ -114,12 +123,31 @@ impl LamuMcpServer {
                     "preserve_head_system_turns": head.len(),
                     "summarize_middle_turns": middle.len(),
                     "preserve_tail_turns": tail.len(),
+                    "estimated_after_approx_tokens": est_after,
+                    "estimated_savings_approx_tokens": before_tokens.saturating_sub(est_after),
                 },
-                "note": "call again with confirm:true to perform the compaction",
+                "note": "estimates are char/4 approximations; call again with confirm:true to perform the compaction",
             })
             .to_string();
         }
 
+        // Self-enforce the routing gate. The confirm path makes a cloud call,
+        // but the tool is `cloud:false` (so dry-run stays usable in local-only),
+        // which means the dispatcher's local-only refusal doesn't fire here —
+        // mirror parallel_query (handlers.rs) and refuse the cloud step itself.
+        // Don't hold the lock across the .await below.
+        if self.routing_mode.lock().await.as_str() == "local-only" {
+            return json!({
+                "compacted": false,
+                "error": "routing mode is 'local-only' — compact_context's summary needs the cloud model. Dry-run (confirm:false) still works; or set_routing_mode(mode='auto').",
+            })
+            .to_string();
+        }
+
+        // NOTE: middle turns are untrusted conversation content fed to the
+        // summarizer. The call is ephemeral and tool-less, so an injected
+        // instruction can at worst degrade the summary — there is no data-exfil
+        // path. Callers should only compact conversations they trust.
         let summary = crate::cloud::handle_cloud_query(json!({
             "model": model,
             "system": SUMMARIZATION_PROMPT,
@@ -129,7 +157,10 @@ impl LamuMcpServer {
             "ephemeral": true,
         }))
         .await;
-        if summary.starts_with("error:") {
+        // handle_cloud_query signals every failure with an "error:" prefix (the
+        // stringly contract every caller relies on). Also reject an empty
+        // summary so a blank is never spliced into the messages.
+        if summary.starts_with("error:") || summary.trim().is_empty() {
             return json!({"compacted": false, "error": format!("summarization failed: {summary}")})
                 .to_string();
         }
