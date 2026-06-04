@@ -6,8 +6,14 @@
 #   operational_full — the whole agent bible (does the extra length help or dilute?)
 #   checklist        — only the pre-flight gate (is a gate enough?)
 #   opencode         — sst/opencode's actual generic system prompt (default.txt),
-#                      copied verbatim from the repo. Production-battle-tested
-#                      tool-manual style; head-to-head reference point.
+#                      copied verbatim. Source: github.com/sst/opencode
+#                      packages/opencode/src/session/prompt/default.txt @ 69cfc44.
+#                      Production-battle-tested tool-manual style; head-to-head
+#                      reference point. NOTE: it references opencode's own tools
+#                      (Task/WebFetch/Bash/Edit) + <system-reminder> blocks that
+#                      do not exist in this harness — intentional (verbatim), but
+#                      means its tool-usage scaffolding is dead weight in a
+#                      prompt-only rubric eval.
 variants:
   baseline: prompts/baseline.txt
   behavioral_core: prompts/behavioral_core.md
