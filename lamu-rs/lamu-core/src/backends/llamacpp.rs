@@ -51,6 +51,12 @@ pub struct LlamaSpawn {
 ///   unless `LAMU_KV` is explicitly set.
 /// - `LAMU_BIND_HOST` — bind address (default: `127.0.0.1`). Set to
 ///   `0.0.0.0` to opt in to remote exposure.
+
+/// Safe fallback context window: used when the model's trained context is
+/// unknown (`context_max == 0`) and no `LAMU_DEFAULT_CTX` cap is set, and as
+/// the floor that guarantees we never spawn with `--ctx-size 0` (ADR 0021 C1).
+const FALLBACK_CTX_SIZE: u32 = 4096;
+
 pub fn build_llama_spawn(
     entry: &ModelEntry,
     port: u16,
@@ -67,7 +73,7 @@ pub fn build_llama_spawn(
     // safe 4096 floor when no cap is set, so a spawn always has an explicit
     // window. The occupancy layer still reports context_max==0 as unknown.
     let ctx = if entry.context_max == 0 {
-        if ctx_cap == u32::MAX { 4096 } else { ctx_cap }
+        if ctx_cap == u32::MAX { FALLBACK_CTX_SIZE } else { ctx_cap }
     } else {
         entry.context_max.min(ctx_cap)
     };
@@ -75,7 +81,7 @@ pub fn build_llama_spawn(
     // LAMU_DEFAULT_CTX=0 would otherwise zero BOTH branches (cap, or
     // min(real, 0)). 0 is invalid as an explicit window → safe floor. Legit
     // small caps (e.g. 2048) are preserved.
-    let ctx = if ctx == 0 { 4096 } else { ctx };
+    let ctx = if ctx == 0 { FALLBACK_CTX_SIZE } else { ctx };
 
     // Embedding models serve via llama-server `--embedding` with mean
     // pooling (OpenAI-compat /v1/embeddings + /embedding) — none of the
