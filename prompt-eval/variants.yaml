@@ -5,8 +5,12 @@
 #   behavioral_core  — the tight ~procedural subset (best standing system prompt?)
 #   operational_full — the whole agent bible (does the extra length help or dilute?)
 #   checklist        — only the pre-flight gate (is a gate enough?)
+#   opencode         — sst/opencode's actual generic system prompt (default.txt),
+#                      copied verbatim from the repo. Production-battle-tested
+#                      tool-manual style; head-to-head reference point.
 variants:
   baseline: prompts/baseline.txt
   behavioral_core: prompts/behavioral_core.md
   operational_full: ../AGENTIC_BIBLE.md
   checklist: prompts/checklist.md
+  opencode: prompts/opencode.md
