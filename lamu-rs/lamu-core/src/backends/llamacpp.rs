@@ -71,6 +71,11 @@ pub fn build_llama_spawn(
     } else {
         entry.context_max.min(ctx_cap)
     };
+    // Structural guarantee that no path emits `--ctx-size 0`: a deliberate
+    // LAMU_DEFAULT_CTX=0 would otherwise zero BOTH branches (cap, or
+    // min(real, 0)). 0 is invalid as an explicit window → safe floor. Legit
+    // small caps (e.g. 2048) are preserved.
+    let ctx = if ctx == 0 { 4096 } else { ctx };
 
     // Embedding models serve via llama-server `--embedding` with mean
     // pooling (OpenAI-compat /v1/embeddings + /embedding) — none of the
@@ -751,6 +756,21 @@ mod tests {
         let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         clear_env();
         assert!(s.args.join(" ").contains("--ctx-size 16384"));
+    }
+
+    #[test]
+    fn build_llama_spawn_ctx_cap_zero_never_emits_zero() {
+        // Pathological LAMU_DEFAULT_CTX=0 must not zero --ctx-size on any path
+        // (here: known context_max=8192, min(8192,0)=0 → floored to 4096).
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe { std::env::set_var("LAMU_DEFAULT_CTX", "0"); }
+        let entry = dummy_entry("llama", 8192);
+        let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
+        clear_env();
+        let joined = s.args.join(" ");
+        assert!(joined.contains("--ctx-size 4096"), "{joined}");
+        assert!(!joined.contains("--ctx-size 0"), "{joined}");
     }
 
     #[test]
