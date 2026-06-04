@@ -57,6 +57,28 @@ pub struct LlamaSpawn {
 /// the floor that guarantees we never spawn with `--ctx-size 0` (ADR 0021 C1).
 const FALLBACK_CTX_SIZE: u32 = 4096;
 
+/// The effective context window a llama.cpp spawn runs with for a model whose
+/// trained context is `context_max` (0 = unknown). Applies the
+/// `LAMU_DEFAULT_CTX` cap and the `FALLBACK_CTX_SIZE` floor — the single source
+/// of truth for BOTH the spawn `--ctx-size` and the ADR 0021 occupancy
+/// denominator, so the reported window can never disagree with the one the
+/// server actually booted with (assuming `LAMU_DEFAULT_CTX` is unchanged since
+/// spawn). A set-but-unparseable `LAMU_DEFAULT_CTX` warns (via `parse_env_or`)
+/// and falls back to uncapped.
+pub fn effective_ctx_size(context_max: u32) -> u32 {
+    let ctx_cap = crate::config::parse_env_or("LAMU_DEFAULT_CTX", u32::MAX);
+    let ctx = if context_max == 0 {
+        // Unknown trained ctx: never emit `--ctx-size 0` (version-dependent
+        // meaning, unverified on this build). Use the cap, or the safe floor.
+        if ctx_cap == u32::MAX { FALLBACK_CTX_SIZE } else { ctx_cap }
+    } else {
+        context_max.min(ctx_cap)
+    };
+    // Structural guarantee no path yields 0 (e.g. a deliberate
+    // LAMU_DEFAULT_CTX=0 zeroing min(real, 0)). Legit small caps are preserved.
+    if ctx == 0 { FALLBACK_CTX_SIZE } else { ctx }
+}
+
 pub fn build_llama_spawn(
     entry: &ModelEntry,
     port: u16,
@@ -64,24 +86,9 @@ pub fn build_llama_spawn(
     bin: &std::path::Path,
     cuda_index: u32,
 ) -> Result<LlamaSpawn> {
-    // Set-but-unparseable warns (was silently u32::MAX = unbounded ctx).
-    let ctx_cap = crate::config::parse_env_or("LAMU_DEFAULT_CTX", u32::MAX);
-    // context_max == 0 means the GGUF carried no context_length (ADR 0021:
-    // "unknown" — never a fabricated number). Don't emit `--ctx-size 0`: its
-    // "use the model's trained ctx" meaning is llama.cpp-version-dependent and
-    // unverified on this build (#166). Fall back to the configured cap, or a
-    // safe 4096 floor when no cap is set, so a spawn always has an explicit
-    // window. The occupancy layer still reports context_max==0 as unknown.
-    let ctx = if entry.context_max == 0 {
-        if ctx_cap == u32::MAX { FALLBACK_CTX_SIZE } else { ctx_cap }
-    } else {
-        entry.context_max.min(ctx_cap)
-    };
-    // Structural guarantee that no path emits `--ctx-size 0`: a deliberate
-    // LAMU_DEFAULT_CTX=0 would otherwise zero BOTH branches (cap, or
-    // min(real, 0)). 0 is invalid as an explicit window → safe floor. Legit
-    // small caps (e.g. 2048) are preserved.
-    let ctx = if ctx == 0 { FALLBACK_CTX_SIZE } else { ctx };
+    // Single source of truth for the booted context window (ADR 0021): same
+    // value the occupancy denominator divides by. Reads LAMU_DEFAULT_CTX.
+    let ctx = effective_ctx_size(entry.context_max);
 
     // Embedding models serve via llama-server `--embedding` with mean
     // pooling (OpenAI-compat /v1/embeddings + /embedding) — none of the
@@ -762,6 +769,23 @@ mod tests {
         let s = build_llama_spawn(&entry, 8020, false, std::path::Path::new("/usr/bin/llama-server"), 0).unwrap();
         clear_env();
         assert!(s.args.join(" ").contains("--ctx-size 16384"));
+    }
+
+    #[test]
+    fn effective_ctx_size_contract() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // Uncapped: real trained ctx passes through; unknown → safe floor.
+        assert_eq!(effective_ctx_size(32768), 32768);
+        assert_eq!(effective_ctx_size(0), FALLBACK_CTX_SIZE);
+        // Capped: min(real, cap); unknown → cap; pathological 0 → floor.
+        unsafe { std::env::set_var("LAMU_DEFAULT_CTX", "8192"); }
+        assert_eq!(effective_ctx_size(262144), 8192);
+        assert_eq!(effective_ctx_size(4096), 4096);
+        assert_eq!(effective_ctx_size(0), 8192);
+        unsafe { std::env::set_var("LAMU_DEFAULT_CTX", "0"); }
+        assert_eq!(effective_ctx_size(262144), FALLBACK_CTX_SIZE);
+        clear_env();
     }
 
     #[test]

@@ -871,6 +871,12 @@ async fn chat_completions(
     }
 
     let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    // ADR 0021: attach the un-fakeable context-occupancy block to usage.
+    // Denominator = the served model's booted window; numerator = the engine's
+    // own prompt_tokens. Unknown model → context_max 0 → ratio vs the booted
+    // fallback window, still honest.
+    let ctx_max = state.entries.get(&model_name).map(|e| e.context_max).unwrap_or(0);
+    augment_usage_with_context(&mut response, prompt_tokens, ctx_max);
     // Debit the user's bucket by the tokens actually produced (ADR 0018 §4).
     state.quota.charge(principal_ref, completion_tokens);
     // Per-request audit event (ADR 0018 §5) — the durable who-did-what.
@@ -886,6 +892,79 @@ async fn chat_completions(
         "request served",
     );
     Json(response).into_response()
+}
+
+/// ADR 0021: the near-full occupancy threshold. `LAMU_CTX_NEAR_FULL` in (0, 1],
+/// default 0.85.
+fn ctx_near_full_threshold() -> f64 {
+    std::env::var("LAMU_CTX_NEAR_FULL")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.85)
+}
+
+/// ADR 0021: build the un-fakeable `context_window` block for a response
+/// `usage`. `prompt_tokens` is the ENGINE's own count of the prompt it ingested
+/// (the generating model cannot fabricate it). The denominator is the booted
+/// window `effective_ctx_size(context_max)` — what the server actually runs
+/// with — so a capped server does not under-report fill. `context_max` (GGUF
+/// `n_ctx_train`, 0 = unknown) is surfaced as `n_ctx_train` when known.
+/// `prompt_tokens == 0` (backend returned no usage) → honest "unknown", never a
+/// fabricated ratio.
+fn build_context_window(prompt_tokens: u64, context_max: u32) -> Value {
+    let n_ctx = lamu_core::backends::llamacpp::effective_ctx_size(context_max);
+    context_window_value(prompt_tokens, n_ctx, context_max, ctx_near_full_threshold())
+}
+
+/// Pure core of the `context_window` block (no env / no engine reads) so the
+/// ratio + near-full logic is unit-testable. `n_ctx` is the booted window
+/// (denominator); `context_max` is the trained max (info only, 0 = unknown).
+fn context_window_value(
+    prompt_tokens: u64,
+    n_ctx: u32,
+    context_max: u32,
+    near_full_threshold: f64,
+) -> Value {
+    if prompt_tokens == 0 || n_ctx == 0 {
+        // No engine token count (or no window) → honest unknown, never a
+        // fabricated ratio.
+        return json!({
+            "prompt_tokens": prompt_tokens,
+            "n_ctx": n_ctx,
+            "occupancy_ratio": Value::Null,
+            "near_full": false,
+            "source": "unknown",
+        });
+    }
+    let ratio = prompt_tokens as f64 / n_ctx as f64;
+    let mut cw = json!({
+        "prompt_tokens": prompt_tokens,
+        "n_ctx": n_ctx,
+        "occupancy_ratio": (ratio * 1000.0).round() / 1000.0,
+        "near_full": ratio >= near_full_threshold,
+        "source": "engine_prompt_tokens",
+    });
+    if context_max > 0 {
+        cw["n_ctx_train"] = json!(context_max);
+    }
+    cw
+}
+
+/// Insert the ADR 0021 `context_window` into a response's `usage` object
+/// (additive — existing OpenAI clients ignore unknown keys inside `usage`). If
+/// `usage` is absent/not an object (rare error path), create it so the signal
+/// still surfaces.
+fn augment_usage_with_context(response: &mut Value, prompt_tokens: u64, context_max: u32) {
+    let cw = build_context_window(prompt_tokens, context_max);
+    match response.get_mut("usage").and_then(|u| u.as_object_mut()) {
+        Some(obj) => {
+            obj.insert("context_window".to_string(), cw);
+        }
+        None => {
+            response["usage"] = json!({ "context_window": cw });
+        }
+    }
 }
 
 async fn stream_response(
@@ -1556,6 +1635,10 @@ async fn anthropic_messages(
     principal: Option<Extension<Principal>>,
     Json(req): Json<AnthropicRequest>,
 ) -> Response {
+    // ADR 0021: capture the entries map (cheap Arc clone) before `state` is
+    // moved into the delegated chat_completions call, so the occupancy block
+    // can look up the served model's context_max after conversion.
+    let entries = state.entries.clone();
     // Translate to OpenAI-style messages. For multi-turn tool flows,
     // expand each Anthropic message's content blocks into one or more
     // OpenAI messages — preserves tool_use / tool_result semantics so
@@ -1748,7 +1831,7 @@ async fn anthropic_messages(
     }
     let stop_reason = anthropic_stop_reason(oai_finish, had_tool_use);
 
-    let anthro = json!({
+    let mut anthro = json!({
         "id": format!("msg_{}", random_hex(12)),
         "type": "message",
         "role": "assistant",
@@ -1761,6 +1844,10 @@ async fn anthropic_messages(
             "output_tokens": out_tokens,
         },
     });
+    // ADR 0021: same un-fakeable context-occupancy block, additive inside the
+    // Anthropic usage object (Claude-style clients ignore the extra key).
+    let ctx_max = entries.get(oai_model).map(|e| e.context_max).unwrap_or(0);
+    anthro["usage"]["context_window"] = build_context_window(in_tokens, ctx_max);
     (StatusCode::OK, Json(anthro)).into_response()
 }
 
@@ -2410,6 +2497,60 @@ async fn stream_response_ollama(
 mod compat_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn context_window_normal_fill() {
+        // 7000 / 8192 ≈ 0.854 ≥ 0.85 → near_full. n_ctx_train surfaced.
+        let cw = context_window_value(7000, 8192, 32768, 0.85);
+        assert_eq!(cw["prompt_tokens"], 7000);
+        assert_eq!(cw["n_ctx"], 8192);
+        assert_eq!(cw["n_ctx_train"], 32768);
+        assert_eq!(cw["occupancy_ratio"], 0.854);
+        assert_eq!(cw["near_full"], true);
+        assert_eq!(cw["source"], "engine_prompt_tokens");
+    }
+
+    #[test]
+    fn context_window_low_fill_not_near_full() {
+        let cw = context_window_value(1000, 8192, 8192, 0.85);
+        assert_eq!(cw["near_full"], false);
+        assert_eq!(cw["occupancy_ratio"], 0.122);
+        assert_eq!(cw["source"], "engine_prompt_tokens");
+    }
+
+    #[test]
+    fn context_window_zero_prompt_is_unknown() {
+        // No engine token count → honest unknown, never a fabricated ratio.
+        let cw = context_window_value(0, 4096, 0, 0.85);
+        assert_eq!(cw["source"], "unknown");
+        assert!(cw["occupancy_ratio"].is_null());
+        assert_eq!(cw["near_full"], false);
+        assert!(cw.get("n_ctx_train").is_none());
+    }
+
+    #[test]
+    fn context_window_unknown_ctx_still_measures_vs_booted_window() {
+        // context_max 0 (GGUF had no context_length) → no n_ctx_train field,
+        // but fill is still measured against the booted fallback window. A
+        // prompt over that window honestly reports ratio > 1 (overflow).
+        let cw = context_window_value(5000, 4096, 0, 0.85);
+        assert_eq!(cw["source"], "engine_prompt_tokens");
+        assert!(cw.get("n_ctx_train").is_none());
+        assert_eq!(cw["near_full"], true);
+        assert_eq!(cw["occupancy_ratio"], 1.221);
+    }
+
+    #[test]
+    fn augment_usage_is_additive_and_preserves_existing() {
+        let mut resp = json!({
+            "usage": { "prompt_tokens": 100, "completion_tokens": 20 }
+        });
+        augment_usage_with_context(&mut resp, 100, 8192);
+        // Existing fields untouched; context_window added inside usage.
+        assert_eq!(resp["usage"]["prompt_tokens"], 100);
+        assert_eq!(resp["usage"]["completion_tokens"], 20);
+        assert_eq!(resp["usage"]["context_window"]["source"], "engine_prompt_tokens");
+    }
 
     // ── bug-hunt batch A regressions ────────────────────────────────
 
