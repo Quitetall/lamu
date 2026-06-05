@@ -107,7 +107,7 @@ run_one() {
   body="$(body_for "$surface")"
 
   if [[ -n "$OUTDIR" ]]; then
-    json_arg=(-j)  # oha emits a JSON summary to stdout when -j is set
+    json_arg=(--output-format json)  # oha 1.14+ renamed `-j` → `--output-format json`
   fi
 
   echo "── ${surface}  POST ${path}  conc=${conc} n=${REQUESTS} max_tokens=${MAXTOK} ──"

@@ -1,0 +1,185 @@
+{
+  "schema": "lamu-http-baseline/v2",
+  "captured_utc": "2026-06-05",
+  "gpu": "single RTX 4090 (24 GB)",
+  "model": "qwen3.6-27b-uncensored-heretic-v2-q4_k_m (a THINKING model)",
+  "backend": "beellama.cpp llama-server (~20 GB resident)",
+  "binary_note": "deployed lamu serve PRE-dates ADR 0021; exact build commit unknown (delta not cleanly attributable)",
+  "load_gen": "oha 1.14.0 via loadtest/oha.sh",
+  "conditions": {
+    "prompt": "fixed 6-word ('Say hi in one short sentence.')",
+    "temperature": 0,
+    "stream": false,
+    "max_tokens": {
+      "runA": 24,
+      "runB": 128
+    },
+    "repeats": 1,
+    "warm": true,
+    "IMPORTANT_reasoning_only": "with these small max_tokens the thinking model spent the whole budget in <think>: finish_reason=length, content='' (reasoning only). Runs measure raw DECODE latency, NOT answer latency.",
+    "oha_successRate_caveat": "oha successRate = got-an-HTTP-response, NOT 2xx. Trust status_codes."
+  },
+  "results_2xx_verified": {
+    "24tok": {
+      "openai": {
+        "c1": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.5,
+          "p50_s": 0.391,
+          "p95_s": 0.464,
+          "p99_s": 0.616
+        },
+        "c4": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.56,
+          "p50_s": 1.544,
+          "p95_s": 1.738,
+          "p99_s": 1.874
+        },
+        "c16": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.52,
+          "p50_s": 6.282,
+          "p95_s": 6.443,
+          "p99_s": 6.472
+        },
+        "c64": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.47,
+          "p50_s": 12.623,
+          "p95_s": 24.513,
+          "p99_s": 25.875
+        }
+      },
+      "ollama": {
+        "c1": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.46,
+          "p50_s": 0.404,
+          "p95_s": 0.459,
+          "p99_s": 0.477
+        },
+        "c4": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.45,
+          "p50_s": 1.637,
+          "p95_s": 1.793,
+          "p99_s": 1.849
+        },
+        "c16": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.73,
+          "p50_s": 5.736,
+          "p95_s": 6.123,
+          "p99_s": 6.195
+        },
+        "c64": {
+          "status_codes": {
+            "200": 64
+          },
+          "req_per_sec": 2.64,
+          "p50_s": 13.228,
+          "p95_s": 23.178,
+          "p99_s": 24.225
+        }
+      }
+    },
+    "128tok": {
+      "openai": {
+        "c1": {
+          "status_codes": {
+            "200": 32
+          },
+          "req_per_sec": 0.76,
+          "p50_s": 1.304,
+          "p95_s": 1.412,
+          "p99_s": 1.459
+        },
+        "c4": {
+          "status_codes": {
+            "200": 32
+          },
+          "req_per_sec": 0.76,
+          "p50_s": 5.055,
+          "p95_s": 6.646,
+          "p99_s": 6.735
+        },
+        "c16": {
+          "status_codes": {
+            "200": 32
+          },
+          "req_per_sec": 0.82,
+          "p50_s": 19.168,
+          "p95_s": 20.232,
+          "p99_s": 20.249
+        }
+      }
+    },
+    "read_path_conc16": {
+      "health": {
+        "c16": {
+          "status_codes": {
+            "200": 200
+          },
+          "req_per_sec": 16260.15,
+          "p50_s": 0.0,
+          "p95_s": 0.001,
+          "p99_s": 0.011
+        }
+      },
+      "v1_models": {
+        "c16": {
+          "status_codes": {
+            "200": 200
+          },
+          "req_per_sec": 17018.56,
+          "p50_s": 0.0,
+          "p95_s": 0.0,
+          "p99_s": 0.01
+        }
+      },
+      "metrics": {
+        "c16": {
+          "status_codes": {
+            "200": 200
+          },
+          "req_per_sec": 24960.8,
+          "p50_s": 0.0,
+          "p95_s": 0.002,
+          "p99_s": 0.005
+        }
+      }
+    }
+  },
+  "anthropic_FAILED": {
+    "status": "HTTP 502 on 64/64 at every concurrency (backend_returned_empty)",
+    "root_cause": "reasoning-only/empty-content response \u2192 anthropic bridge builds 0 content_blocks \u2192 502; openai returns empty-200. See anthropic-502-repro.txt.",
+    "raw_files": "anthropic-c*.json retained as evidence (502 distribution)"
+  },
+  "decode_tok_per_sec_derived": {
+    "note": "= max_tokens / openai-c1 p50 (valid: finish_reason=length \u2192 exactly max_tokens generated)",
+    "24tok": 61.4,
+    "128tok": 98.2
+  },
+  "findings": [
+    "Anthropic /v1/messages 502s for reasoning-only completions (real divergence vs openai empty-200) \u2014 follow-up.",
+    "req/s flat vs concurrency (openai/ollama, 1->64) \u2014 consistent with single-flight OR one-27B saturating the 4090; this run cannot distinguish (n=64 one-deep, stream:false).",
+    "decode ~61 tok/s @24 vs ~98 tok/s @128 \u2014 prefill/HTTP fixed-cost amortized over more tokens.",
+    "read path (decode-free GET) 16-25k req/s; p95<=1.74ms but p99 5-11ms.",
+    "NOT measured: streaming/TTFT, real/long prompts, cold start, sustained load, variance (single runs), multi-model."
+  ]
+}
