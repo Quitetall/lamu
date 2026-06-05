@@ -1551,6 +1551,55 @@ pub(crate) fn anthropic_stop_reason(finish_reason: &str, had_tool_use: bool) -> 
     }
 }
 
+/// Build Anthropic content blocks from an OpenAI `choices[0].message`:
+/// - a `text` block for `content` when present;
+/// - if `content` is empty but the model emitted `reasoning_content` (a thinking
+///   model that hit `max_tokens` mid-`<think>`, `finish_reason=length`), surface
+///   the reasoning as text rather than dropping it — the fix for the
+///   `/v1/messages` 502 (`backend_returned_empty`) on reasoning-only completions
+///   (the OpenAI surface returns those as an empty-content 200);
+/// - `tool_use` blocks for any `tool_calls`.
+///
+/// Returns empty ONLY when there is genuinely nothing (no content, no reasoning,
+/// no tools) — the caller maps that to a 502.
+fn anthropic_content_blocks(oai_msg: Option<&Value>) -> Vec<Value> {
+    let mut blocks: Vec<Value> = Vec::new();
+    let content = oai_msg
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !content.is_empty() {
+        blocks.push(json!({"type": "text", "text": content}));
+    } else {
+        let reasoning = oai_msg
+            .and_then(|m| m.get("reasoning_content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !reasoning.is_empty() {
+            blocks.push(json!({"type": "text", "text": reasoning}));
+        }
+    }
+    if let Some(tcs) = oai_msg.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
+        for tc in tcs {
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let fname = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args_raw = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let args_val: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
+            blocks.push(json!({"type": "tool_use", "id": id, "name": fname, "input": args_val}));
+        }
+    }
+    blocks
+}
+
 async fn anthropic_messages(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1684,10 +1733,6 @@ async fn anthropic_messages(
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"));
-    let oai_content = oai_msg
-        .and_then(|m| m.get("content"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
     let oai_model = oai_resp
         .get("model")
         .and_then(|v| v.as_str())
@@ -1708,41 +1753,23 @@ async fn anthropic_messages(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // Build content blocks. Text block first (if any), then tool_use blocks
-    // for any tool_calls the model emitted. Mirrors Anthropic's native
-    // response shape so Claude Code can drive multi-turn tool flows.
-    let mut content_blocks: Vec<Value> = Vec::new();
-    if !oai_content.is_empty() {
-        content_blocks.push(json!({"type":"text","text": oai_content}));
-    }
-    let mut had_tool_use = false;
-    if let Some(tcs) = oai_msg.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
-        for tc in tcs {
-            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let fname = tc.get("function").and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args_raw = tc.get("function").and_then(|f| f.get("arguments"))
-                .and_then(|v| v.as_str()).unwrap_or("{}");
-            let args_val: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
-            content_blocks.push(json!({
-                "type":"tool_use",
-                "id": id,
-                "name": fname,
-                "input": args_val,
-            }));
-            had_tool_use = true;
-        }
-    }
+    // Build Anthropic content blocks (text / reasoning-fallback / tool_use).
+    // Factored + unit-tested in `anthropic_content_blocks`.
+    let content_blocks = anthropic_content_blocks(oai_msg);
+    let had_tool_use = content_blocks
+        .iter()
+        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
     if content_blocks.is_empty() {
-        // chat_completions already filters structurally-empty backend
-        // responses to 502 (see backend_returned_empty gate), so reaching
-        // this is unexpected. Surface a 502 here too instead of silently
-        // returning an empty text block — clients can retry.
+        // Genuinely nothing — no text, no reasoning, no tool_calls. (A
+        // reasoning-only response, e.g. a thinking model truncated mid-<think>
+        // with finish_reason=length, is NOT empty here: anthropic_content_blocks
+        // surfaces the reasoning as text rather than 502ing — that was the
+        // /v1/messages-502 bug.)
         return (StatusCode::BAD_GATEWAY, Json(json!({
             "type": "error",
             "error": {
                 "type": "backend_returned_empty",
-                "message": "backend produced neither text nor tool_use blocks",
+                "message": "backend produced neither text nor reasoning nor tool_use blocks",
             }
         }))).into_response();
     }
@@ -2410,6 +2437,58 @@ async fn stream_response_ollama(
 mod compat_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn anthropic_blocks_text_when_content_present() {
+        let m = json!({"content": "hello", "reasoning_content": "ignored"});
+        let b = anthropic_content_blocks(Some(&m));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["type"], "text");
+        assert_eq!(b[0]["text"], "hello");
+    }
+
+    #[test]
+    fn anthropic_blocks_reasoning_fallback_when_content_empty() {
+        // THE FIX: a reasoning-only completion (thinking model truncated
+        // mid-<think>) must surface the reasoning as text, NOT 502.
+        let m = json!({"content": "", "reasoning_content": "let me think..."});
+        let b = anthropic_content_blocks(Some(&m));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["type"], "text");
+        assert_eq!(b[0]["text"], "let me think...");
+    }
+
+    #[test]
+    fn anthropic_blocks_empty_only_when_truly_nothing() {
+        // No content, no reasoning, no tools → empty (caller 502s). This is the
+        // ONLY path that still 502s.
+        let m = json!({"content": ""});
+        assert!(anthropic_content_blocks(Some(&m)).is_empty());
+        assert!(anthropic_content_blocks(None).is_empty());
+    }
+
+    #[test]
+    fn anthropic_blocks_tool_use_and_text() {
+        let m = json!({
+            "content": "doing it",
+            "tool_calls": [{"id":"t1","function":{"name":"f","arguments":"{\"x\":1}"}}]
+        });
+        let b = anthropic_content_blocks(Some(&m));
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["type"], "text");
+        assert_eq!(b[1]["type"], "tool_use");
+        assert_eq!(b[1]["name"], "f");
+        assert_eq!(b[1]["input"]["x"], 1);
+    }
+
+    #[test]
+    fn anthropic_blocks_tool_use_without_text_is_not_empty() {
+        // Tool-only turn (empty content, no reasoning) must NOT 502.
+        let m = json!({"content": "", "tool_calls": [{"id":"t1","function":{"name":"f","arguments":"{}"}}]});
+        let b = anthropic_content_blocks(Some(&m));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["type"], "tool_use");
+    }
 
     // ── bug-hunt batch A regressions ────────────────────────────────
 
