@@ -2482,6 +2482,22 @@ mod compat_tests {
     }
 
     #[test]
+    fn anthropic_blocks_reasoning_and_tool_use_together() {
+        // Combinatorial: empty content + reasoning + a tool_call → reasoning
+        // surfaced as text THEN the tool_use block.
+        let m = json!({
+            "content": "",
+            "reasoning_content": "thinking",
+            "tool_calls": [{"id":"t1","function":{"name":"f","arguments":"{}"}}]
+        });
+        let b = anthropic_content_blocks(Some(&m));
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["type"], "text");
+        assert_eq!(b[0]["text"], "thinking");
+        assert_eq!(b[1]["type"], "tool_use");
+    }
+
+    #[test]
     fn anthropic_blocks_tool_use_without_text_is_not_empty() {
         // Tool-only turn (empty content, no reasoning) must NOT 502.
         let m = json!({"content": "", "tool_calls": [{"id":"t1","function":{"name":"f","arguments":"{}"}}]});
