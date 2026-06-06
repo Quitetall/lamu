@@ -532,6 +532,43 @@ impl ModelEntryYaml {
     }
 }
 
+/// Merge freshly-`discovered` entries with the `existing` registry, preserving
+/// operator-curated fields on models that still exist — so a re-scan no longer
+/// destroys hand-set config (the bug: `lamu scan` overwrote `main`, the DFlash
+/// `speculative` configs, `sampling`, `notes`, etc.).
+///
+/// - Physical fields (path, format, backend, arch, params_b, quant, vram_mb,
+///   capabilities, modality) come from the fresh scan.
+/// - Curated fields (main, speculative, sampling, pinned, notes, status) are
+///   carried over from the existing entry.
+/// - `context_max`: the discovered GGUF value wins when known (>0, ADR 0021 C1);
+///   when the GGUF lacks the key (0) the existing value is preserved, so a
+///   keyless GGUF does not lose a working/hand-set context window.
+/// - `reasoning_marker`: existing wins if set, else the scan's arch default.
+/// - Models in the registry but no longer on disk are dropped (scan = disk).
+pub fn merge_registry(existing: Vec<ModelEntry>, discovered: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    let mut old: HashMap<String, ModelEntry> =
+        existing.into_iter().map(|e| (e.name.clone(), e)).collect();
+    discovered
+        .into_iter()
+        .map(|mut d| {
+            if let Some(o) = old.remove(&d.name) {
+                d.main = o.main;
+                d.speculative = o.speculative;
+                d.sampling = o.sampling;
+                d.pinned = o.pinned;
+                d.notes = o.notes;
+                d.status = o.status;
+                d.reasoning_marker = o.reasoning_marker.or(d.reasoning_marker);
+                if d.context_max == 0 {
+                    d.context_max = o.context_max;
+                }
+            }
+            d
+        })
+        .collect()
+}
+
 pub fn write_registry(models: &[ModelEntry], output: &Path) -> Result<()> {
     let mut models_map: HashMap<String, ModelEntryYaml> = HashMap::new();
     for m in models {
@@ -720,6 +757,41 @@ mod tests {
         // Unknown stays None → context_max 0 → spawn defers to the engine,
         // never a guessed number.
         assert_eq!(meta.n_ctx_train, None);
+    }
+
+    #[test]
+    fn merge_registry_preserves_curated_drops_deleted_updates_physical() {
+        let p = Path::new("/m/keep.gguf");
+        // Existing: curated (main, notes, context_max 131072), plus a model
+        // that will be deleted on disk.
+        let mut old_keep = sample_entry("keep", p);
+        old_keep.main = true;
+        old_keep.notes = "daily driver, dflash".into();
+        old_keep.context_max = 131072;
+        old_keep.pinned = true;
+        let old_gone = sample_entry("gone", Path::new("/m/gone.gguf"));
+        // Discovered: scan defaults (main=false, empty notes), one with a real
+        // GGUF ctx (262144) and one keyless (0).
+        let mut disc_keep = sample_entry("keep", p);
+        disc_keep.main = false;
+        disc_keep.notes = String::new();
+        disc_keep.context_max = 0; // keyless GGUF → must preserve 131072
+        disc_keep.vram_mb = 99999; // physical → must update
+        let mut disc_new = sample_entry("newmodel", Path::new("/m/new.gguf"));
+        disc_new.context_max = 262144;
+
+        let merged = merge_registry(vec![old_keep, old_gone], vec![disc_keep, disc_new]);
+        let names: Vec<_> = merged.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"keep") && names.contains(&"newmodel"));
+        assert!(!names.contains(&"gone"), "deleted model must be dropped");
+        let keep = merged.iter().find(|e| e.name == "keep").unwrap();
+        assert!(keep.main, "curated main preserved");
+        assert!(keep.pinned, "curated pinned preserved");
+        assert_eq!(keep.notes, "daily driver, dflash", "curated notes preserved");
+        assert_eq!(keep.context_max, 131072, "keyless GGUF preserves existing ctx");
+        assert_eq!(keep.vram_mb, 99999, "physical field updated from scan");
+        let new = merged.iter().find(|e| e.name == "newmodel").unwrap();
+        assert_eq!(new.context_max, 262144, "new model takes its real GGUF ctx");
     }
 
     fn sample_entry(name: &str, path: &Path) -> ModelEntry {

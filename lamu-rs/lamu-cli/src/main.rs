@@ -859,7 +859,12 @@ fn cmd_agent(allow_net: bool, cmd: Vec<String>) -> Result<()> {
 async fn cmd_scan() -> Result<()> {
     let dir = models_dir();
     let path = registry_path();
-    let entries = scan_directory(&dir)?;
+    let discovered = scan_directory(&dir)?;
+    // Merge with the existing registry so operator-curated config (main,
+    // speculative/DFlash, sampling, notes, status) survives the re-scan instead
+    // of being overwritten with scan defaults.
+    let existing = load_registry(&path).unwrap_or_default();
+    let entries = lamu_core::registry::merge_registry(existing, discovered);
     write_registry(&entries, &path)?;
     println!("Discovered {} models → {}", entries.len(), path.display());
     for e in &entries {
@@ -1176,9 +1181,13 @@ fn cmd_rm(query: &str, yes: bool) -> Result<()> {
         }
     }
 
-    // Re-scan to drop the entry from registry.
+    // Re-scan to drop the entry from registry. Merge-preserve so the surviving
+    // models keep their curated config (the deleted model isn't rediscovered →
+    // dropped).
     let dir = models_dir();
-    let entries = scan_directory(&dir)?;
+    let discovered = scan_directory(&dir)?;
+    let existing = load_registry(&registry_path()).unwrap_or_default();
+    let entries = lamu_core::registry::merge_registry(existing, discovered);
     write_registry(&entries, &registry_path())?;
     println!("  registry refreshed ({} models remaining)", entries.len());
     Ok(())
