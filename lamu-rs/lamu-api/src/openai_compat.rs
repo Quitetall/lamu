@@ -691,8 +691,14 @@ async fn chat_completions(
         // known. The accurate streaming audit + per-token reconciliation lands
         // with the stream-teeing follow-up; emitting a premature status=200
         // would lie when the backend then fails. ADR 0018 §5.
+        // ADR 0021: ask the backend for a final usage chunk + pass the
+        // occupancy denominator (booted window) so the stream surfaces a
+        // context_window usage chunk before [DONE].
+        payload["stream_options"] = json!({"include_usage": true});
+        let booted = state.scheduler.lock().booted_ctx(&model_name);
+        let ctx_max = state.entries.get(&model_name).map(|e| e.context_max).unwrap_or(0);
         return stream_response(state.client.clone(), backend_url, payload,
-                               completion_id, created, model_name, marker).await
+                               completion_id, created, model_name, marker, booted, ctx_max).await
             .into_response();
     }
 
@@ -982,6 +988,7 @@ fn augment_usage_with_context(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     client: reqwest::Client,
     backend_url: String,
@@ -990,6 +997,8 @@ async fn stream_response(
     created: u64,
     model_name: String,
     marker: Option<ReasoningMarker>,
+    booted_ctx: Option<u32>,
+    ctx_max: u32,
 ) -> Sse<Pin<Box<dyn Stream<Item = std::result::Result<Event, Infallible>> + Send>>> {
     let s = async_stream::stream! {
         let resp = match client.post(&backend_url).json(&payload).send().await {
@@ -1016,6 +1025,9 @@ async fn stream_response(
         // the non-streaming 502 backend_returned_empty gate.
         let mut any_content = false;
         let mut finish_reason = String::new();
+        // ADR 0021: engine token counts from the final include_usage chunk.
+        let mut prompt_tokens: u64 = 0;
+        let mut comp_tokens: u64 = 0;
 
         use futures_util::stream::StreamExt;
         while let Some(chunk_res) = byte_stream.next().await {
@@ -1055,12 +1067,33 @@ async fn stream_response(
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                     });
                     yield Ok(Event::default().data(done_chunk.to_string()));
+                    // ADR 0021: emit a usage chunk with the occupancy block when
+                    // the engine reported prompt_tokens (include_usage). Clients
+                    // that didn't ask for usage ignore the extra chunk.
+                    if prompt_tokens > 0 {
+                        let usage_chunk = json!({
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_name, "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": comp_tokens,
+                                "total_tokens": prompt_tokens + comp_tokens,
+                                "context_window": build_context_window(prompt_tokens, ctx_max, booted_ctx),
+                            }
+                        });
+                        yield Ok(Event::default().data(usage_chunk.to_string()));
+                    }
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
                 let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
                 if let Some(fr) = finish_reason_of(&val) {
                     finish_reason = fr.to_string();
+                }
+                // ADR 0021: the include_usage final chunk carries token counts.
+                if let Some(u) = val.get("usage") {
+                    if let Some(pt) = u.get("prompt_tokens").and_then(|v| v.as_u64()) { prompt_tokens = pt; }
+                    if let Some(ct) = u.get("completion_tokens").and_then(|v| v.as_u64()) { comp_tokens = ct; }
                 }
                 let Some(token) = val.get("choices").and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
@@ -1948,6 +1981,9 @@ async fn stream_response_anthropic(
         "max_tokens": eff_max_tokens,
         "temperature": eff_temperature,
         "stream": true,
+        // ADR 0021: ask the backend for a final usage chunk so the stream
+        // carries the engine's prompt_tokens (the occupancy numerator).
+        "stream_options": {"include_usage": true},
     });
     // Only emit samplers when actually set (no nulls — fixes the prior
     // quirk where an omitted top_k/top_p serialized to JSON `null`).
@@ -1969,6 +2005,10 @@ async fn stream_response_anthropic(
 
     let msg_id = format!("msg_{}", random_hex(12));
     let client = state.client.clone();
+    // ADR 0021: occupancy denominator (booted window) + trained max, captured
+    // before the generator so it need not hold `state`.
+    let booted_ctx = state.scheduler.lock().booted_ctx(&model_name);
+    let ctx_max = state.entries.get(&model_name).map(|e| e.context_max).unwrap_or(0);
 
     let s = async_stream::stream! {
         // message_start
@@ -2010,6 +2050,8 @@ async fn stream_response_anthropic(
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut out_tokens: u64 = 0;
+        // ADR 0021: engine prompt_tokens from the final include_usage chunk.
+        let mut prompt_tokens: u64 = 0;
         // Tool calls accumulated by their OpenAI delta index. BTreeMap so
         // the emitted tool_use blocks keep the backend's call order.
         let mut tool_acc: std::collections::BTreeMap<usize, ToolAcc> = std::collections::BTreeMap::new();
@@ -2035,6 +2077,10 @@ async fn stream_response_anthropic(
                 let choice = val.get("choices").and_then(|c| c.get(0));
                 if let Some(fr) = finish_reason_of(&val) {
                     finish_reason = fr.to_string();
+                }
+                // ADR 0021: the include_usage final chunk carries prompt_tokens.
+                if let Some(pt) = val.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()) {
+                    prompt_tokens = pt;
                 }
                 let delta = choice.and_then(|c| c.get("delta"));
 
@@ -2165,10 +2211,16 @@ async fn stream_response_anthropic(
         }
 
         let stop_reason = anthropic_stop_reason(&finish_reason, emitted_tools);
+        // ADR 0021: attach the un-fakeable occupancy block when the engine
+        // reported prompt_tokens (include_usage final chunk).
+        let mut delta_usage = json!({"output_tokens": out_tokens});
+        if prompt_tokens > 0 {
+            delta_usage["context_window"] = build_context_window(prompt_tokens, ctx_max, booted_ctx);
+        }
         let m_delta = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null},
-            "usage": {"output_tokens": out_tokens}
+            "usage": delta_usage
         });
         yield Ok(Event::default().event("message_delta").data(m_delta.to_string()));
         let m_stop = json!({"type":"message_stop"});
