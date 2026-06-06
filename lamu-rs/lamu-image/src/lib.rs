@@ -28,6 +28,7 @@ pub fn register() {
         description: "Generate an image via the local ComfyUI backend (a registry model with modality: image). Spawns/evicts ComfyUI through the scheduler, runs a txt2img workflow, writes a PNG to a confined dir.",
         schema_fn: image::schema_generate_image,
         handler: image::dispatch_generate_image,
+        cloud: false, // local ComfyUI only — no cloud image provider wired.
     });
 }
 

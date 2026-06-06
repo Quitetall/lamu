@@ -12,44 +12,64 @@
 //!
 //! NOTE: pass already-VERBALIZED prose. Fish reads input literally — raw
 //! LaTeX/markup ("\\iint_D", "$x^2$") is spoken character-by-character.
+//!
+//! ADR 0023: this tool lives in the lamu-tts MODULE and runs against a
+//! `&dyn lamu_core::tools_ext::ToolCtx` (it needs only the model's modality, a
+//! load trigger, and the loaded port) — no lamu-mcp dependency. The cloud path
+//! ignores the ctx entirely.
 
-use crate::server::LamuMcpServer;
+use lamu_core::media_paths::resolve_confined_output_path;
+use lamu_core::tools_ext::ToolCtx;
 use lamu_core::types::Modality;
-use crate::media_paths::resolve_confined_output_path;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 const DEFAULT_BASE: &str = "https://api.fish.audio";
 const KEY_ENV: &str = "FISH_AUDIO_API_KEY";
 const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB safety cap
 
-/// True iff `model` is a registry entry with `modality: tts` (→ serve
-/// locally). Pure over the entries map so it's unit-testable without a
-/// running server.
-fn is_local_tts(entries: &HashMap<String, lamu_core::types::ModelEntry>, model: &str) -> bool {
-    entries
-        .get(model)
-        .map(|e| e.modality == Modality::Tts)
-        .unwrap_or(false)
+/// JSON schema for the `text_to_speech` MCP tool.
+pub fn schema_text_to_speech() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Text to synthesize. Pass already-VERBALIZED prose — spell math/symbols out ('the integral of x squared'); raw LaTeX/markup is read literally."},
+            "model": {"type": "string", "default": "s2-pro", "description": "Fish Audio model header: 's2-pro' (default) or 's1'. A registry model with modality: tts is served locally instead."},
+            "format": {"type": "string", "enum": ["mp3", "wav", "pcm", "opus"], "default": "mp3"},
+            "reference_id": {"type": "string", "description": "Optional Fish Audio voice model id (cloned/preset voice)."},
+            "temperature": {"type": "number", "description": "Expressiveness 0-1 (Fish default 0.7)."},
+            "top_p": {"type": "number", "description": "Nucleus sampling 0-1 (Fish default 0.7)."},
+            "mp3_bitrate": {"type": "integer", "enum": [64, 128, 192], "description": "mp3 only."},
+            "output_path": {"type": "string", "description": "Where to write the audio file. Default: <data_dir>/lamu/tts/tts-<unixsecs>.<format>."}
+        },
+        "required": ["text"]
+    })
+}
+
+/// The `ModuleToolHandler` wrapper registered into lamu-core's tool registry.
+pub fn dispatch_text_to_speech<'a>(
+    ctx: &'a dyn ToolCtx,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(handle_text_to_speech(ctx, args))
 }
 
 /// Tool entrypoint. Branches local-vs-cloud BEFORE the cloud `s2-pro|s1`
-/// model validator (which would otherwise reject a local registry name).
-pub async fn handle_text_to_speech_stateful(server: &LamuMcpServer, args: Value) -> String {
+/// model validator (which would otherwise reject a local registry name). A
+/// `model` whose registry entry is `modality: tts` is served locally; anything
+/// else (including the default `s2-pro`) goes to Fish Audio cloud.
+pub async fn handle_text_to_speech(ctx: &dyn ToolCtx, args: Value) -> String {
     let model = args["model"].as_str().unwrap_or("s2-pro").to_string();
-    let local = {
-        let st = server.state.lock();
-        is_local_tts(&st.entries, &model)
-    };
-    if local {
-        handle_text_to_speech_local(server, model, args).await
+    if ctx.model_modality(&model) == Some(Modality::Tts) {
+        handle_text_to_speech_local(ctx, model, args).await
     } else {
         handle_text_to_speech_cloud(args).await
     }
 }
 
 /// LOCAL path: ensure the fish-speech server is loaded, then proxy to it.
-async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args: Value) -> String {
+async fn handle_text_to_speech_local(ctx: &dyn ToolCtx, model: String, args: Value) -> String {
     let text = args["text"].as_str().unwrap_or("").trim().to_string();
     if text.is_empty() {
         return "error: text_to_speech requires a non-empty `text`".into();
@@ -59,21 +79,18 @@ async fn handle_text_to_speech_local(server: &LamuMcpServer, model: String, args
         return format!("error: unsupported format '{format}' (mp3|wav|pcm|opus)");
     }
 
-    // Ensure the local server is up. handle_load_model does the atomic
+    // Ensure the local server is up. ensure_loaded does the atomic
     // plan/evict/spawn/confirm (evicting LLMs per the modality-tiered
     // scheduler) and is idempotent — "already loaded" if it's up. A pinned
     // LLM blocking the eviction surfaces here as a clear "insufficient
     // space" error.
-    let status = server.handle_load_model(json!({ "name": model })).await;
+    let status = ctx.ensure_loaded(&model).await;
     if status.starts_with("error") {
         return status;
     }
-    let port = {
-        let st = server.state.lock();
-        match st.scheduler.get_loaded(&model) {
-            Some(m) if m.port != 0 => m.port,
-            _ => return format!("error: TTS '{model}' not loaded after attempt: {status}"),
-        }
+    let port = match ctx.loaded_port(&model) {
+        Some(p) if p != 0 => p,
+        _ => return format!("error: TTS '{model}' not loaded after attempt: {status}"),
     };
 
     // Long input: the server caps a single request at --max-text-length
@@ -382,48 +399,6 @@ async fn handle_text_to_speech_cloud(args: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lamu_core::types::{
-        BackendType, ModelEntry, ModelFormat, ModelStatus,
-    };
-    use std::path::PathBuf;
-
-    fn entry(name: &str, modality: Modality) -> ModelEntry {
-        ModelEntry {
-            name: name.to_string(),
-            path: PathBuf::from("/tmp/x"),
-            format: ModelFormat::Gguf,
-            backend: BackendType::LlamaCpp,
-            arch: "t".into(),
-            params_b: 1.0,
-            quant: "Q4".into(),
-            vram_mb: 1,
-            context_max: 0,
-            capabilities: vec![],
-            reasoning_marker: None,
-            speculative: None,
-            sampling: None,
-            pinned: false,
-            main: false,
-            notes: String::new(),
-            status: ModelStatus::Unspecified,
-            modality,
-        }
-    }
-
-    #[test]
-    fn is_local_tts_true_for_tts_entry() {
-        let mut m = HashMap::new();
-        m.insert("local-fish-s2pro".to_string(), entry("local-fish-s2pro", Modality::Tts));
-        assert!(is_local_tts(&m, "local-fish-s2pro"));
-    }
-
-    #[test]
-    fn is_local_tts_false_for_llm_or_unknown() {
-        let mut m = HashMap::new();
-        m.insert("chat".to_string(), entry("chat", Modality::Llm));
-        assert!(!is_local_tts(&m, "chat")); // an LLM entry
-        assert!(!is_local_tts(&m, "s2-pro")); // unknown → cloud
-    }
 
     #[test]
     fn split_for_tts_packs_and_hard_splits() {

@@ -283,9 +283,16 @@ impl LamuMcpServer {
                 crate::tools::HandlerKind::Free(f) => f(args).await,
             },
             // ADR 0023: not a built-in — try the module-tool registry
-            // (generate_image, future tts/jart tools), dispatched over ToolCtx.
+            // (generate_image, text_to_speech, future jart tools), dispatched
+            // over ToolCtx. A module tool flagged `cloud` gets the SAME
+            // local-only gate as a built-in cloud tool.
             None => match lamu_core::tools_ext::find_handler(tool_name) {
-                Some(h) => h(self as &dyn lamu_core::tools_ext::ToolCtx, args).await,
+                Some((_, cloud)) if local_only && cloud => format!(
+                    "error: routing mode is 'local-only' — cloud tool '{}' refused. \
+                     Call set_routing_mode(mode='auto') to re-enable.",
+                    tool_name
+                ),
+                Some((h, _)) => h(self as &dyn lamu_core::tools_ext::ToolCtx, args).await,
                 None => format!("Unknown tool: {}", tool_name),
             },
         };

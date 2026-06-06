@@ -22,6 +22,5 @@ pub mod rag;
 pub mod server;
 pub mod tools;
 pub mod train_tool;
-pub mod tts;
 pub mod untrusted;
 pub mod vector_index;

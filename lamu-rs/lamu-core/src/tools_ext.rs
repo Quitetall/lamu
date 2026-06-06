@@ -38,6 +38,10 @@ pub struct ModuleTool {
     pub description: &'static str,
     pub schema_fn: fn() -> Value,
     pub handler: ModuleToolHandler,
+    /// True if the tool can reach a cloud provider — so a frontend can apply the
+    /// same `local-only` routing gate built-in cloud tools get. A purely-local
+    /// tool (e.g. `generate_image` → managed ComfyUI) sets `false`.
+    pub cloud: bool,
 }
 
 static MODULE_TOOLS: OnceLock<Mutex<Vec<ModuleTool>>> = OnceLock::new();
@@ -57,15 +61,16 @@ pub fn register_tool(tool: ModuleTool) {
     }
 }
 
-/// Look up a module tool's handler by name (copied out — fn ptrs are `Copy`, so
-/// nothing is borrowed across the dispatch `.await`).
-pub fn find_handler(name: &str) -> Option<ModuleToolHandler> {
+/// Look up a module tool's handler + cloud flag by name (both copied out — fn
+/// ptrs and `bool` are `Copy`, so nothing is borrowed across the dispatch
+/// `.await`). The `cloud` flag lets the frontend apply its `local-only` gate.
+pub fn find_handler(name: &str) -> Option<(ModuleToolHandler, bool)> {
     registry()
         .lock()
         .expect("module-tool registry poisoned")
         .iter()
         .find(|t| t.name == name)
-        .map(|t| t.handler)
+        .map(|t| (t.handler, t.cloud))
 }
 
 /// MCP `tools/list` entries for every registered module tool.

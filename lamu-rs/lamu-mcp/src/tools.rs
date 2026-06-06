@@ -166,23 +166,6 @@ fn schema_council() -> Value {
     })
 }
 
-fn schema_text_to_speech() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "text": {"type": "string", "description": "Text to synthesize. Pass already-VERBALIZED prose — spell math/symbols out ('the integral of x squared'); raw LaTeX/markup is read literally."},
-            "model": {"type": "string", "default": "s2-pro", "description": "Fish Audio model header: 's2-pro' (default) or 's1'."},
-            "format": {"type": "string", "enum": ["mp3", "wav", "pcm", "opus"], "default": "mp3"},
-            "reference_id": {"type": "string", "description": "Optional Fish Audio voice model id (cloned/preset voice)."},
-            "temperature": {"type": "number", "description": "Expressiveness 0-1 (Fish default 0.7)."},
-            "top_p": {"type": "number", "description": "Nucleus sampling 0-1 (Fish default 0.7)."},
-            "mp3_bitrate": {"type": "integer", "enum": [64, 128, 192], "description": "mp3 only."},
-            "output_path": {"type": "string", "description": "Where to write the audio file. Default: <data_dir>/lamu/tts/tts-<unixsecs>.<format>."}
-        },
-        "required": ["text"]
-    })
-}
-
 fn schema_review_commit() -> Value {
     json!({
         "type": "object",
@@ -480,15 +463,6 @@ fn dispatch_council<'a>(
     Box::pin(crate::council::handle_council(s, args))
 }
 
-fn dispatch_text_to_speech<'a>(
-    s: &'a LamuMcpServer,
-    args: Value,
-) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-    // Stateful: the local path needs the scheduler/backends to spawn the
-    // fish-speech server; the cloud path ignores `s`.
-    Box::pin(crate::tts::handle_text_to_speech_stateful(s, args))
-}
-
 fn dispatch_list_cloud_models(_args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     let r = crate::cloud::handle_list_cloud_models();
     Box::pin(async move { r })
@@ -641,13 +615,6 @@ pub static TOOLS: &[ToolDef] = &[
         schema_fn: schema_council,
         handler: HandlerKind::Stateful(dispatch_council),
         cloud: false,
-    },
-    ToolDef {
-        name: "text_to_speech",
-        description: "Synthesize speech from text. Routes by the model's registry modality: a `modality: tts` entry (e.g. 'local-fish-s2pro') is served LOCALLY (spawns the managed fish-speech S2-Pro server, evicting LLMs as needed); any other model goes to the Fish Audio CLOUD API ('s2-pro'/'s1', needs FISH_AUDIO_API_KEY). Writes an audio file under <data_dir>/lamu/tts and returns its path. Pass VERBALIZED prose — raw LaTeX/markup is spoken literally.",
-        schema_fn: schema_text_to_speech,
-        handler: HandlerKind::Stateful(dispatch_text_to_speech),
-        cloud: true,
     },
     ToolDef {
         name: "list_cloud_models",
@@ -830,7 +797,9 @@ mod tests {
         // consolidate_memory reaches MiMo for fact extraction.
         for name in [
             "cloud_query", "review_commit", "review_diff", "warmup",
-            "consolidate_memory", "text_to_speech",
+            "consolidate_memory",
+            // text_to_speech moved to the lamu-tts module (ADR 0023); its
+            // cloud gate is asserted in lamu-tts and the server fallthrough.
         ] {
             assert!(find(name).unwrap().cloud, "{name} must have cloud:true (local-only gate)");
         }
