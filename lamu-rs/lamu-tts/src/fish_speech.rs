@@ -107,6 +107,17 @@ impl Backend for FishSpeechBackend {
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
 
+        // TTS context window. fish-speech sizes its KV cache + a
+        // max_seq_len×max_seq_len causal mask to this, so S2-Pro's shipped 32768
+        // costs ~6-10GB on top of the ~10GB bf16 weights — enough to OOM a 24GB
+        // card that's also driving a desktop. Chunked TTS (<=4000 chars/request)
+        // rarely needs more than a few thousand tokens, so default to 4096 and
+        // let an operator opt into the full window via the registry entry's
+        // context_max (e.g. 32768 — needs the VRAM headroom). Honored by our
+        // local fish-speech patch (init_model reads FISH_MAX_SEQ_LEN); a stock
+        // fish-speech simply ignores the env var.
+        let tts_ctx: u32 = if entry.context_max > 0 { entry.context_max } else { 4096 };
+
         let mut cmd = Command::new(&python_bin);
         cmd.arg(&api_server)
             .arg("--mode")
@@ -131,6 +142,12 @@ impl Backend for FishSpeechBackend {
             .arg("1")
             .current_dir(repo)
             .env("CUDA_VISIBLE_DEVICES", self.cuda_index.to_string())
+            // Cap the KV-cache/causal-mask window (see tts_ctx above).
+            .env("FISH_MAX_SEQ_LEN", tts_ctx.to_string())
+            // Reduce allocator fragmentation so the warm-up's last large block
+            // can fit when headroom is tight (the error fish-speech prints on
+            // OOM explicitly recommends this).
+            .env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
             .stdout(Stdio::null())
             .stderr(stderr_sink);
         lamu_core::backends::harden_child_command(&mut cmd);
