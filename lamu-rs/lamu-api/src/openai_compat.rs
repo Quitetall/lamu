@@ -876,7 +876,8 @@ async fn chat_completions(
     // own prompt_tokens. Unknown model → context_max 0 → ratio vs the booted
     // fallback window, still honest.
     let ctx_max = state.entries.get(&model_name).map(|e| e.context_max).unwrap_or(0);
-    augment_usage_with_context(&mut response, prompt_tokens, ctx_max);
+    let booted = state.scheduler.lock().booted_ctx(&model_name);
+    augment_usage_with_context(&mut response, prompt_tokens, ctx_max, booted);
     // Debit the user's bucket by the tokens actually produced (ADR 0018 §4).
     state.quota.charge(principal_ref, completion_tokens);
     // Per-request audit event (ADR 0018 §5) — the durable who-did-what.
@@ -913,13 +914,13 @@ static CTX_NEAR_FULL: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
 /// `n_ctx_train`, 0 = unknown) is surfaced as `n_ctx_train` when known.
 /// `prompt_tokens == 0` (backend returned no usage) → honest "unknown", never a
 /// fabricated ratio.
-fn build_context_window(prompt_tokens: u64, context_max: u32) -> Value {
-    // NOTE (deferred, ADR 0021 follow-up): effective_ctx_size re-reads
-    // LAMU_DEFAULT_CTX here rather than the value captured at spawn. Correct as
-    // long as the env is unchanged since the server booted (the convention —
-    // changing it requires a restart to re-spawn anyway). A spawn-time cache on
-    // LoadedModel would close the residual TOCTOU.
-    let n_ctx = lamu_core::backends::llamacpp::effective_ctx_size(context_max);
+fn build_context_window(prompt_tokens: u64, context_max: u32, booted_ctx: Option<u32>) -> Value {
+    // Denominator = the window the backend ACTUALLY booted with, cached on
+    // LoadedModel at spawn (`booted_ctx`). Only when the model isn't loaded (no
+    // spawn happened) do we fall back to re-deriving from LAMU_DEFAULT_CTX —
+    // which closes the per-request TOCTOU the value previously had.
+    let n_ctx = booted_ctx
+        .unwrap_or_else(|| lamu_core::backends::llamacpp::effective_ctx_size(context_max));
     context_window_value(prompt_tokens, n_ctx, context_max, *CTX_NEAR_FULL)
 }
 
@@ -961,8 +962,13 @@ fn context_window_value(
 /// (additive — existing OpenAI clients ignore unknown keys inside `usage`). If
 /// `usage` is absent/not an object (rare error path), create it so the signal
 /// still surfaces.
-fn augment_usage_with_context(response: &mut Value, prompt_tokens: u64, context_max: u32) {
-    let cw = build_context_window(prompt_tokens, context_max);
+fn augment_usage_with_context(
+    response: &mut Value,
+    prompt_tokens: u64,
+    context_max: u32,
+    booted_ctx: Option<u32>,
+) {
+    let cw = build_context_window(prompt_tokens, context_max, booted_ctx);
     match response.get_mut("usage").and_then(|u| u.as_object_mut()) {
         Some(obj) => {
             obj.insert("context_window".to_string(), cw);
@@ -1695,8 +1701,10 @@ async fn anthropic_messages(
 ) -> Response {
     // ADR 0021: capture the entries map (cheap Arc clone) before `state` is
     // moved into the delegated chat_completions call, so the occupancy block
-    // can look up the served model's context_max after conversion.
+    // can look up the served model's context_max + booted window after
+    // conversion. scheduler is an Arc — cloning is a refcount bump.
     let entries = state.entries.clone();
+    let scheduler = state.scheduler.clone();
     // Translate to OpenAI-style messages. For multi-turn tool flows,
     // expand each Anthropic message's content blocks into one or more
     // OpenAI messages — preserves tool_use / tool_result semantics so
@@ -1885,7 +1893,8 @@ async fn anthropic_messages(
     // `oai_model` (the resolved/internal model name) is the correct key —
     // `entries` is keyed by internal name, not the client's requested alias.
     let ctx_max = entries.get(oai_model).map(|e| e.context_max).unwrap_or(0);
-    anthro["usage"]["context_window"] = build_context_window(in_tokens, ctx_max);
+    let booted = scheduler.lock().booted_ctx(oai_model);
+    anthro["usage"]["context_window"] = build_context_window(in_tokens, ctx_max, booted);
     (StatusCode::OK, Json(anthro)).into_response()
 }
 
@@ -2583,11 +2592,22 @@ mod compat_tests {
         let mut resp = json!({
             "usage": { "prompt_tokens": 100, "completion_tokens": 20 }
         });
-        augment_usage_with_context(&mut resp, 100, 8192);
+        augment_usage_with_context(&mut resp, 100, 8192, Some(8192));
         // Existing fields untouched; context_window added inside usage.
         assert_eq!(resp["usage"]["prompt_tokens"], 100);
         assert_eq!(resp["usage"]["completion_tokens"], 20);
         assert_eq!(resp["usage"]["context_window"]["source"], "engine_prompt_tokens");
+    }
+
+    #[test]
+    fn build_context_window_prefers_booted_over_context_max() {
+        // booted_ctx (spawn-time window) is the denominator; context_max here is
+        // huge but ignored because the booted window is given. n_ctx must be the
+        // booted 200, NOT effective_ctx_size(999999).
+        let cw = build_context_window(150, 999999, Some(200));
+        assert_eq!(cw["n_ctx"], 200);
+        assert_eq!(cw["occupancy_ratio"], 0.75);
+        assert_eq!(cw["n_ctx_train"], 999999);
     }
 
     #[test]

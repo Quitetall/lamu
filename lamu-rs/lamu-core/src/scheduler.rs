@@ -288,6 +288,7 @@ impl VramScheduler {
         for d in &mut self.devices {
             d.loaded.remove(&name);
         }
+        let booted_ctx = crate::backends::llamacpp::effective_ctx_size(entry.context_max);
         let model = LoadedModel {
             entry,
             state: ModelState::Loaded,
@@ -296,6 +297,7 @@ impl VramScheduler {
             vram_actual_mb,
             last_used: Instant::now(),
             device: DevicePlacement::Single(nvml_index),
+            booted_ctx,
         };
         self.devices[dev].loaded.insert(name.clone(), model);
         self.devices[dev].loaded.get(&name).expect("just inserted")
@@ -318,6 +320,13 @@ impl VramScheduler {
 
     pub fn get_loaded(&self, name: &str) -> Option<&LoadedModel> {
         self.devices.iter().find_map(|d| d.loaded.get(name))
+    }
+
+    /// The booted context window for a loaded model (ADR 0021): the
+    /// `--ctx-size` captured at spawn. `None` if `name` is not loaded. The
+    /// occupancy denominator reads this instead of re-deriving per request.
+    pub fn booted_ctx(&self, name: &str) -> Option<u32> {
+        self.get_loaded(name).map(|m| m.booted_ctx)
     }
 
     /// The GPU placement recorded for `name` (ADR 0017 P2), or `None` if
@@ -419,6 +428,7 @@ impl VramScheduler {
         for d in &mut self.devices {
             d.loaded.remove(&entry.name);
         }
+        let booted_ctx = crate::backends::llamacpp::effective_ctx_size(entry.context_max);
         let model = LoadedModel {
             entry: entry.clone(),
             state: ModelState::Loading,
@@ -427,6 +437,7 @@ impl VramScheduler {
             vram_actual_mb: entry.vram_mb,
             last_used: Instant::now(),
             device: DevicePlacement::Single(nvml_index),
+            booted_ctx,
         };
         self.devices[dev].loaded.insert(entry.name, model);
     }

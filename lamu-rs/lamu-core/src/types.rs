@@ -397,6 +397,12 @@ pub struct LoadedModel {
     /// single-GPU path is unchanged. Read by the loader to call
     /// `Backend::set_device` before spawn.
     pub device: DevicePlacement,
+    /// The booted context window (ADR 0021): `effective_ctx_size(context_max)`
+    /// captured at load time, i.e. the `--ctx-size` the backend actually
+    /// spawned with. The occupancy denominator reads THIS instead of
+    /// re-deriving from `LAMU_DEFAULT_CTX` per request, so it can't drift if
+    /// the env changes after spawn.
+    pub booted_ctx: u32,
 }
 
 /// Result of router's model selection. Used by plan_query dry-run.
