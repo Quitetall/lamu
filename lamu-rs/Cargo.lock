@@ -1894,6 +1894,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamu-jart-frontend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "jart",
+ "lamu-core",
+ "tokio",
+]
+
+[[package]]
 name = "lamu-mcp"
 version = "0.1.0"
 dependencies = [

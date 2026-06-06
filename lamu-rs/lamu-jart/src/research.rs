@@ -97,16 +97,35 @@ pub async fn handle_research(ctx: &dyn ToolCtx, args: Value) -> String {
             .map(|p| format!("{}\n{}", p.title, p.grounding))
             .collect();
         let content = ai::build_grounded_content(SUMMARY_PROMPT, &items);
-        let summary = ctx.generate(&model, &content).await;
-        // ctx.generate returns an "error:"-prefixed string on failure (the MCP
-        // convention — matches the server's own is_error check, which keys on
-        // "error:" WITH the colon so prose like "Error bars on the chart…" isn't
-        // misread). Surface a failure in a dedicated field rather than failing
-        // the whole tool — the feed is still useful without the summary.
-        if summary.trim_start().to_lowercase().starts_with("error:") {
-            out["summary_error"] = Value::String(summary);
+        // A LOCAL registry model must be loaded before generate — handle_query
+        // does NOT auto-load a cold model (it returns "error: model ... not
+        // loaded"). model_modality is Some only for local models; cloud models
+        // are routed by generate and need no load.
+        let load_err = if ctx.model_modality(&model).is_some() {
+            let status = ctx.ensure_loaded(&model).await;
+            // handle_load_model returns "error: ..." (with colon) on failure.
+            if status.trim_start().to_lowercase().starts_with("error:") {
+                Some(status)
+            } else {
+                None
+            }
         } else {
-            out["summary"] = Value::String(summary);
+            None
+        };
+        if let Some(status) = load_err {
+            out["summary_error"] = Value::String(status);
+        } else {
+            let summary = ctx.generate(&model, &content).await;
+            // ctx.generate returns an "error:"-prefixed string on failure (the MCP
+            // convention — matches the server's own is_error check, which keys on
+            // "error:" WITH the colon so prose like "Error bars on the chart…" isn't
+            // misread). Surface a failure in a dedicated field rather than failing
+            // the whole tool — the feed is still useful without the summary.
+            if summary.trim_start().to_lowercase().starts_with("error:") {
+                out["summary_error"] = Value::String(summary);
+            } else {
+                out["summary"] = Value::String(summary);
+            }
         }
     }
 

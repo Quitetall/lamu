@@ -1,0 +1,17 @@
+[package]
+name = "lamu-jart-frontend"
+version = "0.1.0"
+edition.workspace = true
+
+# lamu-jart-frontend — FRONTEND (ADR 0023). Drives the lamu-jart research
+# capability: a LAMU-backed Summarizer (in-process via ToolCtx::generate), and
+# (later phases) the `lamu research` TUI + bundled web SPA. As a composition
+# root it may depend on lamu-mcp to CONSTRUCT the ToolCtx provider; the module
+# rule (module -> core only) does not bind frontends. `jart` is a path dep.
+
+[dependencies]
+lamu-core.workspace = true
+jart = { path = "../../../Desktop/jart" }
+anyhow.workspace = true
+async-trait = "0.1"
+tokio.workspace = true
