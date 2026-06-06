@@ -2,7 +2,7 @@
 //! outer agent can pick a LOCAL model by predicted throughput + VRAM fit
 //! instead of guessing. Read-only; same scorer as `lamu cookbook` (ADR 0015).
 
-use lamu_core::cookbook::{self, Backend, Hardware, ModelSpec};
+use lamu_core::cookbook::{self, ModelSpec};
 use lamu_core::types::{Capability, Modality, ModelEntry};
 use serde_json::{json, Value};
 
@@ -28,19 +28,16 @@ fn infer_use_case(e: &ModelEntry) -> String {
 }
 
 pub async fn handle_cookbook(args: Value) -> String {
-    let sched = lamu_core::scheduler::VramScheduler::new();
-    let (_, total) = sched.query_vram();
-    let gpu = sched.gpu_name();
-
-    // simulate_vram (MB) overrides the detected card.
-    let vram_mb = args["simulate_vram"].as_u64().map(|v| v as u32).unwrap_or(total);
+    // Cross-vendor detection (ADR 0015): NVIDIA → AMD → Apple → Intel → CPU.
+    let mut hw = cookbook::detect_hardware();
+    // simulate_vram (MB) overrides the detected card's VRAM. Zero the RAM-offload
+    // budget too, so the simulation is a pure GPU budget (no double-counting on a
+    // CPU box where avail_ram was populated).
+    if let Some(v) = args["simulate_vram"].as_u64() {
+        hw.gpu_vram_gb = v as f32 / 1024.0;
+        hw.avail_ram_gb = 0.0;
+    }
     let ctx_override = args["ctx"].as_u64().map(|c| c as u32);
-    let hw = Hardware {
-        gpu_name: gpu.clone(),
-        gpu_vram_gb: vram_mb as f32 / 1024.0,
-        avail_ram_gb: 0.0, // GPU-only budget
-        backend: Backend::Cuda,
-    };
 
     let entries =
         lamu_core::registry::load_registry(&lamu_core::config::registry_path()).unwrap_or_default();
@@ -70,8 +67,10 @@ pub async fn handle_cookbook(args: Value) -> String {
     }
 
     let body = json!({
-        "gpu": gpu,
-        "vram_gb": vram_mb as f32 / 1024.0,
+        "gpu": hw.gpu_name,
+        "backend": hw.backend.tag(),
+        "vram_gb": hw.gpu_vram_gb,
+        "avail_ram_gb": hw.avail_ram_gb,
         "models": serde_json::to_value(&ranked).unwrap_or(Value::Null),
     });
     serde_json::to_string_pretty(&body).unwrap_or_else(|e| format!("error: serialize cookbook: {e}"))

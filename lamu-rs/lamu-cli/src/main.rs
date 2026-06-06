@@ -390,20 +390,16 @@ const CURATED: &[(&str, f32, &str, u32, bool, f32, &str)] = &[
 ];
 
 fn cmd_cookbook(opts: CookbookOpts) -> Result<()> {
-    use lamu_core::cookbook::{self, Backend, FitLevel, Hardware, ModelSpec};
+    use lamu_core::cookbook::{self, FitLevel, ModelSpec};
 
-    let sched = lamu_core::scheduler::VramScheduler::new();
-    let (used, total) = sched.query_vram();
-    let gpu_name = sched.gpu_name();
-
-    // --simulate-vram overrides the detected card's budget.
-    let vram_mb = opts.simulate_vram.unwrap_or(total);
-    let hw = Hardware {
-        gpu_name: gpu_name.clone(),
-        gpu_vram_gb: vram_mb as f32 / 1024.0,
-        avail_ram_gb: 0.0, // GPU-only budget
-        backend: Backend::Cuda,
-    };
+    // Cross-vendor detection (ADR 0015): NVIDIA → AMD → Apple → Intel → CPU.
+    let mut hw = cookbook::detect_hardware();
+    // --simulate-vram overrides the detected card's budget (pure GPU budget:
+    // zero the RAM-offload pool so a CPU box doesn't double-count).
+    if let Some(sim) = opts.simulate_vram {
+        hw.gpu_vram_gb = sim as f32 / 1024.0;
+        hw.avail_ram_gb = 0.0;
+    }
 
     let entries =
         lamu_core::registry::load_registry(&lamu_core::config::registry_path()).unwrap_or_default();
@@ -439,14 +435,18 @@ fn cmd_cookbook(opts: CookbookOpts) -> Result<()> {
 
     if let Some(sim) = opts.simulate_vram {
         println!("Simulating {:.1} GB VRAM\n", sim as f32 / 1024.0);
-    } else if total == 0 {
-        println!("GPU: no NVIDIA GPU detected via NVML — throughput uses the CPU fallback.\n");
+    } else if hw.gpu_name.is_none() {
+        println!(
+            "GPU: none detected — throughput uses the {} fallback (avail RAM {:.1} GB).\n",
+            hw.backend.tag(),
+            hw.avail_ram_gb,
+        );
     } else {
         println!(
-            "GPU: {} — {:.1} GB VRAM ({:.1} GB free)\n",
-            gpu_name.as_deref().unwrap_or("unknown"),
-            total as f32 / 1024.0,
-            total.saturating_sub(used) as f32 / 1024.0,
+            "GPU: {} [{}] — {:.1} GB VRAM\n",
+            hw.gpu_name.as_deref().unwrap_or("unknown"),
+            hw.backend.tag(),
+            hw.gpu_vram_gb,
         );
     }
 

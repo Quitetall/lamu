@@ -79,6 +79,16 @@ const GPU_BANDWIDTH: &[(&str, u32)] = &[
     ("6600 xt", 256), ("6600", 224),
     ("mi300x", 5300), ("mi300", 5300), ("mi250x", 3277), ("mi250", 3277), ("mi210", 1638), ("mi100", 1229),
     ("9070 xt", 624), ("9070", 488),
+    // Apple Silicon — unified-memory bandwidth (GB/s). Names matched from
+    // system_profiler ("Apple M3 Max"); Ultra/Max/Pro suffixes disambiguated
+    // by longest-key-wins.
+    ("m1 ultra", 800), ("m1 max", 400), ("m1 pro", 200), ("m1", 68),
+    ("m2 ultra", 800), ("m2 max", 400), ("m2 pro", 200), ("m2", 100),
+    ("m3 ultra", 800), ("m3 max", 400), ("m3 pro", 150), ("m3", 100),
+    ("m4 max", 546), ("m4 pro", 273), ("m4", 120),
+    // Intel Arc (Alchemist/Battlemage).
+    ("arc a770", 560), ("arc a750", 512), ("arc a580", 512), ("arc a380", 186),
+    ("arc b580", 456), ("arc b570", 380),
 ];
 
 /// use-case → composite weights (quality, speed, fit, context).
@@ -112,6 +122,7 @@ const CONTEXT_TARGET_DEFAULT: u32 = 4096;
 /// Compute backend → fallback tok/s constant `k` (when GPU bandwidth unknown).
 const FALLBACK_K: &[(Backend, f32)] = &[
     (Backend::Cuda, 220.0), (Backend::Rocm, 180.0),
+    (Backend::Metal, 140.0), (Backend::Oneapi, 130.0),
     (Backend::CpuX86, 70.0), (Backend::CpuArm, 90.0),
 ];
 const FALLBACK_K_DEFAULT: f32 = 70.0;
@@ -120,10 +131,26 @@ const FALLBACK_K_DEFAULT: f32 = 70.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    Cuda,
-    Rocm,
+    Cuda,   // NVIDIA (CUDA)
+    Rocm,   // AMD (ROCm/HIP)
+    Metal,  // Apple Silicon (unified memory)
+    Oneapi, // Intel Arc/Xe (oneAPI/Level Zero)
     CpuX86,
     CpuArm,
+}
+
+impl Backend {
+    /// Stable lowercase tag for JSON/CLI output.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Backend::Cuda => "cuda",
+            Backend::Rocm => "rocm",
+            Backend::Metal => "metal",
+            Backend::Oneapi => "oneapi",
+            Backend::CpuX86 => "cpu-x86",
+            Backend::CpuArm => "cpu-arm",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -182,6 +209,128 @@ pub struct FitResult {
     pub speed: f32,
     pub fit: f32,
     pub context_score: f32,
+}
+
+// ── hardware detection (cross-vendor) ──────────────────────────────────────
+
+/// Detect the best-available accelerator for cookbook scoring, cross-vendor:
+/// NVIDIA (NVML) → AMD (ROCm sysfs) → Apple (Metal) → Intel (sysfs) → CPU.
+///
+/// This drives RECOMMENDATIONS only; lamu's runtime serving + eviction remain
+/// NVIDIA/NVML (the scheduler). On a non-NVIDIA box `lamu cookbook` still ranks
+/// models for the detected card / CPU.
+pub fn detect_hardware() -> Hardware {
+    // 1. NVIDIA via NVML (the same probe the scheduler uses).
+    let sched = crate::scheduler::VramScheduler::new();
+    let (_, total_mb) = sched.query_vram();
+    if total_mb > 0 {
+        if let Some(name) = sched.gpu_name() {
+            return Hardware {
+                gpu_name: Some(name),
+                gpu_vram_gb: total_mb as f32 / 1024.0,
+                avail_ram_gb: 0.0, // GPU-only budget (offload scoring is CPU-path only)
+                backend: Backend::Cuda,
+            };
+        }
+    }
+    // 2. AMD discrete (Linux sysfs: vendor 0x1002 + mem_info_vram_total).
+    if let Some((name, vram_gb)) = detect_pci_gpu("0x1002", "AMD Radeon") {
+        return Hardware { gpu_name: Some(name), gpu_vram_gb: vram_gb, avail_ram_gb: 0.0, backend: Backend::Rocm };
+    }
+    // 3. Apple Silicon (macOS). Unified memory IS the GPU budget, so no separate
+    //    offload pool.
+    #[cfg(target_os = "macos")]
+    if let Some((name, vram_gb)) = detect_apple() {
+        return Hardware { gpu_name: Some(name), gpu_vram_gb: vram_gb, avail_ram_gb: 0.0, backend: Backend::Metal };
+    }
+    // 4. Intel discrete (Linux sysfs: vendor 0x8086 + dGPU VRAM).
+    if let Some((name, vram_gb)) = detect_pci_gpu("0x8086", "Intel Arc") {
+        return Hardware { gpu_name: Some(name), gpu_vram_gb: vram_gb, avail_ram_gb: 0.0, backend: Backend::Oneapi };
+    }
+    // 5. CPU fallback.
+    Hardware {
+        gpu_name: None,
+        gpu_vram_gb: 0.0,
+        avail_ram_gb: read_avail_ram_gb(),
+        backend: cpu_backend(),
+    }
+}
+
+/// CPU backend from the build-target arch.
+fn cpu_backend() -> Backend {
+    match std::env::consts::ARCH {
+        "aarch64" | "arm" => Backend::CpuArm,
+        _ => Backend::CpuX86,
+    }
+}
+
+/// Available system RAM (GB) from `/proc/meminfo` MemAvailable (Linux); 0.0 if
+/// unreadable (non-Linux or restricted), which the cookbook treats as a
+/// GPU-only budget.
+fn read_avail_ram_gb() -> f32 {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0.0 };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // "MemAvailable:   12345678 kB"
+            if let Some(kb) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
+                return kb as f32 / 1024.0 / 1024.0;
+            }
+        }
+    }
+    0.0
+}
+
+/// Find a discrete GPU on Linux by PCI vendor id via DRM sysfs, returning a
+/// label + VRAM (GB). Discrete cards expose `mem_info_vram_total` (bytes);
+/// integrated GPUs without it are skipped, so this won't misreport an iGPU as a
+/// serving target. The label is generic (sysfs has no marketing string), so the
+/// bandwidth table usually misses and the per-backend FALLBACK_K applies — a
+/// deliberately conservative estimate. Returns the largest-VRAM match.
+fn detect_pci_gpu(vendor: &str, label: &str) -> Option<(String, f32)> {
+    let mut best: Option<(String, f32)> = None;
+    for e in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let fname = e.file_name();
+        let fname = fname.to_string_lossy();
+        // cardN only (skip connectors like card0-eDP-1).
+        if !(fname.starts_with("card") && fname.len() > 4 && fname[4..].chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let dev = e.path().join("device");
+        let Ok(vid) = std::fs::read_to_string(dev.join("vendor")) else { continue };
+        if vid.trim() != vendor {
+            continue;
+        }
+        let Ok(vram_s) = std::fs::read_to_string(dev.join("mem_info_vram_total")) else { continue };
+        let Ok(bytes) = vram_s.trim().parse::<u64>() else { continue };
+        // GiB, matching the NVML path (MiB/1024) — one unit convention everywhere.
+        let vram_gb = bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+        // Skip iGPUs: newer kernels expose mem_info_vram_total for integrated
+        // graphics too (a small stolen carve-out), so require a discrete-sized
+        // pool (>= 2 GiB) before treating it as a serving target.
+        if vram_gb < 2.0 {
+            continue;
+        }
+        if best.as_ref().map(|(_, g)| vram_gb > *g).unwrap_or(true) {
+            best = Some((label.to_string(), vram_gb));
+        }
+    }
+    best
+}
+
+/// Apple Silicon chip name + unified memory (GB) via sysctl. macOS only.
+#[cfg(target_os = "macos")]
+fn detect_apple() -> Option<(String, f32)> {
+    use std::process::Command;
+    // Absolute path — don't trust $PATH for a privileged probe.
+    let sysctl = "/usr/sbin/sysctl";
+    let chip = Command::new(sysctl).args(["-n", "machdep.cpu.brand_string"]).output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let mem = Command::new(sysctl).args(["-n", "hw.memsize"]).output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())?;
+    Some((chip, mem as f32 / (1024.0 * 1024.0 * 1024.0)))
 }
 
 // ── table lookups ─────────────────────────────────────────────────────────
@@ -550,6 +699,47 @@ mod tests {
         assert_eq!(lookup_bandwidth(Some("RTX 4090")), Some(1008));
         assert_eq!(lookup_bandwidth(Some("some unknown gpu")), None);
         assert_eq!(lookup_bandwidth(None), None);
+    }
+
+    #[test]
+    fn bandwidth_cross_vendor_entries() {
+        // Apple unified memory — Max/Pro/Ultra disambiguated by longest match.
+        assert_eq!(lookup_bandwidth(Some("Apple M3 Max")), Some(400));
+        assert_eq!(lookup_bandwidth(Some("Apple M3 Pro")), Some(150));
+        assert_eq!(lookup_bandwidth(Some("Apple M2 Ultra")), Some(800));
+        // AMD + Intel.
+        assert_eq!(lookup_bandwidth(Some("AMD Radeon RX 7900 XTX")), Some(960));
+        assert_eq!(lookup_bandwidth(Some("Intel Arc A770")), Some(560));
+    }
+
+    #[test]
+    fn backend_tags_are_stable() {
+        assert_eq!(Backend::Cuda.tag(), "cuda");
+        assert_eq!(Backend::Rocm.tag(), "rocm");
+        assert_eq!(Backend::Metal.tag(), "metal");
+        assert_eq!(Backend::Oneapi.tag(), "oneapi");
+        assert_eq!(Backend::CpuX86.tag(), "cpu-x86");
+        assert_eq!(Backend::CpuArm.tag(), "cpu-arm");
+    }
+
+    #[test]
+    fn detect_hardware_is_sane_and_total() {
+        // Environment-independent: whatever the box, detection must return a
+        // usable Hardware without panicking. VRAM/RAM are non-negative; a CPU
+        // fallback (no GPU) must expose some RAM budget so models can still fit.
+        let hw = detect_hardware();
+        assert!(hw.gpu_vram_gb >= 0.0);
+        assert!(hw.avail_ram_gb >= 0.0);
+        if hw.gpu_name.is_none() {
+            assert!(matches!(hw.backend, Backend::CpuX86 | Backend::CpuArm));
+        }
+    }
+
+    #[test]
+    fn cpu_backend_matches_target_arch() {
+        // On the common targets we build for.
+        let b = cpu_backend();
+        assert!(matches!(b, Backend::CpuX86 | Backend::CpuArm));
     }
 
     #[test]
