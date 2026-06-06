@@ -15,7 +15,9 @@ pub mod council;
 pub mod handlers;
 pub mod image;
 pub mod lifetime_memory;
-pub mod media_paths;
+/// Re-export: media_paths moved to lamu-core (ADR 0023). Keeps
+/// `crate::media_paths::…` working for the in-tree tts/image tools.
+pub use lamu_core::media_paths;
 pub mod memory;
 pub mod rag;
 pub mod server;

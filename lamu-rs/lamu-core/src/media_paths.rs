@@ -10,7 +10,7 @@
 
 use std::path::{Component, PathBuf};
 
-pub(crate) fn resolve_confined_output_path(
+pub fn resolve_confined_output_path(
     subdir: &str,
     prefix: &str,
     ext: &str,

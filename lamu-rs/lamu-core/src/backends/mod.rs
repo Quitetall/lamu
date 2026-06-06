@@ -148,7 +148,7 @@ pub struct ChatMessage {
 /// Non-Linux (incl. macOS): no-op — there is no portable
 /// `PR_SET_PDEATHSIG` equivalent. lamu's backends are CUDA/Linux-only in
 /// practice, so the gap is theoretical.
-pub(crate) fn harden_child_command(cmd: &mut tokio::process::Command) {
+pub fn harden_child_command(cmd: &mut tokio::process::Command) {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `pre_exec` runs in the forked child between fork and
@@ -370,7 +370,7 @@ pub async fn kill_pid_and_verify(_pid: u32, _port: u16) -> Result<()> {
 /// Last ~2 KiB of a captured backend log — surfaces WHY a python-server
 /// spawn failed (CUDA OOM, missing dep, bad checkpoint) in the error.
 /// Empty if unreadable. Shared by the fish_speech + comfyui backends.
-pub(crate) fn read_log_tail(path: &std::path::Path) -> String {
+pub fn read_log_tail(path: &std::path::Path) -> String {
     match std::fs::read(path) {
         Ok(bytes) => {
             let start = bytes.len().saturating_sub(2048);
@@ -384,7 +384,7 @@ pub(crate) fn read_log_tail(path: &std::path::Path) -> String {
 /// when `Some`, no nulls). Unknown fields are ignored server-side, so it's
 /// a safe no-op where unsupported. Shared by the dflash + megakernel
 /// custom-server backends.
-pub(crate) fn build_payload(
+pub fn build_payload(
     messages: &[ChatMessage],
     max_tokens: u32,
     temperature: f32,

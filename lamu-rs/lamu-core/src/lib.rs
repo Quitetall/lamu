@@ -11,6 +11,9 @@ pub mod router;
 pub mod reasoning;
 pub mod sse;
 pub mod config;
+/// Confined-output path resolver (symlink/traversal-safe). Shared by the media
+/// modules (lamu-image, lamu-tts); lived in lamu-mcp before ADR 0023.
+pub mod media_paths;
 pub mod cookbook;
 pub mod error;
 pub mod health;
