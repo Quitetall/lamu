@@ -15,9 +15,9 @@
 //! for the lifecycle (load / unload / is_healthy / port) the scheduler drives.
 //! `Modality::Image` (tiered eviction: dropped before LLMs) is already wired.
 
-use crate::backends::{Backend, ChatMessage};
-use crate::types::{DevicePlacement, ModelEntry};
-use crate::{Error, Result};
+use lamu_core::backends::{Backend, ChatMessage};
+use lamu_core::types::{DevicePlacement, ModelEntry};
+use lamu_core::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
 use std::pin::Pin;
@@ -45,7 +45,7 @@ impl ComfyUIBackend {
             port: 0,
             model_name: String::new(),
             client,
-            cuda_index: crate::config::gpu_index(),
+            cuda_index: lamu_core::config::gpu_index(),
         })
     }
 }
@@ -94,7 +94,7 @@ impl Backend for ComfyUIBackend {
             .env("CUDA_VISIBLE_DEVICES", self.cuda_index.to_string())
             .stdout(Stdio::null())
             .stderr(stderr_sink);
-        crate::backends::harden_child_command(&mut cmd);
+        lamu_core::backends::harden_child_command(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -114,7 +114,7 @@ impl Backend for ComfyUIBackend {
                 if let Ok(Some(status)) = p.try_wait() {
                     return Err(Error::Backend(format!(
                         "comfyui server exited during startup (port {port}, {status})\nstderr tail:\n{}",
-                        crate::backends::read_log_tail(&log_file)
+                        lamu_core::backends::read_log_tail(&log_file)
                     )));
                 }
             }
@@ -126,14 +126,14 @@ impl Backend for ComfyUIBackend {
         let _ = self.unload().await;
         Err(Error::Backend(format!(
             "comfyui health timeout (port {port})\nstderr tail:\n{}",
-            crate::backends::read_log_tail(&log_file)
+            lamu_core::backends::read_log_tail(&log_file)
         )))
     }
 
     async fn unload(&mut self) -> Result<()> {
         // Borrow (don't take) so a failed kill retains the handle for a retry.
         if let Some(p) = self.proc.as_mut() {
-            crate::backends::graceful_kill(p, self.port).await?;
+            lamu_core::backends::graceful_kill(p, self.port).await?;
         }
         self.proc = None;
         self.model_name.clear();
@@ -180,7 +180,7 @@ impl Backend for ComfyUIBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::BackendType;
+    use lamu_core::types::BackendType;
 
     #[test]
     fn backend_type_comfyui_serde() {

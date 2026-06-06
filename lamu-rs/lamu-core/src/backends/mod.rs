@@ -1,7 +1,6 @@
 //! Backends — model lifecycle management.
 //! Direct port of `lamu/backends/`.
 
-pub mod comfyui;
 pub mod dflash;
 pub mod fish_speech;
 pub mod llamacpp;
@@ -28,7 +27,46 @@ pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
             Ok(Box::new(dflash::DflashBackend::new()?))
         }
         BackendType::FishSpeech => Ok(Box::new(fish_speech::FishSpeechBackend::new()?)),
-        BackendType::ComfyUI => Ok(Box::new(comfyui::ComfyUIBackend::new()?)),
+        // ADR 0023: ComfyUI moved to the `lamu-image` module. Core no longer
+        // names it — it resolves via the backend registry that the module
+        // populates at the composition root.
+        BackendType::ComfyUI => make_registered("comfyui", entry),
+    }
+}
+
+/// Factory for a module-provided backend kind (ADR 0023).
+pub type BackendFactory = fn(&ModelEntry) -> Result<Box<dyn Backend>>;
+
+static BACKEND_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, BackendFactory>>,
+> = std::sync::OnceLock::new();
+
+fn backend_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, BackendFactory>> {
+    BACKEND_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register a backend kind from a module (ADR 0023). Each module's `register()`
+/// calls this once at the binary's startup (the composition root); `make_backend`
+/// then resolves that `backend_kind` here instead of core naming the module.
+pub fn register_backend(kind: &str, factory: BackendFactory) {
+    backend_registry()
+        .lock()
+        .expect("backend registry poisoned")
+        .insert(kind.to_string(), factory);
+}
+
+fn make_registered(kind: &str, entry: &ModelEntry) -> Result<Box<dyn Backend>> {
+    let f = backend_registry()
+        .lock()
+        .expect("backend registry poisoned")
+        .get(kind)
+        .copied();
+    match f {
+        Some(factory) => factory(entry),
+        None => Err(crate::Error::Backend(format!(
+            "backend kind '{kind}' is not registered — its module was not loaded at startup (ADR 0023)"
+        ))),
     }
 }
 

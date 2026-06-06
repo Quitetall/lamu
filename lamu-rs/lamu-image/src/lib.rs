@@ -10,9 +10,14 @@
 //! reg)` to install this module's backend factory (kind `comfyui`, eviction
 //! tier = media) and its tool definition.
 //!
-//! STATUS: scaffold (ADR 0023 step 0 — seams first). No backend moved yet so
-//! the workspace build + `lamu serve` stay green.
+mod comfyui;
+pub use comfyui::ComfyUIBackend;
 
-/// Placeholder so the crate has a symbol until the ComfyUI backend lands here.
-/// Replaced by `pub fn register(reg: &mut lamu_core::registry::LamuRegistry)`.
-pub const MODULE_NAME: &str = "lamu-image";
+/// Register this module's backend(s) into lamu-core (ADR 0023). Call ONCE at the
+/// composition root (binary startup) before serving, so `make_backend` can
+/// resolve `backend_kind = "comfyui"`. Idempotent (re-registering overwrites).
+pub fn register() {
+    lamu_core::backends::register_backend("comfyui", |_entry| {
+        Ok(Box::new(comfyui::ComfyUIBackend::new()?) as Box<dyn lamu_core::backends::Backend>)
+    });
+}
