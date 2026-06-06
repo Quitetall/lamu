@@ -794,6 +794,19 @@ mod tests {
         assert_eq!(new.context_max, 262144, "new model takes its real GGUF ctx");
     }
 
+    #[test]
+    fn merge_registry_discovered_ctx_wins_over_stale_existing() {
+        // Existing model with a stale ctx; a re-scan now reads the real GGUF
+        // value (>0) → discovered wins (the C1 correction propagates).
+        let p = Path::new("/m/up.gguf");
+        let mut old = sample_entry("up", p);
+        old.context_max = 8192;
+        let mut disc = sample_entry("up", p);
+        disc.context_max = 262144;
+        let merged = merge_registry(vec![old], vec![disc]);
+        assert_eq!(merged[0].context_max, 262144, "known discovered ctx overrides stale existing");
+    }
+
     fn sample_entry(name: &str, path: &Path) -> ModelEntry {
         ModelEntry {
             name: name.into(),

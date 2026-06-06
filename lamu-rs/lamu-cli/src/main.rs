@@ -863,7 +863,13 @@ async fn cmd_scan() -> Result<()> {
     // Merge with the existing registry so operator-curated config (main,
     // speculative/DFlash, sampling, notes, status) survives the re-scan instead
     // of being overwritten with scan defaults.
-    let existing = load_registry(&path).unwrap_or_default();
+    let existing = match load_registry(&path) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("warning: existing registry unreadable ({e}); curated config will NOT be preserved this scan");
+            Vec::new()
+        }
+    };
     let entries = lamu_core::registry::merge_registry(existing, discovered);
     write_registry(&entries, &path)?;
     println!("Discovered {} models → {}", entries.len(), path.display());
@@ -1186,7 +1192,13 @@ fn cmd_rm(query: &str, yes: bool) -> Result<()> {
     // dropped).
     let dir = models_dir();
     let discovered = scan_directory(&dir)?;
-    let existing = load_registry(&registry_path()).unwrap_or_default();
+    let existing = match load_registry(&registry_path()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("warning: existing registry unreadable ({e}); curated config will NOT be preserved");
+            Vec::new()
+        }
+    };
     let entries = lamu_core::registry::merge_registry(existing, discovered);
     write_registry(&entries, &registry_path())?;
     println!("  registry refreshed ({} models remaining)", entries.len());
