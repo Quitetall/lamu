@@ -17,6 +17,9 @@ pub use comfyui::ComfyUIBackend;
 /// composition root (binary startup) before serving, so `make_backend` can
 /// resolve `backend_kind = "comfyui"`. Idempotent (re-registering overwrites).
 pub fn register() {
+    // `entry` is ignored: ComfyUI is one sidecar process; model/checkpoint
+    // selection happens at the workflow level in the generate_image tool, not at
+    // backend construction. A future per-model variant would read `entry` here.
     lamu_core::backends::register_backend("comfyui", |_entry| {
         Ok(Box::new(comfyui::ComfyUIBackend::new()?) as Box<dyn lamu_core::backends::Backend>)
     });

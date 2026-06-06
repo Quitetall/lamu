@@ -29,7 +29,8 @@ pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
         BackendType::FishSpeech => Ok(Box::new(fish_speech::FishSpeechBackend::new()?)),
         // ADR 0023: ComfyUI moved to the `lamu-image` module. Core no longer
         // names it — it resolves via the backend registry that the module
-        // populates at the composition root.
+        // populates at the composition root. As lamu-tts/lamu-jart land, their
+        // BackendType variants route here the same way (-> make_registered(kind)).
         BackendType::ComfyUI => make_registered("comfyui", entry),
     }
 }

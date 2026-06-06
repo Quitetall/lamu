@@ -9,7 +9,9 @@ edition.workspace = true
 lamu-core.workspace = true
 async-trait = "0.1"
 futures-util = "0.3"
-tokio = { workspace = true, features = ["process", "time", "macros", "rt-multi-thread"] }
+# Library crate: only the primitives comfyui uses. The binary (lamu-cli) owns
+# the runtime (rt-multi-thread/macros), so they don't belong here.
+tokio = { workspace = true, features = ["process", "time"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tracing.workspace = true
 dirs = "5"
