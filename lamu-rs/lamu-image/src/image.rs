@@ -1,29 +1,54 @@
-//! Image generation — local ComfyUI (managed subprocess), modality routing
-//! mirrors `tts`. A `model` whose registry entry is `modality: image` is
-//! served by spawning ComfyUI (evicting LLMs via the tiered scheduler) and
-//! proxying a txt2img workflow: POST /prompt → poll /history → GET /view.
+//! Image generation — local ComfyUI (managed subprocess). A `model` whose
+//! registry entry is `modality: image` is served by spawning ComfyUI (evicting
+//! LLMs via the tiered scheduler) and proxying a txt2img workflow:
+//! POST /prompt → poll /history → GET /view.
 //!
-//! One ComfyUI serves many checkpoints; the per-request `checkpoint`
-//! (a file under <comfy>/models/checkpoints/) is selected in the workflow
-//! graph, not at spawn. Output PNGs are written to a CONFINED dir
-//! (<data_dir>/lamu/images) — an MCP caller never gets an arbitrary write.
+//! One ComfyUI serves many checkpoints; the per-request `checkpoint` is selected
+//! in the workflow graph, not at spawn. Output PNGs land in a CONFINED dir
+//! (`<data_dir>/lamu/images`) — an MCP caller never gets an arbitrary write.
+//!
+//! ADR 0023: this tool lives in the lamu-image MODULE and runs against a
+//! `&dyn lamu_core::tools_ext::ToolCtx` (it needs only the model's modality, a
+//! load trigger, and the loaded port) — no lamu-mcp dependency.
 
-use crate::media_paths::resolve_confined_output_path;
-use crate::server::LamuMcpServer;
+use lamu_core::media_paths::resolve_confined_output_path;
+use lamu_core::tools_ext::ToolCtx;
 use lamu_core::types::Modality;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::future::Future;
 use std::path::Component;
+use std::pin::Pin;
 use std::time::Duration;
 
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB/image safety cap
 
-/// True iff `model` is a registry entry with `modality: image`.
-fn is_local_image(entries: &HashMap<String, lamu_core::types::ModelEntry>, model: &str) -> bool {
-    entries
-        .get(model)
-        .map(|e| e.modality == Modality::Image)
-        .unwrap_or(false)
+/// JSON schema for the `generate_image` MCP tool.
+pub fn schema_generate_image() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "Positive text prompt."},
+            "model": {"type": "string", "default": "comfy-image", "description": "Registry image model (modality: image) — spawns the managed ComfyUI server."},
+            "checkpoint": {"type": "string", "description": "Checkpoint filename under ComfyUI models/checkpoints/, e.g. 'sd_xl_base_1.0.safetensors'. Required."},
+            "negative": {"type": "string", "default": "", "description": "Negative prompt."},
+            "width": {"type": "integer", "default": 1024},
+            "height": {"type": "integer", "default": 1024},
+            "steps": {"type": "integer", "default": 25},
+            "cfg": {"type": "number", "default": 7.0},
+            "sampler": {"type": "string", "default": "euler", "description": "KSampler sampler_name (euler, dpmpp_2m, etc.)."},
+            "seed": {"type": "integer", "description": "Omit for a time-seeded random image."},
+            "output_path": {"type": "string", "description": "Relative name under <data_dir>/lamu/images. Default: img-<nanos>.png."}
+        },
+        "required": ["prompt", "checkpoint"]
+    })
+}
+
+/// The `ModuleToolHandler` wrapper registered into lamu-core's tool registry.
+pub fn dispatch_generate_image<'a>(
+    ctx: &'a dyn ToolCtx,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    Box::pin(handle_generate_image(ctx, args))
 }
 
 /// Canonical SDXL/SD txt2img workflow in ComfyUI API format.
@@ -55,13 +80,9 @@ fn build_workflow(
 }
 
 /// Tool entrypoint. Local ComfyUI only (no cloud image provider in M1).
-pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> String {
+pub async fn handle_generate_image(ctx: &dyn ToolCtx, args: Value) -> String {
     let model = args["model"].as_str().unwrap_or("comfy-image").to_string();
-    let local = {
-        let st = server.state.lock();
-        is_local_image(&st.entries, &model)
-    };
-    if !local {
+    if ctx.model_modality(&model) != Some(Modality::Image) {
         return format!(
             "error: '{model}' is not a registry image model (need modality: image). No cloud image provider is wired."
         );
@@ -75,9 +96,8 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
         Some(c) if !c.is_empty() => c.to_string(),
         _ => return "error: generate_image requires `checkpoint` (a file under ComfyUI models/checkpoints/, e.g. 'sd_xl_base_1.0.safetensors')".into(),
     };
-    // Confine the checkpoint to models/checkpoints/ — block absolute paths
-    // and `..` so a crafted name can't load a .safetensors from elsewhere.
-    // (Subfolders like 'sdxl/foo.safetensors' are allowed.)
+    // Confine the checkpoint to models/checkpoints/ — block absolute paths and
+    // `..` so a crafted name can't load a .safetensors from elsewhere.
     {
         let cpb = std::path::Path::new(&checkpoint);
         if cpb.is_absolute() || cpb.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -100,16 +120,13 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
     });
 
     // Ensure ComfyUI is up (spawns + evicts LLMs per the scheduler).
-    let status = server.handle_load_model(json!({ "name": model })).await;
+    let status = ctx.ensure_loaded(&model).await;
     if status.starts_with("error") {
         return status;
     }
-    let port = {
-        let st = server.state.lock();
-        match st.scheduler.get_loaded(&model) {
-            Some(m) if m.port != 0 => m.port,
-            _ => return format!("error: image model '{model}' not loaded after attempt: {status}"),
-        }
+    let port = match ctx.loaded_port(&model) {
+        Some(p) if p != 0 => p,
+        _ => return format!("error: image model '{model}' not loaded after attempt: {status}"),
     };
 
     let out_path = match resolve_confined_output_path("images", "img", "png", args["output_path"].as_str()) {
@@ -140,13 +157,7 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
         Err(e) => return format!("error: post /prompt: {e}"),
     };
     if !queue.status().is_success() {
-        let body: String = queue
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(400)
-            .collect();
+        let body: String = queue.text().await.unwrap_or_default().chars().take(400).collect();
         return format!("error: ComfyUI rejected workflow (checkpoint '{checkpoint}' present?): {body}");
     }
     let qv: Value = match queue.json().await {
@@ -166,9 +177,6 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
         if i > 0 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        // Short per-poll timeout (separate from the client's 600s): if
-        // ComfyUI's port is bound but the server hung, the default timeout
-        // would block each poll for 600s → 150×600s, not the intended ~5min.
         let h = match client.get(&hist_url).timeout(Duration::from_secs(5)).send().await {
             Ok(r) => r,
             Err(_) => continue,
@@ -178,12 +186,10 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
             Err(_) => continue,
         };
         if let Some(entry) = hv.get(&prompt_id) {
-            // SaveImage node "9" → outputs.images[]
             if let Some(imgs) = entry["outputs"]["9"]["images"].as_array() {
                 images = imgs.clone();
                 break;
             }
-            // Some graphs key outputs by a different SaveImage id; scan all.
             if let Some(outputs) = entry["outputs"].as_object() {
                 for node in outputs.values() {
                     if let Some(imgs) = node["images"].as_array() {
@@ -233,7 +239,6 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
         return "error: ComfyUI returned an empty image".into();
     }
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        // Guards the no-Content-Length case the pre-check above can't catch.
         return format!("error: image exceeds cap ({} bytes)", bytes.len());
     }
     if let Err(e) = std::fs::write(&out_path, &bytes) {
@@ -252,41 +257,6 @@ pub async fn handle_generate_image(server: &LamuMcpServer, args: Value) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lamu_core::types::{BackendType, ModelEntry, ModelFormat, ModelStatus};
-    use std::path::PathBuf;
-
-    fn entry(name: &str, modality: Modality) -> ModelEntry {
-        ModelEntry {
-            name: name.to_string(),
-            path: PathBuf::from("/tmp/x"),
-            format: ModelFormat::Gguf,
-            backend: BackendType::LlamaCpp,
-            arch: "t".into(),
-            params_b: 1.0,
-            quant: "Q4".into(),
-            vram_mb: 1,
-            context_max: 0,
-            capabilities: vec![],
-            reasoning_marker: None,
-            speculative: None,
-            sampling: None,
-            pinned: false,
-            main: false,
-            notes: String::new(),
-            status: ModelStatus::Unspecified,
-            modality,
-        }
-    }
-
-    #[test]
-    fn is_local_image_true_only_for_image_entry() {
-        let mut m = HashMap::new();
-        m.insert("comfy-image".to_string(), entry("comfy-image", Modality::Image));
-        m.insert("chat".to_string(), entry("chat", Modality::Llm));
-        assert!(is_local_image(&m, "comfy-image"));
-        assert!(!is_local_image(&m, "chat"));
-        assert!(!is_local_image(&m, "unknown"));
-    }
 
     #[test]
     fn workflow_has_required_nodes() {

@@ -282,7 +282,12 @@ impl LamuMcpServer {
                 crate::tools::HandlerKind::Stateful(f) => f(self, args).await,
                 crate::tools::HandlerKind::Free(f) => f(args).await,
             },
-            None => format!("Unknown tool: {}", tool_name),
+            // ADR 0023: not a built-in — try the module-tool registry
+            // (generate_image, future tts/jart tools), dispatched over ToolCtx.
+            None => match lamu_core::tools_ext::find_handler(tool_name) {
+                Some(h) => h(self as &dyn lamu_core::tools_ext::ToolCtx, args).await,
+                None => format!("Unknown tool: {}", tool_name),
+            },
         };
 
         // Heuristic: handlers prefix error responses with "error:" or
@@ -315,6 +320,21 @@ impl LamuMcpServer {
 
 }
 
+/// ADR 0023: the server's implementation of what module tools (generate_image,
+/// future tts/jart) need — modality lookup, load trigger, loaded port.
+#[async_trait::async_trait]
+impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
+    fn model_modality(&self, model: &str) -> Option<lamu_core::types::Modality> {
+        self.state.lock().entries.get(model).map(|e| e.modality)
+    }
+    async fn ensure_loaded(&self, model: &str) -> String {
+        self.handle_load_model(json!({ "name": model })).await
+    }
+    fn loaded_port(&self, model: &str) -> Option<u16> {
+        self.state.lock().scheduler.get_loaded(model).map(|m| m.port)
+    }
+}
+
 fn initialize_response(id: Option<Value>) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -331,9 +351,11 @@ fn initialize_response(id: Option<Value>) -> Value {
 fn tools_list_response(id: Option<Value>) -> Value {
     // Phase 2.1: iterate the single-source tool catalog. Adding a
     // new tool to crate::tools::TOOLS shows up here automatically.
-    let tools: Vec<Value> = crate::tools::TOOLS.iter()
+    let mut tools: Vec<Value> = crate::tools::TOOLS.iter()
         .map(|t| t.to_list_entry())
         .collect();
+    // ADR 0023: append module-contributed tools (generate_image, …).
+    tools.extend(lamu_core::tools_ext::list_entries());
 
     json!({
         "jsonrpc": "2.0",

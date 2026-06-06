@@ -166,26 +166,6 @@ fn schema_council() -> Value {
     })
 }
 
-fn schema_generate_image() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "prompt": {"type": "string", "description": "Positive text prompt."},
-            "model": {"type": "string", "default": "comfy-image", "description": "Registry image model (modality: image) — spawns the managed ComfyUI server."},
-            "checkpoint": {"type": "string", "description": "Checkpoint filename under ComfyUI models/checkpoints/, e.g. 'sd_xl_base_1.0.safetensors'. Required."},
-            "negative": {"type": "string", "default": "", "description": "Negative prompt."},
-            "width": {"type": "integer", "default": 1024},
-            "height": {"type": "integer", "default": 1024},
-            "steps": {"type": "integer", "default": 25},
-            "cfg": {"type": "number", "default": 7.0},
-            "sampler": {"type": "string", "default": "euler", "description": "KSampler sampler_name (euler, dpmpp_2m, etc.)."},
-            "seed": {"type": "integer", "description": "Omit for a time-seeded random image."},
-            "output_path": {"type": "string", "description": "Relative name under <data_dir>/lamu/images. Default: img-<nanos>.png."}
-        },
-        "required": ["prompt", "checkpoint"]
-    })
-}
-
 fn schema_text_to_speech() -> Value {
     json!({
         "type": "object",
@@ -492,12 +472,6 @@ fn dispatch_cloud_query(args: Value) -> Pin<Box<dyn Future<Output = String> + Se
     Box::pin(crate::cloud::handle_cloud_query(args))
 }
 
-fn dispatch_generate_image<'a>(
-    s: &'a LamuMcpServer,
-    args: Value,
-) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-    Box::pin(crate::image::handle_generate_image(s, args))
-}
 
 fn dispatch_council<'a>(
     s: &'a LamuMcpServer,
@@ -666,13 +640,6 @@ pub static TOOLS: &[ToolDef] = &[
         description: "Convene N models on one prompt (local + cloud), then a judge model picks the best BLIND answer and synthesizes a final one combining their strengths. PewDiePie 'Council' pattern. cloud:false — mixes local+cloud, self-enforces local-only per member.",
         schema_fn: schema_council,
         handler: HandlerKind::Stateful(dispatch_council),
-        cloud: false,
-    },
-    ToolDef {
-        name: "generate_image",
-        description: "Generate an image from a text prompt via the managed local ComfyUI server (model with modality: image, default 'comfy-image'; spawns ComfyUI, evicting LLMs as needed). Requires `checkpoint` (a file under ComfyUI models/checkpoints/). Writes a PNG under <data_dir>/lamu/images and returns its path. Local-only — no cloud image provider.",
-        schema_fn: schema_generate_image,
-        handler: HandlerKind::Stateful(dispatch_generate_image),
         cloud: false,
     },
     ToolDef {
@@ -876,7 +843,7 @@ mod tests {
             "set_routing_mode", "routing_status", "search_repo", "index_repo",
             "recall_conversation", "train_from_conversations", "write_file",
             "parallel_query", "remember", "recall_memory",
-            "forget_memory", "export_memory_graph", "generate_image", "council",
+            "forget_memory", "export_memory_graph", "council",
         ] {
             assert!(!find(name).unwrap().cloud, "{name} must have cloud:false");
         }

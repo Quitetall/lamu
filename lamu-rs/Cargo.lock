@@ -1769,6 +1769,7 @@ dependencies = [
  "globset",
  "lamu-api",
  "lamu-core",
+ "lamu-image",
  "lamu-mcp",
  "lamu-providers",
  "ratatui",
@@ -1814,10 +1815,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamu-image"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dirs 5.0.1",
+ "futures-util",
+ "lamu-core",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lamu-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
  "futures-util",
  "getrandom 0.2.17",
