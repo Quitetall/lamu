@@ -8,6 +8,7 @@ members = [
     "lamu-providers",
     "lamu-image",
     "lamu-tts",
+    "lamu-jart",
 ]
 
 # BLUT (Brian Lam's Universal Trainer) extracted to its own repo

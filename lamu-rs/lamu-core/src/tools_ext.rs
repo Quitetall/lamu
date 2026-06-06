@@ -25,6 +25,12 @@ pub trait ToolCtx: Send + Sync {
     async fn ensure_loaded(&self, model: &str) -> String;
     /// Bound port of `model` if currently loaded with a live port.
     fn loaded_port(&self, model: &str) -> Option<u16>;
+    /// Generate a completion from `model` (a local registry model OR a cloud
+    /// model), honoring routing mode + the scheduler. Returns the completion
+    /// text, or an `"error"`-prefixed string on failure (mirrors the MCP
+    /// handlers' convention). Lets a module (e.g. lamu-jart) summarize/generate
+    /// in-process instead of a self-HTTP round-trip.
+    async fn generate(&self, model: &str, prompt: &str) -> String;
 }
 
 /// Async handler for a module tool. Borrows the ctx for the future's lifetime

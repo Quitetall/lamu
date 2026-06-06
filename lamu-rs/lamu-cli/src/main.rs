@@ -234,6 +234,7 @@ async fn main() -> Result<()> {
     // lamu-image). Each module is one register() call at this composition root.
     lamu_image::register();
     lamu_tts::register();
+    lamu_jart::register();
     // Default to `warn` when RUST_LOG is unset so operationally-relevant
     // warnings (zombie children, dropped thinking blocks, etc.) are
     // visible without the user having to opt in. RUST_LOG=info or debug

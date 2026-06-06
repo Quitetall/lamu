@@ -20,6 +20,7 @@ lamu-api = { path = "../lamu-api" }
 # Backend modules (ADR 0023) — registered at startup in main().
 lamu-image = { path = "../lamu-image" }
 lamu-tts = { path = "../lamu-tts" }
+lamu-jart = { path = "../lamu-jart" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

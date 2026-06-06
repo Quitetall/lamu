@@ -1,0 +1,15 @@
+[package]
+name = "lamu-jart"
+version = "0.1.0"
+edition.workspace = true
+
+# lamu-jart — research MODULE (ADR 0023). Wraps the standalone `jart` crate
+# (Just Another Research Tool) as a backend extension: a `research` MCP tool
+# that fans out jart's scrapers and summarizes in-process via lamu-core.
+# `jart` is a path dependency (its core stays the upstream Quitetall/jart repo).
+
+[dependencies]
+lamu-core.workspace = true
+jart = { path = "../../../Desktop/jart" }
+serde_json.workspace = true
+dirs = "5"

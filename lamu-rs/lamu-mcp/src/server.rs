@@ -340,6 +340,23 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
     fn loaded_port(&self, model: &str) -> Option<u16> {
         self.state.lock().scheduler.get_loaded(model).map(|m| m.port)
     }
+    async fn generate(&self, model: &str, prompt: &str) -> String {
+        // Route like `council`: a model present in the local registry goes
+        // through the queued/scheduled local path; anything else is treated as
+        // a cloud model. Summarization defaults (low temp, bounded length).
+        let args = json!({
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 1200,
+            "temperature": 0.3,
+        });
+        let is_local = self.state.lock().entries.contains_key(model);
+        if is_local {
+            self.handle_query(args).await
+        } else {
+            crate::cloud::handle_cloud_query(args).await
+        }
+    }
 }
 
 fn initialize_response(id: Option<Value>) -> Value {
