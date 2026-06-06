@@ -2,7 +2,6 @@
 //! Direct port of `lamu/backends/`.
 
 pub mod dflash;
-pub mod fish_speech;
 pub mod llamacpp;
 pub mod megakernel;
 
@@ -26,7 +25,8 @@ pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
         BackendType::Dflash | BackendType::DflashLucebox => {
             Ok(Box::new(dflash::DflashBackend::new()?))
         }
-        BackendType::FishSpeech => Ok(Box::new(fish_speech::FishSpeechBackend::new()?)),
+        // ADR 0023: fish-speech moved to the `lamu-tts` module (registry-resolved).
+        BackendType::FishSpeech => make_registered("fish_speech", entry),
         // ADR 0023: ComfyUI moved to the `lamu-image` module. Core no longer
         // names it — it resolves via the backend registry that the module
         // populates at the composition root. As lamu-tts/lamu-jart land, their

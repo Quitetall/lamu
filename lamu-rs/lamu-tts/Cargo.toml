@@ -1,0 +1,17 @@
+[package]
+name = "lamu-tts"
+version = "0.1.0"
+edition.workspace = true
+
+# TTS MODULE (ADR 0023). Depends on lamu-core; lamu-core never depends on this.
+# Owns the fish-speech backend (engine seam will add dots.tts) + the
+# text_to_speech tool. Module crate: the binary owns the tokio runtime.
+[dependencies]
+lamu-core.workspace = true
+async-trait = "0.1"
+futures-util = "0.3"
+tokio = { workspace = true, features = ["process", "time"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde_json.workspace = true
+tracing.workspace = true
+dirs = "5"

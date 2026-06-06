@@ -233,6 +233,7 @@ async fn main() -> Result<()> {
     // so make_backend can resolve their backend_kind (e.g. "comfyui" →
     // lamu-image). Each module is one register() call at this composition root.
     lamu_image::register();
+    lamu_tts::register();
     // Default to `warn` when RUST_LOG is unset so operationally-relevant
     // warnings (zombie children, dropped thinking blocks, etc.) are
     // visible without the user having to opt in. RUST_LOG=info or debug
