@@ -9,8 +9,10 @@
 //! Frontends (a `lamu research` TUI + the bundled web SPA) drive this tool; they
 //! reuse `jart::tui` / `jart::server` with an in-process summarizer.
 
+mod chat;
 mod deep_research;
 mod research;
+mod session;
 
 /// Register this module's MCP tools into lamu-core (ADR 0023). Call ONCE at the
 /// composition root before serving. Idempotent.
@@ -35,6 +37,13 @@ pub fn register() {
         // Default models are cloud (mimo); ctx.generate enforces routing mode.
         cloud: true,
     });
+    lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
+        name: "research_chat",
+        description: "Ask a follow-up grounded in a deep_research session's studies: retrieves the most relevant papers from the session corpus (embeddings RAG) and answers with [N] citations that resolve to real retrieved papers. Requires a session_id from deep_research.",
+        schema_fn: chat::schema_research_chat,
+        handler: chat::dispatch_research_chat,
+        cloud: true,
+    });
 }
 
 #[cfg(test)]
@@ -42,7 +51,7 @@ mod tests {
     #[test]
     fn register_installs_research_tools() {
         super::register();
-        for name in ["research", "deep_research"] {
+        for name in ["research", "deep_research", "research_chat"] {
             assert!(
                 lamu_core::tools_ext::find_handler(name).is_some(),
                 "register() must install the {name} tool"

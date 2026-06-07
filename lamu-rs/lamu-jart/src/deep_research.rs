@@ -21,8 +21,14 @@ use std::pin::Pin;
 
 const DECOMPOSE_PROMPT: &str =
     "You are planning a literature search. Break the user's research question into \
-     a few focused, non-overlapping sub-questions that together cover it. Reply \
-     with ONLY a JSON array of strings (the sub-questions) and nothing else.";
+     a few focused, non-overlapping SEARCH QUERIES — short keyword phrases of 2-6 \
+     words, NOT questions — that together cover it. LEAD each phrase with the most \
+     specific domain term (e.g. 'EEG', 'seizure') so keyword search and filtering \
+     work; do not start a phrase with a question word like What/How/Which. Reply \
+     with ONLY a JSON array of strings and nothing else. \
+     Example for 'EEG foundation models for seizure detection': \
+     [\"EEG foundation model pretraining\", \"EEG seizure detection deep learning\", \
+     \"EEG transformer cross-subject generalization\"].";
 
 const SYNTH_PROMPT: &str =
     "You are a research assistant writing a grounded briefing. Using ONLY the \
@@ -144,8 +150,19 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
     // 5. Resolve cited [N] → corpus[N-1].link IN CODE (only real, in-range refs).
     let citations = cited_links(&report, &corpus);
 
+    // 6. Open a follow-up chat session: embed the final corpus (best-effort) and
+    //    store it so research_chat can answer grounded in the same studies.
+    let corpus_texts: Vec<String> =
+        corpus.iter().map(|p| format!("{} {}", p.title, p.grounding)).collect();
+    let corpus_embs = match ctx.embed(&corpus_texts).await {
+        Ok(e) if e.len() == corpus.len() => e,
+        _ => Vec::new(),
+    };
+    let session_id = crate::session::put(corpus.clone(), corpus_embs);
+
     json!({
         "query": query,
+        "session_id": session_id,
         "sub_questions": subqs,
         "corpus": corpus_json(&corpus),
         "report": report,
@@ -187,7 +204,7 @@ async fn rank_corpus(ctx: &dyn ToolCtx, query: &str, mut corpus: Vec<Paper>) -> 
 }
 
 /// Cosine similarity; 0 for a zero vector or length mismatch.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
