@@ -46,7 +46,8 @@ pub fn schema_deep_research() -> Value {
             "sub_questions": {"type": "integer", "default": 4, "description": "How many sub-questions to decompose into (1-8)."},
             "limit_per_source": {"type": "integer", "default": 6, "description": "Max items per source per sub-question (1-15)."},
             "decompose_model": {"type": "string", "description": "Model for query decomposition. Defaults to $LAMU_RESEARCH_MODEL, else mimo-v2.5."},
-            "synthesis_model": {"type": "string", "description": "Model for the final cited synthesis. Defaults to $LAMU_RESEARCH_MODEL, else mimo-v2.5."}
+            "synthesis_model": {"type": "string", "description": "Model for the final cited synthesis. Defaults to $LAMU_RESEARCH_MODEL, else mimo-v2.5."},
+            "verify": {"type": "boolean", "default": false, "description": "After synthesis, check each citation: does the cited source actually support the claim? Adds a 'verified' (yes/partial/no) field per citation. One extra model call per citation."}
         },
         "required": ["query"]
     })
@@ -148,7 +149,13 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
     }
 
     // 5. Resolve cited [N] → corpus[N-1].link IN CODE (only real, in-range refs).
-    let citations = cited_links(&report, &corpus);
+    let mut citations = cited_links(&report, &corpus);
+
+    // 5b. Optional per-citation verification: does the cited source actually
+    //     support the claim? (one fast generate per citation, concurrent).
+    if args["verify"].as_bool().unwrap_or(false) && !citations.is_empty() {
+        citations = verify_citations(ctx, &decompose_model, &report, &corpus, citations).await;
+    }
 
     // 6. Open a follow-up chat session: embed the final corpus (best-effort) and
     //    store it so research_chat can answer grounded in the same studies.
@@ -175,6 +182,74 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
 /// Max papers fed to synthesis. Above this, RAG-rank and keep the top-K so the
 /// synthesis prompt stays bounded.
 const MAX_SYNTH: usize = 18;
+
+/// Verify each citation against its source (concurrent). Adds a `verified`
+/// (yes/partial/no/unknown) field. Skips (returns unchanged) if a local verify
+/// model can't load.
+async fn verify_citations(
+    ctx: &dyn ToolCtx,
+    model: &str,
+    report: &str,
+    corpus: &[Paper],
+    citations: Vec<Value>,
+) -> Vec<Value> {
+    if ctx.model_modality(model).is_some() {
+        let s = ctx.ensure_loaded(model).await;
+        if s.trim_start().to_lowercase().starts_with("error:") {
+            return citations;
+        }
+    }
+    let tasks = citations.into_iter().map(|mut c| async move {
+        let idx = c["idx"].as_u64().unwrap_or(0) as usize;
+        if idx < 1 || idx > corpus.len() {
+            return c;
+        }
+        let claim = claim_sentence(report, idx);
+        let src = &corpus[idx - 1];
+        let prompt = format!(
+            "A research briefing states:\n\"{claim}\"\n\nIt cites source [{idx}]:\nTitle: {}\nAbstract: {}\n\nDoes the source support that statement? Answer with exactly one word: yes, partial, or no.",
+            src.title, src.grounding
+        );
+        let verdict = normalize_verdict(&ctx.generate(model, &prompt).await);
+        c["verified"] = json!(verdict);
+        c
+    });
+    futures::future::join_all(tasks).await
+}
+
+/// The sentence (or marker window) in `report` that carries citation `[idx]`.
+fn claim_sentence(report: &str, idx: usize) -> String {
+    let marker = format!("[{idx}]");
+    for sent in report.split_inclusive(['.', '\n']) {
+        if sent.contains(&marker) {
+            return sent.trim().to_string();
+        }
+    }
+    if let Some(pos) = report.find(&marker) {
+        let start = report[..pos].rfind(['.', '\n']).map(|i| i + 1).unwrap_or(0);
+        let end = (pos + marker.len()).min(report.len());
+        return report[start..end].trim().to_string();
+    }
+    String::new()
+}
+
+/// One-word verdict from a verification reply.
+fn normalize_verdict(s: &str) -> &'static str {
+    let l = s.trim().to_lowercase();
+    if l.starts_with("partial") || l.contains("partial") {
+        "partial"
+    } else if l.starts_with("yes") {
+        "yes"
+    } else if l.starts_with("no") {
+        "no"
+    } else if l.contains("not support") || l.contains("does not") || l.contains("unsupported") {
+        "no"
+    } else if l.contains("support") || l.contains("yes") {
+        "yes"
+    } else {
+        "unknown"
+    }
+}
 
 /// Rank the corpus by cosine similarity to the query (embeddings RAG) and keep
 /// the top `MAX_SYNTH`. No-op when the corpus already fits; falls back to the
@@ -369,6 +444,22 @@ mod tests {
     fn cited_links_empty_when_no_citations() {
         let corpus = vec![paper("A", "https://a")];
         assert!(cited_links("No citations in this prose.", &corpus).is_empty());
+    }
+
+    #[test]
+    fn claim_sentence_extracts_the_citing_sentence() {
+        let r = "First point. The model generalizes well [2]. Another thing.";
+        assert_eq!(claim_sentence(r, 2), "The model generalizes well [2].");
+        assert_eq!(claim_sentence(r, 9), ""); // marker absent
+    }
+
+    #[test]
+    fn normalize_verdict_maps_words() {
+        assert_eq!(normalize_verdict("Yes."), "yes");
+        assert_eq!(normalize_verdict("partial"), "partial");
+        assert_eq!(normalize_verdict("No, it does not."), "no");
+        assert_eq!(normalize_verdict("The source does not support this"), "no");
+        assert_eq!(normalize_verdict("hmm unclear"), "unknown");
     }
 
     #[test]
