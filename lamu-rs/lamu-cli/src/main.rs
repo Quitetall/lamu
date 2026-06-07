@@ -19,7 +19,7 @@ use lamu_core::config::{models_dir, registry_path, PORT_MAIN, PORT_SIDECAR};
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
 use lamu_core::scheduler::VramScheduler;
 use lamu_mcp::server::LamuMcpServer;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -38,6 +38,29 @@ enum Command {
     Status,
     /// Boot MCP server (stdio)
     Start,
+    /// Deep research: decompose a question, search HuggingFace/PubMed/bioRxiv/
+    /// Semantic Scholar (+ web when keyed), synthesize a CITED answer, then drop
+    /// into a follow-up chat grounded in the retrieved studies.
+    Research {
+        /// The research question (all trailing words).
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Sub-questions to decompose into.
+        #[arg(long, default_value_t = 4)]
+        sub_questions: u64,
+        /// Items per source per sub-question.
+        #[arg(long, default_value_t = 5)]
+        limit: u64,
+        /// Model override (default $LAMU_RESEARCH_MODEL, else mimo-v2.5).
+        #[arg(long)]
+        model: Option<String>,
+        /// Verify each citation against its cited source.
+        #[arg(long)]
+        verify: bool,
+        /// Skip the interactive follow-up chat.
+        #[arg(long)]
+        no_chat: bool,
+    },
     /// Boot OpenAI-compat HTTP server
     Serve {
         #[arg(short, long, default_value_t = 8020)]
@@ -277,6 +300,9 @@ async fn main() -> Result<()> {
         Some(Command::Scan) => cmd_scan().await,
         Some(Command::Status) => cmd_status().await,
         Some(Command::Start) => cmd_start().await,
+        Some(Command::Research { query, sub_questions, limit, model, verify, no_chat }) => {
+            cmd_research(query.join(" "), sub_questions, limit, model, verify, !no_chat).await
+        }
         Some(Command::Serve { port }) => cmd_serve(port).await,
         Some(Command::Repl { api_url }) => {
             // Themed ratatui chat. chat_tui::run falls back to the
@@ -969,6 +995,14 @@ fn format_status_line(port: u16, health: Option<&Value>, models: Option<&Value>)
 }
 
 async fn cmd_start() -> Result<()> {
+    let server = build_mcp_server().await?;
+    server.run().await
+}
+
+/// Build the MCP server (registry + VRAM scheduler, auto-registering any models
+/// already running on the known ports). Shared by `start` (stdio loop) and
+/// `research` (drives module tools in-process via the server as a `ToolCtx`).
+async fn build_mcp_server() -> Result<LamuMcpServer> {
     let dir = models_dir();
     let path = registry_path();
     let mut scheduler = VramScheduler::new();
@@ -1006,12 +1040,126 @@ async fn cmd_start() -> Result<()> {
         }
     }
 
-    let server = LamuMcpServer::new(dir, path, scheduler)?;
-    server.run().await
+    LamuMcpServer::new(dir, path, scheduler)
 }
 
 async fn cmd_serve(port: u16) -> Result<()> {
     lamu_api::serve(port).await
+}
+
+/// `lamu research <query>` — drive the lamu-jart deep_research orchestrator in
+/// process (the server is the `ToolCtx`), print a cited report, then an
+/// interactive follow-up chat grounded in the same studies. lamu-cli is a
+/// frontend (ADR 0023): it composes the backend + drives the registered tools.
+async fn cmd_research(
+    query: String,
+    sub_questions: u64,
+    limit: u64,
+    model: Option<String>,
+    verify: bool,
+    chat: bool,
+) -> Result<()> {
+    use std::io::Write;
+    // lamu_jart::register() already ran at main(); the server impls ToolCtx.
+    let server = build_mcp_server().await?;
+    let ctx: &dyn lamu_core::tools_ext::ToolCtx = &server;
+
+    let (deep, _) = lamu_core::tools_ext::find_handler("deep_research")
+        .context("deep_research tool not registered")?;
+    let mut args = json!({
+        "query": query,
+        "sub_questions": sub_questions,
+        "limit_per_source": limit,
+        "verify": verify,
+    });
+    if let Some(m) = &model {
+        args["decompose_model"] = json!(m);
+        args["synthesis_model"] = json!(m);
+    }
+    eprintln!("researching “{query}” …");
+    let out = deep(ctx, args).await;
+    let v: Value = serde_json::from_str(&out).map_err(|_| anyhow::anyhow!(out.clone()))?;
+    print_research(&v);
+
+    let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    if !chat || session_id.is_empty() {
+        return Ok(());
+    }
+    let Some((chat_h, _)) = lamu_core::tools_ext::find_handler("research_chat") else {
+        return Ok(());
+    };
+    println!("\n── follow-up chat (blank line or 'exit' to quit) ──");
+    let stdin = std::io::stdin();
+    loop {
+        print!("\nask> ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        let q = line.trim();
+        if q.is_empty() || q == "exit" || q == "quit" {
+            break;
+        }
+        let mut cargs = json!({ "session_id": session_id, "message": q });
+        if let Some(m) = &model {
+            cargs["model"] = json!(m);
+        }
+        let cout = chat_h(ctx, cargs).await;
+        match serde_json::from_str::<Value>(&cout) {
+            Ok(cv) => {
+                println!("\n{}", cv.get("answer").and_then(|a| a.as_str()).unwrap_or(&cout));
+                print_citation_list(&cv);
+            }
+            Err(_) => println!("\n{cout}"),
+        }
+    }
+    Ok(())
+}
+
+/// Print a deep_research result: the cited report, numbered sources, failures.
+fn print_research(v: &Value) {
+    if let Some(facets) = v.get("sub_questions").and_then(|s| s.as_array()) {
+        let list: Vec<&str> = facets.iter().filter_map(|f| f.as_str()).collect();
+        println!("searched: {}", list.join(" · "));
+    }
+    let report = v.get("report").and_then(|r| r.as_str()).unwrap_or("");
+    if report.is_empty() {
+        if let Some(e) = v.get("synthesis_error").and_then(|e| e.as_str()) {
+            println!("\n(no synthesis: {e})");
+        } else if let Some(n) = v.get("note").and_then(|n| n.as_str()) {
+            println!("\n{n}");
+        }
+    } else {
+        println!("\n{report}");
+    }
+    if let Some(corpus) = v.get("corpus").and_then(|c| c.as_array()) {
+        if !corpus.is_empty() {
+            println!("\nSources:");
+            for p in corpus {
+                let idx = p.get("idx").and_then(|i| i.as_u64()).unwrap_or(0);
+                let title = p.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                let link = p.get("link").and_then(|l| l.as_str()).unwrap_or("");
+                let src = p.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                println!("  [{idx}] {title}  ({src})\n        {link}");
+            }
+        }
+    }
+    let failed = v.get("sources_failed").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0);
+    if failed > 0 {
+        println!("\n({failed} source(s) unavailable — e.g. throttled without an API key)");
+    }
+}
+
+/// Print a research_chat answer's citation links.
+fn print_citation_list(cv: &Value) {
+    if let Some(cites) = cv.get("citations").and_then(|c| c.as_array()) {
+        for c in cites {
+            let idx = c.get("idx").and_then(|i| i.as_u64()).unwrap_or(0);
+            let link = c.get("link").and_then(|l| l.as_str()).unwrap_or("");
+            println!("  [{idx}] {link}");
+        }
+    }
 }
 
 // ── Ollama-shaped subcommands ──────────────────────────────────────────────
