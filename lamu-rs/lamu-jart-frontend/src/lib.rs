@@ -83,6 +83,9 @@ mod tests {
         async fn generate(&self, _m: &str, _p: &str) -> String {
             self.gen_out.clone()
         }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+        }
     }
 
     #[tokio::test]

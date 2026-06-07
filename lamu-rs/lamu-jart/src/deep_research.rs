@@ -115,6 +115,11 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
         .to_string();
     }
 
+    // Bound the synthesis context: when the corpus is large, rank by relevance to
+    // the query via embeddings (RAG) and keep the top-K; else use it as-is. On
+    // any embedding failure this falls back to the recency order.
+    let corpus = rank_corpus(ctx, &query, corpus).await;
+
     // 4. Cited synthesis (1 generate). build_grounded_content fences each item as
     //    <source id="N">; the prompt instructs the model to cite [N].
     let items: Vec<String> = corpus
@@ -148,6 +153,48 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
         "sources_failed": sources_failed
     })
     .to_string()
+}
+
+/// Max papers fed to synthesis. Above this, RAG-rank and keep the top-K so the
+/// synthesis prompt stays bounded.
+const MAX_SYNTH: usize = 18;
+
+/// Rank the corpus by cosine similarity to the query (embeddings RAG) and keep
+/// the top `MAX_SYNTH`. No-op when the corpus already fits; falls back to the
+/// existing (recency) order on any embedding failure.
+async fn rank_corpus(ctx: &dyn ToolCtx, query: &str, mut corpus: Vec<Paper>) -> Vec<Paper> {
+    if corpus.len() <= MAX_SYNTH {
+        return corpus;
+    }
+    let mut texts: Vec<String> = Vec::with_capacity(corpus.len() + 1);
+    texts.push(query.to_string());
+    texts.extend(corpus.iter().map(|p| format!("{} {}", p.title, p.grounding)));
+    let embs = match ctx.embed(&texts).await {
+        Ok(e) if e.len() == corpus.len() + 1 => e,
+        _ => {
+            corpus.truncate(MAX_SYNTH); // recency fallback
+            return corpus;
+        }
+    };
+    let q = embs[0].clone();
+    let mut scored: Vec<(f32, Paper)> = corpus
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (cosine(&q, &embs[i + 1]), p))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(MAX_SYNTH).map(|(_, p)| p).collect()
+}
+
+/// Cosine similarity; 0 for a zero vector or length mismatch.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
 }
 
 /// Normalized dedup key for a title (lowercase ascii-alphanumeric, capped).
@@ -305,5 +352,13 @@ mod tests {
     fn cited_links_empty_when_no_citations() {
         let corpus = vec![paper("A", "https://a")];
         assert!(cited_links("No citations in this prose.", &corpus).is_empty());
+    }
+
+    #[test]
+    fn cosine_basics() {
+        assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0); // zero vector
+        assert_eq!(cosine(&[1.0], &[1.0, 1.0]), 0.0); // length mismatch
     }
 }

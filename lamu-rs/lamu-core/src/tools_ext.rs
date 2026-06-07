@@ -31,6 +31,11 @@ pub trait ToolCtx: Send + Sync {
     /// handlers' convention). Lets a module (e.g. lamu-jart) summarize/generate
     /// in-process instead of a self-HTTP round-trip.
     async fn generate(&self, model: &str, prompt: &str) -> String;
+    /// Embed `texts` via the registry's embedding-capable model (e.g. nomic,
+    /// 768-dim). Ensure-loads it and returns one vector per input (same order).
+    /// `Err(msg)` on no embedding model / backend failure. Lets a module
+    /// (e.g. lamu-jart RAG) rank/retrieve without a self-HTTP round-trip.
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
 }
 
 /// Async handler for a module tool. Borrows the ctx for the future's lifetime

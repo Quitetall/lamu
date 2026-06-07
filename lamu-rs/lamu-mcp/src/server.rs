@@ -351,11 +351,70 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
             "temperature": 0.3,
         });
         let is_local = self.state.lock().entries.contains_key(model);
-        if is_local {
-            self.handle_query(args).await
-        } else {
-            crate::cloud::handle_cloud_query(args).await
+        if !is_local {
+            return crate::cloud::handle_cloud_query(args).await;
         }
+        let out = self.handle_query(args.clone()).await;
+        // A reasoning model can emit an all-`<think>` completion and leave the
+        // visible `content` empty (handle_query strips the reasoning). Retry once
+        // with thinking disabled to force visible output. Non-empty output
+        // (including an "error:" string) passes straight through.
+        if !out.trim().is_empty() {
+            return out;
+        }
+        let mut retry = args;
+        retry["enable_thinking"] = json!(false);
+        self.handle_query(retry).await
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        // Resolve the embedding model from the registry (capability Embedding).
+        let name = {
+            let st = self.state.lock();
+            st.entries
+                .values()
+                .find(|e| e.capabilities.contains(&lamu_core::types::Capability::Embedding))
+                .map(|e| e.name.clone())
+        }; // parking_lot guard dropped before any await
+        let Some(name) = name else {
+            return Err("no embedding model in registry — add one with capability 'embedding'".into());
+        };
+        // Ensure loaded + resolve its port.
+        let status = self.ensure_loaded(&name).await;
+        if status.trim_start().to_lowercase().starts_with("error:") {
+            return Err(format!("load embedding model '{name}': {status}"));
+        }
+        let port = self
+            .loaded_port(&name)
+            .ok_or_else(|| format!("embedding model '{name}' is not on a live port"))?;
+        let url = format!("http://localhost:{port}/v1/embeddings");
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .json(&json!({ "model": name, "input": texts }))
+            .send()
+            .await
+            .map_err(|e| format!("embeddings backend: {e}"))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(format!("embeddings backend {s}: {}", resp.text().await.unwrap_or_default()));
+        }
+        let v: Value = resp.json().await.map_err(|e| format!("embeddings non-JSON: {e}"))?;
+        let data = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| "embeddings response missing data[]".to_string())?;
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let emb = item
+                .get("embedding")
+                .and_then(|e| e.as_array())
+                .ok_or_else(|| "embeddings item missing embedding[]".to_string())?;
+            out.push(emb.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect());
+        }
+        Ok(out)
     }
 }
 
