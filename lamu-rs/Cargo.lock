@@ -1888,6 +1888,7 @@ name = "lamu-jart"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "futures",
  "jart",
  "lamu-core",
  "serde_json",

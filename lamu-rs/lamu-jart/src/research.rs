@@ -19,7 +19,7 @@ const SUMMARY_PROMPT: &str =
 
 /// Where jart's Python scrapers live. `JART_SCRAPERS_DIR` overrides; otherwise
 /// the standalone jart checkout's `scrapers/` (this module depends on that repo).
-fn scrapers_dir() -> PathBuf {
+pub(crate) fn scrapers_dir() -> PathBuf {
     if let Ok(p) = std::env::var("JART_SCRAPERS_DIR") {
         if !p.trim().is_empty() {
             return PathBuf::from(p);

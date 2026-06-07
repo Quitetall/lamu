@@ -9,9 +9,10 @@
 //! Frontends (a `lamu research` TUI + the bundled web SPA) drive this tool; they
 //! reuse `jart::tui` / `jart::server` with an in-process summarizer.
 
+mod deep_research;
 mod research;
 
-/// Register this module's MCP tool into lamu-core (ADR 0023). Call ONCE at the
+/// Register this module's MCP tools into lamu-core (ADR 0023). Call ONCE at the
 /// composition root before serving. Idempotent.
 pub fn register() {
     lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
@@ -26,20 +27,30 @@ pub fn register() {
         // tool is usable local-only (summarize=false or a local model).
         cloud: false,
     });
+    lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
+        name: "deep_research",
+        description: "Multi-step research orchestrator: decompose a question into sub-questions, search HuggingFace/PubMed/bioRxiv/Semantic Scholar concurrently per sub-question, merge into an indexed corpus, then synthesize a cited answer (every [N] citation resolves to a real retrieved paper). Returns the corpus, the cited report, the citation→link map, and any failed sources.",
+        schema_fn: deep_research::schema_deep_research,
+        handler: deep_research::dispatch_deep_research,
+        // Default models are cloud (mimo); ctx.generate enforces routing mode.
+        cloud: true,
+    });
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn register_installs_research_tool() {
+    fn register_installs_research_tools() {
         super::register();
-        assert!(
-            lamu_core::tools_ext::find_handler("research").is_some(),
-            "register() must install the research tool"
-        );
-        assert!(
-            lamu_core::tools_ext::list_entries().iter().any(|e| e["name"] == "research"),
-            "research must appear in tools/list"
-        );
+        for name in ["research", "deep_research"] {
+            assert!(
+                lamu_core::tools_ext::find_handler(name).is_some(),
+                "register() must install the {name} tool"
+            );
+            assert!(
+                lamu_core::tools_ext::list_entries().iter().any(|e| e["name"] == name),
+                "{name} must appear in tools/list"
+            );
+        }
     }
 }

@@ -13,3 +13,4 @@ lamu-core.workspace = true
 jart = { path = "../../../Desktop/jart" }
 serde_json.workspace = true
 dirs = "5"
+futures = "0.3"
