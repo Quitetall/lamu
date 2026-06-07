@@ -371,13 +371,17 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        // Resolve the embedding model from the registry (capability Embedding).
-        let name = {
+        // Resolve the embedding model from the registry (capability Embedding)
+        // and clone the pooled HTTP client (reuse the connection pool + the
+        // configured timeout) — both under one short lock, dropped before await.
+        let (name, client) = {
             let st = self.state.lock();
-            st.entries
+            let name = st
+                .entries
                 .values()
                 .find(|e| e.capabilities.contains(&lamu_core::types::Capability::Embedding))
-                .map(|e| e.name.clone())
+                .map(|e| e.name.clone());
+            (name, st.client.clone())
         }; // parking_lot guard dropped before any await
         let Some(name) = name else {
             return Err("no embedding model in registry — add one with capability 'embedding'".into());
@@ -391,7 +395,7 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
             .loaded_port(&name)
             .ok_or_else(|| format!("embedding model '{name}' is not on a live port"))?;
         let url = format!("http://localhost:{port}/v1/embeddings");
-        let resp = reqwest::Client::new()
+        let resp = client
             .post(&url)
             .json(&json!({ "model": name, "input": texts }))
             .send()
