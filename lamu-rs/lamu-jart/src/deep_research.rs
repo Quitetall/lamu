@@ -11,7 +11,7 @@
 //! `feed::load` — the per-provider concurrency cap is enforced inside LAMU, so
 //! the module never reimplements throttling (ADR 0023 / cloud.rs semaphore).
 
-use crate::research::scrapers_dir;
+use crate::research::{default_research_model, scrapers_dir};
 use jart::core::{ai, cache::Cache, config::Topic, feed, model::Paper, ratelimit::Pacer};
 use lamu_core::tools_ext::ToolCtx;
 use serde_json::{json, Value};
@@ -39,8 +39,8 @@ pub fn schema_deep_research() -> Value {
             "query": {"type": "string", "description": "The research question to investigate."},
             "sub_questions": {"type": "integer", "default": 4, "description": "How many sub-questions to decompose into (1-8)."},
             "limit_per_source": {"type": "integer", "default": 6, "description": "Max items per source per sub-question (1-15)."},
-            "decompose_model": {"type": "string", "default": "mimo-v2.5", "description": "Model for query decomposition (a fast, clean model is ideal)."},
-            "synthesis_model": {"type": "string", "default": "mimo-v2.5", "description": "Model for the final cited synthesis (cloud or a clean local model)."}
+            "decompose_model": {"type": "string", "description": "Model for query decomposition. Defaults to $LAMU_RESEARCH_MODEL, else mimo-v2.5."},
+            "synthesis_model": {"type": "string", "description": "Model for the final cited synthesis. Defaults to $LAMU_RESEARCH_MODEL, else mimo-v2.5."}
         },
         "required": ["query"]
     })
@@ -60,8 +60,8 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
     }
     let n_sub = args["sub_questions"].as_u64().unwrap_or(4).clamp(1, 8) as usize;
     let limit = args["limit_per_source"].as_u64().unwrap_or(6).clamp(1, 15) as usize;
-    let decompose_model = args["decompose_model"].as_str().unwrap_or("mimo-v2.5").to_string();
-    let synthesis_model = args["synthesis_model"].as_str().unwrap_or("mimo-v2.5").to_string();
+    let decompose_model = args["decompose_model"].as_str().map(String::from).unwrap_or_else(default_research_model);
+    let synthesis_model = args["synthesis_model"].as_str().map(String::from).unwrap_or_else(default_research_model);
 
     let sdir = scrapers_dir();
     if !sdir.exists() {

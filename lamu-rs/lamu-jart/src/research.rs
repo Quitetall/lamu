@@ -30,6 +30,18 @@ pub(crate) fn scrapers_dir() -> PathBuf {
         .join("Desktop/jart/scrapers")
 }
 
+/// Default model for research summarization/synthesis. `LAMU_RESEARCH_MODEL`
+/// overrides — set it to a local registry model (e.g. the installed
+/// `tongyi-deepresearch-30b-a3b`) to keep research fully local; otherwise the
+/// cloud workhorse. The chosen model is loaded on demand (ensure_loaded), so a
+/// cold local model just costs a one-time load.
+pub(crate) fn default_research_model() -> String {
+    std::env::var("LAMU_RESEARCH_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "mimo-v2.5".to_string())
+}
+
 /// JSON schema for the `research` MCP tool.
 pub fn schema_research() -> Value {
     json!({
@@ -38,7 +50,7 @@ pub fn schema_research() -> Value {
             "query": {"type": "string", "description": "Topic/search query (used as both the HuggingFace and PubMed search term)."},
             "limit": {"type": "integer", "default": 8, "description": "Max items per source (1-25)."},
             "summarize": {"type": "boolean", "default": true, "description": "Summarize the results in-process via the model below."},
-            "model": {"type": "string", "default": "mimo-v2.5", "description": "Model for the summary — a local registry model or a cloud model (honors routing mode)."}
+            "model": {"type": "string", "description": "Model for the summary — a local registry model or a cloud model (honors routing mode). Defaults to $LAMU_RESEARCH_MODEL, else mimo-v2.5."}
         },
         "required": ["query"]
     })
@@ -60,7 +72,7 @@ pub async fn handle_research(ctx: &dyn ToolCtx, args: Value) -> String {
     }
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
     let summarize = args["summarize"].as_bool().unwrap_or(true);
-    let model = args["model"].as_str().unwrap_or("mimo-v2.5").to_string();
+    let model = args["model"].as_str().map(String::from).unwrap_or_else(default_research_model);
 
     let sdir = scrapers_dir();
     if !sdir.exists() {

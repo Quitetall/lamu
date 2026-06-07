@@ -49,6 +49,29 @@ models:
       Largest model that fits the 4090. MoE A3B = 3B active params per token,
       ~102 t/s on bee config. 35B knowledge at 3B speeds. 22.2 GB → 2.4 GB
       headroom; no parallel CUDA work while loaded.
+  tongyi-deepresearch-30b-a3b:
+    path: /home/brianklam/models/tongyi-deepresearch-30b-a3b/Alibaba-NLP_Tongyi-DeepResearch-30B-A3B-Q4_K_M.gguf
+    format: gguf
+    backend: llama_cpp
+    arch: qwen3moe
+    params_b: 30.5
+    quant: Q4_K_M
+    vram_mb: 20000
+    context_max: 131072
+    capabilities:
+    - chat
+    - reasoning
+    - long_context
+    reasoning_marker:
+      open_tag: <think>
+      close_tag: </think>
+      family: qwen35
+    status: recommended
+    notes: |
+      Alibaba Tongyi DeepResearch — 30B-A3B MoE (3B active), agentic
+      deep-research model. Local default for the lamu-jart research +
+      deep_research tools (LAMU_RESEARCH_MODEL=tongyi-deepresearch-30b-a3b).
+      18.6 GB Q4_K_M; fits the 4090 with KV headroom. No dflash draft yet.
   gemma-4-26b-a4b-it-q4_k_m:
     path: /home/brianklam/models/gemma-4-26b-gguf/gemma-4-26B-A4B-it-Q4_K_M.gguf
     format: gguf
