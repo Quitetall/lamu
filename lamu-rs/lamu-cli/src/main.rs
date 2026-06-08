@@ -42,9 +42,15 @@ enum Command {
     /// Semantic Scholar (+ web when keyed), synthesize a CITED answer, then drop
     /// into a follow-up chat grounded in the retrieved studies.
     Research {
-        /// The research question (all trailing words).
-        #[arg(required = true, num_args = 1..)]
+        /// The research question (all trailing words). Omit with --tui/--web.
+        #[arg(num_args = 0..)]
         query: Vec<String>,
+        /// Open jart's graphical TUI (topic feed + AI summaries), LAMU-backed.
+        #[arg(long)]
+        tui: bool,
+        /// Open jart's web SPA in the browser, LAMU-backed.
+        #[arg(long)]
+        web: bool,
         /// Sub-questions to decompose into.
         #[arg(long, default_value_t = 4)]
         sub_questions: u64,
@@ -300,8 +306,17 @@ async fn main() -> Result<()> {
         Some(Command::Scan) => cmd_scan().await,
         Some(Command::Status) => cmd_status().await,
         Some(Command::Start) => cmd_start().await,
-        Some(Command::Research { query, sub_questions, limit, model, verify, no_chat }) => {
-            cmd_research(query.join(" "), sub_questions, limit, model, verify, !no_chat).await
+        Some(Command::Research { query, tui, web, sub_questions, limit, model, verify, no_chat }) => {
+            if tui || web {
+                // Graphical frontend: jart's TUI / web SPA, LAMU-backed summarizer.
+                let server = std::sync::Arc::new(build_mcp_server().await?);
+                let model = model.unwrap_or_else(default_research_model);
+                lamu_jart_frontend::run_graphical(server, model, web).await
+            } else if query.is_empty() {
+                anyhow::bail!("provide a research question, or use --tui / --web for the graphical frontend");
+            } else {
+                cmd_research(query.join(" "), sub_questions, limit, model, verify, !no_chat).await
+            }
         }
         Some(Command::Serve { port }) => cmd_serve(port).await,
         Some(Command::Repl { api_url }) => {
@@ -1045,6 +1060,15 @@ async fn build_mcp_server() -> Result<LamuMcpServer> {
 
 async fn cmd_serve(port: u16) -> Result<()> {
     lamu_api::serve(port).await
+}
+
+/// Default research/summary model: `$LAMU_RESEARCH_MODEL`, else cloud `mimo-v2.5`.
+/// (Mirrors lamu-jart's resolver for the graphical-frontend path.)
+fn default_research_model() -> String {
+    std::env::var("LAMU_RESEARCH_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "mimo-v2.5".to_string())
 }
 
 /// `lamu research <query>` — drive the lamu-jart deep_research orchestrator in

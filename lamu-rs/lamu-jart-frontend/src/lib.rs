@@ -9,8 +9,81 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use jart::core::ai::{build_grounded_content, Summarizer};
+use jart::core::cache::Cache;
+use jart::core::config::Config;
+use jart::core::ratelimit::Pacer;
+use jart::server::{router, AppState};
+use jart::tui::{self, TuiConfig};
 use lamu_core::tools_ext::ToolCtx;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// jart's Python scrapers dir. `JART_SCRAPERS_DIR` overrides; else the jart
+/// checkout's `scrapers/`. (lamu-jart-frontend can't read jart's
+/// `CARGO_MANIFEST_DIR`, so it resolves the standalone checkout.)
+fn scrapers_dir() -> PathBuf {
+    jart_path("JART_SCRAPERS_DIR", "scrapers")
+}
+/// jart's built web SPA dir. `JART_DIST_DIR` overrides; else the checkout's
+/// `frontend/dist/`.
+fn dist_dir() -> PathBuf {
+    jart_path("JART_DIST_DIR", "frontend/dist")
+}
+fn jart_path(env_key: &str, rel: &str) -> PathBuf {
+    if let Some(p) = std::env::var_os(env_key).filter(|s| !s.is_empty()) {
+        return PathBuf::from(p);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Desktop/jart")
+        .join(rel)
+}
+
+/// Run jart's GRAPHICAL frontend (the ratatui TUI, or the bundled web SPA when
+/// `web`) wired to a LAMU-backed [`LamuSummarizer`] — so the "Summarize with AI"
+/// feature generates IN-PROCESS via `ctx.generate` instead of a self-HTTP round
+/// trip. Mirrors `jart::cli::run`'s setup but injects the LAMU summarizer at
+/// jart's `Arc<dyn Summarizer>` seam. `model` is the summary model (local or
+/// cloud; routed by `ctx.generate`).
+pub async fn run_graphical<C: ToolCtx + 'static>(
+    ctx: Arc<C>,
+    model: String,
+    web: bool,
+) -> Result<()> {
+    let cfg = Config::load(None);
+    let ai: Arc<dyn Summarizer> = Arc::new(LamuSummarizer::new(ctx, model));
+    let scrapers = scrapers_dir();
+    let dist = dist_dir();
+    let cache = Arc::new(Cache::new());
+    let pacer = Arc::new(Pacer::new());
+    let topics = cfg.topics();
+    let addr = format!("127.0.0.1:{}", cfg.web_port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let web_url = format!("http://{addr}");
+
+    // Web server in the background for both modes (TUI's `w` key + `--web`).
+    let state = AppState {
+        scrapers_dir: scrapers.clone(),
+        topics: topics.clone(),
+        ai: ai.clone(),
+        dist_dir: dist,
+        cache: cache.clone(),
+        pacer: pacer.clone(),
+    };
+    let server = router(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, server).await;
+    });
+
+    if web {
+        let _ = std::process::Command::new("xdg-open").arg(&web_url).spawn();
+        println!("jart web GUI (LAMU-backed) on {web_url}  (Ctrl-C to stop)");
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
+    }
+    tui::run(TuiConfig { scrapers_dir: scrapers, topics, ai, web_url, cache, pacer }).await
+}
 
 /// jart [`Summarizer`] backed by an in-process [`ToolCtx`] (a running
 /// `LamuMcpServer`). Generic over the ctx so it is unit-testable with a fake and

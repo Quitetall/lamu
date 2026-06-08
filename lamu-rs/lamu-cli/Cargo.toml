@@ -21,6 +21,7 @@ lamu-api = { path = "../lamu-api" }
 lamu-image = { path = "../lamu-image" }
 lamu-tts = { path = "../lamu-tts" }
 lamu-jart = { path = "../lamu-jart" }
+lamu-jart-frontend = { path = "../lamu-jart-frontend" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
