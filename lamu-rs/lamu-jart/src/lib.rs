@@ -13,6 +13,7 @@ mod chat;
 mod deep_research;
 mod research;
 mod session;
+mod web_search;
 
 /// Register this module's MCP tools into lamu-core (ADR 0023). Call ONCE at the
 /// composition root before serving. Idempotent.
@@ -44,6 +45,14 @@ pub fn register() {
         handler: chat::dispatch_research_chat,
         cloud: true,
     });
+    lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
+        name: "web_search",
+        description: "General keyless web search via a self-hosted SearXNG instance (metasearch over many engines). Pure retrieval — no model call — so a local model (or the agent) can look facts up instead of answering from memory. Returns title/url/snippet/engine per result. Configurable via $SEARXNG_URL (default http://127.0.0.1:8888).",
+        schema_fn: web_search::schema_web_search,
+        handler: web_search::dispatch_web_search,
+        // Pure retrieval, no model + no provider key — safe under local-only.
+        cloud: false,
+    });
 }
 
 #[cfg(test)]
@@ -51,7 +60,7 @@ mod tests {
     #[test]
     fn register_installs_research_tools() {
         super::register();
-        for name in ["research", "deep_research", "research_chat"] {
+        for name in ["research", "deep_research", "research_chat", "web_search"] {
             assert!(
                 lamu_core::tools_ext::find_handler(name).is_some(),
                 "register() must install the {name} tool"
