@@ -313,7 +313,11 @@ async fn main() -> Result<()> {
                 let model = model.unwrap_or_else(default_research_model);
                 lamu_jart_frontend::run_graphical(server, model, web).await
             } else if query.is_empty() {
-                anyhow::bail!("provide a research question, or use --tui / --web for the graphical frontend");
+                // Bare `lamu research` → the interactive orchestrator TUI
+                // (query box → cited answer → follow-up chat).
+                let server = std::sync::Arc::new(build_mcp_server().await?);
+                let model = model.unwrap_or_else(default_research_model);
+                lamu_jart_frontend::run_orchestrator_tui(server, model).await
             } else {
                 cmd_research(query.join(" "), sub_questions, limit, model, verify, !no_chat).await
             }

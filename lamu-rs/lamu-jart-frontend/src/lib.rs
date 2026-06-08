@@ -6,6 +6,9 @@
 //! summarize through LAMU's scheduler + routing. The `lamu research` TUI and the
 //! bundled web SPA come in later phases.
 
+mod orchestrator;
+pub use orchestrator::run_orchestrator_tui;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use jart::core::ai::{build_grounded_content, Summarizer};
