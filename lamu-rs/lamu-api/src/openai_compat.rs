@@ -587,9 +587,21 @@ async fn chat_completions(
         scheduler.mark_used(&model_name);
     }
 
-    let messages_json: Vec<Value> = req.messages.iter()
-        .map(|m| json!({"role": m.role, "content": m.content}))
-        .collect();
+    // Grounding default: if the caller supplied no system message, prepend the
+    // configured default (built-in: "look facts up, don't answer from memory").
+    // Local models have strong reasoning but limited world knowledge; this
+    // nudges them to use the search/research tools. Overridable per request
+    // (send your own system message) or globally (~/.config/lamu/system_prompt.txt).
+    let has_system = req.messages.iter().any(|m| m.role.eq_ignore_ascii_case("system"));
+    let mut messages_json: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    if !has_system {
+        if let Some(sys) = lamu_core::config::default_system_prompt() {
+            messages_json.push(json!({"role": "system", "content": sys}));
+        }
+    }
+    messages_json.extend(
+        req.messages.iter().map(|m| json!({"role": m.role, "content": m.content})),
+    );
 
     // Merge the per-model sampling profile (if any) with the request's
     // sampler values. Precedence: locked profile field > request value >

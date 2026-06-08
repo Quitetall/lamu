@@ -36,6 +36,46 @@ pub fn registry_path() -> PathBuf {
     lamu_root().join("config").join("models.yaml")
 }
 
+/// Built-in grounding system prompt. A local model has strong reasoning but
+/// limited / possibly-stale world knowledge, so by default it should LOOK THINGS
+/// UP (the `web_search` / `research` tools) rather than answer factual questions
+/// from parametric memory. Applied to a chat request that carries no system
+/// message of its own; a request with its own system message is left untouched.
+pub const GROUNDING_SYSTEM_PROMPT: &str = "You are a capable reasoning assistant running locally. Your built-in world knowledge is limited and may be outdated or wrong, so do NOT answer factual questions from memory — names, dates, numbers, current events, prices, library/API details, who-said-or-did-what. Instead use the available search/research tools to look them up, and ground your answer in what you actually find, with sources. If you cannot look something up and are not sure, say so plainly rather than guessing. Your reasoning, math, coding, and analysis of information you've been given are strong — use them freely.";
+
+fn system_prompt_override_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|c| c.join("lamu").join("system_prompt.txt"))
+}
+
+/// Pure resolver (testable). Precedence: `LAMU_DISABLE_GROUNDING_PROMPT` set →
+/// `None` (clean context, for eval/structured-output callers); else an override
+/// file at `path` — its trimmed contents, or `None` if blank (explicit disable);
+/// else the built-in [`GROUNDING_SYSTEM_PROMPT`].
+fn resolve_system_prompt(path: Option<&std::path::Path>) -> Option<String> {
+    if std::env::var_os("LAMU_DISABLE_GROUNDING_PROMPT").is_some() {
+        return None;
+    }
+    if let Some(p) = path {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let t = s.trim();
+            return if t.is_empty() { None } else { Some(t.to_string()) };
+        }
+    }
+    Some(GROUNDING_SYSTEM_PROMPT.to_string())
+}
+
+/// The default system prompt applied to a chat request that omits one. Override
+/// the text in `~/.config/lamu/system_prompt.txt`; make that file empty (or set
+/// `LAMU_DISABLE_GROUNDING_PROMPT`) to disable. Cached on first call — the
+/// override file is read once, so restart to change it (it's config, not a hot
+/// value), keeping the per-request serve path allocation-free.
+pub fn default_system_prompt() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| resolve_system_prompt(system_prompt_override_path().as_deref()))
+        .clone()
+}
+
 /// Root of the user's `llama.cpp` checkout. Resolution order:
 ///
 ///   1. `$LAMU_LLAMACPP_DIR` env var (explicit override).
@@ -176,6 +216,25 @@ mod tests {
     // Other test binaries in the workspace are separate processes,
     // so the lock only needs to cover this module.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn grounding_resolver_precedence() {
+        let _g = ENV_LOCK.lock().unwrap(); // resolver reads LAMU_DISABLE_GROUNDING_PROMPT
+        // Absent override file -> the built-in grounding default.
+        let p = resolve_system_prompt(None).expect("absent file -> built-in default");
+        assert_eq!(p, GROUNDING_SYSTEM_PROMPT);
+        assert!(p.contains("look") || p.contains("search"), "must nudge lookups");
+        assert!(p.to_lowercase().contains("memory") || p.to_lowercase().contains("knowledge"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("system_prompt.txt");
+        // Custom file -> its trimmed contents.
+        std::fs::write(&f, "  custom house rules  ").unwrap();
+        assert_eq!(resolve_system_prompt(Some(&f)).as_deref(), Some("custom house rules"));
+        // Blank file -> disabled (None).
+        std::fs::write(&f, "   \n").unwrap();
+        assert_eq!(resolve_system_prompt(Some(&f)), None);
+    }
 
     #[test]
     fn ports_distinct() {
