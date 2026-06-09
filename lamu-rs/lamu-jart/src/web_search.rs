@@ -53,43 +53,42 @@ pub async fn handle_web_search(args: Value) -> String {
     }
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
     let categories = args["categories"].as_str().unwrap_or("general");
-    let base = searxng_url();
 
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
-        Ok(c) => c,
-        Err(e) => return format!("error: http client: {e}"),
-    };
+    match searxng_search(&query, limit, categories).await {
+        Ok(results) => json!({"query": query, "count": results.len(), "results": results}).to_string(),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Run one SearXNG query and return up to `limit` parsed results
+/// ({title,url,snippet,engine}). Shared by the `web_search` tool and the
+/// agentic `answer` loop. Err string on transport / non-200 / parse failure.
+pub(crate) async fn searxng_search(
+    query: &str,
+    limit: usize,
+    categories: &str,
+) -> Result<Vec<Value>, String> {
+    let base = searxng_url();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
     let resp = client
         .get(format!("{}/search", base.trim_end_matches('/')))
-        .query(&[("q", query.as_str()), ("format", "json"), ("categories", categories)])
+        .query(&[("q", query), ("format", "json"), ("categories", categories)])
         .send()
-        .await;
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            return format!(
-                "error: SearXNG unreachable at {base} ({e}) — is the container up? set SEARXNG_URL to override."
-            )
-        }
-    };
+        .await
+        .map_err(|e| {
+            format!("SearXNG unreachable at {base} ({e}) — is the container up? set SEARXNG_URL to override.")
+        })?;
     if !resp.status().is_success() {
-        return format!(
-            "error: SearXNG HTTP {} (JSON format may be disabled — settings.yml search.formats must include 'json')",
+        return Err(format!(
+            "SearXNG HTTP {} (JSON format may be disabled — settings.yml search.formats must include 'json')",
             resp.status().as_u16()
-        );
+        ));
     }
-    let body: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => return format!("error: parse SearXNG response: {e}"),
-    };
-
-    let results = parse_results(&body, limit);
-    json!({
-        "query": query,
-        "count": results.len(),
-        "results": results,
-    })
-    .to_string()
+    let body: Value = resp.json().await.map_err(|e| format!("parse SearXNG response: {e}"))?;
+    Ok(parse_results(&body, limit))
 }
 
 /// Extract the top-`limit` results into a compact shape. Pure over the parsed

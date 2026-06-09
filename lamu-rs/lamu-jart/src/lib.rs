@@ -9,6 +9,7 @@
 //! Frontends (a `lamu research` TUI + the bundled web SPA) drive this tool; they
 //! reuse `jart::tui` / `jart::server` with an in-process summarizer.
 
+mod answer;
 mod chat;
 mod deep_research;
 mod research;
@@ -53,6 +54,14 @@ pub fn register() {
         // Pure retrieval, no model + no provider key — safe under local-only.
         cloud: false,
     });
+    lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
+        name: "answer",
+        description: "Answer a question with agentic web grounding: the model first decides whether facts need looking up, runs SearXNG searches if so, then answers using ONLY the retrieved sources with [N] citations that resolve to real URLs. Pure-reasoning questions skip the search. Honors routing mode via the chosen model.",
+        schema_fn: answer::schema_answer,
+        handler: answer::dispatch_answer,
+        // May summarize with a cloud model by default (ctx.generate enforces routing).
+        cloud: true,
+    });
 }
 
 #[cfg(test)]
@@ -60,7 +69,7 @@ mod tests {
     #[test]
     fn register_installs_research_tools() {
         super::register();
-        for name in ["research", "deep_research", "research_chat", "web_search"] {
+        for name in ["research", "deep_research", "research_chat", "web_search", "answer"] {
             assert!(
                 lamu_core::tools_ext::find_handler(name).is_some(),
                 "register() must install the {name} tool"
