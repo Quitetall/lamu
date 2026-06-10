@@ -1219,12 +1219,16 @@ async fn stream_response(
                         yield Ok(Event::default().data("[DONE]"));
                         return;
                     }
+                    // Report the backend's real finish_reason (length/tool_calls/
+                    // content_filter), not a hardcoded "stop" — else streaming
+                    // clients can't detect truncation or tool calls.
+                    let fr = if finish_reason.is_empty() { "stop" } else { finish_reason.as_str() };
                     let done_chunk = json!({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": fr}]
                     });
                     yield Ok(Event::default().data(done_chunk.to_string()));
                     // ADR 0021: emit a usage chunk with the occupancy block when
@@ -1254,6 +1258,23 @@ async fn stream_response(
                 if let Some(u) = val.get("usage") {
                     if let Some(pt) = u.get("prompt_tokens").and_then(|v| v.as_u64()) { prompt_tokens = pt; }
                     if let Some(ct) = u.get("completion_tokens").and_then(|v| v.as_u64()) { comp_tokens = ct; }
+                }
+                // Forward streamed tool_call deltas verbatim. The content-only
+                // extraction below would `continue` past them, silently eating a
+                // tool-calling completion (the client then gets an empty stream
+                // ending finish_reason "stop"). Mark output seen so the
+                // empty-backend gate doesn't fire on a tool-only completion.
+                if let Some(tc) = val.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta")).and_then(|d| d.get("tool_calls"))
+                    .filter(|tc| !tc.is_null())
+                {
+                    any_content = true;
+                    let tc_chunk = json!({
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0, "delta": {"tool_calls": tc}, "finish_reason": Value::Null}]
+                    });
+                    yield Ok(Event::default().data(tc_chunk.to_string()));
                 }
                 let Some(token) = val.get("choices").and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
@@ -1331,12 +1352,13 @@ async fn stream_response(
             yield Ok(Event::default().data("[DONE]"));
             return;
         }
+        let fr = if finish_reason.is_empty() { "stop" } else { finish_reason.as_str() };
         let done_chunk = json!({
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_name,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            "choices": [{"index": 0, "delta": {}, "finish_reason": fr}]
         });
         yield Ok(Event::default().data(done_chunk.to_string()));
         yield Ok(Event::default().data("[DONE]"));
