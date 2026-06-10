@@ -485,15 +485,18 @@ impl LamuMcpServer {
         // pick_backend_port skips ports held by Loaded/Loading models;
         // port-0 (this in-flight entry, just mark_loading'd) is ignored.
         // See commit c219449 for the is_empty() collision it replaces.
+        // Exclude PORT_MAIN (the canonical `lamu serve` HTTP port) — a fresh MCP
+        // must never pick the serve port for a backend, or its identity-blind
+        // health poll could confirm a model onto lamu-api's listener.
         let port: u16 = {
             let st = self.state.lock();
-            lamu_core::loader::pick_backend_port(&st.scheduler, None)
+            lamu_core::loader::pick_backend_port(&st.scheduler, Some(lamu_core::config::PORT_MAIN))
         }
         // m10: refuse rather than spawn onto an occupied port when all candidate
         // ports are taken. (This precedes mark_loading, so nothing to roll back.)
         .unwrap_or(0);
         if port == 0 {
-            return "error: no free backend port available (all candidate ports 8000-8009 occupied)".to_string();
+            return "error: no free backend port available (8001-8009 all occupied; 8020 reserved for `lamu serve`)".to_string();
         }
 
         // Construct the right Backend for this entry. The Backend impl

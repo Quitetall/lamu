@@ -451,7 +451,15 @@ impl Backend for LlamaCppBackend {
                     )));
                 }
             }
-            if self.is_healthy().await {
+            // Identity-anchored accept: /health "ok" alone is not enough — a
+            // FOREIGN server on this port (e.g. lamu-api, which returns exactly
+            // {"status":"ok"} on /health) would otherwise satisfy the poll while
+            // our child is still binding, aliasing the model onto another
+            // server's port. Require /props too — a llama.cpp-server endpoint
+            // lamu-api does NOT implement (404). If a foreign server holds the
+            // port, the poll keeps waiting until our child binds (and answers
+            // /props) or exits (caught by try_wait above).
+            if self.is_healthy().await && self.confirm_props().await {
                 // Warmup: one-token completion so cuBLAS / cuDNN
                 // handles + kv slot are JIT-compiled before the user's
                 // first real prompt. Otherwise TTFT for the first
@@ -633,6 +641,20 @@ impl Backend for LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
+    /// Confirm the server answering on our port is a llama.cpp server (a `/props`
+    /// 200), not another process that merely returns `/health: ok`. lamu-api
+    /// returns exactly `{"status":"ok"}` on `/health` but has no `/props` (404),
+    /// so this is the discriminator that prevents binding a model onto lamu-api's
+    /// port (PORT_MAIN) and silently serving the wrong model. Used only at
+    /// load-confirm time (not the ongoing health poll).
+    async fn confirm_props(&self) -> bool {
+        let url = format!("http://localhost:{}/props", self.port);
+        matches!(
+            self.client.get(&url).timeout(Duration::from_secs(2)).send().await,
+            Ok(r) if r.status().is_success()
+        )
+    }
+
     /// Query actual VRAM usage via NVML PID lookup.
     pub fn get_vram_mb(&self, scheduler: &VramScheduler) -> u32 {
         let Some(p) = self.proc.as_ref() else { return 0 };
