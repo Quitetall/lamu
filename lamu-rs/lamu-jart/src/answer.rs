@@ -151,13 +151,24 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
     // Resolve [N] → sources[N-1].url IN CODE.
     let citations = cited_urls(&answer, &sources);
 
+    // Auto-save the draft (markdown) so no research is lost — best-effort.
+    let sources_j = sources_json(&sources);
+    let saved_to = crate::drafts::save_draft(
+        "answer",
+        &question,
+        &answer,
+        &sources_j,
+        &[("model", model.clone())],
+    );
+
     json!({
         "question": question,
         "searched": queries,
-        "sources": sources_json(&sources),
+        "sources": sources_j,
         "answer": answer,
         "citations": citations,
         "grounded": true,
+        "saved_to": saved_to,
         "search_failed": search_failed,
     })
     .to_string()

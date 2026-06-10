@@ -12,6 +12,7 @@
 mod answer;
 mod chat;
 mod deep_research;
+mod drafts;
 mod research;
 mod session;
 mod web_search;

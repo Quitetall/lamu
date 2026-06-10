@@ -167,11 +167,22 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
     };
     let session_id = crate::session::put(corpus.clone(), corpus_embs);
 
+    // Auto-save the draft (markdown) so no research is lost — best-effort.
+    let corpus_j = corpus_json(&corpus);
+    let saved_to = crate::drafts::save_draft(
+        "deep_research",
+        &query,
+        &report,
+        &corpus_j,
+        &[("model", synthesis_model.clone()), ("session", session_id.clone())],
+    );
+
     json!({
         "query": query,
         "session_id": session_id,
+        "saved_to": saved_to,
         "sub_questions": subqs,
-        "corpus": corpus_json(&corpus),
+        "corpus": corpus_j,
         "report": report,
         "citations": citations,
         "sources_failed": sources_failed
