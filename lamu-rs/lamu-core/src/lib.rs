@@ -18,6 +18,10 @@ pub mod media_paths;
 /// modules contribute MCP tools without a lamu-mcp dependency.
 pub mod tools_ext;
 pub mod cookbook;
+/// Shared SearXNG retrieval + prompt-injection sanitization (ADR audit B7):
+/// one keyless metasearch backend + `sanitize_field` for both lamu-jart's
+/// `web_search`/`answer` and lamu-api's auto-grounding.
+pub mod web_search;
 pub mod error;
 pub mod health;
 pub mod backends;

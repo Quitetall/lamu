@@ -12,7 +12,8 @@
 //! for a needless search.
 
 use crate::research::default_research_model;
-use crate::web_search::searxng_search;
+use lamu_core::web_search::searxng_search;
+use std::time::Duration;
 use jart::core::ai::build_grounded_content;
 use lamu_core::tools_ext::ToolCtx;
 use serde_json::{json, Value};
@@ -101,19 +102,26 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
         .to_string();
     }
 
-    // 2. SEARCH — merge + dedup by URL.
+    // 2. SEARCH — fan the queries out concurrently, then merge + dedup by URL.
+    // Per-query order is preserved (join_all keeps input order), so dedup is
+    // deterministic regardless of which network round-trip finishes first.
+    let hits_per_q = futures::future::join_all(
+        queries
+            .iter()
+            .map(|q| searxng_search(q, per_q, "general", Duration::from_secs(20))),
+    )
+    .await;
     let mut sources: Vec<Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut search_failed: Vec<Value> = Vec::new();
-    for q in &queries {
-        match searxng_search(q, per_q, "general").await {
-            Ok(results) => {
-                for r in results {
-                    let url = r["url"].as_str().unwrap_or("").to_string();
-                    if url.is_empty() || !seen.insert(url) {
+    for (q, res) in queries.iter().zip(hits_per_q) {
+        match res {
+            Ok(hits) => {
+                for h in hits {
+                    if h.url.is_empty() || !seen.insert(h.url.clone()) {
                         continue;
                     }
-                    sources.push(r);
+                    sources.push(h.to_json());
                 }
             }
             Err(e) => search_failed.push(json!({"query": q, "error": e})),
