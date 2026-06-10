@@ -352,6 +352,19 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
         });
         let is_local = self.state.lock().entries.contains_key(model);
         if !is_local {
+            // Enforce routing at the capability seam (the trait contract promises
+            // generate honors routing mode). The dispatcher's static per-tool
+            // `cloud` flag can't express "depends on the model arg" — without
+            // this check a module tool flagged cloud:false (e.g. `research` with
+            // its default cloud summary model) would leak to the cloud under
+            // local-only. Frontends that drive handlers directly (cmd_research)
+            // inherit the gate here for free.
+            if self.routing_mode.lock().await.as_str() == "local-only" {
+                return format!(
+                    "error: routing mode is 'local-only' — cloud model '{model}' refused. \
+                     Call set_routing_mode(mode='auto') to re-enable."
+                );
+            }
             return crate::cloud::handle_cloud_query(args).await;
         }
         let out = self.handle_query(args.clone()).await;

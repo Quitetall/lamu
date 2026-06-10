@@ -37,15 +37,19 @@ pub fn register() {
         description: "Multi-step research orchestrator: decompose a question into sub-questions, search HuggingFace/PubMed/bioRxiv/Semantic Scholar concurrently per sub-question, merge into an indexed corpus, then synthesize a cited answer (every [N] citation resolves to a real retrieved paper). Returns the corpus, the cited report, the citation→link map, and any failed sources.",
         schema_fn: deep_research::schema_deep_research,
         handler: deep_research::dispatch_deep_research,
-        // Default models are cloud (mimo); ctx.generate enforces routing mode.
-        cloud: true,
+        // Model-dependent: default model is cloud (mimo) but a local model works
+        // too. ctx.generate enforces routing per-model (refuses a cloud model
+        // under local-only), so the static gate must NOT statically refuse this
+        // tool — otherwise a local-model deep_research is over-blocked.
+        cloud: false,
     });
     lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
         name: "research_chat",
         description: "Ask a follow-up grounded in a deep_research session's studies: retrieves the most relevant papers from the session corpus (embeddings RAG) and answers with [N] citations that resolve to real retrieved papers. Requires a session_id from deep_research.",
         schema_fn: chat::schema_research_chat,
         handler: chat::dispatch_research_chat,
-        cloud: true,
+        // Model-dependent — ctx.generate enforces routing per-model.
+        cloud: false,
     });
     lamu_core::tools_ext::register_tool(lamu_core::tools_ext::ModuleTool {
         name: "web_search",
@@ -60,8 +64,8 @@ pub fn register() {
         description: "Answer a question with agentic web grounding: the model first decides whether facts need looking up, runs SearXNG searches if so, then answers using ONLY the retrieved sources with [N] citations that resolve to real URLs. Pure-reasoning questions skip the search. Honors routing mode via the chosen model.",
         schema_fn: answer::schema_answer,
         handler: answer::dispatch_answer,
-        // May summarize with a cloud model by default (ctx.generate enforces routing).
-        cloud: true,
+        // Model-dependent — ctx.generate enforces routing per-model.
+        cloud: false,
     });
 }
 
