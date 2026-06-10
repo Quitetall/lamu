@@ -186,30 +186,59 @@ pub fn save_api_key_env(var: &str, val: &str) -> std::io::Result<PathBuf> {
 /// missing-file would be surprising. The lamu-cli TUI uses `load()` (in
 /// lamu-cli) which seeds the file when missing.
 pub fn load_or_empty() -> Vec<CloudModel> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+    // Cache the parsed list, invalidated on file mtime — this is called on every
+    // cloud_query / council member / routing_status, and re-reading + YAML-
+    // parsing the (potentially 300+-row) catalog per call is blocking IO on a
+    // tokio worker. The mtime check preserves the only reason it re-read: picking
+    // up edits made by `lamu cloud sync` / the TUI without a restart.
+    static CACHE: OnceLock<Mutex<Option<(SystemTime, Vec<CloudModel>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    // Recover from a poisoned lock rather than panicking — a re-parse is cheaper
+    // than bricking every later cloud call.
+    let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
+
     let path = config_path();
-    let body = match std::fs::read_to_string(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if let Some(mt) = mtime {
+        if let Some((cmt, cached)) = lock().as_ref() {
+            if *cmt == mt {
+                return cached.clone();
+            }
+        }
+    }
+
+    // On a read/parse failure return an empty list, but still cache it (against
+    // the file's mtime) so a corrupt cloud-models.yaml doesn't re-parse +
+    // eprintln on every cloud call until it's fixed.
+    let models = match std::fs::read_to_string(&path) {
+        Ok(body) => match serde_yaml::from_str::<CloudModelList>(&body) {
+            Ok(l) => l.models,
+            Err(e) => {
+                eprintln!(
+                    "lamu: cloud-models.yaml is corrupt at {} ({}); using empty list.",
+                    path.display(),
+                    e
+                );
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => {
             eprintln!(
                 "lamu: cloud-models.yaml read failed at {} ({}); using empty list.",
                 path.display(),
                 e
             );
-            return Vec::new();
-        }
-    };
-    match serde_yaml::from_str::<CloudModelList>(&body) {
-        Ok(l) => l.models,
-        Err(e) => {
-            eprintln!(
-                "lamu: cloud-models.yaml is corrupt at {} ({}); using empty list.",
-                path.display(),
-                e
-            );
             Vec::new()
         }
+    };
+    if let Some(mt) = mtime {
+        *lock() = Some((mt, models.clone()));
     }
+    models
 }
 
 /// Write the cloud-model list to `config_path()` as YAML, creating the parent
