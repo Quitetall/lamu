@@ -590,7 +590,7 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "scan_models",
-        description: "Re-scan disk for new models.",
+        description: "Re-scan the models dir and REWRITE the registry (merging discovered GGUFs with curated fields — main/speculative/sampling/notes preserved; a .bak is written first). Use after adding model files.",
         schema_fn: schema_empty_object,
         handler: HandlerKind::Stateful(dispatch_scan),
         cloud: false,

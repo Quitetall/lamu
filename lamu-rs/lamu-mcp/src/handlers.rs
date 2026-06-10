@@ -10,7 +10,7 @@ use lamu_core::backends::{make_backend, Backend};
 use lamu_core::observability::{emit, new_trace_id, trace_id_from_traceparent};
 use lamu_core::queue::{QueueRequest, Strategy as QueueStrategy};
 use lamu_core::reasoning::get_extractor;
-use lamu_core::registry::{scan_directory, write_registry};
+use lamu_core::registry::{merge_registry, scan_directory, write_registry};
 use lamu_core::types::{Capability, ModelEntry};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -1005,9 +1005,27 @@ impl LamuMcpServer {
 
     pub(crate) fn handle_scan(&self) -> String {
         let mut st = self.state.lock();
-        let entries = match scan_directory(&st.models_dir) {
+        let discovered = match scan_directory(&st.models_dir) {
             Ok(e) => e,
             Err(e) => return format!("error: scan: {}", e),
+        };
+        // Merge with the in-memory registry so operator-curated fields (main,
+        // speculative/DFlash, sampling, notes, status, reasoning_marker,
+        // context_max) survive the re-scan instead of being overwritten with
+        // scan defaults — mirrors cmd_scan. The CLI path was fixed; this MCP
+        // tool was the last destructive writer.
+        let existing: Vec<_> = st.entries.values().cloned().collect();
+        let existing_n = existing.len();
+        let entries = merge_registry(existing, discovered);
+        // One-deep backup before the rewrite: an unmounted/empty models dir
+        // scans to zero entries and would otherwise clobber the curated registry
+        // with no recovery.
+        let bak = st.registry_path.with_extension("yaml.bak");
+        // Best-effort backup; report it honestly (the first-ever scan has no
+        // file to copy, so don't claim a .bak that wasn't written).
+        let bak_msg = match std::fs::copy(&st.registry_path, &bak) {
+            Ok(_) => format!(" Backup at {}.", bak.display()),
+            Err(_) => String::new(),
         };
         if let Err(e) = write_registry(&entries, &st.registry_path) {
             return format!("error: write registry: {}", e);
@@ -1015,8 +1033,9 @@ impl LamuMcpServer {
         st.entries = entries.iter().map(|e| (e.name.clone(), e.clone())).collect();
         st.router.update_registry(entries.clone());
         format!(
-            "Scanned {}: {} models found. Registry updated.",
-            st.models_dir.display(), entries.len()
+            "Scanned {}: {} models (merged with {} existing — curated fields preserved). \
+             Registry rewritten.{}",
+            st.models_dir.display(), entries.len(), existing_n, bak_msg
         )
     }
 }
