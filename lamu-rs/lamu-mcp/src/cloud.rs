@@ -479,10 +479,22 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         }
     };
 
+    // A reasoning model can burn its whole token budget inside <think> and
+    // return empty visible content (finish=length, content=""). Flag that as an
+    // error — mirrors the local-path m19 fix (handlers.rs) — so the council
+    // quorum / judge, the review pipeline, autocapture, and conversation memory
+    // don't treat an empty turn as a real answer.
+    let result = if result.trim().is_empty() {
+        "error: cloud model returned empty content (reasoning truncated mid-think)".to_string()
+    } else {
+        result
+    };
+
     // Persist to conversation memory if conversation_id was set.
     // Best-effort: a memory failure must not fail the query — the
-    // model already produced a reply, the user wants it.
-    if !conv_id.is_empty() {
+    // model already produced a reply, the user wants it. Skip on the empty/error
+    // result so a non-answer never lands as an assistant turn.
+    if !conv_id.is_empty() && !result.starts_with("error:") {
         if let Ok(mem) = crate::memory::shared() {
             let meta = format!("model={}", model_name);
             if let Err(e) = mem.append_turns(
