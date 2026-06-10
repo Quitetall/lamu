@@ -590,32 +590,61 @@ fn format_search_grounding(hits: &[(String, String, String)]) -> Option<String> 
 /// `None` on any transport/parse failure or no results — a SearXNG outage must
 /// degrade to a normal (ungrounded) answer, never break the chat request.
 async fn searxng_grounding(client: &reqwest::Client, query: &str, limit: usize) -> Option<String> {
-    let base = searxng_base();
-    let resp = client
-        .get(format!("{}/search", base.trim_end_matches('/')))
-        .query(&[("q", query), ("format", "json"), ("categories", "general")])
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    // 60s TTL cache keyed on the normalized query. An agent loop re-sends the
+    // same history every turn, re-firing the identical search and re-paying the
+    // round-trip on TTFT; cache the result (misses too, so a SearXNG outage
+    // doesn't re-stall for 3s on every turn).
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = query.trim().to_lowercase();
+    {
+        let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|_, (t, _)| t.elapsed().as_secs() < 60);
+        if let Some((_, v)) = g.get(&key) {
+            return v.clone();
+        }
     }
-    let body: Value = resp.json().await.ok()?;
-    let hits: Vec<(String, String, String)> = body["results"]
-        .as_array()?
-        .iter()
-        .filter_map(|r| {
-            let url = r["url"].as_str()?.to_string();
-            Some((
-                r["title"].as_str().unwrap_or("").to_string(),
-                r["content"].as_str().unwrap_or("").to_string(),
-                url,
-            ))
-        })
-        .take(limit)
-        .collect();
-    format_search_grounding(&hits)
+
+    // Short timeout: grounding is best-effort and on the TTFT path, so a slow
+    // SearXNG must not add seconds to the turn (it degrades to ungrounded).
+    let result: Option<String> = async {
+        let base = searxng_base();
+        let resp = client
+            .get(format!("{}/search", base.trim_end_matches('/')))
+            .query(&[("q", query), ("format", "json"), ("categories", "general")])
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: Value = resp.json().await.ok()?;
+        let hits: Vec<(String, String, String)> = body["results"]
+            .as_array()?
+            .iter()
+            .filter_map(|r| {
+                let url = r["url"].as_str()?.to_string();
+                Some((
+                    r["title"].as_str().unwrap_or("").to_string(),
+                    r["content"].as_str().unwrap_or("").to_string(),
+                    url,
+                ))
+            })
+            .take(limit)
+            .collect();
+        format_search_grounding(&hits)
+    }
+    .await;
+
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (Instant::now(), result.clone()));
+    result
 }
 
 async fn chat_completions(
@@ -701,9 +730,11 @@ async fn chat_completions(
     }
     // Phase 3 (opt-in, LAMU_AUTO_GROUND): web-search the last user turn and
     // inject the results so the model answers grounded. Best-effort — a search
-    // failure leaves the turn untouched. The request's own `tools` (if any) are
-    // left alone; this is the no-function-calling RAG-inject path.
-    if auto_ground_enabled() {
+    // failure leaves the turn untouched. Skip entirely when the request carries
+    // its own `tools`: a tool-calling client can search on its own, and the
+    // injected sources would just bloat the prompt / fight the tool loop.
+    let req_has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    if auto_ground_enabled() && !req_has_tools {
         if let Some(last_user) = req.messages.iter().rev().find(|m| m.role.eq_ignore_ascii_case("user")) {
             let q = last_user.content.trim();
             // Skip trivial turns (greetings, "thanks", "go on") that don't need a
