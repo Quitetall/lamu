@@ -347,6 +347,15 @@ impl LamuMcpServer {
             None => return "error: missing 'name' argument".into(),
         };
 
+        // GPU exclusive-lock gate: refuse while lamu-train (or another exclusive
+        // holder) owns the card. handle_query checks this, but the load/evict/
+        // spawn path did not — an explicit load_model (or a module tool's
+        // ensure_loaded) would spawn a multi-GB llama-server mid-training-run and
+        // risk OOMing it. Check before any plan/evict/spawn work.
+        if let Err(e) = lamu_core::scheduler_lock::check_unlocked() {
+            return format!("error: {e}");
+        }
+
         // Routing-mode gate: refuse under 'cloud-only'. set_routing_mode
         // ('cloud-only') drains backends + frees VRAM precisely so the
         // GPU is available for other work; letting load_model re-spawn a

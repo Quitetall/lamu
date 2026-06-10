@@ -104,6 +104,14 @@ pub async fn ensure_loaded(
     health: &Arc<Mutex<HealthRegistry>>,
     http_serve_port: Option<u16>,
 ) -> Result<LoadedModel> {
+    // GPU exclusive-lock gate: refuse while lamu-train (or another exclusive
+    // holder) owns the card. This is the single chokepoint for every HTTP spawn
+    // path — lamu-api chat / anthropic-stream / ollama-stream / /v1/embeddings
+    // all funnel through here, and only non-stream chat_completions checked the
+    // lock before. Even an already-loaded model would run inference on the GPU,
+    // so gate at the entry. (Test paths use `ensure_loaded_with` directly and
+    // are unaffected.)
+    crate::scheduler_lock::check_unlocked()?;
     // Clone for the async spawn closure; `scheduler` itself moves into
     // `ensure_loaded_with` below.
     let sched_for_spawn = scheduler.clone();
