@@ -170,18 +170,25 @@ pub(crate) fn openai_key() -> Option<String> {
     std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty())
 }
 
+/// Pooled embeddings client (no default timeout — set per request). A fresh
+/// Client per embed meant a new TLS handshake to api.openai.com on every
+/// remember/recall/supersede — this reuses one connection pool. Shared with
+/// memory::recall_ranked (same destination) so there's exactly one pool.
+pub(crate) fn embed_client() -> &'static reqwest::Client {
+    static EMBED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    EMBED_CLIENT.get_or_init(reqwest::Client::new)
+}
+
 /// POST a single string to OpenAI's `/embeddings` endpoint. Returns
 /// the 1536-dim vector for text-embedding-3-small.
 pub(crate) async fn embed_one(text: &str, key: &str) -> Result<Vec<f32>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
     let body = json!({
         "model": EMBED_MODEL,
         "input": text,
     });
-    let resp = client
+    let resp = embed_client()
         .post("https://api.openai.com/v1/embeddings")
+        .timeout(std::time::Duration::from_secs(60))
         .bearer_auth(key)
         .json(&body)
         .send()
@@ -200,17 +207,15 @@ pub(crate) async fn embed_one(text: &str, key: &str) -> Result<Vec<f32>> {
 /// Batch-embed many strings. OpenAI accepts an `input` array up to
 /// 2048 items per call. We cap at 96 for safety + smaller payloads.
 async fn embed_batch(texts: &[String], key: &str) -> Result<Vec<Vec<f32>>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
     let mut all = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(96) {
         let body = json!({
             "model": EMBED_MODEL,
             "input": chunk,
         });
-        let resp = client
+        let resp = embed_client()
             .post("https://api.openai.com/v1/embeddings")
+            .timeout(std::time::Duration::from_secs(120))
             .bearer_auth(key)
             .json(&body)
             .send()

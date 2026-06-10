@@ -333,11 +333,6 @@ pub async fn recall_ranked(
 
     // Embed the query + each prior turn. Reuse the rag module's
     // helpers via a thin shim: build the same payload it builds.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| anyhow::anyhow!(e))?;
-
     let mut texts: Vec<String> = Vec::with_capacity(total + 1);
     texts.push(query.to_string());
     for t in &all {
@@ -348,8 +343,11 @@ pub async fn recall_ranked(
         "model": "text-embedding-3-small",
         "input": texts,
     });
-    let resp = client
+    // Pooled client (one shared pool to api.openai.com) with a per-request
+    // timeout — see rag::embed_client.
+    let resp = crate::rag::embed_client()
         .post("https://api.openai.com/v1/embeddings")
+        .timeout(std::time::Duration::from_secs(60))
         .bearer_auth(&key)
         .json(&body)
         .send()

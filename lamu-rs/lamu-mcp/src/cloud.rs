@@ -297,11 +297,18 @@ pub(crate) async fn handle_cloud_query(args: Value) -> String {
         }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build() {
-        Ok(c) => c,
-        Err(e) => return format!("error: client init: {e}"),
+    // Pooled, process-global client: a fresh Client per call meant a new
+    // DNS+TCP+TLS handshake (and a new connection pool) on every cloud_query /
+    // review-ensemble / council / deep_research-verify call. Reuse one so HTTP
+    // keep-alive + the pool actually work across fan-outs.
+    let client = {
+        static CLOUD_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        CLOUD_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("cloud reqwest client init")
+        })
     };
 
     let result: String = if is_anthropic {
