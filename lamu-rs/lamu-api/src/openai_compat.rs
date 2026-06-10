@@ -1170,6 +1170,15 @@ async fn stream_response(
                 return;
             }
         };
+        // Backend HTTP error (reqwest returns Ok for 4xx/5xx) — surface the real
+        // message (e.g. context-overflow 400) instead of letting the empty-body
+        // path emit a generic backend_returned_empty (M1, but for streaming).
+        if !resp.status().is_success() {
+            let msg = backend_error_message(resp).await;
+            yield Ok(Event::default().data(json!({"error": {"type":"backend_error","message": msg}}).to_string()));
+            yield Ok(Event::default().data("[DONE]"));
+            return;
+        }
 
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -1377,6 +1386,33 @@ fn finish_reason_of(val: &Value) -> Option<&str> {
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("finish_reason"))
         .and_then(|v| v.as_str())
+}
+
+/// Read a non-2xx backend response body and extract the actionable error message
+/// (mirrors the non-stream M1 fix), so the streaming bridges surface e.g.
+/// "maximum context length exceeded" instead of the generic
+/// backend_returned_empty — a deterministic 400 must not look retriable.
+/// Consumes the response.
+async fn backend_error_message(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message").and_then(|m| m.as_str()).or_else(|| e.as_str()))
+                // Truncate — a broken/adversarial backend mustn't dump a multi-MB
+                // string into the client stream (matches the fallback's cap).
+                .map(|m| m.chars().take(1024).collect::<String>())
+        })
+        .unwrap_or_else(|| {
+            let snip: String = body.trim().chars().take(300).collect();
+            if snip.is_empty() {
+                format!("backend HTTP {}", status.as_u16())
+            } else {
+                format!("backend HTTP {}: {}", status.as_u16(), snip)
+            }
+        })
 }
 
 /// Empty-backend gate for the streaming paths. True when the backend
@@ -2228,6 +2264,13 @@ async fn stream_response_anthropic(
                 return;
             }
         };
+        // Backend HTTP error → surface the real message as an Anthropic error event.
+        if !resp.status().is_success() {
+            let msg = backend_error_message(resp).await;
+            let err = json!({"type":"error","error":{"type":"backend_error","message": msg}});
+            yield Ok(Event::default().event("error").data(err.to_string()));
+            return;
+        }
 
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -2680,6 +2723,13 @@ async fn stream_response_ollama(
                 return;
             }
         };
+        // Backend HTTP error → surface the real message as an Ollama error line.
+        if !resp.status().is_success() {
+            let msg = backend_error_message(resp).await;
+            let err = json!({"error": msg});
+            yield Ok::<_, std::io::Error>(format!("{}\n", err).into_bytes());
+            return;
+        }
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut out_tokens: u64 = 0;
