@@ -778,7 +778,14 @@ impl LamuMcpServer {
     }
 
     pub(crate) async fn handle_set_routing_mode(&self, args: Value) -> String {
-        let mode = args["mode"].as_str().unwrap_or("auto").to_string();
+        // Distinguish missing/malformed from a valid value: this handler mutates
+        // GLOBAL routing state, so coercing a non-string/absent `mode` to "auto"
+        // would silently flip the server OUT of cloud-only (re-enabling local GPU
+        // loads the operator deliberately disabled) while reporting success.
+        let Some(mode) = args.get("mode").and_then(|v| v.as_str()) else {
+            return "error: 'mode' must be a string: auto | local-only | cloud-only".into();
+        };
+        let mode = mode.to_string();
         if !matches!(mode.as_str(), "auto" | "local-only" | "cloud-only") {
             return format!("error: mode must be 'auto', 'local-only', or 'cloud-only' (got '{}')", mode);
         }
