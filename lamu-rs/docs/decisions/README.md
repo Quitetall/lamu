@@ -65,6 +65,10 @@ grep -l 'Supersedes 0005' decisions/
 | [0018](./0018-multi-user-per-token-identity.md) | Multi-user — per-token identity, per-user memory namespacing, quotas | Accepted |
 | [0019](./0019-cloud-model-catalog-sync.md) | Cloud-model catalog auto-sync from OpenRouter + per-provider /v1/models | Accepted |
 | [0020](./0020-scale-testing-strategy.md) | Scale-testing strategy — ignore-gated harness tiers; HTTP has no request queue (single-flight is load-only) | Accepted |
+| [0021](./0021-context-occupancy-and-self-compaction.md) | Un-fakeable context-occupancy signal and self-compaction tools | Accepted |
+| [0022](./0022-http-serving-baseline.md) | First HTTP serving micro-baseline (warm, short, single-model) | Accepted |
+| [0023](./0023-module-architecture.md) | Backend / module / frontend architecture | Accepted |
+| [0024](./0024-mcp-serial-dispatch-loop.md) | MCP dispatch loop stays serial; concurrency lives in tools and the per-model queue | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.

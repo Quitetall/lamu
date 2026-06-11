@@ -190,6 +190,10 @@ impl LamuMcpServer {
             let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let params = request.get("params").cloned().unwrap_or(Value::Null);
 
+            // Serial by design (ADR 0024): one request is fully handled
+            // before the next line is read. Concurrency lives inside tools
+            // (parallel_query, council) and at the per-model RequestQueue —
+            // do not tokio::spawn here without superseding that ADR.
             let response = self.handle(method, params, id.clone()).await;
 
             // Notifications (no id) → no response
