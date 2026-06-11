@@ -378,7 +378,10 @@ async fn resolve_and_ensure_loaded(
     state: &AppState,
     model_req: Option<&str>,
     principal: Option<&Principal>, // m23: attribute failure-path metrics to the real user
-) -> std::result::Result<(u16, String, Option<ReasoningMarker>, Option<SamplingProfile>), Response> {
+) -> std::result::Result<
+    (u16, String, Option<ReasoningMarker>, Option<SamplingProfile>, Option<String>),
+    Response,
+> {
     let decision = {
         let scheduler = state.scheduler.lock();
         let router = state.router.lock();
@@ -463,7 +466,21 @@ async fn resolve_and_ensure_loaded(
     let entry = state.entries.get(&decision.model_name).cloned();
     let marker = entry.as_ref().and_then(|e| e.reasoning_marker.clone());
     let sampling = entry.as_ref().and_then(|e| e.sampling.clone());
-    Ok((port, decision.model_name, marker, sampling))
+    let system_prompt = entry.as_ref().and_then(|e| e.system_prompt.clone());
+    Ok((port, decision.model_name, marker, sampling, system_prompt))
+}
+
+/// Default system prompt for a chat that carries no system message of its
+/// own. Precedence: per-model `system_prompt` (registry) > global default
+/// (~/.config/lamu/system_prompt.txt / built-in grounding prompt). A blank
+/// per-model value explicitly disables ANY default for that model —
+/// mirroring the global file's blank-disables rule.
+fn effective_system_prompt(per_model: Option<&str>) -> Option<String> {
+    match per_model.map(str::trim) {
+        Some("") => None,
+        Some(s) => Some(s.to_string()),
+        None => lamu_core::config::default_system_prompt(),
+    }
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
@@ -665,7 +682,7 @@ async fn chat_completions(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body_json)).into_response();
     }
 
-    let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
+    let (port, model_name, marker, sampling, per_model_sys) = match resolve_and_ensure_loaded(
         &state,
         req.model.as_deref(),
         principal_ref,
@@ -682,12 +699,13 @@ async fn chat_completions(
     // Grounding default: if the caller supplied no system message, prepend the
     // configured default (built-in: "look facts up, don't answer from memory").
     // Local models have strong reasoning but limited world knowledge; this
-    // nudges them to use the search/research tools. Overridable per request
-    // (send your own system message) or globally (~/.config/lamu/system_prompt.txt).
+    // nudges them to use the search/research tools. Precedence: request's own
+    // system message > per-model `system_prompt` (registry) > global
+    // (~/.config/lamu/system_prompt.txt) > built-in.
     let has_system = req.messages.iter().any(|m| m.role.eq_ignore_ascii_case("system"));
     let mut messages_json: Vec<Value> = Vec::with_capacity(req.messages.len() + 2);
     if !has_system {
-        if let Some(sys) = lamu_core::config::default_system_prompt() {
+        if let Some(sys) = effective_system_prompt(per_model_sys.as_deref()) {
             messages_json.push(json!({"role": "system", "content": sys}));
         }
     }
@@ -2140,7 +2158,7 @@ async fn stream_response_anthropic(
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
 ) -> Response {
-    let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
+    let (port, model_name, marker, sampling, _per_model_sys) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
         None, // stream fns have no Principal; failure metrics attribute to "anon"
@@ -2645,7 +2663,7 @@ async fn stream_response_ollama(
     repeat_penalty: Option<f32>,
     enable_thinking: Option<bool>,
 ) -> Response {
-    let (port, model_name, marker, sampling) = match resolve_and_ensure_loaded(
+    let (port, model_name, marker, sampling, _per_model_sys) = match resolve_and_ensure_loaded(
         &state,
         model_req.as_deref(),
         None, // stream fns have no Principal; failure metrics attribute to "anon"
@@ -2822,6 +2840,23 @@ mod compat_tests {
         let t = sanitize_field(&long, 50);
         assert_eq!(t.chars().count(), 51); // 50 + the '…' marker
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn effective_system_prompt_precedence() {
+        // Per-model text wins over the global default (trimmed).
+        assert_eq!(
+            effective_system_prompt(Some("  house rules  ")).as_deref(),
+            Some("house rules")
+        );
+        // Blank per-model value explicitly disables ANY default.
+        assert_eq!(effective_system_prompt(Some("")), None);
+        assert_eq!(effective_system_prompt(Some("   \n")), None);
+        // No per-model value -> exactly the global default.
+        assert_eq!(
+            effective_system_prompt(None),
+            lamu_core::config::default_system_prompt()
+        );
     }
 
     #[test]

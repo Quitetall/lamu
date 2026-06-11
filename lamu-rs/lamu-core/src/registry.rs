@@ -303,6 +303,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
                 format: ModelFormat::Safetensors,
                 backend: BackendType::LlamaCpp,
                 backend_kind: None,
+                system_prompt: None,
                 arch: "unknown".to_string(),
                 params_b: 0.0,
                 quant: "fp16".to_string(),
@@ -368,6 +369,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             format: ModelFormat::Gguf,
             backend: BackendType::LlamaCpp,
             backend_kind: None,
+            system_prompt: None,
             arch,
             params_b,
             quant,
@@ -483,6 +485,8 @@ struct ModelEntryYaml {
     status: crate::types::ModelStatus,
     #[serde(default, skip_serializing_if = "crate::types::Modality::is_llm")]
     modality: crate::types::Modality,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
@@ -508,6 +512,7 @@ impl From<ModelEntry> for ModelEntryYaml {
             notes: e.notes,
             status: e.status,
             modality: e.modality,
+            system_prompt: e.system_prompt,
         }
     }
 }
@@ -534,6 +539,7 @@ impl ModelEntryYaml {
             notes: self.notes,
             status: self.status,
             modality: self.modality,
+            system_prompt: self.system_prompt,
         }
     }
 }
@@ -568,6 +574,9 @@ pub fn merge_registry(existing: Vec<ModelEntry>, discovered: Vec<ModelEntry>) ->
                 // Curated dispatch override (ADR 0026): operator-set wins;
                 // a scan never sets it, so fall back to the discovered value.
                 d.backend_kind = o.backend_kind.or(d.backend_kind);
+                // Same .or() shape: curated wins, scan value (today always
+                // None) survives only when the operator never set one.
+                d.system_prompt = o.system_prompt.or(d.system_prompt);
                 d.reasoning_marker = o.reasoning_marker.or(d.reasoning_marker);
                 if d.context_max == 0 {
                     d.context_max = o.context_max;
@@ -823,6 +832,7 @@ mod tests {
             format: ModelFormat::Gguf,
             backend: BackendType::LlamaCpp,
             backend_kind: None,
+            system_prompt: None,
             arch: "qwen3".into(),
             params_b: 7.0,
             quant: "Q4_K_M".into(),
@@ -856,6 +866,34 @@ mod tests {
         assert_eq!(custom.backend_kind.as_deref(), Some("comfyui"));
         let plain = loaded.iter().find(|e| e.name == "plain").unwrap();
         assert_eq!(plain.backend_kind, None);
+    }
+
+    #[test]
+    fn system_prompt_roundtrips_multiline_and_absent_stays_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        let mut with_sp = sample_entry("prompted", Path::new("/m/p.gguf"));
+        // Newlines + quotes — YAML escaping must survive the round-trip.
+        with_sp.system_prompt = Some("You are \"jart\".\nCite sources.\n  Keep indent.".into());
+        let without = sample_entry("plain", Path::new("/m/q.gguf"));
+        write_registry(&[with_sp.clone(), without], &reg).expect("write");
+        let yaml = std::fs::read_to_string(&reg).unwrap();
+        assert_eq!(yaml.matches("system_prompt").count(), 1, "absent must not serialize:\n{yaml}");
+        let loaded = load_registry(&reg).expect("load");
+        let p = loaded.iter().find(|e| e.name == "prompted").unwrap();
+        assert_eq!(p.system_prompt, with_sp.system_prompt, "multiline prompt must survive YAML");
+        assert_eq!(loaded.iter().find(|e| e.name == "plain").unwrap().system_prompt, None);
+    }
+
+    #[test]
+    fn merge_registry_preserves_system_prompt() {
+        let p = Path::new("/m/sp.gguf");
+        let mut old = sample_entry("sp", p);
+        old.system_prompt = Some("house rules".into());
+        let disc = sample_entry("sp", p); // scan never sets system_prompt
+        let merged = merge_registry(vec![old], vec![disc]);
+        assert_eq!(merged[0].system_prompt.as_deref(), Some("house rules"),
+            "re-scan must not strip the curated per-model prompt");
     }
 
     #[test]

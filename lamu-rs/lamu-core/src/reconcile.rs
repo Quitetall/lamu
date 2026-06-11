@@ -222,6 +222,7 @@ mod tests {
             notes: String::new(),
             status: ModelStatus::Unspecified,
             modality: Modality::Llm,
+            system_prompt: None,
         }
     }
 

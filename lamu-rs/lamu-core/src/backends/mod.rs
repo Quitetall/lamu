@@ -505,6 +505,7 @@ mod tests {
             notes: String::new(),
             status: Default::default(),
             modality: Default::default(),
+            system_prompt: None,
         }
     }
 

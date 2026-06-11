@@ -357,10 +357,12 @@ mod tests {
             arch: "qwen35".into(), params_b: 1.0, quant: "Q4".into(),
             vram_mb: 8000, context_max: 4096,
             capabilities: vec![lamu_core::types::Capability::Chat],
+            backend_kind: None,
             reasoning_marker: None, speculative: None, sampling: None,
             pinned: false, main: false, notes: String::new(),
             status: lamu_core::types::ModelStatus::default(),
             modality: lamu_core::types::Modality::Llm,
+            system_prompt: None,
         };
         scheduler.register_loaded(entry, Some(1), 8020, 8000);
         m.refresh(&scheduler, &health_reg(), None);

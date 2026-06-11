@@ -353,6 +353,15 @@ pub struct ModelEntry {
     /// Drives VRAM eviction tiering + text_to_speech routing.
     #[serde(default)]
     pub modality: Modality,
+    /// Optional per-model system prompt. Precedence on the chat path:
+    /// a request's own system message wins outright; absent that, this
+    /// value (when set) replaces the global default
+    /// (~/.config/lamu/system_prompt.txt / built-in grounding prompt).
+    /// A blank/whitespace value explicitly disables ANY default prompt
+    /// for this model (mirrors the global file's blank-disables rule).
+    /// Curated: preserved across `lamu scan` like sampling/notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 /// Operator-curated status tag for a model. Stored in the YAML registry
