@@ -70,15 +70,14 @@ pub async fn handle_research_chat(ctx: &dyn ToolCtx, args: Value) -> String {
     let content = ai::build_grounded_content(&instruction, &items);
 
     if ctx.model_modality(&model).is_some() {
-        let status = ctx.ensure_loaded(&model).await;
-        if status.trim_start().to_lowercase().starts_with("error:") {
-            return format!("error: load model '{model}': {status}");
+        if let Err(e) = ctx.ensure_loaded(&model).await {
+            return format!("error: load model '{model}': {e}");
         }
     }
-    let answer = ctx.generate(&model, &content).await;
-    if answer.trim_start().to_lowercase().starts_with("error:") {
-        return format!("error: {answer}");
-    }
+    let answer = match ctx.generate(&model, &content).await {
+        Ok(s) => s,
+        Err(e) => return format!("error: {e}"),
+    };
 
     // Citations resolve against the RANKED subset (the numbered sources shown).
     let citations = cited_links(&answer, &ranked);

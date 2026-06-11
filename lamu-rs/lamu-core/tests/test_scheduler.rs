@@ -23,6 +23,8 @@ fn mk_entry(name: &str, vram: u32, modality: Modality) -> ModelEntry {
         notes: String::new(),
         status: ModelStatus::Unspecified,
         modality,
+        backend_kind: None,
+        system_prompt: None,
     }
 }
 

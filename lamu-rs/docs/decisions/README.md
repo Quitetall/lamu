@@ -71,6 +71,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0024](./0024-mcp-serial-dispatch-loop.md) | MCP dispatch loop stays serial; concurrency lives in tools and the per-model queue | Accepted |
 | [0025](./0025-registry-out-of-work-tree.md) | Live model registry moves to the user data dir, out of the git work tree | Accepted |
 | [0026](./0026-backend-kind-string-dispatch.md) | `backend_kind` string dispatch key + composition-root drift test | Accepted |
+| [0027](./0027-typed-toolctx-error-seam.md) | Typed `ToolCtxError` at the ToolCtx seam; "error:" strings stay wire-only | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.

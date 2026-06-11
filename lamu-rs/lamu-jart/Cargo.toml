@@ -14,4 +14,5 @@ jart = { path = "../../../Desktop/jart" }
 serde_json.workspace = true
 dirs = "5"
 futures = "0.3"
+tracing.workspace = true
 reqwest = { version = "0.12", features = ["json"] }

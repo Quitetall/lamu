@@ -111,38 +111,33 @@ impl<C: ToolCtx + 'static> Summarizer for LamuSummarizer<C> {
         let content = build_grounded_content(prompt, items);
 
         // A LOCAL registry model must be loaded before generate — handle_query
-        // does NOT auto-load a cold model (it returns "error: model ... not
-        // loaded"). `model_modality` is Some only for local models; cloud models
-        // are routed by `generate` and need no load.
+        // does NOT auto-load a cold model. `model_modality` is Some only for
+        // local models; cloud models are routed by `generate` and need no load.
         if self.ctx.model_modality(&self.model).is_some() {
-            let status = self.ctx.ensure_loaded(&self.model).await;
-            // handle_load_model returns "error: ..." (with colon) on failure;
-            // key on the colon to match generate's convention.
-            if status.trim_start().to_lowercase().starts_with("error:") {
-                return Err(anyhow!("load model '{}': {status}", self.model));
+            if let Err(e) = self.ctx.ensure_loaded(&self.model).await {
+                return Err(anyhow!("load model '{}': {e}", self.model));
             }
         }
 
-        let out = self.ctx.generate(&self.model, &content).await;
-        // ToolCtx convention: an "error:"-prefixed string is a failure (matches
-        // the server's is_error check, which keys on the colon).
-        if out.trim_start().to_lowercase().starts_with("error:") {
-            return Err(anyhow!(out));
-        }
-        Ok(out)
+        // ADR 0027: the seam is typed — Err carries the failure message.
+        self.ctx
+            .generate(&self.model, &content)
+            .await
+            .map_err(|e| anyhow!("{e}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamu_core::tools_ext::ToolCtxError;
     use lamu_core::types::Modality;
 
-    /// Fake ToolCtx: toggle local-vs-cloud, load success, and the generate output.
+    /// Fake ToolCtx: toggle local-vs-cloud, load success, and the generate result.
     struct FakeCtx {
         local: bool,
         load_ok: bool,
-        gen_out: String,
+        gen_out: std::result::Result<String, String>,
     }
 
     #[async_trait]
@@ -150,16 +145,27 @@ mod tests {
         fn model_modality(&self, _m: &str) -> Option<Modality> {
             self.local.then_some(Modality::Llm)
         }
-        async fn ensure_loaded(&self, _m: &str) -> String {
-            if self.load_ok { "loaded".into() } else { "error: out of VRAM".into() }
+        async fn ensure_loaded(&self, _m: &str) -> std::result::Result<String, ToolCtxError> {
+            if self.load_ok {
+                Ok("loaded".into())
+            } else {
+                Err(ToolCtxError::Load("out of VRAM".into()))
+            }
         }
         fn loaded_port(&self, _m: &str) -> Option<u16> {
             None
         }
-        async fn generate(&self, _m: &str, _p: &str) -> String {
-            self.gen_out.clone()
+        async fn generate(
+            &self,
+            _m: &str,
+            _p: &str,
+        ) -> std::result::Result<String, ToolCtxError> {
+            self.gen_out.clone().map_err(ToolCtxError::Generate)
         }
-        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        async fn embed(
+            &self,
+            texts: &[String],
+        ) -> std::result::Result<Vec<Vec<f32>>, ToolCtxError> {
             Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
         }
     }
@@ -168,29 +174,30 @@ mod tests {
     async fn cloud_model_skips_load_and_returns_text() {
         // Cloud model: model_modality None -> no ensure_loaded (load_ok=false
         // would error if it were called).
-        let ctx = Arc::new(FakeCtx { local: false, load_ok: false, gen_out: "a summary".into() });
+        let ctx = Arc::new(FakeCtx { local: false, load_ok: false, gen_out: Ok("a summary".into()) });
         let s = LamuSummarizer::new(ctx, "claude-opus-4-7");
         assert_eq!(s.summarize("sum", &["t".into()]).await.unwrap(), "a summary");
     }
 
     #[tokio::test]
     async fn local_cold_load_failure_surfaces_as_err() {
-        let ctx = Arc::new(FakeCtx { local: true, load_ok: false, gen_out: "x".into() });
+        let ctx = Arc::new(FakeCtx { local: true, load_ok: false, gen_out: Ok("x".into()) });
         let s = LamuSummarizer::new(ctx, "qwen3.6-27b");
         let err = s.summarize("sum", &["t".into()]).await.unwrap_err();
         assert!(err.to_string().contains("load model"), "got: {err}");
     }
 
     #[tokio::test]
-    async fn error_prefixed_generate_is_err() {
-        let ctx = Arc::new(FakeCtx { local: false, load_ok: true, gen_out: "error: boom".into() });
+    async fn generate_err_propagates_as_err() {
+        let ctx = Arc::new(FakeCtx { local: false, load_ok: true, gen_out: Err("boom".into()) });
         let s = LamuSummarizer::new(ctx, "mimo-v2.5");
-        assert!(s.summarize("sum", &["t".into()]).await.is_err());
+        let err = s.summarize("sum", &["t".into()]).await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "got: {err}");
     }
 
     #[tokio::test]
     async fn local_loaded_returns_text() {
-        let ctx = Arc::new(FakeCtx { local: true, load_ok: true, gen_out: "ok summary".into() });
+        let ctx = Arc::new(FakeCtx { local: true, load_ok: true, gen_out: Ok("ok summary".into()) });
         let s = LamuSummarizer::new(ctx, "qwen3.6-27b");
         assert_eq!(s.summarize("sum", &["t".into()]).await.unwrap(), "ok summary");
     }

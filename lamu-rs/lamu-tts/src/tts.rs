@@ -84,10 +84,12 @@ async fn handle_text_to_speech_local(ctx: &dyn ToolCtx, model: String, args: Val
     // scheduler) and is idempotent — "already loaded" if it's up. A pinned
     // LLM blocking the eviction surfaces here as a clear "insufficient
     // space" error.
-    let status = ctx.ensure_loaded(&model).await;
-    if status.starts_with("error") {
-        return status;
-    }
+    // ADR 0027: typed Err replaces the old `starts_with("error")` sniff
+    // (which, missing the colon, could false-match prose).
+    let status = match ctx.ensure_loaded(&model).await {
+        Ok(s) => s,
+        Err(e) => return format!("error: load TTS model '{model}': {e}"),
+    };
     let port = match ctx.loaded_port(&model) {
         Some(p) if p != 0 => p,
         _ => return format!("error: TTS '{model}' not loaded after attempt: {status}"),

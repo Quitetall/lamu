@@ -120,10 +120,12 @@ pub async fn handle_generate_image(ctx: &dyn ToolCtx, args: Value) -> String {
     });
 
     // Ensure ComfyUI is up (spawns + evicts LLMs per the scheduler).
-    let status = ctx.ensure_loaded(&model).await;
-    if status.starts_with("error") {
-        return status;
-    }
+    // ADR 0027: typed Err replaces the old `starts_with("error")` sniff
+    // (which, missing the colon, could false-match prose).
+    let status = match ctx.ensure_loaded(&model).await {
+        Ok(s) => s,
+        Err(e) => return format!("error: load image model '{model}': {e}"),
+    };
     let port = match ctx.loaded_port(&model) {
         Some(p) if p != 0 => p,
         _ => return format!("error: image model '{model}' not loaded after attempt: {status}"),

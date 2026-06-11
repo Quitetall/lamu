@@ -72,29 +72,30 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
 
     // A local model must be loaded before generate (cloud routes via generate).
     if ctx.model_modality(&model).is_some() {
-        let status = ctx.ensure_loaded(&model).await;
-        if status.trim_start().to_lowercase().starts_with("error:") {
-            return format!("error: load model '{model}': {status}");
+        if let Err(e) = ctx.ensure_loaded(&model).await {
+            return format!("error: load model '{model}': {e}");
         }
     }
 
     // 1. DECIDE.
-    let decide = ctx
+    let decide = match ctx
         .generate(&model, &format!("{DECIDE_PROMPT}\n\nQuestion: {question}"))
-        .await;
-    if decide.trim_start().to_lowercase().starts_with("error:") {
-        return format!("error: decide step: {decide}");
-    }
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return format!("error: decide step: {e}"),
+    };
     let queries: Vec<String> = parse_queries(&decide).into_iter().take(max_q).collect();
 
     // No lookup needed → direct reasoning answer.
     if queries.is_empty() {
-        let ans = ctx
+        let ans = match ctx
             .generate(&model, &format!("{ANSWER_DIRECT_PROMPT}\n\nQuestion: {question}"))
-            .await;
-        if ans.trim_start().to_lowercase().starts_with("error:") {
-            return format!("error: answer step: {ans}");
-        }
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return format!("error: answer step: {e}"),
+        };
         return json!({
             "question": question, "searched": [], "sources": [],
             "answer": ans, "citations": [], "grounded": false
@@ -151,10 +152,10 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
         .collect();
     let instruction = format!("{ANSWER_GROUNDED_PROMPT}\n\nQuestion: {question}");
     let content = build_grounded_content(&instruction, &items);
-    let answer = ctx.generate(&model, &content).await;
-    if answer.trim_start().to_lowercase().starts_with("error:") {
-        return format!("error: answer step: {answer}");
-    }
+    let answer = match ctx.generate(&model, &content).await {
+        Ok(s) => s,
+        Err(e) => return format!("error: answer step: {e}"),
+    };
 
     // Resolve [N] → sources[N-1].url IN CODE.
     let citations = cited_urls(&answer, &sources);

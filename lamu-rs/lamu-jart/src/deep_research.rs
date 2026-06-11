@@ -138,15 +138,19 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
 
     // A local synthesis model must be loaded first (cloud routes via generate).
     if ctx.model_modality(&synthesis_model).is_some() {
-        let status = ctx.ensure_loaded(&synthesis_model).await;
-        if status.trim_start().to_lowercase().starts_with("error:") {
-            return with_corpus(&query, &subqs, &corpus, &sources_failed, "synthesis_error", &status);
+        if let Err(e) = ctx.ensure_loaded(&synthesis_model).await {
+            let msg = format!("load model '{synthesis_model}': {e}");
+            return with_corpus(&query, &subqs, &corpus, &sources_failed, "synthesis_error", &msg);
         }
     }
-    let report = ctx.generate(&synthesis_model, &content).await;
-    if report.trim_start().to_lowercase().starts_with("error:") {
-        return with_corpus(&query, &subqs, &corpus, &sources_failed, "synthesis_error", &report);
-    }
+    let report = match ctx.generate(&synthesis_model, &content).await {
+        Ok(s) => s,
+        Err(e) => {
+            return with_corpus(
+                &query, &subqs, &corpus, &sources_failed, "synthesis_error", &e.to_string(),
+            )
+        }
+    };
 
     // 5. Resolve cited [N] → corpus[N-1].link IN CODE (only real, in-range refs).
     let mut citations = cited_links(&report, &corpus);
@@ -205,8 +209,9 @@ async fn verify_citations(
     citations: Vec<Value>,
 ) -> Vec<Value> {
     if ctx.model_modality(model).is_some() {
-        let s = ctx.ensure_loaded(model).await;
-        if s.trim_start().to_lowercase().starts_with("error:") {
+        if let Err(e) = ctx.ensure_loaded(model).await {
+            // Best-effort: verification is skipped, but say why in the log.
+            tracing::warn!("verify_citations: load '{model}' failed, skipping verification: {e}");
             return citations;
         }
     }
@@ -221,7 +226,10 @@ async fn verify_citations(
             "A research briefing states:\n\"{claim}\"\n\nIt cites source [{idx}]:\nTitle: {}\nAbstract: {}\n\nDoes the source support that statement? Answer with exactly one word: yes, partial, or no.",
             src.title, src.grounding
         );
-        let verdict = normalize_verdict(&ctx.generate(model, &prompt).await);
+        let verdict = match ctx.generate(model, &prompt).await {
+            Ok(s) => normalize_verdict(&s),
+            Err(_) => "unknown",
+        };
         c["verified"] = json!(verdict);
         c
     });
@@ -345,14 +353,19 @@ fn with_corpus(
 /// Decompose the query into sub-questions; fall back to [query] on any failure.
 async fn decompose(ctx: &dyn ToolCtx, model: &str, query: &str, n: usize) -> Vec<String> {
     if ctx.model_modality(model).is_some() {
-        let status = ctx.ensure_loaded(model).await;
-        if status.trim_start().to_lowercase().starts_with("error:") {
+        if let Err(e) = ctx.ensure_loaded(model).await {
+            tracing::warn!("decompose: load '{model}' failed, falling back to [query]: {e}");
             return vec![query.to_string()];
         }
     }
     let prompt = format!("{DECOMPOSE_PROMPT}\n\nResearch question: {query}\n\n(at most {n} sub-questions)");
-    let out = ctx.generate(model, &prompt).await;
-    parse_subquestions(&out, query, n)
+    match ctx.generate(model, &prompt).await {
+        Ok(out) => parse_subquestions(&out, query, n),
+        Err(e) => {
+            tracing::warn!("decompose: generate on '{model}' failed, falling back to [query]: {e}");
+            vec![query.to_string()]
+        }
+    }
 }
 
 /// Tolerant parse: extract a JSON array of strings from model output (first `[`

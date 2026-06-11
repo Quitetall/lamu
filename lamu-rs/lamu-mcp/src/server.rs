@@ -11,6 +11,7 @@ use lamu_core::queue::{RequestQueue, Strategy as QueueStrategy};
 use lamu_core::registry::{load_registry, scan_directory, write_registry};
 use lamu_core::router::Router;
 use lamu_core::scheduler::VramScheduler;
+use lamu_core::tools_ext::ToolCtxError;
 use lamu_core::types::ModelEntry;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -338,13 +339,20 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
     fn model_modality(&self, model: &str) -> Option<lamu_core::types::Modality> {
         self.state.lock().entries.get(model).map(|e| e.modality)
     }
-    async fn ensure_loaded(&self, model: &str) -> String {
-        self.handle_load_model(json!({ "name": model })).await
+    async fn ensure_loaded(&self, model: &str) -> Result<String, ToolCtxError> {
+        // Bridge: handle_load_model still speaks the legacy wire convention
+        // ("error:"-prefixed string). Convert at the seam (ADR 0027).
+        let s = self.handle_load_model(json!({ "name": model })).await;
+        if lamu_core::tools_ext::is_wire_error(&s) {
+            Err(ToolCtxError::Load(ToolCtxError::strip_wire_prefix(&s).to_string()))
+        } else {
+            Ok(s)
+        }
     }
     fn loaded_port(&self, model: &str) -> Option<u16> {
         self.state.lock().scheduler.get_loaded(model).map(|m| m.port)
     }
-    async fn generate(&self, model: &str, prompt: &str) -> String {
+    async fn generate(&self, model: &str, prompt: &str) -> Result<String, ToolCtxError> {
         // Route like `council`: a model present in the local registry goes
         // through the queued/scheduled local path; anything else is treated as
         // a cloud model. Summarization defaults (low temp, bounded length).
@@ -354,6 +362,15 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
             "max_tokens": 1200,
             "temperature": 0.3,
         });
+        // Legacy-wire bridge (ADR 0027): handle_query/handle_cloud_query still
+        // return "error:"-prefixed strings; convert at the seam.
+        let to_result = |s: String| -> Result<String, ToolCtxError> {
+            if lamu_core::tools_ext::is_wire_error(&s) {
+                Err(ToolCtxError::Generate(ToolCtxError::strip_wire_prefix(&s).to_string()))
+            } else {
+                Ok(s)
+            }
+        };
         let is_local = self.state.lock().entries.contains_key(model);
         if !is_local {
             // Enforce routing at the capability seam (the trait contract promises
@@ -364,27 +381,28 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
             // local-only. Frontends that drive handlers directly (cmd_research)
             // inherit the gate here for free.
             if self.routing_mode.lock().await.as_str() == "local-only" {
-                return format!(
-                    "error: routing mode is 'local-only' — cloud model '{model}' refused. \
+                return Err(ToolCtxError::Generate(format!(
+                    "routing mode is 'local-only' — cloud model '{model}' refused. \
                      Call set_routing_mode(mode='auto') to re-enable."
-                );
+                )));
             }
-            return crate::cloud::handle_cloud_query(args).await;
+            return to_result(crate::cloud::handle_cloud_query(args).await);
         }
         let out = self.handle_query(args.clone()).await;
         // A reasoning model can emit an all-`<think>` completion and leave the
         // visible `content` empty (handle_query strips the reasoning). Retry once
         // with thinking disabled to force visible output. Non-empty output
-        // (including an "error:" string) passes straight through.
+        // (including an error) passes straight through.
         if !out.trim().is_empty() {
-            return out;
+            return to_result(out);
         }
         let mut retry = args;
         retry["enable_thinking"] = json!(false);
-        self.handle_query(retry).await
+        to_result(self.handle_query(retry).await)
     }
 
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ToolCtxError> {
+        let embed_err = |m: String| ToolCtxError::Embed(m);
         if texts.is_empty() {
             return Ok(vec![]);
         }
@@ -401,38 +419,45 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
             (name, st.client.clone())
         }; // parking_lot guard dropped before any await
         let Some(name) = name else {
-            return Err("no embedding model in registry — add one with capability 'embedding'".into());
+            return Err(embed_err(
+                "no embedding model in registry — add one with capability 'embedding'".into(),
+            ));
         };
         // Ensure loaded + resolve its port.
-        let status = self.ensure_loaded(&name).await;
-        if status.trim_start().to_lowercase().starts_with("error:") {
-            return Err(format!("load embedding model '{name}': {status}"));
+        if let Err(e) = self.ensure_loaded(&name).await {
+            return Err(embed_err(format!("load embedding model '{name}': {e}")));
         }
         let port = self
             .loaded_port(&name)
-            .ok_or_else(|| format!("embedding model '{name}' is not on a live port"))?;
+            .ok_or_else(|| embed_err(format!("embedding model '{name}' is not on a live port")))?;
         let url = format!("http://localhost:{port}/v1/embeddings");
         let resp = client
             .post(&url)
             .json(&json!({ "model": name, "input": texts }))
             .send()
             .await
-            .map_err(|e| format!("embeddings backend: {e}"))?;
+            .map_err(|e| embed_err(format!("embeddings backend: {e}")))?;
         if !resp.status().is_success() {
             let s = resp.status();
-            return Err(format!("embeddings backend {s}: {}", resp.text().await.unwrap_or_default()));
+            return Err(embed_err(format!(
+                "embeddings backend {s}: {}",
+                resp.text().await.unwrap_or_default()
+            )));
         }
-        let v: Value = resp.json().await.map_err(|e| format!("embeddings non-JSON: {e}"))?;
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| embed_err(format!("embeddings non-JSON: {e}")))?;
         let data = v
             .get("data")
             .and_then(|d| d.as_array())
-            .ok_or_else(|| "embeddings response missing data[]".to_string())?;
+            .ok_or_else(|| embed_err("embeddings response missing data[]".to_string()))?;
         let mut out = Vec::with_capacity(data.len());
         for item in data {
             let emb = item
                 .get("embedding")
                 .and_then(|e| e.as_array())
-                .ok_or_else(|| "embeddings item missing embedding[]".to_string())?;
+                .ok_or_else(|| embed_err("embeddings item missing embedding[]".to_string()))?;
             out.push(emb.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect());
         }
         Ok(out)
