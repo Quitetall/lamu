@@ -1,0 +1,48 @@
+# lamu-serve — user-level systemd unit for the LAMU HTTP serving plane.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/lamu-serve.service ~/.config/systemd/user/
+#   cp deploy/lamu-serve.env.example ~/.config/lamu/lamu-serve.env   # then edit
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lamu-serve
+#
+# See deploy/README.md for the full walkthrough.
+
+[Unit]
+Description=LAMU model serving plane (lamu serve)
+Documentation=https://github.com/Quitetall/lamu
+# Weak ordering only: SearXNG (web grounding) is best-effort and optional;
+# serve must come up fine without it (ADR: web_search is keyless + optional).
+After=network-online.target
+Wants=network-online.target
+# Stop retrying after 6 failures in 2 minutes (e.g. a manual `lamu serve`
+# already holds the pidfile). Recover with: systemctl --user reset-failed
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=simple
+# lamu serve runs in the foreground, writes an RAII pidfile to
+# $XDG_RUNTIME_DIR/lamu-serve-{port}.pid, and removes it on SIGTERM.
+# systemd tracks the main PID itself, so the pidfile is purely lamu's
+# own double-start guard — no PIDFile= needed here.
+ExecStart=%h/.cargo/bin/lamu serve
+# All LAMU_* knobs live in the env file; cloud API keys are loaded by the
+# binary itself from ~/.config/lamu/api-keys.env (load_api_keys_env).
+EnvironmentFile=-%h/.config/lamu/lamu-serve.env
+# on-failure (not always): a clean SIGTERM/SIGINT shutdown stays down;
+# crashes and double-start refusals retry after 5s. The GPU training lock
+# (~/.local/state/lamu/scheduler.lock) is advisory and checked per-request
+# inside serve — a held lock does NOT make startup fail, so the unit will
+# not flap during training runs.
+Restart=on-failure
+RestartSec=5
+# Model loads can take tens of seconds; give shutdown time to reap
+# llama-server children gracefully before systemd escalates to SIGKILL.
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
