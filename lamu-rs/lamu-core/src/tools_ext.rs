@@ -75,6 +75,12 @@ pub fn is_wire_error(s: &str) -> bool {
         .is_some_and(|h| h.eq_ignore_ascii_case("error:"))
 }
 
+/// Defaults a `ToolCtx::generate` impl MUST apply when the caller passes
+/// `None` — sized for short summaries. One source of truth so a second
+/// impl can't drift from the trait docs.
+pub const GENERATE_DEFAULT_MAX_TOKENS: u32 = 1200;
+pub const GENERATE_DEFAULT_TEMPERATURE: f32 = 0.3;
+
 /// What a module tool needs from the running server, abstracted so the tool
 /// (e.g. `generate_image`) lives in its module crate rather than lamu-mcp.
 #[async_trait::async_trait]
@@ -92,7 +98,18 @@ pub trait ToolCtx: Send + Sync {
     /// text; `Err(ToolCtxError::Generate)` carries the failure message
     /// (ADR 0027). Lets a module (e.g. lamu-jart) summarize/generate
     /// in-process instead of a self-HTTP round-trip.
-    async fn generate(&self, model: &str, prompt: &str) -> Result<String, ToolCtxError>;
+    ///
+    /// `max_tokens`/`temperature`: `None` keeps the summarization defaults
+    /// ([`GENERATE_DEFAULT_MAX_TOKENS`] / [`GENERATE_DEFAULT_TEMPERATURE`]).
+    /// Long-form callers (deep_research synthesis, grounded answers) pass
+    /// `Some` so syntheses stop truncating at the short-summary budget.
+    async fn generate(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+    ) -> Result<String, ToolCtxError>;
     /// Embed `texts` via the registry's embedding-capable model (e.g. nomic,
     /// 768-dim). Ensure-loads it and returns one vector per input (same
     /// order). `Err(ToolCtxError::Embed)` on no embedding model / backend

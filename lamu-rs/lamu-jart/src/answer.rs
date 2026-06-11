@@ -40,6 +40,12 @@ const ANSWER_DIRECT_PROMPT: &str =
      facts — but if any specific fact you're unsure of slips in, flag it as \
      uncertain rather than stating it confidently.";
 
+/// Token budget for the actual ANSWER generations (direct + grounded). The
+/// seam default (1200) is sized for short summaries; real answers were
+/// being truncated mid-thought. DECIDE keeps the default (it returns a
+/// tiny JSON array).
+const ANSWER_MAX_TOKENS: u32 = 4096;
+
 /// JSON schema for the `answer` MCP tool.
 pub fn schema_answer() -> Value {
     json!({
@@ -79,7 +85,7 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
 
     // 1. DECIDE.
     let decide = match ctx
-        .generate(&model, &format!("{DECIDE_PROMPT}\n\nQuestion: {question}"))
+        .generate(&model, &format!("{DECIDE_PROMPT}\n\nQuestion: {question}"), None, None)
         .await
     {
         Ok(s) => s,
@@ -90,7 +96,12 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
     // No lookup needed → direct reasoning answer.
     if queries.is_empty() {
         let ans = match ctx
-            .generate(&model, &format!("{ANSWER_DIRECT_PROMPT}\n\nQuestion: {question}"))
+            .generate(
+                &model,
+                &format!("{ANSWER_DIRECT_PROMPT}\n\nQuestion: {question}"),
+                Some(ANSWER_MAX_TOKENS),
+                None,
+            )
             .await
         {
             Ok(s) => s,
@@ -152,7 +163,7 @@ pub async fn handle_answer(ctx: &dyn ToolCtx, args: Value) -> String {
         .collect();
     let instruction = format!("{ANSWER_GROUNDED_PROMPT}\n\nQuestion: {question}");
     let content = build_grounded_content(&instruction, &items);
-    let answer = match ctx.generate(&model, &content).await {
+    let answer = match ctx.generate(&model, &content, Some(ANSWER_MAX_TOKENS), None).await {
         Ok(s) => s,
         Err(e) => return format!("error: answer step: {e}"),
     };

@@ -120,8 +120,9 @@ impl<C: ToolCtx + 'static> Summarizer for LamuSummarizer<C> {
         }
 
         // ADR 0027: the seam is typed — Err carries the failure message.
+        // None = short-summary defaults (this IS the summarizer).
         self.ctx
-            .generate(&self.model, &content)
+            .generate(&self.model, &content, None, None)
             .await
             .map_err(|e| anyhow!("{e}"))
     }
@@ -159,6 +160,8 @@ mod tests {
             &self,
             _m: &str,
             _p: &str,
+            _max_tokens: Option<u32>,
+            _temperature: Option<f32>,
         ) -> std::result::Result<String, ToolCtxError> {
             self.gen_out.clone().map_err(ToolCtxError::Generate)
         }

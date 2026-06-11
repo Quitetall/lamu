@@ -24,6 +24,10 @@ const CHAT_PROMPT: &str =
 /// How many of the session's studies to ground each chat turn on.
 const TOP_K: usize = 8;
 
+/// Token budget for the grounded chat answer (long-form; the seam default
+/// of 1200 is sized for short summaries and truncated cited answers).
+const CHAT_MAX_TOKENS: u32 = 4096;
+
 pub fn schema_research_chat() -> Value {
     json!({
         "type": "object",
@@ -74,7 +78,7 @@ pub async fn handle_research_chat(ctx: &dyn ToolCtx, args: Value) -> String {
             return format!("error: load model '{model}': {e}");
         }
     }
-    let answer = match ctx.generate(&model, &content).await {
+    let answer = match ctx.generate(&model, &content, Some(CHAT_MAX_TOKENS), None).await {
         Ok(s) => s,
         Err(e) => return format!("error: {e}"),
     };

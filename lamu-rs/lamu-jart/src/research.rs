@@ -124,7 +124,9 @@ pub async fn handle_research(ctx: &dyn ToolCtx, args: Value) -> String {
             // Surface a generate failure in a dedicated field rather than
             // failing the whole tool — the feed is still useful without the
             // summary (ADR 0027: typed Err replaces "error:" sniffing).
-            match ctx.generate(&model, &content).await {
+            // None = the seam's short-summary defaults — exactly what a
+            // feed summary wants.
+            match ctx.generate(&model, &content, None, None).await {
                 Ok(summary) => out["summary"] = Value::String(summary),
                 Err(e) => out["summary_error"] = Value::String(e.to_string()),
             }

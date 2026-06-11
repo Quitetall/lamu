@@ -1894,6 +1894,7 @@ dependencies = [
  "lamu-core",
  "reqwest",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

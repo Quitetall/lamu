@@ -19,6 +19,14 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Token budget for the cited synthesis — the longest-form generation in the
+/// pipeline (a full research briefing over up to MAX_SYNTH sources). The seam
+/// default (1200) truncated reports mid-citation; this budget lets the model
+/// produce complete cited briefings ("the model should be able to respond
+/// rather than be capped by token budgets"). decompose/verify keep the
+/// default (tiny JSON / one-word verdicts).
+const SYNTH_MAX_TOKENS: u32 = 8192;
+
 const DECOMPOSE_PROMPT: &str =
     "You are planning a literature search. Break the user's research question into \
      a few focused, non-overlapping SEARCH QUERIES — short keyword phrases of 2-6 \
@@ -143,7 +151,10 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
             return with_corpus(&query, &subqs, &corpus, &sources_failed, "synthesis_error", &msg);
         }
     }
-    let report = match ctx.generate(&synthesis_model, &content).await {
+    let report = match ctx
+        .generate(&synthesis_model, &content, Some(SYNTH_MAX_TOKENS), None)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             return with_corpus(
@@ -198,6 +209,7 @@ pub async fn handle_deep_research(ctx: &dyn ToolCtx, args: Value) -> String {
 /// synthesis prompt stays bounded.
 const MAX_SYNTH: usize = 18;
 
+
 /// Verify each citation against its source (concurrent). Adds a `verified`
 /// (yes/partial/no/unknown) field. Skips (returns unchanged) if a local verify
 /// model can't load.
@@ -226,7 +238,7 @@ async fn verify_citations(
             "A research briefing states:\n\"{claim}\"\n\nIt cites source [{idx}]:\nTitle: {}\nAbstract: {}\n\nDoes the source support that statement? Answer with exactly one word: yes, partial, or no.",
             src.title, src.grounding
         );
-        let verdict = match ctx.generate(model, &prompt).await {
+        let verdict = match ctx.generate(model, &prompt, None, None).await {
             Ok(s) => normalize_verdict(&s),
             Err(_) => "unknown",
         };
@@ -359,7 +371,7 @@ async fn decompose(ctx: &dyn ToolCtx, model: &str, query: &str, n: usize) -> Vec
         }
     }
     let prompt = format!("{DECOMPOSE_PROMPT}\n\nResearch question: {query}\n\n(at most {n} sub-questions)");
-    match ctx.generate(model, &prompt).await {
+    match ctx.generate(model, &prompt, None, None).await {
         Ok(out) => parse_subquestions(&out, query, n),
         Err(e) => {
             tracing::warn!("decompose: generate on '{model}' failed, falling back to [query]: {e}");

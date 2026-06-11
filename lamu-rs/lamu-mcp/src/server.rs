@@ -352,15 +352,25 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
     fn loaded_port(&self, model: &str) -> Option<u16> {
         self.state.lock().scheduler.get_loaded(model).map(|m| m.port)
     }
-    async fn generate(&self, model: &str, prompt: &str) -> Result<String, ToolCtxError> {
+    async fn generate(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+    ) -> Result<String, ToolCtxError> {
         // Route like `council`: a model present in the local registry goes
         // through the queued/scheduled local path; anything else is treated as
-        // a cloud model. Summarization defaults (low temp, bounded length).
+        // a cloud model. `None` keeps the summarization defaults (low temp,
+        // bounded length) that every short-summary caller relies on; long-form
+        // callers override per call (trait contract).
         let args = json!({
             "model": model,
             "prompt": prompt,
-            "max_tokens": 1200,
-            "temperature": 0.3,
+            "max_tokens": max_tokens
+                .unwrap_or(lamu_core::tools_ext::GENERATE_DEFAULT_MAX_TOKENS),
+            "temperature": temperature
+                .unwrap_or(lamu_core::tools_ext::GENERATE_DEFAULT_TEMPERATURE),
         });
         // Legacy-wire bridge (ADR 0027): handle_query/handle_cloud_query still
         // return "error:"-prefixed strings; convert at the seam.
