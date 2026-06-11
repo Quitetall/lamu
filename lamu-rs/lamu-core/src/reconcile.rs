@@ -207,6 +207,7 @@ mod tests {
             path: "/dev/null".into(),
             format: ModelFormat::Gguf,
             backend: BackendType::LlamaCpp,
+            backend_kind: None,
             arch: "qwen35".to_string(),
             params_b: 1.0,
             quant: "Q4_K_M".to_string(),

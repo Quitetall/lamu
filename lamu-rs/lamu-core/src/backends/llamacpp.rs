@@ -727,6 +727,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.gguf"),
             format: ModelFormat::Gguf,
             backend: BackendType::LlamaCpp,
+            backend_kind: None,
             arch: arch.into(),
             params_b: 4.0,
             quant: "Q4_K_M".into(),

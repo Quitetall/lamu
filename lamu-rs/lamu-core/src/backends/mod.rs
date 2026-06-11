@@ -5,7 +5,7 @@ pub mod dflash;
 pub mod llamacpp;
 pub mod megakernel;
 
-use crate::types::{BackendType, DevicePlacement, ModelEntry};
+use crate::types::{DevicePlacement, ModelEntry};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
@@ -14,24 +14,40 @@ use std::pin::Pin;
 
 /// Construct the right backend impl for the entry's declared type.
 ///
-/// For `LlamaCpp`, uses `new_for_entry` so registry entries carrying a
+/// Dispatch key (ADR 0026): an explicit `backend_kind` string wins; absent
+/// (every pre-0026 registry entry) the `backend` enum's canonical string
+/// (`BackendType::as_kind_str`) is used — one namespace, one match. Builtin
+/// kinds resolve to core backends; anything else resolves through the
+/// module registry populated at the composition root (ADR 0023).
+///
+/// For `llama_cpp`, uses `new_for_entry` so registry entries carrying a
 /// `speculative: { method: dflash, ... }` config transparently spawn
 /// the BeeLlama fork binary with DFlash drafter + `turbo3_tcq` KV.
 /// Entries without spec config get the generic `llama_bin()`.
 pub fn make_backend(entry: &ModelEntry) -> Result<Box<dyn Backend>> {
-    match entry.backend {
-        BackendType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppBackend::new_for_entry(entry)?)),
-        BackendType::Megakernel => Ok(Box::new(megakernel::MegakernelBackend::new()?)),
-        BackendType::Dflash | BackendType::DflashLucebox => {
-            Ok(Box::new(dflash::DflashBackend::new()?))
+    let kind = match entry.backend_kind.as_deref() {
+        Some(k) => {
+            if k != entry.backend.as_kind_str() {
+                // Conflicting keys must never pick a backend silently.
+                tracing::warn!(
+                    model = %entry.name,
+                    backend = entry.backend.as_kind_str(),
+                    backend_kind = k,
+                    "backend_kind overrides the backend enum for dispatch (ADR 0026)"
+                );
+            }
+            k
         }
-        // ADR 0023: fish-speech moved to the `lamu-tts` module (registry-resolved).
-        BackendType::FishSpeech => make_registered("fish_speech", entry),
-        // ADR 0023: ComfyUI moved to the `lamu-image` module. Core no longer
-        // names it — it resolves via the backend registry that the module
-        // populates at the composition root. As lamu-tts/lamu-jart land, their
-        // BackendType variants route here the same way (-> make_registered(kind)).
-        BackendType::ComfyUI => make_registered("comfyui", entry),
+        None => entry.backend.as_kind_str(),
+    };
+    match kind {
+        "llama_cpp" => Ok(Box::new(llamacpp::LlamaCppBackend::new_for_entry(entry)?)),
+        "megakernel" => Ok(Box::new(megakernel::MegakernelBackend::new()?)),
+        "dflash" | "dflash_lucebox" => Ok(Box::new(dflash::DflashBackend::new()?)),
+        // ADR 0023: fish_speech (lamu-tts), comfyui (lamu-image), and any
+        // future module kind resolve via the backend registry the modules
+        // populate at the binary's composition root.
+        other => make_registered(other, entry),
     }
 }
 
@@ -446,6 +462,74 @@ pub fn build_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::BackendType;
+
+    /// ADR 0026 drift tripwire: the enum's serde wire name and
+    /// `as_kind_str` must agree for EVERY variant — `make_backend`
+    /// dispatches on the string, so a mismatch (e.g. a serde rename
+    /// without the matching `as_kind_str` arm) would silently route an
+    /// entry to the wrong backend or to "not registered".
+    #[test]
+    fn backend_type_serde_name_matches_kind_str() {
+        for bt in [
+            BackendType::LlamaCpp,
+            BackendType::Megakernel,
+            BackendType::Dflash,
+            BackendType::DflashLucebox,
+            BackendType::FishSpeech,
+            BackendType::ComfyUI,
+        ] {
+            let wire = serde_yaml::to_string(&bt).unwrap().trim().to_string();
+            assert_eq!(wire, bt.as_kind_str(), "serde name and kind string drifted for {bt:?}");
+        }
+    }
+
+    fn kind_entry(kind: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            name: "t".into(),
+            path: "/m/t.gguf".into(),
+            format: crate::types::ModelFormat::Gguf,
+            backend: BackendType::LlamaCpp,
+            backend_kind: kind.map(String::from),
+            arch: "qwen3".into(),
+            params_b: 7.0,
+            quant: "Q4_K_M".into(),
+            vram_mb: 8000,
+            context_max: 32768,
+            capabilities: vec![],
+            reasoning_marker: None,
+            speculative: None,
+            sampling: None,
+            pinned: false,
+            main: false,
+            notes: String::new(),
+            status: Default::default(),
+            modality: Default::default(),
+        }
+    }
+
+    /// An unregistered string kind must fail loudly with the ADR 0023
+    /// "not registered" error — never fall back to the enum silently.
+    #[test]
+    fn make_backend_unregistered_kind_fails_loudly() {
+        let e = kind_entry(Some("definitely_not_a_backend"));
+        match make_backend(&e) {
+            Ok(_) => panic!("unregistered kind must error"),
+            Err(err) => {
+                let msg = format!("{err}");
+                assert!(msg.contains("not registered"), "got: {msg}");
+                assert!(msg.contains("definitely_not_a_backend"), "must name the kind: {msg}");
+            }
+        }
+    }
+
+    /// Absent backend_kind → enum dispatch, exactly as before ADR 0026.
+    /// (llama_cpp construction succeeds without any module registration.)
+    #[test]
+    fn make_backend_enum_fallback_unchanged() {
+        let e = kind_entry(None);
+        assert!(make_backend(&e).is_ok(), "enum-dispatch path must still work");
+    }
 
     #[test]
     fn generate_opts_default_all_none() {

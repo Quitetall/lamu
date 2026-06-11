@@ -46,6 +46,25 @@ pub enum BackendType {
     ComfyUI,
 }
 
+impl BackendType {
+    /// Canonical string key for this backend kind — MUST stay identical to
+    /// the serde wire name (ADR 0026). `make_backend` dispatches on this
+    /// string, so the enum and the string-keyed module registry share one
+    /// namespace. A unit test pins serde-name ↔ this-method agreement;
+    /// adding a variant without updating both is a compile/test failure,
+    /// not silent drift.
+    pub fn as_kind_str(&self) -> &'static str {
+        match self {
+            BackendType::LlamaCpp => "llama_cpp",
+            BackendType::Megakernel => "megakernel",
+            BackendType::Dflash => "dflash",
+            BackendType::DflashLucebox => "dflash_lucebox",
+            BackendType::FishSpeech => "fish_speech",
+            BackendType::ComfyUI => "comfyui",
+        }
+    }
+}
+
 /// Model modality. `Default == Llm` keeps every existing models.yaml valid
 /// (an entry with no `modality:` key deserializes to `Llm`). Drives
 /// modality-aware VRAM eviction (evict image/tts before LLMs) and
@@ -287,6 +306,14 @@ pub struct ModelEntry {
     pub path: PathBuf,
     pub format: ModelFormat,
     pub backend: BackendType,
+    /// Optional string dispatch key (ADR 0026). When set, `make_backend`
+    /// routes by THIS string (module-registry kinds included) and the
+    /// `backend` enum is ignored for dispatch — operator-curated entries
+    /// can target module backends core never names. Absent (every
+    /// pre-0026 registry) → enum dispatch, byte-identical behavior.
+    /// Preserved across `lamu scan` like other curated fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<String>,
     pub arch: String,
     pub params_b: f32,
     pub quant: String,

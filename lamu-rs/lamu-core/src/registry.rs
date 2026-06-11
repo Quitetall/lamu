@@ -302,6 +302,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
                 path: path.to_path_buf(),
                 format: ModelFormat::Safetensors,
                 backend: BackendType::LlamaCpp,
+                backend_kind: None,
                 arch: "unknown".to_string(),
                 params_b: 0.0,
                 quant: "fp16".to_string(),
@@ -366,6 +367,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             path: path.to_path_buf(),
             format: ModelFormat::Gguf,
             backend: BackendType::LlamaCpp,
+            backend_kind: None,
             arch,
             params_b,
             quant,
@@ -456,6 +458,8 @@ struct ModelEntryYaml {
     path: PathBuf,
     format: ModelFormat,
     backend: BackendType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_kind: Option<String>,
     arch: String,
     params_b: f32,
     quant: String,
@@ -489,6 +493,7 @@ impl From<ModelEntry> for ModelEntryYaml {
             path: e.path,
             format: e.format,
             backend: e.backend,
+            backend_kind: e.backend_kind,
             arch: e.arch,
             params_b: e.params_b,
             quant: e.quant,
@@ -514,6 +519,7 @@ impl ModelEntryYaml {
             path: self.path,
             format: self.format,
             backend: self.backend,
+            backend_kind: self.backend_kind,
             arch: self.arch,
             params_b: self.params_b,
             quant: self.quant,
@@ -559,6 +565,9 @@ pub fn merge_registry(existing: Vec<ModelEntry>, discovered: Vec<ModelEntry>) ->
                 d.pinned = o.pinned;
                 d.notes = o.notes;
                 d.status = o.status;
+                // Curated dispatch override (ADR 0026): operator-set wins;
+                // a scan never sets it, so fall back to the discovered value.
+                d.backend_kind = o.backend_kind.or(d.backend_kind);
                 d.reasoning_marker = o.reasoning_marker.or(d.reasoning_marker);
                 if d.context_max == 0 {
                     d.context_max = o.context_max;
@@ -813,6 +822,7 @@ mod tests {
             path: path.into(),
             format: ModelFormat::Gguf,
             backend: BackendType::LlamaCpp,
+            backend_kind: None,
             arch: "qwen3".into(),
             params_b: 7.0,
             quant: "Q4_K_M".into(),
@@ -828,6 +838,38 @@ mod tests {
             status: ModelStatus::default(),
             modality: crate::types::Modality::Llm,
         }
+    }
+
+    #[test]
+    fn backend_kind_roundtrips_and_absent_stays_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("models.yaml");
+        let mut with_kind = sample_entry("custom", Path::new("/m/custom.gguf"));
+        with_kind.backend_kind = Some("comfyui".into());
+        let without = sample_entry("plain", Path::new("/m/plain.gguf"));
+        write_registry(&[with_kind, without], &reg).expect("write");
+        // Absent field must not serialize (old registries stay byte-stable).
+        let yaml = std::fs::read_to_string(&reg).unwrap();
+        assert_eq!(yaml.matches("backend_kind").count(), 1, "exactly one entry carries the key:\n{yaml}");
+        let loaded = load_registry(&reg).expect("load");
+        let custom = loaded.iter().find(|e| e.name == "custom").unwrap();
+        assert_eq!(custom.backend_kind.as_deref(), Some("comfyui"));
+        let plain = loaded.iter().find(|e| e.name == "plain").unwrap();
+        assert_eq!(plain.backend_kind, None);
+    }
+
+    #[test]
+    fn merge_registry_preserves_curated_backend_kind() {
+        let p = Path::new("/m/x.gguf");
+        let mut old = sample_entry("x", p);
+        old.backend_kind = Some("comfyui".into());
+        let disc = sample_entry("x", p); // scan never sets backend_kind
+        let merged = merge_registry(vec![old], vec![disc]);
+        assert_eq!(
+            merged[0].backend_kind.as_deref(),
+            Some("comfyui"),
+            "re-scan must not strip the curated dispatch override (ADR 0026)"
+        );
     }
 
     #[test]
