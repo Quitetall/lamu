@@ -251,7 +251,7 @@ impl AppState {
             ),
             ("Edit lamu config (~/.config/lamu/config.toml)".into(), SettingAction::EditFile(SettingFile::LamuConfig)),
             ("Edit cloud models (~/.config/lamu/cloud-models.yaml)".into(), SettingAction::EditFile(SettingFile::CloudModels)),
-            ("Edit local models registry (~/local-llm/config/models.yaml)".into(), SettingAction::EditFile(SettingFile::LocalModels)),
+            ("Edit local models registry (~/.local/share/lamu/models.yaml)".into(), SettingAction::EditFile(SettingFile::LocalModels)),
             ("Edit MCP servers (~/.claude.json)".into(), SettingAction::EditFile(SettingFile::McpServers)),
             ("Edit favorites (~/.config/lamu/favorites.json)".into(), SettingAction::EditFile(SettingFile::Favorites)),
             ("Open themes directory (~/.config/lamu/themes/)".into(), SettingAction::EditFile(SettingFile::ThemesDir)),

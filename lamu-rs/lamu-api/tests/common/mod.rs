@@ -34,11 +34,11 @@ pub fn lamu_binary() -> Option<PathBuf> {
     which::which("lamu").ok()
 }
 
+/// Same resolution as production (`lamu_core::config::registry_path`,
+/// ADR 0025: data dir + $LAMU_REGISTRY override) — the E2E harness must
+/// probe the registry the real `lamu` binary will read.
 pub fn registry_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("local-llm")
-        .join("config")
-        .join("models.yaml")
+    lamu_core::config::registry_path()
 }
 
 /// Choose a model to exercise the surfaces with. Strategy:

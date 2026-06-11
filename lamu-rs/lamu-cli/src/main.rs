@@ -294,6 +294,13 @@ async fn main() -> Result<()> {
 
     load_api_keys_env();
 
+    // First-run seed / pre-ADR-0025 migration of the live registry into the
+    // user data dir. Best-effort: a failure here just means downstream sees
+    // an empty registry (and says so), which beats refusing cloud-only use.
+    if let Err(e) = lamu_core::config::ensure_registry() {
+        eprintln!("lamu: registry seed failed: {e} (continuing; `lamu scan` will recreate it)");
+    }
+
     let cli = Cli::parse();
     match cli.command {
         None => {

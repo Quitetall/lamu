@@ -32,8 +32,95 @@ pub fn models_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join("models")
 }
 
+/// Live model registry: `~/.local/share/lamu/models.yaml` — in the user data
+/// dir, OUTSIDE the git work tree (ADR 0025), because every scan and load
+/// status flip mutates it at runtime and kept dirtying the tree. Override
+/// with `$LAMU_REGISTRY` (tests, sandboxes). Seeded on first run by
+/// [`ensure_registry`].
 pub fn registry_path() -> PathBuf {
+    if let Ok(p) = std::env::var("LAMU_REGISTRY") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    // Explicit ~/.local/share fallback: a None data_dir must not collapse
+    // to a *relative* path that scan would then write into the CWD.
+    dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+        .unwrap_or_default()
+        .join("lamu")
+        .join("models.yaml")
+}
+
+/// Tracked seed registry shipped in the repo: `config/models_default.yaml`.
+/// Read-only from LAMU's perspective — the live copy is [`registry_path`].
+pub fn registry_default_path() -> PathBuf {
+    lamu_root().join("config").join("models_default.yaml")
+}
+
+/// Where the live registry lived before ADR 0025 (inside the work tree).
+/// Only consulted as a migration source by [`ensure_registry`].
+fn registry_legacy_path() -> PathBuf {
     lamu_root().join("config").join("models.yaml")
+}
+
+/// First-run seed / migration for the live registry. No-op when the live
+/// file already exists. Otherwise copies, in preference order: the legacy
+/// in-tree registry (preserves curated main/speculative/sampling/notes from
+/// pre-ADR-0025 setups), else the tracked seed. Neither existing is fine —
+/// the first `lamu scan` creates the file.
+pub fn ensure_registry() -> Result<()> {
+    seed_registry(
+        &registry_path(),
+        &[
+            (registry_legacy_path(), "legacy in-tree registry"),
+            (registry_default_path(), "tracked seed"),
+        ],
+    )
+}
+
+/// Pure-path core of [`ensure_registry`] (testable with tempdirs). Copies
+/// the first existing source to `live` via a pid-suffixed temp file +
+/// rename, so a crash or a concurrent first-run never leaves a half-written
+/// registry at the live path.
+fn seed_registry(live: &std::path::Path, sources: &[(PathBuf, &str)]) -> Result<()> {
+    if live.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = live.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Config(format!("create {}: {e}", parent.display())))?;
+    }
+    for (src, what) in sources {
+        if !src.exists() {
+            continue;
+        }
+        // Benign TOCTOU: two concurrent first-runs both pass the exists()
+        // check, both copy the same source, and the atomic rename means the
+        // loser overwrites the winner byte-for-byte. PID suffix keeps their
+        // temp files from interleaving.
+        let tmp = live.with_extension(format!("yaml.tmp.{}", std::process::id()));
+        std::fs::copy(src, &tmp).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::Config(format!("seed registry: copy {} failed: {e}", src.display()))
+        })?;
+        std::fs::rename(&tmp, live).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::Config(format!("seed registry: rename to {} failed: {e}", live.display()))
+        })?;
+        tracing::info!(
+            "seeded live registry {} from {} ({what})",
+            live.display(),
+            src.display()
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        "no registry seed found; {} will be created by the first scan",
+        live.display()
+    );
+    Ok(())
 }
 
 /// Built-in grounding system prompt. A local model has strong reasoning but
@@ -251,10 +338,55 @@ mod tests {
     }
 
     #[test]
-    fn registry_path_under_root() {
-        let root = lamu_root();
+    fn registry_path_in_data_dir_not_work_tree() {
+        let _g = ENV_LOCK.lock().unwrap(); // registry_path reads LAMU_REGISTRY
+        let prev = std::env::var("LAMU_REGISTRY").ok();
+        unsafe { std::env::remove_var("LAMU_REGISTRY") };
         let reg = registry_path();
-        assert!(reg.starts_with(&root) || reg.to_string_lossy().contains("local-llm"));
+        // ADR 0025: the live registry must NOT resolve into the git work tree.
+        assert!(!reg.starts_with(lamu_root()), "live registry in work tree: {reg:?}");
+        assert!(reg.ends_with("lamu/models.yaml"), "unexpected layout: {reg:?}");
+        // The override wins verbatim.
+        unsafe { std::env::set_var("LAMU_REGISTRY", "/tmp/override.yaml") };
+        assert_eq!(registry_path(), PathBuf::from("/tmp/override.yaml"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_REGISTRY", v),
+                None => std::env::remove_var("LAMU_REGISTRY"),
+            }
+        }
+    }
+
+    #[test]
+    fn seed_registry_prefers_legacy_then_default_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("data").join("models.yaml");
+        let legacy = dir.path().join("legacy.yaml");
+        let seed = dir.path().join("default.yaml");
+        std::fs::write(&seed, "from-seed").unwrap();
+
+        // Only the tracked seed exists -> seeded from it (parent dir created).
+        seed_registry(&live, &[(legacy.clone(), "legacy"), (seed.clone(), "seed")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "from-seed");
+
+        // Live exists -> no-op even though legacy now appears.
+        std::fs::write(&legacy, "from-legacy").unwrap();
+        seed_registry(&live, &[(legacy.clone(), "legacy"), (seed.clone(), "seed")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "from-seed");
+
+        // Fresh live path with both present -> legacy (curated entries) wins.
+        let live2 = dir.path().join("data2").join("models.yaml");
+        seed_registry(&live2, &[(legacy, "legacy"), (seed, "seed")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&live2).unwrap(), "from-legacy");
+    }
+
+    #[test]
+    fn seed_registry_no_sources_is_ok_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("models.yaml");
+        let ghost = dir.path().join("ghost.yaml");
+        seed_registry(&live, &[(ghost, "ghost")]).unwrap();
+        assert!(!live.exists(), "no source must mean no live file");
     }
 
     #[test]

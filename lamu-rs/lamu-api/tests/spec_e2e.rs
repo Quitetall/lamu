@@ -11,7 +11,7 @@
 //!
 //! Skips automatically (returns Ok) when:
 //! - the `lamu` binary isn't on $PATH (CI without prior `cargo install`)
-//! - $HOME/local-llm/config/models.yaml is missing
+//! - the live registry (~/.local/share/lamu/models.yaml, ADR 0025) is missing
 //! - no model in the registry fits in available VRAM (laptop / non-GPU
 //!   runners — explicit skip rather than a hang)
 //!
