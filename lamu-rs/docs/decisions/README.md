@@ -72,6 +72,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0025](./0025-registry-out-of-work-tree.md) | Live model registry moves to the user data dir, out of the git work tree | Accepted |
 | [0026](./0026-backend-kind-string-dispatch.md) | `backend_kind` string dispatch key + composition-root drift test | Accepted |
 | [0027](./0027-typed-toolctx-error-seam.md) | Typed `ToolCtxError` at the ToolCtx seam; "error:" strings stay wire-only | Accepted |
+| [0037](./0037-provider-grade-serving.md) | Provider-grade serving: structured reasoning on all bridges, prefix-cache exposure, caps discovery | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.

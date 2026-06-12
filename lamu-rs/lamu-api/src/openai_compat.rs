@@ -524,7 +524,28 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
             "modality": modality,
             "params_b": entry.params_b,
             "vram_mb": entry.vram_mb,
+            // Model-level capability TAGS (chat/code/reasoning/...) — the
+            // router's vocabulary, distinct from `caps` below.
             "capabilities": caps,
+            // ADR 0037: ProviderCaps discovery — an embedding harness
+            // (katana's Provider::capabilities()) reads what THIS model's
+            // serving path actually supports instead of hardcoding it.
+            "caps": {
+                // <think> extraction + structured reasoning_content/thinking
+                // surfaces exist for models with a reasoning marker.
+                "thinking": entry.reasoning_marker.is_some(),
+                // Tool schemas forward to the chat template on LLM chat
+                // paths (template support varies by model family).
+                "tools": entry.modality.is_llm(),
+                // llama-server prefix cache honors cache_prompt; reuse is
+                // reported back in usage (engine-dependent).
+                "cache_prompt": matches!(
+                    entry.backend,
+                    lamu_core::types::BackendType::LlamaCpp
+                ),
+                "embeddings": entry.capabilities.contains(&Capability::Embedding),
+                "context_max": entry.context_max,
+            },
         }));
     }
     Json(json!({"data": data, "object": "list"}))

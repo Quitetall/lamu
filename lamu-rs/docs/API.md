@@ -214,16 +214,29 @@ chat templates honor it. `false` skips the `<think>` block to shave latency.
 **Omit it** and the backend template default applies (typically thinking ON for
 Qwen3.6). For non-Qwen model families the flag is forwarded but may be a no-op.
 
-### `<think>` / reasoning handling differs by surface
-- `/v1/chat/completions` **non-stream**: reasoning is returned as
-  `message.reasoning_content` (only present when non-empty). LAMU prefers the
-  backend's structured `reasoning_content`; if absent it splits the raw content on
-  the model's marker.
-- `/v1/chat/completions` **stream**: reasoning is **stripped and discarded** — never
-  emitted to the client (handles tags split across token boundaries).
-- `/v1/messages` **stream** and `/api/chat` **stream**: the marker is **ignored** —
-  raw token content is forwarded, so literal `<think>...</think>` may appear. On
-  these surfaces `enable_thinking: false` is the only reliable suppression.
+### `<think>` / reasoning is structured data on every surface (ADR 0037)
+One shared splitter routes reasoning out of the visible message on all three
+surfaces — it is never dropped and never leaks into content (tags split
+across token boundaries handled; an unclosed think block flushes to the
+reasoning side):
+- `/v1/chat/completions` **non-stream**: `message.reasoning_content` (present
+  only when non-empty). **Stream**: `delta.reasoning_content` chunks (the
+  DeepSeek convention; unknown-field-tolerant clients ignore them).
+- `/v1/messages`: real `thinking` content blocks — non-stream leads with one
+  before the text block; streams emit a lazy `content_block_start(thinking)`
+  → `thinking_delta`s → `content_block_stop` lifecycle before the text block.
+  A reasoning-only completion yields a lone thinking block (not a 502).
+- `/api/chat`: `message.thinking` field on NDJSON lines (Ollama's native shape).
+
+### `cache_prompt` (llama-server prefix cache, ADR 0037)
+Lamu extension on `/v1/chat/completions` and `/v1/messages`: top-level
+`cache_prompt: true|false`, forwarded to llama-server's native prefix cache
+only when present (omit = engine default). Reuse is reported back ONLY when
+the engine reports it — OpenAI `usage.prompt_tokens_details.cached_tokens`,
+Anthropic `usage.cache_read_input_tokens`; the field is omitted when the
+engine is silent, never fabricated. Keep your prompt prefix stable
+(system + history append-only) and the second call's cached count tells you
+the cache held.
 
 ### VRAM-aware auto-load (and the no-auto-evict rule)
 Request a model that isn't loaded and LAMU spawns the `llama-server` subprocess on
@@ -707,6 +720,36 @@ model actually backs the request. If running off-loopback, configure the token f
     families it is a forwarded no-op; there is no per-model declaration in the response.
 
 ---
+
+## Embedding LAMU as a provider
+
+For an external agent harness embedding `lamu serve` as its local model
+provider (e.g. a katana `Provider` impl), the contract is exactly the
+documented surface — no private fields:
+
+- **Completion**: `/v1/chat/completions` (or `/v1/messages`), stream or not.
+- **Per-call usage** (engine-true, ADR 0021): `usage.prompt_tokens` /
+  `completion_tokens`, plus `usage.context_window`
+  `{tokens, occupancy_ratio, n_ctx, n_ctx_train, near_full, source}` — the
+  un-fakeable occupancy signal.
+- **Thinking blocks**: structured on every surface (see ADR 0037 section
+  above); store/strip them per your own policy — LAMU never mixes them into
+  visible content.
+- **Prompt cache**: send `cache_prompt: true` with a stable prefix; read
+  reuse back from `usage.prompt_tokens_details.cached_tokens` /
+  `cache_read_input_tokens`. Absent field = engine reported nothing — treat
+  as a cache miss in metrics, don't invent a number.
+- **Capability discovery**: each `/v1/models` entry carries
+  `caps: {thinking, tools, cache_prompt, embeddings, context_max}` plus
+  `loaded`, `modality`, `vram_mb` — implement `Provider::capabilities()` by
+  reading this, not by hardcoding. (`caps.tools` means schemas are forwarded
+  to the chat template; template support varies by model family. The
+  separate `capabilities` array is the ROUTER's model-tag vocabulary —
+  chat/code/reasoning/… — not the serving-path contract.)
+- **Errors**: typed envelopes per surface (§ Status codes); streams surface
+  backend failures as in-band error events with the engine's real message.
+- **Model switching**: change the `model` field per call; `lamu`/`main`/
+  `default` aliases resolve to the operator-designated default.
 
 ## MCP is the agent plane
 
