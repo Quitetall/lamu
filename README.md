@@ -1,16 +1,15 @@
 # LAMU
 
-**Local Agent Model Utility** — single-process MCP-first daemon. Auto-discovers GGUF models, schedules them on a budgeted GPU, serves them over MCP and OpenAI-compatible HTTP. Three speed tiers up to **106 t/s** on one RTX 4090.
+**Local Agent Model Utility** — the model OS for one GPU. A single Rust
+binary that discovers your models, schedules them on a budgeted card,
+and serves them to every client you have: OpenAI, Anthropic, and Ollama
+HTTP; MCP for agent harnesses; native ACP for Zed. Built to be the local
+backend other agent systems stand on.
 
-```
-                     ┌──────── lamu ────────┐
- Claude Code ─MCP─▶ │  router · scheduler  │ ─▶ llama.cpp / megakernel / DFlash
-       agents        │  queue · reasoning   │      (per-backend spawn)
-                     └────────┬─────────────┘
-                              ▼
-                          OpenAI HTTP
-                          for everything else
-```
+Started from 2021 InferKit / GPT-2 nostalgia — the GPT-2 proxy is still
+in the registry, not dead code. Now it runs a 27B uncensored model at
+**106 t/s** with speculative decoding, agentic research, temporal
+memory, and a training pipeline, all on one RTX 4090.
 
 | Tier | Speed | Engine | Use |
 |------|-------|--------|-----|
@@ -18,7 +17,49 @@
 | **ngram-mod** (warm) | 49.5 t/s | hash-based speculation, no draft | always-on, 131K ctx |
 | **megakernel** | 494 t/s | hand-written CUDA, Qwen3.5-0.8B | routing, agent tools |
 
-Started from 2021 InferKit / GPT-2 nostalgia — the GPT-2 proxy is still in the registry, not dead code. Two upstream merges along the way ([Lucebox #89](https://github.com/Luce-Org/lucebox-hub/pull/89), [#94](https://github.com/Luce-Org/lucebox-hub/pull/94)).
+## Why LAMU
+
+- **Five serving protocols, one port + one stdio pair.** OpenAI
+  (`/v1/chat/completions`), Anthropic (`/v1/messages` with real
+  `thinking` blocks), Ollama (`/api/chat`), MCP (30+ tools for Claude
+  Code), and **ACP** — `lamu acp` is a native Zed agent with streamed
+  thoughts, tool lifecycle, and permission prompts.
+- **Research where fake citations are structurally impossible.**
+  `deep_research` / `answer` resolve every `[N]` to a real retrieved
+  source IN CODE — the model never fabricates a link, because links
+  never come from the model.
+- **A real memory store, not a vibe.** Temporal facts (valid-time,
+  supersede, contradiction judging), hybrid recall (FTS5 + quantized
+  vector search with persistent indexes), local embeddings — zero API
+  keys required — and an owner-scoped HTTP memory API other agent
+  harnesses consume as a service.
+- **Provider-grade serving for harness builders.** Per-call engine-true
+  token usage and context occupancy (un-fakeable: counted by the
+  engine's own tokenizer), structured reasoning on every surface,
+  prefix-cache control + honest cached-token reporting, capability
+  discovery on `/v1/models`. The embedding contract is one documented
+  page: [`docs/API.md`](lamu-rs/docs/API.md) § *Embedding LAMU as a provider*.
+- **Three model formats.** GGUF via llama.cpp/BeeLlama, `.onnx`
+  embedding models via ort, and raw HuggingFace safetensors via candle
+  (Llama/Mistral/Qwen2 families) — scan finds them all, the scheduler
+  budgets them all.
+- **GPU safety as architecture.** PDEATHSIG-hardened children that
+  cannot outlive lamu, verified kills anchored on ports (PID reuse
+  safe), a VRAM scheduler that never silently evicts on the HTTP path,
+  and a training lock so `lamu` and a fine-tune run share the card
+  without fighting.
+- **Multi-model judgment.** `council` runs N models on one prompt and
+  judges headlessly; `parallel_query` fans out with per-provider caps.
+- **Hardware-aware model picking.** `lamu cookbook` ranks every model
+  for YOUR card with roofline math (quality/speed/fit/context).
+- **Sandboxed agents.** `lamu agent -- <cmd>` wraps mutating agents in
+  bubblewrap (cwd-rw only) with a filesystem journal — `lamu rollback`
+  reverses any session.
+- **37 ADRs.** Every architectural decision is written down with its
+  alternatives and a falsifiable validation section
+  ([`docs/decisions/`](lamu-rs/docs/decisions/)).
+
+Two upstream merges along the way ([Lucebox #89](https://github.com/Luce-Org/lucebox-hub/pull/89), [#94](https://github.com/Luce-Org/lucebox-hub/pull/94)).
 
 ---
 
@@ -140,9 +181,33 @@ Reload Claude Code, then `/mcp` should show `local-llm` connected. Tools exposed
 
 ---
 
-## HTTP API
+## Serving Surfaces
 
-`lamu serve` exposes the local model pool over **OpenAI-, Anthropic-, and Ollama-compatible** HTTP — point whatever client you already use at it. LAMU is the backend orchestrator; the frontend is your choice of harness (ADR [0016](lamu-rs/docs/decisions/0016-backend-orchestrator-byo-frontend.md)).
+`lamu serve` exposes the local model pool over **OpenAI-, Anthropic-, and Ollama-compatible** HTTP; `lamu start` speaks MCP on stdio; `lamu acp` is a native ACP agent for Zed. Point whatever client you already use at it — LAMU is the backend orchestrator; the frontend is your choice of harness (ADR [0016](lamu-rs/docs/decisions/0016-backend-orchestrator-byo-frontend.md)).
+
+Register LAMU as a Zed agent (`settings.json`):
+
+```jsonc
+{
+  "agent_servers": {
+    "LAMU": { "command": "lamu", "args": ["acp"] }
+  }
+}
+```
+
+Zed gets streamed answers AND thoughts (`<think>` blocks arrive as
+`agent_thought_chunk`s), live tool-call status for LAMU's research/memory
+tools, and permission prompts before any file write (ADR
+[0036](lamu-rs/docs/decisions/0036-acp-agent-surface.md)).
+
+Reasoning is structured data on every HTTP surface (OpenAI
+`reasoning_content`, Anthropic `thinking` blocks, Ollama
+`message.thinking`), and llama-server's prefix cache is exposed via
+`cache_prompt` with engine-true cached-token reporting (ADR
+[0037](lamu-rs/docs/decisions/0037-provider-grade-serving.md)). The
+memory store is served too: `POST /v1/memory/{remember,recall,forget,supersede}`
+with per-API-key owner isolation (ADR
+[0032](lamu-rs/docs/decisions/0032-memory-as-a-service.md)).
 
 📖 **The authoritative API reference is [`lamu-rs/docs/API.md`](lamu-rs/docs/API.md)** — every endpoint with request/response shapes, streaming, auth, error envelopes, LAMU extensions, and per-frontend setup. This README is a summary; **API.md is the single source of truth.**
 
@@ -202,7 +267,8 @@ precedence request > model > global, blank = explicitly disable) and
 [0026](lamu-rs/docs/decisions/0026-backend-kind-string-dispatch.md)).
 
 Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` in core, plus
-module-provided kinds (`comfyui`, `fish_speech`) registered at startup (ADR
+module-provided kinds (`comfyui`, `fish_speech`, and the feature-gated
+`onnx` + `hf_candle` engines — build with `--features full`) registered at startup (ADR
 [0023](lamu-rs/docs/decisions/0023-module-architecture.md)). Adding a module
 backend is one crate + one `register_backend("kind", …)` call at the
 composition root — core never names it; a drift test proves every kind
@@ -262,7 +328,7 @@ lamu               scan|status|start|serve|repl  # canonical
 
 ```bash
 pytest tests/ -q          # 288 unit + 14 integration, heavy deps stubbed
-cargo test --workspace    # 600+ Rust tests across 9 crates
+cargo test --workspace    # ~790 Rust tests across 13 crates
 just test-contract        # Python ↔ Rust MCP wire-format parity
 ruff check lamu           # strict on lamu/, soft on legacy paths
 ```
