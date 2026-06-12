@@ -1927,6 +1927,7 @@ dependencies = [
  "getrandom 0.2.17",
  "humantime",
  "lamu-core",
+ "lamu-memory",
  "lamu-providers",
  "libc",
  "parking_lot",
@@ -1941,8 +1942,23 @@ dependencies = [
  "tracing",
  "tree-sitter",
  "tree-sitter-rust",
- "turbovec",
  "which",
+]
+
+[[package]]
+name = "lamu-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "parking_lot",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "turbovec",
 ]
 
 [[package]]

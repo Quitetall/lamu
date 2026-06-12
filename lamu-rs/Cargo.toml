@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "lamu-core",
+    "lamu-memory",
     "lamu-mcp",
     "lamu-api",
     "lamu-cli",
@@ -46,6 +47,7 @@ walkdir = "2"
 
 # Internal crates
 lamu-core = { path = "lamu-core" }
+lamu-memory = { path = "lamu-memory" }
 lamu-providers = { path = "lamu-providers" }
 
 [profile.release]

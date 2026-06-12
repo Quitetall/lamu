@@ -51,6 +51,7 @@ fn sample_entry(name: &str) -> ModelEntry {
         path: PathBuf::from(format!("/tmp/{name}.gguf")),
         format: ModelFormat::Gguf,
         backend: BackendType::LlamaCpp,
+        backend_kind: None,
         arch: "qwen35".into(),
         params_b: 27.0,
         quant: "Q5_K_M".into(),
@@ -65,6 +66,7 @@ fn sample_entry(name: &str) -> ModelEntry {
         notes: String::new(),
         status: lamu_core::types::ModelStatus::default(),
         modality: lamu_core::types::Modality::Llm,
+        system_prompt: None,
     }
 }
 

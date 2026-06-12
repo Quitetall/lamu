@@ -13,6 +13,11 @@ pub mod context;
 pub mod cookbook_tool;
 pub mod council;
 pub mod handlers;
+/// Memory/persistence storage moved to the lamu-memory crate (ADR 0029);
+/// the `memory` / `rag` / `lifetime_memory` modules below are frontend
+/// shims that re-export it plus the MCP-shaped pieces (tool handlers,
+/// cloud-judged orchestration, untrusted fencing). The vector_index seam
+/// lives at `lamu_memory::vector_index`.
 pub mod lifetime_memory;
 /// Re-export: media_paths moved to lamu-core (ADR 0023). Keeps
 /// `crate::media_paths::…` working for the in-tree tts/image tools.
@@ -23,4 +28,3 @@ pub mod server;
 pub mod tools;
 pub mod train_tool;
 pub mod untrusted;
-pub mod vector_index;
