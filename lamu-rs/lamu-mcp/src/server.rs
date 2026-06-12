@@ -302,7 +302,31 @@ impl LamuMcpServer {
     async fn tools_call(&self, params: Value, id: Option<Value>) -> Value {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+        let result = self.dispatch_tool_text(tool_name, args).await;
 
+        // Shared heuristic (also used by the ACP frontend) so the two
+        // surfaces can never drift on what counts as a failed tool call.
+        let is_error = is_tool_error_text(&result);
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": result }],
+                "isError": is_error,
+            }
+        })
+    }
+
+    /// Dispatch one tool by name through the exact path `tools/call` uses
+    /// (built-in TOOLS table first, then the ADR 0023 module-tool registry,
+    /// with the `local-only` routing gate applied to cloud-flagged tools)
+    /// and return the raw wire text. Public so other frontends that compose
+    /// this server in-process (the ACP agent loop, ADR 0036) reuse the same
+    /// dispatch semantics instead of duplicating the gate + fallback logic.
+    /// Failures use the legacy wire convention: an `"error:"`-prefixed (or
+    /// `"Unknown tool:"`) string — sniff with `tools_ext::is_wire_error`.
+    pub async fn dispatch_tool_text(&self, tool_name: &str, args: Value) -> String {
         // Routing-mode gate: 'local-only' refuses cloud-LLM tools — the
         // mirror of handle_query's 'cloud-only' refusal for local
         // queries. Cloud tools are HandlerKind::Free and never receive
@@ -316,7 +340,7 @@ impl LamuMcpServer {
         // Phase 2.1: dispatcher reads from `tools::TOOLS`. Adding a new
         // tool means one entry in tools.rs; the dispatcher and the
         // tools/list response both pick it up automatically.
-        let result = match crate::tools::find(tool_name) {
+        match crate::tools::find(tool_name) {
             Some(t) if local_only && t.cloud => format!(
                 "error: routing mode is 'local-only' — cloud tool '{}' refused. \
                  Call set_routing_mode(mode='auto') to re-enable.",
@@ -339,24 +363,7 @@ impl LamuMcpServer {
                 Some((h, _)) => h(self as &dyn lamu_core::tools_ext::ToolCtx, args).await,
                 None => format!("Unknown tool: {}", tool_name),
             },
-        };
-
-        // Heuristic: handlers prefix error responses with "error:" or
-        // "Unknown tool:". Surface that as MCP `isError: true` so
-        // clients can branch on tool failure programmatically.
-        let lower = result.trim_start().to_lowercase();
-        let is_error = lower.starts_with("error:")
-            || lower.starts_with("unknown tool:")
-            || lower.starts_with("missing prompt");
-
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": result }],
-                "isError": is_error,
-            }
-        })
+        }
     }
 
     pub(crate) async fn get_or_create_queue(&self, model_name: &str) -> Arc<RequestQueue<()>> {
@@ -568,6 +575,17 @@ impl lamu_memory::embedder::Embedder for McpServerEmbedder {
         }
         Ok(out)
     }
+}
+
+/// One heuristic for "this tool result is a failure", shared by the MCP
+/// dispatcher (`isError`) and the ACP frontend (`tool_call_update` status)
+/// so the two surfaces can never drift. Handlers prefix failures with
+/// "error:"; the dispatcher itself emits "Unknown tool:" / "missing prompt".
+pub fn is_tool_error_text(result: &str) -> bool {
+    let lower = result.trim_start().to_lowercase();
+    lower.starts_with("error:")
+        || lower.starts_with("unknown tool:")
+        || lower.starts_with("missing prompt")
 }
 
 fn initialize_response(id: Option<Value>) -> Value {

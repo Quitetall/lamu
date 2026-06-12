@@ -1,5 +1,6 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
+mod acp;
 mod chat_tui;
 mod clean;
 mod cloud_models;
@@ -40,6 +41,10 @@ enum Command {
     Status,
     /// Boot MCP server (stdio)
     Start,
+    /// Boot ACP agent (stdio) — Zed-style editor↔agent protocol
+    /// (agentclientprotocol.com, ADR 0036). The editor spawns this and
+    /// drives a LOCAL model with LAMU's in-process tool surface.
+    Acp,
     /// Deep research: decompose a question, search HuggingFace/PubMed/bioRxiv/
     /// Semantic Scholar (+ web when keyed), synthesize a CITED answer, then drop
     /// into a follow-up chat grounded in the retrieved studies.
@@ -391,6 +396,7 @@ async fn main() -> Result<()> {
         Some(Command::Scan) => cmd_scan().await,
         Some(Command::Status) => cmd_status().await,
         Some(Command::Start) => cmd_start().await,
+        Some(Command::Acp) => cmd_acp().await,
         Some(Command::Research { query, tui, web, sub_questions, limit, model, verify, no_chat }) => {
             if tui || web {
                 // Graphical frontend: jart's TUI / web SPA, LAMU-backed summarizer.
@@ -1113,6 +1119,17 @@ fn format_status_line(port: u16, health: Option<&Value>, models: Option<&Value>)
 async fn cmd_start() -> Result<()> {
     let server = build_mcp_server().await?;
     server.run().await
+}
+
+/// `lamu acp` — ACP agent over stdio (ADR 0036). Composes the same
+/// backend state as `lamu start` (registry + scheduler + ADR 0023
+/// modules registered in main()) and runs the ACP loop on top of it.
+async fn cmd_acp() -> Result<()> {
+    let server = std::sync::Arc::new(build_mcp_server().await?);
+    let acp = std::sync::Arc::new(acp::AcpServer::new(server, acp::AcpConfig::default())?);
+    // Startup banner on stderr (stdout is the protocol channel).
+    eprintln!("LAMU ACP agent ready (rust)");
+    acp.run(tokio::io::stdin(), tokio::io::stdout()).await
 }
 
 /// Build the MCP server (registry + VRAM scheduler, auto-registering any models

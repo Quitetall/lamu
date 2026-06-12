@@ -71,3 +71,6 @@ full = ["onnx", "hf-candle"]
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+# ACP tests implement lamu-core's #[async_trait] Backend for the fake
+# in-test model backend. Already in the tree (lamu-core/mcp use it).
+async-trait = "0.1"
