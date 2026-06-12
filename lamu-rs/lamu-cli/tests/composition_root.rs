@@ -32,6 +32,7 @@ fn entry_for(kind: &str) -> ModelEntry {
         main: false,
         notes: String::new(),
         status: Default::default(),
+        system_prompt: None,
         modality: Default::default(),
     }
 }

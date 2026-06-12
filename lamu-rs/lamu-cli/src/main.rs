@@ -1,6 +1,7 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
 mod chat_tui;
+mod clean;
 mod cloud_models;
 mod cloud_sync;
 mod favorites;
@@ -109,6 +110,46 @@ enum Command {
     Use {
         /// Model name or substring. Resolved against the local registry.
         model: String,
+    },
+    /// Retention for LAMU's data dir (drafts, sessions, transcripts, media,
+    /// logs). DRY-RUN by default — pass --yes to actually delete. Never
+    /// touches the registry, the SQLite stores, train data, or ~/.config.
+    ///
+    /// Examples:
+    ///   lamu clean --drafts --keep-days 30          # report only
+    ///   lamu clean --drafts --keep-days 30 --yes    # delete
+    ///   lamu clean --all --keep-days 60 --keep-count 10 --yes
+    Clean {
+        /// Research drafts (~/.local/share/lamu/research/*.md).
+        #[arg(long)]
+        drafts: bool,
+        /// Sandbox session snapshots + their untracked archives (paired).
+        #[arg(long)]
+        sessions: bool,
+        /// Saved chat transcripts (incl. crash auto-saves).
+        #[arg(long)]
+        conversations: bool,
+        /// Generated images + TTS audio.
+        #[arg(long)]
+        media: bool,
+        /// Backend startup logs (comfyui-*.log, fish-speech-*.log).
+        #[arg(long)]
+        logs: bool,
+        /// All of the above.
+        #[arg(long)]
+        all: bool,
+        /// Delete files older than N days (0 = age deletes nothing).
+        #[arg(long, default_value_t = 30)]
+        keep_days: u64,
+        /// Always keep the newest N per category.
+        #[arg(long, default_value_t = 0)]
+        keep_count: usize,
+        /// Per-category size budget in MiB; oldest deleted until under it.
+        #[arg(long, default_value_t = 0)]
+        max_size_mb: u64,
+        /// Actually delete (without this: dry-run report).
+        #[arg(long)]
+        yes: bool,
     },
     /// List recent chat sessions (git snapshots).
     Sessions,
@@ -346,6 +387,13 @@ async fn main() -> Result<()> {
         Some(Command::Show { model }) => cmd_show(&model),
         Some(Command::Rm { model, yes }) => cmd_rm(&model, yes),
         Some(Command::Use { model }) => cmd_use(&model),
+        Some(Command::Clean {
+            drafts, sessions, conversations, media, logs, all,
+            keep_days, keep_count, max_size_mb, yes,
+        }) => clean::cmd_clean(clean::CleanOpts {
+            drafts, sessions, conversations, media, logs, all,
+            keep_days, keep_count, max_size_mb, yes,
+        }),
         Some(Command::Sessions) => cmd_sessions(),
         Some(Command::Undo { session_id, yes }) => cmd_undo(session_id, yes),
         Some(Command::Rollback { session_id }) => cmd_rollback(&session_id),

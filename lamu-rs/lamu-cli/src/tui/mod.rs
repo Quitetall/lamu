@@ -1212,6 +1212,8 @@ mod tests {
             notes: String::new(),
             status: lamu_core::types::ModelStatus::default(),
             modality: lamu_core::types::Modality::Llm,
+            backend_kind: None,
+            system_prompt: None,
         }
     }
 }
