@@ -171,15 +171,67 @@ pub enum FitLevel {
     TooTight,
 }
 
+/// One accelerator the cookbook can place a model on (device-awareness
+/// layer for ADR 0015 Phase 4 / ADR 0017). On today's single-GPU rigs the
+/// list holds exactly one entry and behavior is byte-identical to the
+/// scalar-only Hardware; multi-GPU enumeration arrives with the ADR 0017
+/// P1 device pool.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeviceInfo {
+    /// NVML / CUDA_VISIBLE_DEVICES index.
+    pub index: u32,
+    pub name: Option<String>,
+    pub vram_gb: f32,
+}
+
 /// Detected hardware. `avail_ram_gb == 0` means GPU-only (the Phase-1
 /// default): models that only "fit" by spilling to system RAM are reported as
 /// too-tight rather than recommended.
+///
+/// `gpu_vram_gb` stays the aggregate scoring budget (all scoring math keys
+/// on it — unchanged); `devices` is placement metadata layered on top.
 #[derive(Clone, Debug)]
 pub struct Hardware {
     pub gpu_name: Option<String>,
     pub gpu_vram_gb: f32,
     pub avail_ram_gb: f32,
     pub backend: Backend,
+    /// Per-device view. Single-GPU default: one entry mirroring
+    /// `gpu_name`/`gpu_vram_gb`; empty on the CPU path. Invariant: when
+    /// non-empty, `devices[0].vram_gb == gpu_vram_gb` — mutate via
+    /// [`Hardware::set_total_vram_gb`], not directly, to keep them in sync.
+    pub devices: Vec<DeviceInfo>,
+}
+
+impl Hardware {
+    /// Override the GPU VRAM budget (e.g. `--simulate_vram`), keeping the
+    /// device list in sync. Simulation is a single-card what-if, so only
+    /// device 0 is rewritten.
+    pub fn set_total_vram_gb(&mut self, gb: f32) {
+        self.gpu_vram_gb = gb;
+        if let Some(d) = self.devices.first_mut() {
+            d.vram_gb = gb;
+        }
+    }
+}
+
+/// The device a model needing `required_gb` would run on: the largest
+/// single device that fits it (most headroom). `None` = no single device
+/// fits — on a single-GPU rig that is exactly "doesn't fit in VRAM", and
+/// the caller's existing offload/too-tight logic takes over unchanged.
+/// (Sum-across-devices for shardable models is the ADR 0017 P4 follow-up,
+/// blocked on the P1/P2 multi-GPU foundation.)
+pub fn choose_device(hw: &Hardware, required_gb: f32) -> Option<u32> {
+    // Defense: a NaN/negative requirement (corrupted spec) must not
+    // "fit everywhere"; refuse placement instead.
+    if !required_gb.is_finite() || required_gb < 0.0 {
+        return None;
+    }
+    hw.devices
+        .iter()
+        .filter(|d| d.vram_gb >= required_gb)
+        .max_by(|a, b| a.vram_gb.partial_cmp(&b.vram_gb).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|d| d.index)
 }
 
 /// One model's scoring inputs, derived from a registry `ModelEntry`.
@@ -209,6 +261,12 @@ pub struct FitResult {
     pub speed: f32,
     pub fit: f32,
     pub context_score: f32,
+    /// Device the model would run on (`choose_device`): `Some(index)` for a
+    /// GPU fit, `None` for offload/CPU/no-fit. Pure metadata — the score is
+    /// device-agnostic. Omitted from JSON when `None` (pre-device output
+    /// shape stays stable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<u32>,
 }
 
 // ── hardware detection (cross-vendor) ──────────────────────────────────────
@@ -225,34 +283,43 @@ pub fn detect_hardware() -> Hardware {
     let (_, total_mb) = sched.query_vram();
     if total_mb > 0 {
         if let Some(name) = sched.gpu_name() {
-            return Hardware {
-                gpu_name: Some(name),
-                gpu_vram_gb: total_mb as f32 / 1024.0,
-                avail_ram_gb: 0.0, // GPU-only budget (offload scoring is CPU-path only)
-                backend: Backend::Cuda,
-            };
+            return gpu_hardware(name, total_mb as f32 / 1024.0, Backend::Cuda, crate::config::gpu_index());
         }
     }
     // 2. AMD discrete (Linux sysfs: vendor 0x1002 + mem_info_vram_total).
     if let Some((name, vram_gb)) = detect_pci_gpu("0x1002", "AMD Radeon") {
-        return Hardware { gpu_name: Some(name), gpu_vram_gb: vram_gb, avail_ram_gb: 0.0, backend: Backend::Rocm };
+        return gpu_hardware(name, vram_gb, Backend::Rocm, 0);
     }
     // 3. Apple Silicon (macOS). Unified memory IS the GPU budget, so no separate
     //    offload pool.
     #[cfg(target_os = "macos")]
     if let Some((name, vram_gb)) = detect_apple() {
-        return Hardware { gpu_name: Some(name), gpu_vram_gb: vram_gb, avail_ram_gb: 0.0, backend: Backend::Metal };
+        return gpu_hardware(name, vram_gb, Backend::Metal, 0);
     }
     // 4. Intel discrete (Linux sysfs: vendor 0x8086 + dGPU VRAM).
     if let Some((name, vram_gb)) = detect_pci_gpu("0x8086", "Intel Arc") {
-        return Hardware { gpu_name: Some(name), gpu_vram_gb: vram_gb, avail_ram_gb: 0.0, backend: Backend::Oneapi };
+        return gpu_hardware(name, vram_gb, Backend::Oneapi, 0);
     }
-    // 5. CPU fallback.
+    // 5. CPU fallback — no devices.
     Hardware {
         gpu_name: None,
         gpu_vram_gb: 0.0,
         avail_ram_gb: read_avail_ram_gb(),
         backend: cpu_backend(),
+        devices: Vec::new(),
+    }
+}
+
+/// Single-detected-GPU Hardware: the device list mirrors the scalar fields
+/// (one entry). Multi-GPU enumeration plugs in here when the ADR 0017 P1
+/// device pool lands — every consumer is already shaped for a Vec.
+fn gpu_hardware(name: String, vram_gb: f32, backend: Backend, index: u32) -> Hardware {
+    Hardware {
+        gpu_name: Some(name.clone()),
+        gpu_vram_gb: vram_gb,
+        avail_ram_gb: 0.0, // GPU-only budget (offload scoring is CPU-path only)
+        backend,
+        devices: vec![DeviceInfo { index, name: Some(name), vram_gb }],
     }
 }
 
@@ -576,6 +643,7 @@ pub fn score_model(spec: &ModelSpec, hw: &Hardware, use_case: &str, target_quant
             speed: 0.0,
             fit: 0.0,
             context_score: 0.0,
+            device: None,
         });
     };
 
@@ -611,6 +679,13 @@ pub fn score_model(spec: &ModelSpec, hw: &Hardware, use_case: &str, target_quant
     let (wq, ws, wf, wc) = use_case_weights(use_case);
     let composite = q * wq + s * ws + f * wf + c * wc;
 
+    // Placement metadata only — never feeds the score.
+    let device = if run_mode == RunMode::Gpu {
+        choose_device(hw, required_gb)
+    } else {
+        None
+    };
+
     Some(FitResult {
         name: spec.name.clone(),
         fit_level,
@@ -624,6 +699,7 @@ pub fn score_model(spec: &ModelSpec, hw: &Hardware, use_case: &str, target_quant
         speed: s,
         fit: f,
         context_score: c,
+        device,
     })
 }
 
@@ -676,6 +752,11 @@ mod tests {
             gpu_vram_gb: 24.0,
             avail_ram_gb: 0.0, // GPU-only
             backend: Backend::Cuda,
+            devices: vec![DeviceInfo {
+                index: 0,
+                name: Some("NVIDIA GeForce RTX 4090".into()),
+                vram_gb: 24.0,
+            }],
         }
     }
 
@@ -689,6 +770,52 @@ mod tests {
             context_max: ctx,
             use_case: uc.into(),
         }
+    }
+
+    #[test]
+    fn choose_device_picks_largest_fitting() {
+        let mut hw = rtx4090();
+        // Synthetic second card (pure arithmetic — no hardware needed): a
+        // 12 GB card at index 1 alongside the 24 GB at index 0.
+        hw.devices.push(DeviceInfo { index: 1, name: Some("RTX 3060".into()), vram_gb: 12.0 });
+        // Fits both → largest (24 GB, index 0) wins.
+        assert_eq!(choose_device(&hw, 10.0), Some(0));
+        // Fits only the big card.
+        assert_eq!(choose_device(&hw, 20.0), Some(0));
+        // Fits nothing → None (caller's offload/too-tight logic unchanged).
+        assert_eq!(choose_device(&hw, 48.0), None);
+        // CPU box: no devices, never Some.
+        let cpu = Hardware {
+            gpu_name: None, gpu_vram_gb: 0.0, avail_ram_gb: 32.0,
+            backend: Backend::CpuX86, devices: Vec::new(),
+        };
+        assert_eq!(choose_device(&cpu, 1.0), None);
+    }
+
+    #[test]
+    fn device_metadata_never_moves_the_score() {
+        // Single-GPU parity: identical Hardware with and without the device
+        // list must produce identical scores — device is metadata only.
+        let spec = dense("qwen3.6-27b", 27.6, "Q4_K_M", 262144, "general");
+        let with_dev = rtx4090();
+        let mut without_dev = rtx4090();
+        without_dev.devices.clear();
+        let a = score_model(&spec, &with_dev, "general", None).unwrap();
+        let b = score_model(&spec, &without_dev, "general", None).unwrap();
+        assert_eq!(a.score, b.score);
+        assert_eq!(a.fit_level, b.fit_level);
+        assert_eq!(a.tps_est, b.tps_est);
+        // The only difference: placement metadata.
+        assert_eq!(a.device, Some(0), "GPU fit on the single 4090 → device 0");
+        assert_eq!(b.device, None, "no device list → no placement");
+    }
+
+    #[test]
+    fn set_total_vram_keeps_device_in_sync() {
+        let mut hw = rtx4090();
+        hw.set_total_vram_gb(8.0);
+        assert_eq!(hw.gpu_vram_gb, 8.0);
+        assert_eq!(hw.devices[0].vram_gb, 8.0);
     }
 
     #[test]

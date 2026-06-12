@@ -34,7 +34,7 @@ pub async fn handle_cookbook(args: Value) -> String {
     // budget too, so the simulation is a pure GPU budget (no double-counting on a
     // CPU box where avail_ram was populated).
     if let Some(v) = args["simulate_vram"].as_u64() {
-        hw.gpu_vram_gb = v as f32 / 1024.0;
+        hw.set_total_vram_gb(v as f32 / 1024.0); // keeps the device list in sync
         hw.avail_ram_gb = 0.0;
     }
     let ctx_override = args["ctx"].as_u64().map(|c| c as u32);

@@ -449,7 +449,7 @@ fn cmd_cookbook(opts: CookbookOpts) -> Result<()> {
     // --simulate-vram overrides the detected card's budget (pure GPU budget:
     // zero the RAM-offload pool so a CPU box doesn't double-count).
     if let Some(sim) = opts.simulate_vram {
-        hw.gpu_vram_gb = sim as f32 / 1024.0;
+        hw.set_total_vram_gb(sim as f32 / 1024.0); // keeps the device list in sync
         hw.avail_ram_gb = 0.0;
     }
 
