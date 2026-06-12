@@ -17,6 +17,10 @@ pub mod media_paths;
 /// Module-tool extension seam (ADR 0023): ToolCtx + ModuleTool registry so
 /// modules contribute MCP tools without a lamu-mcp dependency.
 pub mod tools_ext;
+/// Scripted ToolCtx double for agentic-flow tests (feature `test-support`;
+/// consumer crates enable it in dev-dependencies — never in production).
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod cookbook;
 /// Shared SearXNG retrieval + prompt-injection sanitization (ADR audit B7):
 /// one keyless metasearch backend + `sanitize_field` for both lamu-jart's

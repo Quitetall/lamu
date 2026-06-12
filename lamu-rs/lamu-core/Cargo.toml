@@ -35,3 +35,8 @@ futures-util = "0.3"
 proptest = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+# Compiles lamu_core::test_support (FakeCtx). For consumer dev-dependencies
+# only — never enable in a production dependency.
+test-support = []

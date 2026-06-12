@@ -9,9 +9,9 @@
 //! Frontends (a `lamu research` TUI + the bundled web SPA) drive this tool; they
 //! reuse `jart::tui` / `jart::server` with an in-process summarizer.
 
-mod answer;
-mod chat;
-mod deep_research;
+pub mod answer;
+pub mod chat;
+pub mod deep_research;
 mod drafts;
 mod research;
 mod session;
