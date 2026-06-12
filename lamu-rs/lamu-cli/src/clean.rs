@@ -2,13 +2,20 @@
 //!
 //! Categories (all under `~/.local/share/lamu/`): research drafts, sandbox
 //! sessions (snapshot + untracked archive deleted as a PAIR), chat
-//! transcripts, media outputs (images + tts), backend startup logs.
+//! transcripts, media outputs (images + tts), backend startup logs, and —
+//! explicit-only, NOT part of `--all` — the legacy pre-ADR-0028 SQLite
+//! stores (`--legacy-dbs`: `conversations.db` / `memory.db` /
+//! `embeddings.db` + their `-wal`/`-shm` sidecars). Those are one-time
+//! import sources left in place by the unified-`lamu.db` migration; the
+//! category is offered ONLY when `lamu.db` exists (i.e. the import
+//! happened), so the data they hold is already in the live store.
 //!
 //! Hard exclusions — never candidates, by construction (the walker only
-//! enters the category subdirs): the live registry (`models.yaml`, ADR
-//! 0025), `scheduler.lock`, the SQLite stores (`conversations.db*`,
-//! `memory.db*` — live state, not retention fodder; their sizes are shown
-//! in the report), `train-data/`/`train-jobs/`, and everything in
+//! enters the category subdirs / the explicit legacy filenames): the live
+//! registry (`models.yaml`, ADR 0025), `scheduler.lock`, the LIVE SQLite
+//! store (`lamu.db*`) and the persistent vector indexes (`index/`, ADR
+//! 0031) — live state, not retention fodder; their sizes are shown in the
+//! report — `train-data/`/`train-jobs/`, and everything in
 //! `~/.config/lamu/`.
 //!
 //! Safety model: DRY-RUN BY DEFAULT — without `--yes` nothing is deleted,
@@ -27,6 +34,11 @@ pub struct CleanOpts {
     pub conversations: bool,
     pub media: bool,
     pub logs: bool,
+    /// Legacy pre-ADR-0028 SQLite stores (conversations.db / memory.db /
+    /// embeddings.db + -wal/-shm sidecars). EXPLICIT-ONLY: deliberately
+    /// not included in `--all` (deleting databases deserves its own
+    /// flag), and only offered when the unified `lamu.db` exists.
+    pub legacy_dbs: bool,
     pub all: bool,
     /// Delete files older than this many days (0 = age alone deletes nothing).
     pub keep_days: u64,
@@ -45,6 +57,7 @@ enum Category {
     Conversations,
     Media,
     Logs,
+    LegacyDbs,
 }
 
 impl Category {
@@ -55,6 +68,7 @@ impl Category {
             Category::Conversations => "conversations",
             Category::Media => "media",
             Category::Logs => "logs",
+            Category::LegacyDbs => "legacy-dbs",
         }
     }
 }
@@ -62,8 +76,9 @@ impl Category {
 #[derive(Debug, Clone)]
 struct Candidate {
     path: PathBuf,
-    /// Companion deleted with `path` (a session's untracked archive).
-    twin: Option<PathBuf>,
+    /// Companions deleted with `path` (a session's untracked archive; a
+    /// legacy db's -wal/-shm sidecars).
+    twins: Vec<PathBuf>,
     mtime: SystemTime,
     size: u64,
 }
@@ -90,10 +105,15 @@ pub fn cmd_clean(opts: CleanOpts) -> anyhow::Result<()> {
     pick(opts.conversations, Category::Conversations, &mut cats);
     pick(opts.media, Category::Media, &mut cats);
     pick(opts.logs, Category::Logs, &mut cats);
+    // EXPLICIT-ONLY: legacy DBs are never swept up by --all — deleting
+    // databases (even import-source leftovers) deserves its own flag.
+    if opts.legacy_dbs {
+        cats.push(Category::LegacyDbs);
+    }
     if cats.is_empty() {
         anyhow::bail!(
             "nothing selected — pass one or more of --drafts --sessions --conversations \
-             --media --logs, or --all"
+             --media --logs --legacy-dbs, or --all"
         );
     }
 
@@ -111,7 +131,7 @@ pub fn cmd_clean(opts: CleanOpts) -> anyhow::Result<()> {
         let cands = collect(&root, cat);
         let doomed = apply_retention(cands, opts.keep_days, opts.keep_count, opts.max_size_mb);
         let bytes: u64 = doomed.iter().map(|c| c.size).sum();
-        let cat_files: usize = doomed.iter().map(|c| if c.twin.is_some() { 2 } else { 1 }).sum();
+        let cat_files: usize = doomed.iter().map(|c| 1 + c.twins.len()).sum();
         println!(
             "  {:<14} {:>5} file(s)  {:>9.2} MiB",
             cat.label(),
@@ -120,12 +140,12 @@ pub fn cmd_clean(opts: CleanOpts) -> anyhow::Result<()> {
         );
         for c in &doomed {
             println!("    {}", c.path.display());
-            if let Some(t) = &c.twin {
+            for t in &c.twins {
                 println!("    {}", t.display());
             }
             if opts.yes {
                 remove_confined(&root, &c.path);
-                if let Some(t) = &c.twin {
+                for t in &c.twins {
                     remove_confined(&root, t);
                 }
             }
@@ -142,7 +162,8 @@ pub fn cmd_clean(opts: CleanOpts) -> anyhow::Result<()> {
     );
 
     // Live state the clean never touches — report sizes so the operator
-    // knows where the rest of the disk went.
+    // knows where the rest of the disk went. The legacy DBs are listed
+    // here too (when not selected) since they predate --legacy-dbs.
     for db in ["conversations.db", "memory.db"] {
         if let Ok(m) = fs::metadata(root.join(db)) {
             println!(
@@ -152,7 +173,35 @@ pub fn cmd_clean(opts: CleanOpts) -> anyhow::Result<()> {
             );
         }
     }
+    // ADR 0028/0031 artifacts: the unified lamu.db and the persistent
+    // vector indexes under index/. NEVER deletable here — live state —
+    // but their sizes belong in the report.
+    if let Ok(m) = fs::metadata(root.join("lamu.db")) {
+        println!(
+            "  (not managed: lamu.db — {:.2} MiB of live state)",
+            m.len() as f64 / (1024.0 * 1024.0)
+        );
+    }
+    let index_bytes = dir_size(&root.join("index"));
+    if index_bytes > 0 {
+        println!(
+            "  (not managed: index/ — {:.2} MiB of live state)",
+            index_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
     Ok(())
+}
+
+/// Total size of the regular files directly inside `dir` (the index/
+/// layout is flat: <store>.tv / .ids / .meta.json). Symlinks skipped;
+/// missing dir → 0.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .filter_map(|e| fs::symlink_metadata(e.path()).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// Enumerate a category's deletable files. Only regular files inside the
@@ -190,14 +239,49 @@ fn collect(root: &Path, cat: Category) -> Vec<Candidate> {
                         let arc = untracked.join(format!("{stem}.tar.zst"));
                         if arc.is_file() {
                             c.size += fs::metadata(&arc).map(|m| m.len()).unwrap_or(0);
-                            c.twin = Some(arc);
+                            c.twins.push(arc);
                         }
                     }
                     c
                 })
                 .collect()
         }
+        Category::LegacyDbs => collect_legacy_dbs(root),
     }
+}
+
+/// The pre-ADR-0028 standalone stores, deletable ONLY once the unified
+/// `lamu.db` exists (i.e. their one-time import has run — before that
+/// they ARE the live data and must never be candidates). Each db is
+/// paired with whatever `-wal`/`-shm` sidecars exist, deleted as a unit
+/// (a dangling sidecar would resurrect stale pages on a re-open).
+fn collect_legacy_dbs(root: &Path) -> Vec<Candidate> {
+    if !root.join("lamu.db").is_file() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for db in ["conversations.db", "memory.db", "embeddings.db"] {
+        let path = root.join(db);
+        // symlink_metadata (not metadata): never follow a planted link.
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mut size = meta.len();
+        let mut twins = Vec::new();
+        for suffix in ["-wal", "-shm"] {
+            let side = root.join(format!("{db}{suffix}"));
+            if let Ok(m) = fs::symlink_metadata(&side) {
+                if m.is_file() {
+                    size += m.len();
+                    twins.push(side);
+                }
+            }
+        }
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push(Candidate { path, twins, mtime, size });
+    }
+    out
 }
 
 fn files_in(dir: &Path, exts: &[&str]) -> Vec<Candidate> {
@@ -218,7 +302,7 @@ fn files_in(dir: &Path, exts: &[&str]) -> Vec<Candidate> {
             continue;
         }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push(Candidate { path, twin: None, mtime, size: meta.len() });
+        out.push(Candidate { path, twins: Vec::new(), mtime, size: meta.len() });
     }
     out
 }
@@ -369,10 +453,60 @@ mod tests {
         touch(&sessions, "s2.toml", 40, 10); // no archive
         let cands = collect(root.path(), Category::Sessions);
         let s1 = cands.iter().find(|c| c.path.ends_with("s1.toml")).unwrap();
-        assert!(s1.twin.as_ref().unwrap().ends_with("s1.tar.zst"));
+        assert_eq!(s1.twins.len(), 1);
+        assert!(s1.twins[0].ends_with("s1.tar.zst"));
         assert_eq!(s1.size, 14, "archive bytes counted with the snapshot");
         let s2 = cands.iter().find(|c| c.path.ends_with("s2.toml")).unwrap();
-        assert!(s2.twin.is_none());
+        assert!(s2.twins.is_empty());
+    }
+
+    #[test]
+    fn legacy_dbs_gated_on_lamu_db_existence() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("conversations.db"), b"legacy").unwrap();
+        fs::write(root.path().join("memory.db"), b"legacy").unwrap();
+        // No lamu.db → the import never ran → these ARE the live data:
+        // the category must offer NOTHING.
+        assert!(
+            collect(root.path(), Category::LegacyDbs).is_empty(),
+            "legacy dbs must not be candidates before the lamu.db import"
+        );
+        // lamu.db present → import happened → both legacy dbs are offered.
+        fs::write(root.path().join("lamu.db"), b"unified").unwrap();
+        let cands = collect(root.path(), Category::LegacyDbs);
+        let names: Vec<String> = cands
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"conversations.db".to_string()));
+        assert!(names.contains(&"memory.db".to_string()));
+        // lamu.db itself is NEVER a candidate.
+        assert!(!names.contains(&"lamu.db".to_string()));
+    }
+
+    #[test]
+    fn legacy_dbs_pair_wal_and_shm_sidecars() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("lamu.db"), b"unified").unwrap();
+        fs::write(root.path().join("memory.db"), vec![b'x'; 100]).unwrap();
+        fs::write(root.path().join("memory.db-wal"), vec![b'w'; 30]).unwrap();
+        fs::write(root.path().join("memory.db-shm"), vec![b's'; 20]).unwrap();
+        fs::write(root.path().join("embeddings.db"), vec![b'e'; 50]).unwrap(); // no sidecars
+        let cands = collect(root.path(), Category::LegacyDbs);
+
+        let mem = cands.iter().find(|c| c.path.ends_with("memory.db")).unwrap();
+        let twin_names: Vec<String> = mem
+            .twins
+            .iter()
+            .map(|t| t.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(twin_names, ["memory.db-wal", "memory.db-shm"]);
+        assert_eq!(mem.size, 150, "sidecar bytes counted with the db");
+
+        let emb = cands.iter().find(|c| c.path.ends_with("embeddings.db")).unwrap();
+        assert!(emb.twins.is_empty());
+        assert_eq!(emb.size, 50);
     }
 
     #[test]

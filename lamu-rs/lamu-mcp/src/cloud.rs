@@ -599,7 +599,13 @@ async fn run_autocapture_job(job: AutocaptureJob) {
         Ok(facts) => {
             let mut stored = 0usize;
             for f in &facts {
-                match crate::lifetime_memory::remember_if_novel(f, "fact", &conv).await {
+                match crate::lifetime_memory::remember_if_novel(
+                    f,
+                    "fact",
+                    &conv,
+                    crate::lifetime_memory::LOCAL_OWNER,
+                )
+                .await {
                     Ok(Some(_)) => stored += 1,
                     Ok(None) => {} // skipped as a near-duplicate
                     Err(e) => tracing::debug!("autocapture({conv}): store fact failed: {e}"),

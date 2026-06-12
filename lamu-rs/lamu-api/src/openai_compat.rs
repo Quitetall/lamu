@@ -123,16 +123,17 @@ fn default_temperature() -> f32 { 0.7 }
 
 /// Bounded `user` label for the structured audit events. StaticToken/Off (no
 /// Principal) → "anon" so the field is always present and never leaks an
-/// unbounded identity. ADR 0018 §5.
-fn user_label(principal: Option<&Principal>) -> &str {
+/// unbounded identity. ADR 0018 §5. (Shared with the ADR 0032 memory routes.)
+pub(crate) fn user_label(principal: Option<&Principal>) -> &str {
     principal.map(|p| p.user.as_str()).unwrap_or("anon")
 }
 
 /// Surface-correct 429 envelope (mirrors `auth::unauthorized`'s per-surface
 /// shapes). Anthropic shape on /v1/messages, Ollama flat-string on /api/*,
 /// else the OpenAI shape. The `limit` is surfaced in the human message and a
-/// `Retry-After: 3600` hint is attached.
-fn over_quota(path: &str, limit: u32) -> Response {
+/// `Retry-After: 3600` hint is attached. (Shared with the ADR 0032 memory
+/// routes, which sit on the OpenAI-shape branch.)
+pub(crate) fn over_quota(path: &str, limit: u32) -> Response {
     let human = format!(
         "daily token quota exhausted (limit {limit}); retry after the bucket refills"
     );
@@ -217,6 +218,14 @@ pub fn build_app(state: AppState) -> AxumRouter {
         // and other tools that hardcode the Ollama API surface.
         .route("/api/tags", get(ollama_tags))
         .route("/api/chat", post(ollama_chat))
+        // Memory-as-a-service (ADR 0032): lamu-memory's temporal fact
+        // store for external harnesses (katana). Registered BEFORE the
+        // bearer layer below so they sit INSIDE it — owner scoping under
+        // KeyStore depends on the middleware's Principal extension.
+        .route("/v1/memory/remember", post(crate::memory_api::memory_remember))
+        .route("/v1/memory/recall", post(crate::memory_api::memory_recall))
+        .route("/v1/memory/forget", post(crate::memory_api::memory_forget))
+        .route("/v1/memory/supersede", post(crate::memory_api::memory_supersede))
         // Bearer auth (ADR 0012). No-op when no token is configured; /health +
         // /metrics are exempt inside the middleware.
         .layer(axum::middleware::from_fn_with_state(

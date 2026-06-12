@@ -19,6 +19,11 @@
 //!   `handle_recall_memory`, `handle_consolidate_memory`,
 //!   `handle_forget_memory`, `handle_export_memory_graph`). Wire
 //!   contracts frozen.
+//!
+//! OWNER (ADR 0032): every MCP handler and the autocapture/reconcile
+//! orchestration passes `LOCAL_OWNER` ("local") — the MCP/stdio surface
+//! is single-tenant by construction. Per-key owners exist only on the
+//! lamu-api HTTP memory routes under `AuthMode::KeyStore`.
 
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
@@ -109,7 +114,7 @@ pub async fn consolidate(conversation_id: &str) -> Result<usize> {
     // the caller think nothing was stored.
     let mut stored = 0usize;
     for fact in facts {
-        match remember(&fact, "fact", conversation_id).await {
+        match remember(&fact, "fact", conversation_id, LOCAL_OWNER).await {
             Ok(_) => stored += 1,
             Err(e) => tracing::warn!("consolidate({conversation_id}): store fact failed: {e}"),
         }
@@ -210,7 +215,7 @@ fn autocontradict_enabled() -> bool {
 /// duplicates, not contradictions. Returns the count expired. Needs an
 /// embedder (ADR 0030 chain; neighbor search) + a reachable cloud model.
 pub async fn reconcile_memory(new_id: i64, new_text: &str) -> Result<usize> {
-    let neighbors = recall_memory(new_text, 8, false).await?;
+    let neighbors = recall_memory(new_text, 8, false, LOCAL_OWNER).await?;
     let candidates: Vec<&MemoryHit> = neighbors
         .iter()
         .filter(|h| h.id != new_id)
@@ -250,7 +255,7 @@ pub async fn reconcile_memory(new_id: i64, new_text: &str) -> Result<usize> {
         if id == new_id || !valid.contains(&id) {
             continue; // self, or a hallucinated id outside the candidate set
         }
-        match forget(id) {
+        match forget(id, LOCAL_OWNER) {
             Ok(true) => expired += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!("reconcile: forget({id}) failed: {e}"),
@@ -295,7 +300,7 @@ pub(crate) async fn handle_remember(args: serde_json::Value) -> String {
         Some(s) if !s.trim().is_empty() => s.trim(),
         _ => "manual",
     };
-    match remember(text, kind, source).await {
+    match remember(text, kind, source, LOCAL_OWNER).await {
         Ok(id) => {
             // Opt-in: retire any current fact this one contradicts (detached).
             maybe_spawn_reconcile(id, text);
@@ -319,7 +324,7 @@ pub(crate) async fn handle_recall_memory(args: serde_json::Value) -> String {
     // Default false: hide superseded/forgotten facts. true → historical
     // recall over the full timeline.
     let include_expired = args["include_expired"].as_bool().unwrap_or(false);
-    match recall_memory(query, k, include_expired).await {
+    match recall_memory(query, k, include_expired, LOCAL_OWNER).await {
         Ok(hits) if hits.is_empty() => "(no memories matched)".to_string(),
         Ok(hits) => {
             let mut out = String::new();
@@ -363,7 +368,7 @@ pub(crate) async fn handle_forget_memory(args: serde_json::Value) -> String {
         Some(id) => id,
         None => return "error: id is required (integer)".to_string(),
     };
-    match forget(id) {
+    match forget(id, LOCAL_OWNER) {
         Ok(true) => format!("forgot memory {id}"),
         Ok(false) => format!("no current memory with id {id}"),
         Err(e) => format!("error: {e}"),
@@ -392,7 +397,7 @@ pub(crate) async fn handle_export_memory_graph(args: serde_json::Value) -> Strin
         return "error: '..' is not allowed in the export dir path".to_string();
     }
     let include_expired = args["include_expired"].as_bool().unwrap_or(false);
-    match export_graph_corpus(&dir, include_expired) {
+    match export_graph_corpus(&dir, include_expired, LOCAL_OWNER) {
         Ok(n) => format!(
             "wrote {n} memories to {} — run `/graphify {}` (or `graphify {}`) to build the \
              entity/hypergraph/community graph; it has an MCP server (graphify.serve) for \

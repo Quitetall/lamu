@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod keys;
+pub mod memory_api;
 pub mod metrics;
 pub mod openai_compat;
 pub mod quota;

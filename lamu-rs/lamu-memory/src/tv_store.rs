@@ -44,9 +44,16 @@
 //!   re-index bump `vector_index_state.stale_count`; the expired row's
 //!   vector stays in the .tv. Searches over-fetch `k *` [`OVERFETCH`]
 //!   and the call sites post-filter hits against SQLite (validity +
-//!   model). When `stale_count` exceeds 25% of indexed rows the next
-//!   search performs a SYNCHRONOUS full rebuild (v1 trade-off: simple +
-//!   correct; a background rebuild task is a documented follow-up).
+//!   model + owner). When `stale_count` exceeds 25% of indexed rows the
+//!   next search performs a SYNCHRONOUS full rebuild (v1 trade-off:
+//!   simple + correct; a background rebuild task is a documented
+//!   follow-up).
+//! - **No owner partitioning (ADR 0032):** the index is built per
+//!   (store, model) across ALL owners; owner scoping rides the same
+//!   SQLite post-filter as validity. Heavy multi-tenant usage would
+//!   want per-owner over-fetch scaling (one owner's rows can crowd a
+//!   small owner's out of the over-fetched candidate set) — documented
+//!   follow-up, not v1.
 //!
 //! ## Locking (load-bearing)
 //!

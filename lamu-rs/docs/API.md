@@ -10,10 +10,12 @@ Continue, LibreChat, a RAG front-end, the OpenAI/Anthropic SDKs, or plain `curl`
 LAMU speaks three HTTP dialects at once — **OpenAI**, **Anthropic Messages**, and
 **Ollama** — so whichever client you point at it just works.
 
-> The orchestration/agent plane (council, commit review, lifetime memory, routing
-> control, cloud models, TTS/image, fine-tuning) lives on a **separate MCP/stdio
-> contract**, not on this HTTP surface. See [MCP is the agent plane](#mcp-is-the-agent-plane).
-> The HTTP surface is deliberately "dumb": pure inference + model listing.
+> The orchestration/agent plane (council, commit review, routing control, cloud
+> models, TTS/image, fine-tuning) lives on a **separate MCP/stdio contract**, not
+> on this HTTP surface. See [MCP is the agent plane](#mcp-is-the-agent-plane).
+> The HTTP surface is deliberately "dumb": pure inference + model listing — plus
+> one storage capability, the [Memory API](#memory-api) (ADR 0032), so an external
+> harness can consume LAMU's lifetime memory out-of-process.
 
 ---
 
@@ -33,6 +35,7 @@ LAMU speaks three HTTP dialects at once — **OpenAI**, **Anthropic Messages**, 
   - [POST /v1/messages](#post-v1messages-anthropic)
   - [GET /api/tags](#get-apitags-ollama)
   - [POST /api/chat](#post-apichat-ollama)
+- [Memory API](#memory-api)
 - [Status codes & error envelopes](#status-codes--error-envelopes)
 - [Point your frontend at LAMU](#point-your-frontend-at-lamu)
 - [Footguns](#footguns)
@@ -271,6 +274,10 @@ middleware):
 | POST | `/v1/messages` | Anthropic |
 | GET  | `/api/tags` | Ollama |
 | POST | `/api/chat` | Ollama |
+| POST | `/v1/memory/remember` | LAMU ([Memory API](#memory-api)) |
+| POST | `/v1/memory/recall` | LAMU ([Memory API](#memory-api)) |
+| POST | `/v1/memory/forget` | LAMU ([Memory API](#memory-api)) |
+| POST | `/v1/memory/supersede` | LAMU ([Memory API](#memory-api)) |
 
 There is **no** `/v1/completions` (legacy), `/v1/models/{id}`, model-management
 routes, or Ollama `/api/generate` / `/api/pull` / `/api/show` / `/api/version` /
@@ -639,13 +646,114 @@ Backend error line: `{"error":"backend: <e>"}`. Empty-backend gate line:
 
 ---
 
+## Memory API
+
+LAMU's lifetime fact store (temporal, hybrid vector+FTS recall — the same store
+the MCP `remember`/`recall_memory` tools use) exposed over HTTP (ADR 0032), so an
+external agent harness (e.g. katana) consumes LAMU memory as an out-of-process
+extension. Four JSON POST routes, all **inside the bearer middleware** (401 rules
+match every other route).
+
+### Owner scoping
+
+Every fact row carries an `owner`; every read and write is scoped to it:
+
+| Auth mode | Owner |
+|-----------|-------|
+| **KeyStore** | the key's `user` — **per-key isolation**: facts written with one key are invisible to every other key, on every recall leg (vector, FTS, recency) |
+| **StaticToken / Off** | `"local"` — the same owner all MCP tool handlers and the CLI use, so a loopback harness shares the operator's own memory |
+
+Cross-owner ids **behave exactly like missing ids** — `forget` returns
+`{"forgotten":false}`, `supersede` returns the same 404 as a nonexistent id — so
+key A can never probe whether an id belongs to key B. The MCP/stdio plane is
+single-tenant by construction and always reads/writes owner `local`.
+
+### Routes
+
+**`POST /v1/memory/remember`** — store a fact.
+
+```json
+{"text":"katana deploys from the blue runner","kind":"fact","source":"katana"}
+```
+→ `200 {"id": 42}`. `kind` defaults to `"fact"`, `source` to `"api"`. This is a
+plain store — **no novelty dedup** (dedup is the MCP autocapture path's concern;
+an explicit API write means you decided it's worth storing).
+
+**`POST /v1/memory/recall`** — hybrid recall.
+
+```json
+{"query":"deploy runner","k":8,"include_expired":false}
+```
+→ `200 {"hits":[{"id":42,"text":"…","kind":"fact","source":"katana","ts":1765432100,"score":0.91,"valid_until":null}]}`
+
+`k` clamps to 1..=50 (default 8). `score` is the cosine similarity for
+vector-leg hits, `null` for FTS/recency-only hits. `valid_until` is `null` for
+currently-valid facts; set `include_expired:true` to recall history (superseded /
+forgotten facts), which then carry their expiry timestamp.
+
+**`POST /v1/memory/forget`** — soft-delete (sets `valid_until`; never hard-deletes).
+
+```json
+{"id":42}
+```
+→ `200 {"forgotten":true}` — `false` when the id is missing, already expired, or
+another owner's (indistinguishable on purpose).
+
+**`POST /v1/memory/supersede`** — replace a fact, keeping the timeline.
+
+```json
+{"old_id":42,"text":"katana deploys from the green runner","kind":"fact","source":"katana"}
+```
+→ `200 {"id":57}` (the new fact; the old one is expired in the same transaction)
+or, when `old_id` isn't the caller's:
+
+```json
+{"error":{"message":"no memory with id 42","type":"not_found"}}   // 404
+```
+
+### Embedding & degradation
+
+Writes embed through the server's own embedding chain (ADR 0030 — the registry's
+embedding-capable model). **No embedding model in the registry → facts are stored
+unembedded** and recall degrades to FTS + recency; the routes never fail on a
+missing embedder. Quota: `remember`/`supersede` charge the key's bucket an
+approximate token count of the text (`len/4`); `recall` and `forget` charge
+nothing (v1).
+
+### Errors
+
+Standard OpenAI-style envelopes on this surface — including parse failures
+(unlike the chat routes' axum-default 4xx prose): malformed/invalid body →
+`400 {"error":{"message":"…","type":"invalid_request_error"}}`; storage failure →
+`500 {"error":{"message":"memory storage error","type":"internal_error"}}` (the
+real error goes to the server log, never the wire); quota exhausted → the usual
+`429 rate_limit_exceeded` envelope.
+
+### curl example
+
+```bash
+TOK=lamu_…   # a KeyStore key → this key's facts are isolated to it
+curl -s http://127.0.0.1:8020/v1/memory/remember \
+  -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+  -d '{"text":"the staging cluster lives in hetzner FSN1","source":"katana"}'
+# {"id":7}
+curl -s http://127.0.0.1:8020/v1/memory/recall \
+  -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+  -d '{"query":"where is staging","k":4}'
+# {"hits":[{"id":7,"text":"the staging cluster lives in hetzner FSN1",…}]}
+```
+
+---
+
 ## Status codes & error envelopes
 
 | Status | When |
 |--------|------|
 | 200 | Success (all surfaces). Also used on `/v1/embeddings` passthrough where the backend's own status is forwarded (can be non-200). |
 | 400 | Malformed JSON body (axum default). |
+| 400 | Memory API: malformed/invalid body — **with** the OpenAI-style envelope (`invalid_request_error`), unlike the chat surfaces' axum prose. |
 | 401 | Bad/missing bearer when StaticToken or KeyStore auth is active (all routes except `/health`, `/metrics`). |
+| 404 | Memory API `supersede`: `old_id` missing **or another owner's** (`type:"not_found"` envelope — deliberately identical). |
 | 422 | JSON deserialization failure (missing `messages`, wrong types) — **axum default body, not a surface envelope** (see footguns). |
 | 429 | KeyStore-only: per-user daily token quota exhausted. Carries `Retry-After: 3600`; body is the surface-correct `rate_limit_*` envelope (see Authentication § Quotas). |
 | 500 | Internal: lost model after spawn; `LAMU_GATEWAY_URL` config error; Anthropic body-read error. |
@@ -750,6 +858,10 @@ documented surface — no private fields:
   backend failures as in-band error events with the engine's real message.
 - **Model switching**: change the `model` field per call; `lamu`/`main`/
   `default` aliases resolve to the operator-designated default.
+- **Memory**: the lifetime fact store is on HTTP too — see the
+  [Memory API](#memory-api) (ADR 0032). Under KeyStore each key's facts are
+  isolated to that key; remember/recall/forget/supersede give a harness
+  durable cross-session memory without the MCP plane.
 
 ## MCP is the agent plane
 
@@ -763,7 +875,9 @@ HTTP. None of these are reachable over `curl` to `lamu serve`:
 - **Routing:** `set_routing_mode` (`auto` / `local-only` / `cloud-only`), `routing_status`
 - **RAG:** `search_repo`, `index_repo`
 - **Memory:** `remember`, `recall_memory`, `forget_memory`, `export_memory_graph`,
-  `recall_conversation`
+  `recall_conversation` — these MCP tools operate as owner `local`; the same
+  store is ALSO on HTTP with per-key owners (the one deliberate exception to
+  "agentic = MCP-only"), see the [Memory API](#memory-api)
 - **Media / train / fs:** `generate_image`, `text_to_speech`,
   `train_from_conversations`, `write_file`
 

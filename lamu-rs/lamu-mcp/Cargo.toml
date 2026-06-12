@@ -39,12 +39,13 @@ tree-sitter-rust = "0.21"
 libc = "0.2"
 
 [features]
-# Enable the TurboVecIndex backend (TurboQuant 2-4 bit compressed search).
-# Brute-force cosine remains the DEFAULT; this only makes turbovec
-# AVAILABLE behind LAMU_VECTOR_BACKEND=turbovec at runtime. The dep itself
-# moved to lamu-memory with the vector_index seam (ADR 0029); this feature
-# just forwards. NOTE (Linux): the feature build needs system OpenBLAS —
-# see lamu-memory/Cargo.toml.
+# Enable the TurboVec backend (TurboQuant 2-4 bit compressed search).
+# COMPILING the feature is the opt-in (ADR 0031): feature-on builds default
+# to lamu-memory's persistent .tv index lifecycle; `LAMU_VECTOR_BACKEND=
+# brute` remains the runtime escape hatch (feature-off: brute, unchanged).
+# The dep itself moved to lamu-memory with the vector_index seam (ADR
+# 0029); this feature just forwards. NOTE (Linux): the feature build needs
+# system OpenBLAS — see lamu-memory/Cargo.toml.
 turbovec = ["lamu-memory/turbovec"]
 
 [dev-dependencies]

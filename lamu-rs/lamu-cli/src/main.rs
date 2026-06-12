@@ -136,7 +136,12 @@ enum Command {
         /// Backend startup logs (comfyui-*.log, fish-speech-*.log).
         #[arg(long)]
         logs: bool,
-        /// All of the above.
+        /// Legacy pre-unified SQLite stores (conversations.db, memory.db,
+        /// embeddings.db + -wal/-shm sidecars). Import-source leftovers;
+        /// only offered once lamu.db exists. NOT included in --all.
+        #[arg(long)]
+        legacy_dbs: bool,
+        /// All of the above (except --legacy-dbs, which is explicit-only).
         #[arg(long)]
         all: bool,
         /// Delete files older than N days (0 = age deletes nothing).
@@ -416,10 +421,10 @@ async fn main() -> Result<()> {
         Some(Command::Rm { model, yes }) => cmd_rm(&model, yes),
         Some(Command::Use { model }) => cmd_use(&model),
         Some(Command::Clean {
-            drafts, sessions, conversations, media, logs, all,
+            drafts, sessions, conversations, media, logs, legacy_dbs, all,
             keep_days, keep_count, max_size_mb, yes,
         }) => clean::cmd_clean(clean::CleanOpts {
-            drafts, sessions, conversations, media, logs, all,
+            drafts, sessions, conversations, media, logs, legacy_dbs, all,
             keep_days, keep_count, max_size_mb, yes,
         }),
         Some(Command::Sessions) => cmd_sessions(),

@@ -12,6 +12,11 @@
 //! tests call directly): [`plan`] is the dry-run report, [`run`] the
 //! batched execution. Both take an explicit connection/embedder so
 //! nothing here touches the process singleton or the global chain.
+//!
+//! OWNER SCOPING (ADR 0032): reembed deliberately takes NO owner and
+//! operates across ALL owners' rows. It is an operator action, and the
+//! embedding-model identity is store-wide — leaving one tenant's rows
+//! on a stale model would silently drop them out of vector recall.
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -279,7 +284,7 @@ mod tests {
 
     fn seed_memories(conn: &Connection) {
         // One NULL-embedding row, one wrong-model row, one current row.
-        insert_memory(conn, "never embedded", None, None, "fact", "manual", 10).unwrap();
+        insert_memory(conn, "never embedded", None, None, "fact", "manual", 10, "local").unwrap();
         insert_memory(
             conn,
             "old model row",
@@ -288,6 +293,7 @@ mod tests {
             "fact",
             "manual",
             20,
+            "local",
         )
         .unwrap();
         insert_memory(
@@ -298,6 +304,7 @@ mod tests {
             "fact",
             "manual",
             30,
+            "local",
         )
         .unwrap();
     }
@@ -441,6 +448,7 @@ mod tests {
                 "fact",
                 "manual",
                 30,
+            "local",
             )
             .unwrap();
         }

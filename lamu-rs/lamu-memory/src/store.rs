@@ -678,6 +678,7 @@ mod tests {
             "fact",
             "manual",
             999,
+            "local",
         )
         .unwrap();
 

@@ -59,6 +59,13 @@ use crate::vector_index::{cosine, vector_backend, BruteForceCosine, Scored, Vect
 /// This module's persistent-index store id (ADR 0031).
 const TV_STORE: crate::tv_store::Store = crate::tv_store::Store::Memories;
 
+/// The default owner for every MCP/local caller (ADR 0032; the schema
+/// default the `owner` column has carried since ADR 0028). HTTP callers
+/// under `AuthMode::KeyStore` pass their key's user instead; everything
+/// else — MCP tool handlers, autocapture/reconcile, the CLI — passes
+/// this constant.
+pub const LOCAL_OWNER: &str = "local";
+
 /// The PRE-ADR-0028 standalone `memory.db` schema. Kept ONLY for the
 /// legacy open path ([`open_legacy_memory_db`]) that normalizes an old
 /// file before its one-time import into `lamu.db` — the live schema is
@@ -198,6 +205,9 @@ fn now_secs() -> i64 {
 
 /// One memory returned from a recall. `score` is `Some` for the
 /// semantic (embedding) path and `None` for the recency fallback.
+/// `valid_until` is `None` for a currently-valid fact; `Some` only when
+/// the hit came from an `include_expired` recall (ADR 0032 surfaces it
+/// on the HTTP recall response).
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
     pub id: i64,
@@ -206,6 +216,7 @@ pub struct MemoryHit {
     pub source: Option<String>,
     pub ts: i64,
     pub score: Option<f32>,
+    pub valid_until: Option<i64>,
 }
 
 /// A memory row loaded for ranking: `(id, text, kind, source, ts,
@@ -233,6 +244,7 @@ pub(crate) struct MemoryPayload {
 /// `embedding_model` tags the row's provenance (ADR 0030) — pass the
 /// embedder's identity model when `embedding` is `Some`, `None` when
 /// the row carries no embedding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_memory(
     conn: &Connection,
     text: &str,
@@ -241,10 +253,11 @@ pub(crate) fn insert_memory(
     kind: &str,
     source: &str,
     ts: i64,
+    owner: &str,
 ) -> Result<i64> {
     // A brand-new fact is valid from `ts`, has no expiry, and supersedes
     // nothing. supersede() uses insert_memory_full to set `supersedes`.
-    insert_memory_full(conn, text, embedding, embedding_model, kind, source, ts, ts, None)
+    insert_memory_full(conn, text, embedding, embedding_model, kind, source, ts, ts, None, owner)
 }
 
 /// Insert one memory row with full control over the temporal columns,
@@ -263,18 +276,18 @@ pub(crate) fn insert_memory_full(
     ts: i64,
     valid_from: i64,
     supersedes: Option<i64>,
+    owner: &str,
 ) -> Result<i64> {
     let blob = embedding.map(vec_to_blob);
     // Only stamp a model when an embedding is actually present — a NULL
     // embedding with a model tag would look reembeddable-but-done.
-    // `owner` is intentionally NOT named — the schema default ('local')
-    // covers it until the multi-owner plumb-through lands (ADR 0028
-    // NEXT wave).
+    // `owner` is named explicitly (ADR 0032 plumb-through) — relying on
+    // the schema default would silently mis-attribute a KeyStore write.
     let model = embedding.and(embedding_model);
     conn.execute(
-        "INSERT INTO memories (text, embedding, embedding_model, kind, source, ts, valid_from, valid_until, supersedes) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-        params![text, blob, model, kind, source, ts, valid_from, supersedes],
+        "INSERT INTO memories (owner, text, embedding, embedding_model, kind, source, ts, valid_from, valid_until, supersedes) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        params![owner, text, blob, model, kind, source, ts, valid_from, supersedes],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -296,8 +309,10 @@ async fn embed_via_chain(text: &str) -> Result<Option<(Vec<f32>, EmbedderId)>> {
 
 /// Store a fact in the lifetime memory. Embeds via the embedder chain
 /// when one resolves; stores `embedding = NULL` otherwise (never fails
-/// on a missing backend). Returns the new rowid.
-pub async fn remember(text: &str, kind: &str, source: &str) -> Result<i64> {
+/// on a missing backend). Returns the new rowid. `owner` scopes the
+/// fact (ADR 0032): MCP/local callers pass [`LOCAL_OWNER`]; the HTTP
+/// surface passes the KeyStore principal's user.
+pub async fn remember(text: &str, kind: &str, source: &str, owner: &str) -> Result<i64> {
     let embedded = embed_via_chain(text).await?;
     let arc = memory_db()?;
     let id = {
@@ -311,6 +326,7 @@ pub async fn remember(text: &str, kind: &str, source: &str) -> Result<i64> {
             kind,
             source,
             now,
+            owner,
         )?;
         if let Some((v, ident)) = &embedded {
             crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
@@ -408,6 +424,10 @@ pub(crate) fn rank_memories(
             source: hit.payload.source,
             ts: hit.payload.ts,
             score: Some(hit.score),
+            // Ranking is only ever fed currently-valid rows (or the
+            // caller hydrates validity afterwards) — the leg itself
+            // doesn't carry the temporal column.
+            valid_until: None,
         })
         .collect()
 }
@@ -435,7 +455,16 @@ pub(crate) fn rank_memories(
 /// behaviour: facts that were superseded or soft-deleted (forgotten) drop
 /// out of default recall but are NEVER removed from the store. Pass
 /// `include_expired = true` for historical recall over the full timeline.
-pub async fn recall_memory(query: &str, k: usize, include_expired: bool) -> Result<Vec<MemoryHit>> {
+///
+/// OWNER SCOPING (ADR 0032): every leg — vector (per-query scan AND the
+/// persistent-index post-filter), FTS, recency — is restricted to rows
+/// whose `owner` matches; cross-owner facts can never surface.
+pub async fn recall_memory(
+    query: &str,
+    k: usize,
+    include_expired: bool,
+    owner: &str,
+) -> Result<Vec<MemoryHit>> {
     // Embed BEFORE taking the lock (network/backend await must not hold
     // the shared store mutex).
     let embedded = match crate::embedder::resolve() {
@@ -460,6 +489,7 @@ pub async fn recall_memory(query: &str, k: usize, include_expired: bool) -> Resu
         k,
         include_expired,
         now,
+        owner,
     )
 }
 
@@ -471,6 +501,7 @@ pub async fn recall_memory(query: &str, k: usize, include_expired: bool) -> Resu
 /// NOTE: the cosine pass runs under the caller's lock — same trade-off
 /// `remember_if_novel` already accepted: fine while the store is small;
 /// revisit if it grows large.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recall_hybrid_conn(
     conn: &Connection,
     query: &str,
@@ -479,6 +510,7 @@ pub(crate) fn recall_hybrid_conn(
     k: usize,
     include_expired: bool,
     now: i64,
+    owner: &str,
 ) -> Result<Vec<MemoryHit>> {
     if k == 0 {
         return Ok(Vec::new());
@@ -491,27 +523,31 @@ pub(crate) fn recall_hybrid_conn(
     let leg1: Vec<(i64, f32)> = if let (Some(qvec), Some(model)) = (qvec, model) {
         // ADR 0031: the persistent index serves the leg when active. Its
         // raw hits are over-fetched (k * OVERFETCH) and post-filtered
-        // against SQLite (validity + model) — expired rows STAY in the
-        // .tv (invalidation-without-delete), the filter hides them.
+        // against SQLite (validity + model + owner) — expired rows STAY
+        // in the .tv (invalidation-without-delete), the filter hides
+        // them; the same post-filter is what enforces owner scoping
+        // (the .tv is built per (store, model), NOT per owner).
         // `None` (inactive / dims not %8 / error) → the per-query scan.
         if let Some(raw) = crate::tv_store::search_persistent(conn, TV_STORE, qvec, model, k) {
-            let kept = filter_indexed_candidates(conn, &raw, model, &valid, k)?;
+            let kept = filter_indexed_candidates(conn, &raw, model, &valid, k, owner)?;
             for (id, s) in &kept {
                 cosine_by_id.insert(*id, *s);
             }
             kept
         } else {
             let where_clause = if valid.is_empty() {
-                "WHERE embedding IS NOT NULL AND embedding_model = ?1".to_string()
+                "WHERE embedding IS NOT NULL AND embedding_model = ?1 AND owner = ?2".to_string()
             } else {
-                format!("WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}")
+                format!(
+                    "WHERE embedding IS NOT NULL AND embedding_model = ?1 AND owner = ?2 AND {valid}"
+                )
             };
             let sql = format!(
                 "SELECT id, text, kind, source, ts, embedding FROM memories {where_clause}"
             );
             let rows: Vec<MemoryRow> = {
                 let mut stmt = conn.prepare(&sql)?;
-                let mapped = stmt.query_map(params![model], |r| {
+                let mapped = stmt.query_map(params![model, owner], |r| {
                     let id: i64 = r.get(0)?;
                     let text: String = r.get(1)?;
                     let kind: String = r.get(2)?;
@@ -538,15 +574,15 @@ pub(crate) fn recall_hybrid_conn(
     } else {
         // No vector leg → recency list takes its slot in the fusion.
         let where_clause = if valid.is_empty() {
-            String::new()
+            "WHERE owner = ?1 ".to_string()
         } else {
-            format!("WHERE {valid} ")
+            format!("WHERE owner = ?1 AND {valid} ")
         };
         let sql = format!(
-            "SELECT id FROM memories {where_clause}ORDER BY ts DESC, id DESC LIMIT ?1"
+            "SELECT id FROM memories {where_clause}ORDER BY ts DESC, id DESC LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mapped = stmt.query_map(params![k as i64], |r| r.get::<_, i64>(0))?;
+        let mapped = stmt.query_map(params![owner, k as i64], |r| r.get::<_, i64>(0))?;
         let mut ids = Vec::new();
         for id in mapped {
             ids.push((id?, 0.0_f32));
@@ -558,6 +594,8 @@ pub(crate) fn recall_hybrid_conn(
     // bm25() is "smaller is better" (negative for good matches), so
     // ascending ORDER BY puts the best first — RRF only needs the rank.
     // The leg fetches more than k candidates so fusion has room.
+    // OWNER: memories_fts has no owner column (external-content FTS over
+    // text only), so the filter rides the JOIN against `memories`.
     let fts_leg: Vec<(i64, f64)> = match sanitize_fts_query(query) {
         None => Vec::new(),
         Some(match_expr) => {
@@ -569,13 +607,13 @@ pub(crate) fn recall_hybrid_conn(
             let sql = format!(
                 "SELECT memories_fts.rowid, bm25(memories_fts) \
                  FROM memories_fts JOIN memories ON memories.id = memories_fts.rowid \
-                 WHERE memories_fts MATCH ?1 {and_valid}\
-                 ORDER BY bm25(memories_fts) ASC LIMIT ?2"
+                 WHERE memories_fts MATCH ?1 AND memories.owner = ?2 {and_valid}\
+                 ORDER BY bm25(memories_fts) ASC LIMIT ?3"
             );
             let limit = (k * 4).max(16) as i64;
             let run = || -> Result<Vec<(i64, f64)>> {
                 let mut stmt = conn.prepare(&sql)?;
-                let mapped = stmt.query_map(params![match_expr, limit], |r| {
+                let mapped = stmt.query_map(params![match_expr, owner, limit], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
                 })?;
                 let mut out = Vec::new();
@@ -609,11 +647,17 @@ pub(crate) fn recall_hybrid_conn(
         format!(" AND {valid}")
     };
     let sql = format!(
-        "SELECT id, text, kind, source, ts FROM memories WHERE id IN ({placeholders}){and_valid}"
+        "SELECT id, text, kind, source, ts, valid_until FROM memories \
+         WHERE id IN ({placeholders}) AND owner = ?{owner_pos}{and_valid}",
+        owner_pos = merged.len() + 1
     );
     let mut stmt = conn.prepare(&sql)?;
-    let id_params: Vec<i64> = merged.iter().map(|(id, _)| *id).collect();
-    let mapped = stmt.query_map(rusqlite::params_from_iter(id_params.iter()), |r| {
+    let bind: Vec<rusqlite::types::Value> = merged
+        .iter()
+        .map(|(id, _)| rusqlite::types::Value::Integer(*id))
+        .chain(std::iter::once(rusqlite::types::Value::Text(owner.to_string())))
+        .collect();
+    let mapped = stmt.query_map(rusqlite::params_from_iter(bind), |r| {
         Ok(MemoryHit {
             id: r.get(0)?,
             text: r.get(1)?,
@@ -621,6 +665,7 @@ pub(crate) fn recall_hybrid_conn(
             source: r.get(3)?,
             ts: r.get(4)?,
             score: None,
+            valid_until: r.get(5)?,
         })
     })?;
     let mut by_id: std::collections::HashMap<i64, MemoryHit> = std::collections::HashMap::new();
@@ -641,15 +686,23 @@ pub(crate) fn recall_hybrid_conn(
 /// Post-filter raw persistent-index candidates against SQLite: keep ids
 /// that are still embedding-bearing under the CURRENT `model` AND pass
 /// the `valid` time clause (expired rows stay in the .tv — this filter is
-/// what hides them), preserve the index's score order, dedup by id
+/// what hides them) AND belong to `owner` (the .tv is built per
+/// (store, model) with NO owner partitioning — this post-filter is the
+/// owner fence, ADR 0032), preserve the index's score order, dedup by id
 /// (chunk-style rowid reuse can alias two slots onto one id; first =
 /// best-scored wins), truncate to `k` (ADR 0031).
+///
+/// FOLLOW-UP (not v1): the index over-fetches `k * OVERFETCH` across ALL
+/// owners; under heavy multi-tenant usage one owner's rows could crowd a
+/// small owner's out of the candidate set. Per-owner over-fetch scaling
+/// (or per-owner indexes) is the documented follow-up if that bites.
 fn filter_indexed_candidates(
     conn: &Connection,
     raw: &[(i64, f32)],
     model: &str,
     valid: &str,
     k: usize,
+    owner: &str,
 ) -> Result<Vec<(i64, f32)>> {
     if raw.is_empty() {
         return Ok(Vec::new());
@@ -662,14 +715,17 @@ fn filter_indexed_candidates(
     };
     let sql = format!(
         "SELECT id FROM memories WHERE id IN ({placeholders}) \
-         AND embedding IS NOT NULL AND embedding_model = ?{model_pos}{and_valid}",
-        model_pos = raw.len() + 1
+         AND embedding IS NOT NULL AND embedding_model = ?{model_pos} \
+         AND owner = ?{owner_pos}{and_valid}",
+        model_pos = raw.len() + 1,
+        owner_pos = raw.len() + 2
     );
     let mut stmt = conn.prepare(&sql)?;
     let bind: Vec<rusqlite::types::Value> = raw
         .iter()
         .map(|(id, _)| rusqlite::types::Value::Integer(*id))
         .chain(std::iter::once(rusqlite::types::Value::Text(model.to_string())))
+        .chain(std::iter::once(rusqlite::types::Value::Text(owner.to_string())))
         .collect();
     let mapped = stmt.query_map(rusqlite::params_from_iter(bind), |r| r.get::<_, i64>(0))?;
     let mut keep = std::collections::HashSet::new();
@@ -698,6 +754,7 @@ fn load_candidate_embeddings(
     raw: &[(i64, f32)],
     model: &str,
     valid: &str,
+    owner: &str,
 ) -> Result<std::collections::HashMap<i64, Vec<f32>>> {
     if raw.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -710,14 +767,17 @@ fn load_candidate_embeddings(
     };
     let sql = format!(
         "SELECT id, embedding FROM memories WHERE id IN ({placeholders}) \
-         AND embedding IS NOT NULL AND embedding_model = ?{model_pos}{and_valid}",
-        model_pos = raw.len() + 1
+         AND embedding IS NOT NULL AND embedding_model = ?{model_pos} \
+         AND owner = ?{owner_pos}{and_valid}",
+        model_pos = raw.len() + 1,
+        owner_pos = raw.len() + 2
     );
     let mut stmt = conn.prepare(&sql)?;
     let bind: Vec<rusqlite::types::Value> = raw
         .iter()
         .map(|(id, _)| rusqlite::types::Value::Integer(*id))
         .chain(std::iter::once(rusqlite::types::Value::Text(model.to_string())))
+        .chain(std::iter::once(rusqlite::types::Value::Text(owner.to_string())))
         .collect();
     let mapped = stmt.query_map(rusqlite::params_from_iter(bind), |r| {
         let id: i64 = r.get(0)?;
@@ -813,10 +873,19 @@ pub(crate) fn is_novel(new_emb: &[f32], existing: &[Vec<f32>], threshold: f32) -
 ///   models is meaningless — ADR 0030), and if [`is_novel`] is false
 ///   return `Ok(None)`. Otherwise insert the row WITH its embedding +
 ///   model tag and return `Ok(Some(id))`.
-pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<Option<i64>> {
+///
+/// OWNER SCOPING (ADR 0032): the novelty scan compares ONLY against
+/// `owner`'s rows — the same fact independently asserted by two owners
+/// is novel for each (cross-owner dedup would leak fact existence).
+pub async fn remember_if_novel(
+    text: &str,
+    kind: &str,
+    source: &str,
+    owner: &str,
+) -> Result<Option<i64>> {
     let Some((emb, ident)) = embed_via_chain(text).await? else {
         // No embedder → can't embed/dedup; store unconditionally.
-        return remember(text, kind, source).await.map(Some);
+        return remember(text, kind, source, owner).await.map(Some);
     };
 
     let arc = memory_db()?;
@@ -846,16 +915,17 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
         let probe =
             crate::tv_store::search_persistent(&conn, TV_STORE, &emb, &ident.model, NOVELTY_PROBE_K);
         let existing: Vec<Vec<f32>> = match probe {
-            Some(raw) => load_candidate_embeddings(&conn, &raw, &ident.model, &valid)?
+            Some(raw) => load_candidate_embeddings(&conn, &raw, &ident.model, &valid, owner)?
                 .into_values()
                 .collect(),
             None => {
                 let sql = format!(
                     "SELECT embedding FROM memories \
-                     WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}"
+                     WHERE embedding IS NOT NULL AND embedding_model = ?1 \
+                     AND owner = ?2 AND {valid}"
                 );
                 let mut stmt = conn.prepare(&sql)?;
-                let mapped = stmt.query_map(params![ident.model], |r| {
+                let mapped = stmt.query_map(params![ident.model, owner], |r| {
                     let blob: Vec<u8> = r.get(0)?;
                     Ok(blob_to_vec(&blob))
                 })?;
@@ -870,8 +940,9 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
         if !is_novel(&emb, &existing, NOVELTY_THRESHOLD) {
             None
         } else {
-            let id =
-                insert_memory(&conn, text, Some(&emb), Some(&ident.model), kind, source, now)?;
+            let id = insert_memory(
+                &conn, text, Some(&emb), Some(&ident.model), kind, source, now, owner,
+            )?;
             crate::store::record_store_identity(&conn, "memories", &ident.model, emb.len(), now);
             crate::tv_store::note_added(&conn, TV_STORE, id, &emb, &ident.model);
             Some(id)
@@ -885,8 +956,8 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
 
 /// Replace fact `old_id` with a NEW fact (`new_text`): the new fact is
 /// inserted with `supersedes = Some(old_id)` and `valid_from = now`, and
-/// the old fact is expired (`valid_until = now`). Returns the new fact's
-/// rowid.
+/// the old fact is expired (`valid_until = now`). Returns
+/// `Ok(Some(new_id))` on success.
 ///
 /// This is the "user moved X → Y" operation: the old fact becomes
 /// historical (still in the store, recallable with `include_expired`) and
@@ -894,9 +965,19 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
 /// expired if it is CURRENTLY valid (`valid_until IS NULL`) — re-superseding
 /// an already-expired fact leaves its earlier `valid_until` intact.
 ///
+/// OWNER SCOPING (ADR 0032): `old_id` must belong to `owner`. A missing
+/// id and ANOTHER owner's id both return `Ok(None)` with NOTHING
+/// inserted — indistinguishable on purpose (no existence leak).
+///
 /// Embeds `new_text` exactly like [`remember`] (NULL embedding when no
 /// embedder resolves), so the new fact is semantically recallable.
-pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) -> Result<i64> {
+pub async fn supersede(
+    old_id: i64,
+    new_text: &str,
+    kind: &str,
+    source: &str,
+    owner: &str,
+) -> Result<Option<i64>> {
     let embedded = embed_via_chain(new_text).await?;
     let now = now_secs();
     let arc = memory_db()?;
@@ -910,8 +991,8 @@ pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) ->
             use rusqlite::OptionalExtension;
             conn.query_row(
                 "SELECT embedding IS NOT NULL FROM memories \
-                 WHERE id = ?1 AND valid_until IS NULL",
-                params![old_id],
+                 WHERE id = ?1 AND owner = ?2 AND valid_until IS NULL",
+                params![old_id, owner],
                 |r| r.get(0),
             )
             .optional()?
@@ -926,16 +1007,19 @@ pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) ->
             kind,
             source,
             now,
+            owner,
         )?;
-        if let Some((v, ident)) = &embedded {
-            crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
-            crate::tv_store::note_added(&conn, TV_STORE, id, v, &ident.model);
-        }
-        if old_indexed {
-            // Invalidation WITHOUT delete: the expired row's vector stays
-            // in the .tv; searches post-filter it out, and the stale
-            // counter drives the >25% rebuild threshold.
-            crate::tv_store::note_stale(&conn, TV_STORE, 1);
+        if let Some(id) = id {
+            if let Some((v, ident)) = &embedded {
+                crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
+                crate::tv_store::note_added(&conn, TV_STORE, id, v, &ident.model);
+            }
+            if old_indexed {
+                // Invalidation WITHOUT delete: the expired row's vector stays
+                // in the .tv; searches post-filter it out, and the stale
+                // counter drives the >25% rebuild threshold.
+                crate::tv_store::note_stale(&conn, TV_STORE, 1);
+            }
         }
         id
     }; // DB lock released — persist (file I/O) must not run under it.
@@ -943,16 +1027,21 @@ pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) ->
     Ok(id)
 }
 
-/// Connection-level core of [`supersede`]: insert the new fact with
-/// `supersedes = Some(old_id)` / `valid_from = now`, then expire the old
-/// fact if it is currently valid. Factored out so tests can drive it
-/// against an in-memory connection with a known embedding and `now`.
+/// Connection-level core of [`supersede`]: verify `old_id` belongs to
+/// `owner`, insert the new fact with `supersedes = Some(old_id)` /
+/// `valid_from = now`, then expire the old fact if it is currently
+/// valid. Returns `Ok(None)` — with NOTHING inserted — when no row with
+/// (`old_id`, `owner`) exists, which covers both a genuinely missing id
+/// and another owner's id (deliberately indistinguishable, ADR 0032).
+/// Factored out so tests can drive it against an in-memory connection
+/// with a known embedding and `now`.
 ///
-/// ATOMICITY: the INSERT (new fact) and UPDATE (expire old fact) run in a
-/// single SQLite transaction. Without it, a crash or error between the two
-/// statements would leave the new fact inserted while the old fact is still
-/// `valid_until IS NULL` — both then appear in default recall, violating the
-/// "exactly one valid version" invariant supersession exists to enforce.
+/// ATOMICITY: the ownership check, INSERT (new fact) and UPDATE (expire
+/// old fact) run in a single SQLite transaction. Without it, a crash or
+/// error between the statements would leave the new fact inserted while
+/// the old fact is still `valid_until IS NULL` — both then appear in
+/// default recall, violating the "exactly one valid version" invariant
+/// supersession exists to enforce.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supersede_conn(
     conn: &mut Connection,
@@ -963,8 +1052,20 @@ pub(crate) fn supersede_conn(
     kind: &str,
     source: &str,
     now: i64,
-) -> Result<i64> {
+    owner: &str,
+) -> Result<Option<i64>> {
     let tx = conn.transaction()?;
+    // Ownership gate: the old row must be `owner`'s. Validity is NOT
+    // required here — re-superseding an owned-but-already-expired fact
+    // keeps its earlier `valid_until` (pre-0032 behavior, unchanged).
+    let owned: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM memories WHERE id = ?1 AND owner = ?2",
+        params![old_id, owner],
+        |r| r.get(0),
+    )?;
+    if owned == 0 {
+        return Ok(None);
+    }
     let new_id = insert_memory_full(
         &tx,
         new_text,
@@ -975,13 +1076,14 @@ pub(crate) fn supersede_conn(
         now,
         now,
         Some(old_id),
+        owner,
     )?;
     tx.execute(
-        "UPDATE memories SET valid_until = ? WHERE id = ? AND valid_until IS NULL",
-        params![now, old_id],
+        "UPDATE memories SET valid_until = ? WHERE id = ? AND owner = ? AND valid_until IS NULL",
+        params![now, old_id, owner],
     )?;
     tx.commit()?;
-    Ok(new_id)
+    Ok(Some(new_id))
 }
 
 /// Soft-delete fact `id`: set `valid_until = now` so it drops out of
@@ -989,8 +1091,12 @@ pub(crate) fn supersede_conn(
 /// survives). Returns `true` if a currently-valid row with that id was
 /// expired, `false` if no such row existed (already expired or absent).
 ///
+/// OWNER SCOPING (ADR 0032): the row must belong to `owner`; another
+/// owner's id returns `false` — the same response as a missing id (no
+/// existence leak).
+///
 /// No fact is ever hard-deleted; `forget` only moves a fact into history.
-pub fn forget(id: i64) -> Result<bool> {
+pub fn forget(id: i64, owner: &str) -> Result<bool> {
     let now = now_secs();
     let arc = memory_db()?;
     let conn = arc.lock();
@@ -999,14 +1105,15 @@ pub fn forget(id: i64) -> Result<bool> {
     let was_indexed: bool = {
         use rusqlite::OptionalExtension;
         conn.query_row(
-            "SELECT embedding IS NOT NULL FROM memories WHERE id = ?1 AND valid_until IS NULL",
-            params![id],
+            "SELECT embedding IS NOT NULL FROM memories \
+             WHERE id = ?1 AND owner = ?2 AND valid_until IS NULL",
+            params![id, owner],
             |r| r.get(0),
         )
         .optional()?
         .unwrap_or(false)
     };
-    let affected = forget_conn(&conn, id, now)?;
+    let affected = forget_conn(&conn, id, now, owner)?;
     if affected && was_indexed {
         crate::tv_store::note_stale(&conn, TV_STORE, 1);
     }
@@ -1014,12 +1121,13 @@ pub fn forget(id: i64) -> Result<bool> {
 }
 
 /// Connection-level core of [`forget`]: expire the row if it is currently
-/// valid, returning whether a row was affected. Factored out for testing
-/// against an in-memory connection with a known `now`.
-pub(crate) fn forget_conn(conn: &Connection, id: i64, now: i64) -> Result<bool> {
+/// valid AND belongs to `owner`, returning whether a row was affected.
+/// Factored out for testing against an in-memory connection with a known
+/// `now`.
+pub(crate) fn forget_conn(conn: &Connection, id: i64, now: i64, owner: &str) -> Result<bool> {
     let affected = conn.execute(
-        "UPDATE memories SET valid_until = ? WHERE id = ? AND valid_until IS NULL",
-        params![now, id],
+        "UPDATE memories SET valid_until = ? WHERE id = ? AND owner = ? AND valid_until IS NULL",
+        params![now, id, owner],
     )?;
     Ok(affected > 0)
 }
@@ -1068,14 +1176,18 @@ fn yaml_scalar(s: &str) -> String {
 /// only emits the corpus. The user then runs `/graphify <dir>` (or
 /// `graphify <dir>`); graphify's LLM extraction + clustering pipeline pulls
 /// entities/hyperedges/communities from these files.
-pub fn export_graph_corpus(dir: &Path, include_expired: bool) -> Result<usize> {
+///
+/// OWNER SCOPING (ADR 0032): only `owner`'s facts are exported. The MCP
+/// `export_memory_graph` handler passes [`LOCAL_OWNER`], so the graphify
+/// corpus never carries HTTP tenants' facts.
+pub fn export_graph_corpus(dir: &Path, include_expired: bool, owner: &str) -> Result<usize> {
     let arc = memory_db()?;
     let now = now_secs();
     // Load all rows under the lock, then release before doing filesystem
     // writes — same don't-hold-the-mutex-across-I/O discipline as recall.
     let rows = {
         let conn = arc.lock();
-        load_corpus_rows(&conn, include_expired, now)?
+        load_corpus_rows(&conn, include_expired, now, owner)?
     };
     write_corpus_rows(dir, &rows)
 }
@@ -1092,25 +1204,27 @@ pub(crate) struct CorpusRow {
     pub supersedes: Option<i64>,
 }
 
-/// Load the rows to export (currently-valid only unless `include_expired`),
-/// ordered by id. Connection-level so tests drive it without the singleton.
+/// Load the rows to export (currently-valid only unless `include_expired`;
+/// `owner`'s rows only), ordered by id. Connection-level so tests drive it
+/// without the singleton.
 pub(crate) fn load_corpus_rows(
     conn: &Connection,
     include_expired: bool,
     now: i64,
+    owner: &str,
 ) -> Result<Vec<CorpusRow>> {
     let valid = valid_time_clause(include_expired, now);
     let where_clause = if valid.is_empty() {
-        String::new()
+        "WHERE owner = ?1 ".to_string()
     } else {
-        format!("WHERE {valid} ")
+        format!("WHERE owner = ?1 AND {valid} ")
     };
     let sql = format!(
         "SELECT id, text, kind, source, ts, valid_from, valid_until, supersedes \
          FROM memories {where_clause}ORDER BY id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mapped = stmt.query_map([], |r| {
+    let mapped = stmt.query_map(params![owner], |r| {
         Ok(CorpusRow {
             id: r.get(0)?,
             text: r.get(1)?,
@@ -1231,12 +1345,12 @@ mod tests {
     fn insert_and_rank_with_known_embeddings() {
         let conn = open_test_db();
         // Hand-crafted 3-dim embeddings.
-        let id_x = insert_memory(&conn, "x-axis fact", Some(&[1.0, 0.0, 0.0]), Some("test-model"), "fact", "manual", 100)
+        let id_x = insert_memory(&conn, "x-axis fact", Some(&[1.0, 0.0, 0.0]), Some("test-model"), "fact", "manual", 100, "local")
             .unwrap();
-        let id_y = insert_memory(&conn, "y-axis fact", Some(&[0.0, 1.0, 0.0]), Some("test-model"), "fact", "manual", 200)
+        let id_y = insert_memory(&conn, "y-axis fact", Some(&[0.0, 1.0, 0.0]), Some("test-model"), "fact", "manual", 200, "local")
             .unwrap();
         let id_near =
-            insert_memory(&conn, "near-x fact", Some(&[0.9, 0.1, 0.0]), Some("test-model"), "fact", "manual", 300)
+            insert_memory(&conn, "near-x fact", Some(&[0.9, 0.1, 0.0]), Some("test-model"), "fact", "manual", 300, "local")
                 .unwrap();
         assert_eq!(id_x, 1);
         assert_eq!(id_y, 2);
@@ -1283,7 +1397,7 @@ mod tests {
     #[test]
     fn null_embedding_round_trip() {
         let conn = open_test_db();
-        let id = insert_memory(&conn, "no-embedding fact", None, None, "fact", "manual", 42).unwrap();
+        let id = insert_memory(&conn, "no-embedding fact", None, None, "fact", "manual", 42, "local").unwrap();
         let emb: Option<Vec<u8>> = conn
             .query_row("SELECT embedding FROM memories WHERE id = ?", params![id], |r| {
                 r.get(0)
@@ -1489,10 +1603,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let conn = open_test_db();
         // Current fact (valid_until NULL via insert_memory).
         let id_current =
-            insert_memory(&conn, "current fact", None, None, "fact", "manual", 100).unwrap();
+            insert_memory(&conn, "current fact", None, None, "fact", "manual", 100, "local").unwrap();
         // Expired fact: insert then expire it with valid_until in the past.
         let id_expired =
-            insert_memory(&conn, "expired fact", None, None, "fact", "manual", 50).unwrap();
+            insert_memory(&conn, "expired fact", None, None, "fact", "manual", 50, "local").unwrap();
         conn.execute(
             "UPDATE memories SET valid_until = ? WHERE id = ?",
             params![60i64, id_expired],
@@ -1517,11 +1631,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn supersede_expires_old_and_links_new() {
         let mut conn = open_test_db();
-        let old_id = insert_memory(&conn, "lives in SF", None, None, "fact", "manual", 100).unwrap();
+        let old_id = insert_memory(&conn, "lives in SF", None, None, "fact", "manual", 100, "local").unwrap();
 
         // Supersede at now = 500.
         let new_id =
-            supersede_conn(&mut conn, old_id, "lives in NYC", None, None, "fact", "manual", 500).unwrap();
+            supersede_conn(&mut conn, old_id, "lives in NYC", None, None, "fact", "manual", 500, "local")
+                .unwrap()
+                .expect("old_id is owned — supersede must insert");
         assert_ne!(old_id, new_id);
 
         // Old row: valid_until now set to 500.
@@ -1584,10 +1700,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn forget_soft_deletes_then_is_idempotent_noop() {
         let conn = open_test_db();
-        let id = insert_memory(&conn, "transient", None, None, "fact", "manual", 100).unwrap();
+        let id = insert_memory(&conn, "transient", None, None, "fact", "manual", 100, "local").unwrap();
 
         // First forget: row is currently valid → affected → true.
-        assert!(forget_conn(&conn, id, 777).unwrap());
+        assert!(forget_conn(&conn, id, 777, "local").unwrap());
         let valid_until: Option<i64> = conn
             .query_row(
                 "SELECT valid_until FROM memories WHERE id = ?",
@@ -1607,7 +1723,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
 
         // Second forget of the same id: already expired → false, and
         // valid_until is unchanged.
-        assert!(!forget_conn(&conn, id, 888).unwrap());
+        assert!(!forget_conn(&conn, id, 888, "local").unwrap());
         let valid_until2: Option<i64> = conn
             .query_row(
                 "SELECT valid_until FROM memories WHERE id = ?",
@@ -1622,9 +1738,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     fn export_graph_corpus_writes_frontmatter_and_respects_include_expired() {
         let conn = open_test_db();
         let id_current =
-            insert_memory(&conn, "current fact", None, None, "preference", "manual", 100).unwrap();
+            insert_memory(&conn, "current fact", None, None, "preference", "manual", 100, "local").unwrap();
         let id_expired =
-            insert_memory(&conn, "expired fact", None, None, "fact", "sess-1", 50).unwrap();
+            insert_memory(&conn, "expired fact", None, None, "fact", "sess-1", 50, "local").unwrap();
         conn.execute(
             "UPDATE memories SET valid_until = ? WHERE id = ?",
             params![60i64, id_expired],
@@ -1635,7 +1751,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
 
         // Default: only the current fact is exported.
         let now = 1000;
-        let rows = load_corpus_rows(&conn, false, now).unwrap();
+        let rows = load_corpus_rows(&conn, false, now, "local").unwrap();
         let n = write_corpus_rows(tmp.path(), &rows).unwrap();
         assert_eq!(n, 1, "default export = currently-valid only");
 
@@ -1659,7 +1775,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         // include_expired = true: BOTH files written, expired carries its
         // numeric valid_until.
         let tmp2 = tempfile::tempdir().unwrap();
-        let rows_all = load_corpus_rows(&conn, true, now).unwrap();
+        let rows_all = load_corpus_rows(&conn, true, now, "local").unwrap();
         let n2 = write_corpus_rows(tmp2.path(), &rows_all).unwrap();
         assert_eq!(n2, 2, "include_expired exports all");
         let expired_body =
@@ -1671,10 +1787,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn export_graph_corpus_creates_missing_dir() {
         let conn = open_test_db();
-        insert_memory(&conn, "a fact", None, None, "fact", "manual", 100).unwrap();
+        insert_memory(&conn, "a fact", None, None, "fact", "manual", 100, "local").unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("does").join("not").join("exist");
-        let rows = load_corpus_rows(&conn, false, 1000).unwrap();
+        let rows = load_corpus_rows(&conn, false, 1000, "local").unwrap();
         let n = write_corpus_rows(&nested, &rows).unwrap();
         assert_eq!(n, 1);
         assert!(nested.join("mem_1.md").exists());
@@ -1683,13 +1799,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn export_prunes_stale_files_but_keeps_foreign() {
         let conn = open_test_db();
-        let id1 = insert_memory(&conn, "fact one", None, None, "fact", "manual", 100).unwrap();
-        let id2 = insert_memory(&conn, "fact two", None, None, "fact", "manual", 100).unwrap();
-        let id3 = insert_memory(&conn, "fact three", None, None, "fact", "manual", 100).unwrap();
+        let id1 = insert_memory(&conn, "fact one", None, None, "fact", "manual", 100, "local").unwrap();
+        let id2 = insert_memory(&conn, "fact two", None, None, "fact", "manual", 100, "local").unwrap();
+        let id3 = insert_memory(&conn, "fact three", None, None, "fact", "manual", 100, "local").unwrap();
         let tmp = tempfile::tempdir().unwrap();
 
         // First export: all three written.
-        let rows = load_corpus_rows(&conn, false, 1000).unwrap();
+        let rows = load_corpus_rows(&conn, false, 1000, "local").unwrap();
         assert_eq!(write_corpus_rows(tmp.path(), &rows).unwrap(), 3);
         // A foreign file the prune must never touch.
         std::fs::write(tmp.path().join("README.md"), b"keep me").unwrap();
@@ -1700,7 +1816,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             params![500i64, id2],
         )
         .unwrap();
-        let rows2 = load_corpus_rows(&conn, false, 1000).unwrap();
+        let rows2 = load_corpus_rows(&conn, false, 1000, "local").unwrap();
         assert_eq!(write_corpus_rows(tmp.path(), &rows2).unwrap(), 2);
 
         assert!(tmp.path().join(format!("mem_{id1}.md")).exists());
@@ -1731,10 +1847,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let (_td, conn) = open_tmp_lamu_db();
         // Two rows under model A, two under model B — all near the same
         // query vector so ANY of them would rank if not filtered.
-        let a1 = insert_memory(&conn, "alpha one", Some(&[1.0, 0.0]), Some("model-a"), "fact", "manual", 10).unwrap();
-        let a2 = insert_memory(&conn, "alpha two", Some(&[0.9, 0.1]), Some("model-a"), "fact", "manual", 20).unwrap();
-        let b1 = insert_memory(&conn, "bravo one", Some(&[1.0, 0.0]), Some("model-b"), "fact", "manual", 30).unwrap();
-        let b2 = insert_memory(&conn, "bravo two", Some(&[0.8, 0.2]), Some("model-b"), "fact", "manual", 40).unwrap();
+        let a1 = insert_memory(&conn, "alpha one", Some(&[1.0, 0.0]), Some("model-a"), "fact", "manual", 10, "local").unwrap();
+        let a2 = insert_memory(&conn, "alpha two", Some(&[0.9, 0.1]), Some("model-a"), "fact", "manual", 20, "local").unwrap();
+        let b1 = insert_memory(&conn, "bravo one", Some(&[1.0, 0.0]), Some("model-b"), "fact", "manual", 30, "local").unwrap();
+        let b2 = insert_memory(&conn, "bravo two", Some(&[0.8, 0.2]), Some("model-b"), "fact", "manual", 40, "local").unwrap();
 
         // Query text shares no tokens with any fact → the FTS leg is
         // empty and the result isolates the vector leg.
@@ -1746,6 +1862,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             10,
             false,
             1000,
+            "local",
         )
         .unwrap();
         let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
@@ -1766,6 +1883,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             10,
             false,
             1000,
+            "local",
         )
         .unwrap();
         let ids_a: std::collections::HashSet<i64> = hits_a.iter().map(|h| h.id).collect();
@@ -1785,6 +1903,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             "fact",
             "manual",
             10,
+            "local",
         )
         .unwrap();
         // Semantic fact: no token overlap with the query, but its vector
@@ -1797,10 +1916,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             "fact",
             "manual",
             20,
+            "local",
         )
         .unwrap();
         // Noise that matches neither leg well.
-        insert_memory(&conn, "unrelated grocery list", Some(&[0.0, 0.0, 1.0]), Some("fake"), "fact", "manual", 30).unwrap();
+        insert_memory(&conn, "unrelated grocery list", Some(&[0.0, 0.0, 1.0]), Some("fake"), "fact", "manual", 30, "local").unwrap();
 
         let hits = recall_hybrid_conn(
             &conn,
@@ -1810,6 +1930,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             2,
             false,
             1000,
+            "local",
         )
         .unwrap();
         let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
@@ -1825,11 +1946,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let (_td, conn) = open_tmp_lamu_db();
         // Old lexical match vs newer unrelated facts. Pre-0030 the
         // no-key fallback was recency-only and would bury the match.
-        let lex = insert_memory(&conn, "the zanzibar deployment protocol", None, None, "fact", "manual", 10).unwrap();
+        let lex = insert_memory(&conn, "the zanzibar deployment protocol", None, None, "fact", "manual", 10, "local").unwrap();
         for i in 0..5 {
-            insert_memory(&conn, &format!("filler fact {i}"), None, None, "fact", "manual", 100 + i).unwrap();
+            insert_memory(&conn, &format!("filler fact {i}"), None, None, "fact", "manual", 100 + i, "local").unwrap();
         }
-        let hits = recall_hybrid_conn(&conn, "zanzibar", None, None, 3, false, 1000).unwrap();
+        let hits = recall_hybrid_conn(&conn, "zanzibar", None, None, 3, false, 1000, "local").unwrap();
         assert!(
             hits.iter().any(|h| h.id == lex),
             "FTS leg must surface the lexical match even without an embedder"
@@ -1841,14 +1962,14 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn hybrid_recall_hides_expired_in_both_legs() {
         let (_td, conn) = open_tmp_lamu_db();
-        let id = insert_memory(&conn, "zanzibar expired fact", Some(&[1.0, 0.0]), Some("fake"), "fact", "manual", 10).unwrap();
+        let id = insert_memory(&conn, "zanzibar expired fact", Some(&[1.0, 0.0]), Some("fake"), "fact", "manual", 10, "local").unwrap();
         conn.execute("UPDATE memories SET valid_until = 50 WHERE id = ?", params![id]).unwrap();
         let hits =
-            recall_hybrid_conn(&conn, "zanzibar", Some(&[1.0, 0.0]), Some("fake"), 5, false, 1000)
+            recall_hybrid_conn(&conn, "zanzibar", Some(&[1.0, 0.0]), Some("fake"), 5, false, 1000, "local")
                 .unwrap();
         assert!(hits.is_empty(), "expired fact hidden from both legs");
         let hits_all =
-            recall_hybrid_conn(&conn, "zanzibar", Some(&[1.0, 0.0]), Some("fake"), 5, true, 1000)
+            recall_hybrid_conn(&conn, "zanzibar", Some(&[1.0, 0.0]), Some("fake"), 5, true, 1000, "local")
                 .unwrap();
         assert_eq!(hits_all.len(), 1, "include_expired surfaces it");
     }
@@ -1856,10 +1977,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn hybrid_recall_query_with_fts_operators_does_not_error() {
         let (_td, conn) = open_tmp_lamu_db();
-        insert_memory(&conn, "plain fact", None, None, "fact", "manual", 10).unwrap();
+        insert_memory(&conn, "plain fact", None, None, "fact", "manual", 10, "local").unwrap();
         // Raw quotes/operators would be FTS5 syntax errors un-sanitized.
         for q in ["\"unbalanced", "NEAR(", "a -b OR (c", "*"] {
-            let r = recall_hybrid_conn(&conn, q, None, None, 5, false, 1000);
+            let r = recall_hybrid_conn(&conn, q, None, None, 5, false, 1000, "local");
             assert!(r.is_ok(), "query {q:?} must not error: {r:?}");
         }
     }
@@ -1886,10 +2007,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             .with("rollout", vec![1.0, 0.0]); // query → semantic neighbor of `sem`
         crate::embedder::set_global(std::sync::Arc::new(fake));
 
-        let lex = remember("the zanzibar deployment protocol", "fact", "manual")
+        let lex = remember("the zanzibar deployment protocol", "fact", "manual", LOCAL_OWNER)
             .await
             .unwrap();
-        let sem = remember("ship the island rollout plan", "fact", "manual")
+        let sem = remember("ship the island rollout plan", "fact", "manual", LOCAL_OWNER)
             .await
             .unwrap();
 
@@ -1916,20 +2037,37 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             assert_eq!(dims, 2);
         }
 
+        // ADR 0032: novelty dedup is owner-scoped. The same fact text is
+        // a duplicate for LOCAL_OWNER (its embedding is already stored
+        // under "local") but NOVEL for a different owner — cross-owner
+        // dedup would leak fact existence between tenants.
+        let dup = remember_if_novel("the zanzibar deployment protocol", "fact", "manual", LOCAL_OWNER)
+            .await
+            .unwrap();
+        assert!(dup.is_none(), "near-duplicate for the same owner is skipped");
+        let other = remember_if_novel("the zanzibar deployment protocol", "fact", "manual", "katana-user")
+            .await
+            .unwrap();
+        assert!(other.is_some(), "same text is novel for a different owner");
+        // ...and the local recall below must NOT surface the other
+        // owner's copy (owner filter on the FTS/vector legs).
+        let other_id = other.unwrap();
+
         // Hybrid recall: "rollout" embeds onto `sem`'s vector (semantic
         // leg) AND lexically matches `sem`'s text; "zanzibar" would be
         // FTS-only. Query "rollout zanzibar" surfaces BOTH.
         let mut fake2 = FakeEmbedder::new("fake-e2e", vec![0.0, 0.0]);
         fake2.map.insert("rollout zanzibar".into(), vec![1.0, 0.0]);
         crate::embedder::set_global(std::sync::Arc::new(fake2));
-        let hits = recall_memory("rollout zanzibar", 2, false).await.unwrap();
+        let hits = recall_memory("rollout zanzibar", 2, false, LOCAL_OWNER).await.unwrap();
         let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
         assert!(ids.contains(&sem), "vector leg surfaces the semantic hit");
         assert!(ids.contains(&lex), "FTS leg surfaces the lexical hit");
+        assert!(!ids.contains(&other_id), "another owner's copy never surfaces locally");
 
         // No embedder at all → FTS still finds the lexical match.
         crate::embedder::clear_global();
-        let hits = recall_memory("zanzibar", 2, false).await.unwrap();
+        let hits = recall_memory("zanzibar", 2, false, LOCAL_OWNER).await.unwrap();
         assert!(hits.iter().any(|h| h.id == lex));
         assert!(hits.iter().all(|h| h.score.is_none()));
 
@@ -1976,5 +2114,143 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         assert_eq!(at3, 200, "mismatch must not touch updated_at");
         // Exercise the warn path a second time (covers the once-per-store set).
         crate::store::record_store_identity(&conn, "memories", "model-b", 768, 400);
+    }
+
+    // ── ADR 0032: owner scoping ─────────────────────────────────────
+
+    /// Seed one embedded + one unembedded fact per owner. Both owners'
+    /// embedded rows sit on the SAME model and near the same vector, and
+    /// both owners' texts share the token "tenancy" — so every leg
+    /// (vector, FTS, recency) would surface BOTH owners if the owner
+    /// filter were missing.
+    fn seed_two_owners(conn: &Connection) -> (i64, i64, i64, i64) {
+        let a_vec = insert_memory(conn, "tenancy fact alpha vec", Some(&[1.0, 0.0]), Some("fake"), "fact", "manual", 10, "alice").unwrap();
+        let a_fts = insert_memory(conn, "tenancy fact alpha fts", None, None, "fact", "manual", 20, "alice").unwrap();
+        let b_vec = insert_memory(conn, "tenancy fact bravo vec", Some(&[0.9, 0.1]), Some("fake"), "fact", "manual", 30, "bob").unwrap();
+        let b_fts = insert_memory(conn, "tenancy fact bravo fts", None, None, "fact", "manual", 40, "bob").unwrap();
+        (a_vec, a_fts, b_vec, b_fts)
+    }
+
+    #[test]
+    fn owner_filters_vector_and_fts_legs() {
+        let (_td, conn) = open_tmp_lamu_db();
+        let (a_vec, a_fts, b_vec, b_fts) = seed_two_owners(&conn);
+
+        // Vector + FTS hybrid as alice: only alice's rows.
+        let hits = recall_hybrid_conn(
+            &conn, "tenancy", Some(&[1.0, 0.0]), Some("fake"), 10, false, 1000, "alice",
+        )
+        .unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, [a_vec, a_fts].into_iter().collect(), "alice sees only alice");
+
+        // Same query as bob: only bob's rows.
+        let hits_b = recall_hybrid_conn(
+            &conn, "tenancy", Some(&[1.0, 0.0]), Some("fake"), 10, false, 1000, "bob",
+        )
+        .unwrap();
+        let ids_b: std::collections::HashSet<i64> = hits_b.iter().map(|h| h.id).collect();
+        assert_eq!(ids_b, [b_vec, b_fts].into_iter().collect(), "bob sees only bob");
+
+        // A third owner sees nothing at all.
+        let hits_c = recall_hybrid_conn(
+            &conn, "tenancy", Some(&[1.0, 0.0]), Some("fake"), 10, false, 1000, "carol",
+        )
+        .unwrap();
+        assert!(hits_c.is_empty(), "stranger sees nothing");
+    }
+
+    #[test]
+    fn owner_filters_recency_leg() {
+        let (_td, conn) = open_tmp_lamu_db();
+        let (a_vec, a_fts, _b_vec, _b_fts) = seed_two_owners(&conn);
+        // No qvec + a query with no FTS match → pure recency leg.
+        let hits = recall_hybrid_conn(&conn, "zzzqqq", None, None, 10, false, 1000, "alice")
+            .unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, [a_vec, a_fts].into_iter().collect(), "recency leg owner-scoped");
+    }
+
+    #[test]
+    fn forget_cross_owner_is_affected_zero() {
+        let (_td, conn) = open_tmp_lamu_db();
+        let (a_vec, ..) = seed_two_owners(&conn);
+        // bob cannot forget alice's fact — same response as a missing id.
+        assert!(!forget_conn(&conn, a_vec, 500, "bob").unwrap());
+        let valid_until: Option<i64> = conn
+            .query_row("SELECT valid_until FROM memories WHERE id = ?", params![a_vec], |r| r.get(0))
+            .unwrap();
+        assert!(valid_until.is_none(), "cross-owner forget must not expire the row");
+        // alice can.
+        assert!(forget_conn(&conn, a_vec, 500, "alice").unwrap());
+    }
+
+    #[test]
+    fn supersede_cross_owner_inserts_nothing() {
+        let (_td, mut conn) = open_tmp_lamu_db();
+        let (a_vec, ..) = seed_two_owners(&conn);
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        // bob superseding alice's fact: None, nothing inserted, old intact.
+        let r = supersede_conn(&mut conn, a_vec, "bob's takeover", None, None, "fact", "manual", 500, "bob")
+            .unwrap();
+        assert!(r.is_none(), "cross-owner supersede must return None");
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "cross-owner supersede must not insert the new fact");
+        let valid_until: Option<i64> = conn
+            .query_row("SELECT valid_until FROM memories WHERE id = ?", params![a_vec], |r| r.get(0))
+            .unwrap();
+        assert!(valid_until.is_none(), "old fact stays current");
+
+        // Missing id behaves identically (no existence leak).
+        let r2 = supersede_conn(&mut conn, 999_999, "ghost", None, None, "fact", "manual", 500, "bob")
+            .unwrap();
+        assert!(r2.is_none());
+
+        // alice superseding her own fact works and the new row is hers.
+        let new_id = supersede_conn(&mut conn, a_vec, "alpha vec v2", None, None, "fact", "manual", 600, "alice")
+            .unwrap()
+            .expect("own supersede inserts");
+        let owner: String = conn
+            .query_row("SELECT owner FROM memories WHERE id = ?", params![new_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "alice");
+    }
+
+    #[test]
+    fn export_corpus_is_owner_scoped() {
+        let (_td, conn) = open_tmp_lamu_db();
+        let (a_vec, a_fts, b_vec, b_fts) = seed_two_owners(&conn);
+        let rows_a = load_corpus_rows(&conn, false, 1000, "alice").unwrap();
+        let ids_a: std::collections::HashSet<i64> = rows_a.iter().map(|r| r.id).collect();
+        assert_eq!(ids_a, [a_vec, a_fts].into_iter().collect());
+        let rows_b = load_corpus_rows(&conn, false, 1000, "bob").unwrap();
+        let ids_b: std::collections::HashSet<i64> = rows_b.iter().map(|r| r.id).collect();
+        assert_eq!(ids_b, [b_vec, b_fts].into_iter().collect());
+        // include_expired stays owner-scoped too.
+        forget_conn(&conn, a_vec, 500, "alice").unwrap();
+        let rows_all = load_corpus_rows(&conn, true, 1000, "alice").unwrap();
+        let ids_all: std::collections::HashSet<i64> = rows_all.iter().map(|r| r.id).collect();
+        assert_eq!(ids_all, [a_vec, a_fts].into_iter().collect());
+    }
+
+    #[test]
+    fn recall_hydrates_valid_until_on_expired_hits() {
+        let (_td, conn) = open_tmp_lamu_db();
+        let id = insert_memory(&conn, "tenancy expiring fact", None, None, "fact", "manual", 10, "alice").unwrap();
+        forget_conn(&conn, id, 500, "alice").unwrap();
+        let hits =
+            recall_hybrid_conn(&conn, "tenancy", None, None, 5, true, 1000, "alice").unwrap();
+        let hit = hits.iter().find(|h| h.id == id).expect("expired hit surfaces");
+        assert_eq!(hit.valid_until, Some(500));
+        // A current fact hydrates None.
+        let id2 = insert_memory(&conn, "tenancy current fact", None, None, "fact", "manual", 20, "alice").unwrap();
+        let hits2 =
+            recall_hybrid_conn(&conn, "tenancy", None, None, 5, false, 1000, "alice").unwrap();
+        let hit2 = hits2.iter().find(|h| h.id == id2).expect("current hit surfaces");
+        assert!(hit2.valid_until.is_none());
     }
 }
