@@ -1142,24 +1142,17 @@ async fn stream_response(
     ctx_max: u32,
 ) -> Sse<Pin<Box<dyn Stream<Item = std::result::Result<Event, Infallible>> + Send>>> {
     let s = async_stream::stream! {
-        let resp = match client.post(&backend_url).json(&payload).send().await {
+        // Transport failure and HTTP error both surface the real message
+        // (e.g. context-overflow 400) instead of letting the empty-body
+        // path emit a generic backend_returned_empty (M1, for streaming).
+        let resp = match send_upstream(&client, &backend_url, &payload).await {
             Ok(r) => r,
-            Err(e) => {
-                let chunk = json!({"error": format!("backend: {}", e)});
-                yield Ok(Event::default().data(chunk.to_string()));
+            Err(msg) => {
+                yield Ok(Event::default().data(json!({"error": {"type":"backend_error","message": msg}}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 return;
             }
         };
-        // Backend HTTP error (reqwest returns Ok for 4xx/5xx) — surface the real
-        // message (e.g. context-overflow 400) instead of letting the empty-body
-        // path emit a generic backend_returned_empty (M1, but for streaming).
-        if !resp.status().is_success() {
-            let msg = backend_error_message(resp).await;
-            yield Ok(Event::default().data(json!({"error": {"type":"backend_error","message": msg}}).to_string()));
-            yield Ok(Event::default().data("[DONE]"));
-            return;
-        }
 
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -1187,142 +1180,137 @@ async fn stream_response(
             buf.extend_from_slice(&bytes);
 
             while let Some(line) = lamu_core::sse::next_sse_line(&mut buf) {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("data: ") else { continue };
-                if rest == "[DONE]" {
-                    // Flush whatever's buffered. The reasoning-tag scan
-                    // buffers tokens until either (a) it spots `<think>`
-                    // and routes to reasoning, or (b) ~24 chars arrive
-                    // without one and we declare reasoning_done. Short
-                    // outputs (e.g. "ok\n") never hit either branch, so
-                    // we have to flush at end-of-stream. Buffered content
-                    // is only safe to drop if we're MID-reasoning — in
-                    // that case the close_tag never arrived and emitting
-                    // the partial think-block would leak it to the user.
-                    if !pending.trim().is_empty() && !in_reasoning {
-                        let chunk = make_chunk(&completion_id, created, &model_name, &pending);
-                        yield Ok(Event::default().data(chunk.to_string()));
-                    }
-                    if streaming_backend_empty(any_content, &finish_reason) {
-                        let err = json!({"error": {"type":"backend_returned_empty","message":"backend produced no content and no legitimate finish reason"}});
-                        yield Ok(Event::default().data(err.to_string()));
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
-                    }
-                    // Report the backend's real finish_reason (length/tool_calls/
-                    // content_filter), not a hardcoded "stop" — else streaming
-                    // clients can't detect truncation or tool calls.
-                    let fr = if finish_reason.is_empty() { "stop" } else { finish_reason.as_str() };
-                    let done_chunk = json!({
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": fr}]
-                    });
-                    yield Ok(Event::default().data(done_chunk.to_string()));
-                    // ADR 0021: emit a usage chunk with the occupancy block when
-                    // the engine reported prompt_tokens (include_usage). Clients
-                    // that didn't ask for usage ignore the extra chunk.
-                    if prompt_tokens > 0 {
-                        let usage_chunk = json!({
-                            "id": completion_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name, "choices": [],
-                            "usage": {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": comp_tokens,
-                                "total_tokens": prompt_tokens + comp_tokens,
-                                "context_window": build_context_window(prompt_tokens, ctx_max, booted_ctx),
+                for ev in parse_upstream_line(&line) {
+                    match ev {
+                        UpstreamEvent::Done => {
+                            // Flush whatever's buffered. The reasoning-tag scan
+                            // buffers tokens until either (a) it spots `<think>`
+                            // and routes to reasoning, or (b) ~24 chars arrive
+                            // without one and we declare reasoning_done. Short
+                            // outputs (e.g. "ok\n") never hit either branch, so
+                            // we have to flush at end-of-stream. Buffered content
+                            // is only safe to drop if we're MID-reasoning — in
+                            // that case the close_tag never arrived and emitting
+                            // the partial think-block would leak it to the user.
+                            if !pending.trim().is_empty() && !in_reasoning {
+                                let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                                yield Ok(Event::default().data(chunk.to_string()));
                             }
-                        });
-                        yield Ok(Event::default().data(usage_chunk.to_string()));
-                    }
-                    yield Ok(Event::default().data("[DONE]"));
-                    return;
-                }
-                let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
-                if let Some(fr) = finish_reason_of(&val) {
-                    finish_reason = fr.to_string();
-                }
-                // ADR 0021: the include_usage final chunk carries token counts.
-                if let Some(u) = val.get("usage") {
-                    if let Some(pt) = u.get("prompt_tokens").and_then(|v| v.as_u64()) { prompt_tokens = pt; }
-                    if let Some(ct) = u.get("completion_tokens").and_then(|v| v.as_u64()) { comp_tokens = ct; }
-                }
-                // Forward streamed tool_call deltas verbatim. The content-only
-                // extraction below would `continue` past them, silently eating a
-                // tool-calling completion (the client then gets an empty stream
-                // ending finish_reason "stop"). Mark output seen so the
-                // empty-backend gate doesn't fire on a tool-only completion.
-                if let Some(tc) = val.get("choices").and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta")).and_then(|d| d.get("tool_calls"))
-                    .filter(|tc| !tc.is_null())
-                {
-                    any_content = true;
-                    let tc_chunk = json!({
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model_name,
-                        "choices": [{"index": 0, "delta": {"tool_calls": tc}, "finish_reason": Value::Null}]
-                    });
-                    yield Ok(Event::default().data(tc_chunk.to_string()));
-                }
-                let Some(token) = val.get("choices").and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                else { continue };
-                if token.is_empty() { continue; }
-                any_content = true;
-
-                pending.push_str(token);
-
-                if !in_reasoning && !reasoning_done {
-                    if let Some(idx) = pending.find(open_tag.as_str()) {
-                        in_reasoning = true;
-                        let pre = pending[..idx].to_string();
-                        let after = pending[idx + open_tag.len()..].to_string();
-                        pending = after;
-                        if !pre.trim().is_empty() {
-                            let chunk = make_chunk(&completion_id, created, &model_name, &pre);
-                            yield Ok(Event::default().data(chunk.to_string()));
-                        }
-                    } else if pending.len() > open_tag.len() * 3 {
-                        reasoning_done = true;
-                        let chunk = make_chunk(&completion_id, created, &model_name, &pending);
-                        yield Ok(Event::default().data(chunk.to_string()));
-                        pending.clear();
-                    }
-                } else if in_reasoning && !reasoning_done {
-                    if let Some(idx) = pending.find(close_tag.as_str()) {
-                        reasoning_done = true;
-                        in_reasoning = false;
-                        pending = pending[idx + close_tag.len()..].to_string();
-                        if !pending.trim().is_empty() {
-                            let chunk = make_chunk(&completion_id, created, &model_name, &pending);
-                            yield Ok(Event::default().data(chunk.to_string()));
-                            pending.clear();
-                        }
-                    } else {
-                        // close_tag may be split across tokens (`</`,`think`,`>`).
-                        // Keep only the trailing close_tag.len()-1 bytes so a
-                        // split tag matches on the next token; the rest is
-                        // reasoning content we intentionally discard. The old
-                        // `pending.clear()` here meant a split close tag NEVER
-                        // matched → in_reasoning stuck → every post-</think>
-                        // answer token dropped → empty completion to the client.
-                        let keep = close_tag.len().saturating_sub(1);
-                        if pending.len() > keep {
-                            let mut cut = pending.len() - keep;
-                            while cut < pending.len() && !pending.is_char_boundary(cut) {
-                                cut += 1;
+                            if streaming_backend_empty(any_content, &finish_reason) {
+                                let err = json!({"error": {"type":"backend_returned_empty","message":"backend produced no content and no legitimate finish reason"}});
+                                yield Ok(Event::default().data(err.to_string()));
+                                yield Ok(Event::default().data("[DONE]"));
+                                return;
                             }
-                            pending.drain(..cut);
+                            // Report the backend's real finish_reason (length/
+                            // tool_calls/content_filter), not a hardcoded "stop" —
+                            // else streaming clients can't detect truncation or
+                            // tool calls.
+                            let fr = if finish_reason.is_empty() { "stop" } else { finish_reason.as_str() };
+                            let done_chunk = json!({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": fr}]
+                            });
+                            yield Ok(Event::default().data(done_chunk.to_string()));
+                            // ADR 0021: emit a usage chunk with the occupancy
+                            // block when the engine reported prompt_tokens
+                            // (include_usage). Clients that didn't ask for usage
+                            // ignore the extra chunk.
+                            if prompt_tokens > 0 {
+                                let usage_chunk = json!({
+                                    "id": completion_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": model_name, "choices": [],
+                                    "usage": {
+                                        "prompt_tokens": prompt_tokens,
+                                        "completion_tokens": comp_tokens,
+                                        "total_tokens": prompt_tokens + comp_tokens,
+                                        "context_window": build_context_window(prompt_tokens, ctx_max, booted_ctx),
+                                    }
+                                });
+                                yield Ok(Event::default().data(usage_chunk.to_string()));
+                            }
+                            yield Ok(Event::default().data("[DONE]"));
+                            return;
+                        }
+                        UpstreamEvent::Finish(fr) => finish_reason = fr,
+                        // ADR 0021: include_usage carries the token counts.
+                        UpstreamEvent::Usage { prompt, completion } => {
+                            if let Some(pt) = prompt { prompt_tokens = pt; }
+                            if let Some(ct) = completion { comp_tokens = ct; }
+                        }
+                        // Forward streamed tool_call deltas verbatim — dropping
+                        // them would silently eat a tool-calling completion (the
+                        // client then gets an empty stream ending finish_reason
+                        // "stop"). Mark output seen so the empty-backend gate
+                        // doesn't fire on a tool-only completion.
+                        UpstreamEvent::ToolDelta(tool_calls) => {
+                            any_content = true;
+                            let tc_chunk = json!({
+                                "id": completion_id, "object": "chat.completion.chunk",
+                                "created": created, "model": model_name,
+                                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": Value::Null}]
+                            });
+                            yield Ok(Event::default().data(tc_chunk.to_string()));
+                        }
+                        UpstreamEvent::Token(token) => {
+                            any_content = true;
+                            pending.push_str(&token);
+
+                            if !in_reasoning && !reasoning_done {
+                                if let Some(idx) = pending.find(open_tag.as_str()) {
+                                    in_reasoning = true;
+                                    let pre = pending[..idx].to_string();
+                                    let after = pending[idx + open_tag.len()..].to_string();
+                                    pending = after;
+                                    if !pre.trim().is_empty() {
+                                        let chunk = make_chunk(&completion_id, created, &model_name, &pre);
+                                        yield Ok(Event::default().data(chunk.to_string()));
+                                    }
+                                } else if pending.len() > open_tag.len() * 3 {
+                                    reasoning_done = true;
+                                    let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                                    yield Ok(Event::default().data(chunk.to_string()));
+                                    pending.clear();
+                                }
+                            } else if in_reasoning && !reasoning_done {
+                                if let Some(idx) = pending.find(close_tag.as_str()) {
+                                    reasoning_done = true;
+                                    in_reasoning = false;
+                                    pending = pending[idx + close_tag.len()..].to_string();
+                                    if !pending.trim().is_empty() {
+                                        let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                                        yield Ok(Event::default().data(chunk.to_string()));
+                                        pending.clear();
+                                    }
+                                } else {
+                                    // close_tag may be split across tokens
+                                    // (`</`,`think`,`>`). Keep only the trailing
+                                    // close_tag.len()-1 bytes so a split tag
+                                    // matches on the next token; the rest is
+                                    // reasoning content we intentionally discard.
+                                    // The old `pending.clear()` here meant a split
+                                    // close tag NEVER matched → in_reasoning stuck
+                                    // → every post-</think> answer token dropped →
+                                    // empty completion to the client.
+                                    let keep = close_tag.len().saturating_sub(1);
+                                    if pending.len() > keep {
+                                        let mut cut = pending.len() - keep;
+                                        while cut < pending.len() && !pending.is_char_boundary(cut) {
+                                            cut += 1;
+                                        }
+                                        pending.drain(..cut);
+                                    }
+                                }
+                            } else if reasoning_done {
+                                let chunk = make_chunk(&completion_id, created, &model_name, &token);
+                                yield Ok(Event::default().data(chunk.to_string()));
+                                pending.clear();
+                            }
                         }
                     }
-                } else if reasoning_done {
-                    let chunk = make_chunk(&completion_id, created, &model_name, token);
-                    yield Ok(Event::default().data(chunk.to_string()));
-                    pending.clear();
                 }
             }
         }
@@ -1405,6 +1393,81 @@ async fn backend_error_message(resp: reqwest::Response) -> String {
 fn streaming_backend_empty(any_output: bool, finish_reason: &str) -> bool {
     !any_output
         && !matches!(finish_reason, "stop" | "length" | "tool_calls" | "content_filter")
+}
+
+/// One parsed upstream SSE line — the shared stream-core (audit deferred
+/// item). All three streaming bridges read the SAME OpenAI-format stream
+/// (lamu's llama-server at :PORT/v1/chat/completions), yet each hand-parsed
+/// it, which is why the B4/B5/B6 audit fixes had to land three times and
+/// could drift again. This is now the single extraction point: a bridge
+/// consumes the events it cares about and ignores the rest (Ollama drops
+/// `ToolDelta`; only OpenAI uses `completion` tokens). The EMISSION state
+/// machines stay per-surface — OpenAI chunks / Anthropic block lifecycle /
+/// Ollama NDJSON are irreducibly different wire formats.
+#[derive(Debug, Clone, PartialEq)]
+enum UpstreamEvent {
+    /// Explicit `data: [DONE]` terminator.
+    Done,
+    /// Non-empty `choices[0].delta.content` token.
+    Token(String),
+    /// `choices[0].delta.tool_calls`, verbatim (non-null).
+    ToolDelta(Value),
+    /// Non-null `choices[0].finish_reason`.
+    Finish(String),
+    /// include_usage token counts. Absent keys stay `None` so a partial
+    /// usage object can never zero a previously-captured count.
+    Usage { prompt: Option<u64>, completion: Option<u64> },
+}
+
+/// Parse one upstream line into events, in the order the old hand-rolled
+/// loops processed the fields (finish → usage → tool deltas → content).
+/// Non-`data:` lines, `[DONE]`-less keepalives, and unparseable JSON all
+/// yield nothing — exactly the old `continue` behavior.
+fn parse_upstream_line(raw: &str) -> Vec<UpstreamEvent> {
+    let line = raw.trim();
+    let Some(rest) = line.strip_prefix("data: ") else { return Vec::new() };
+    if rest == "[DONE]" {
+        return vec![UpstreamEvent::Done];
+    }
+    let Ok(val) = serde_json::from_str::<Value>(rest) else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(fr) = finish_reason_of(&val) {
+        out.push(UpstreamEvent::Finish(fr.to_string()));
+    }
+    if let Some(u) = val.get("usage").filter(|u| !u.is_null()) {
+        let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
+        let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
+        if prompt.is_some() || completion.is_some() {
+            out.push(UpstreamEvent::Usage { prompt, completion });
+        }
+    }
+    let delta = val.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta"));
+    if let Some(tc) = delta.and_then(|d| d.get("tool_calls")).filter(|tc| !tc.is_null()) {
+        out.push(UpstreamEvent::ToolDelta(tc.clone()));
+    }
+    if let Some(tok) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+        if !tok.is_empty() {
+            out.push(UpstreamEvent::Token(tok.to_string()));
+        }
+    }
+    out
+}
+
+/// POST `payload` upstream and hand back the response only when 2xx.
+/// Transport failures and HTTP-error statuses both collapse to one
+/// human-readable message (`backend_error_message` decodes the body) —
+/// the B6 fix in exactly one place; each surface wraps the message in its
+/// own error envelope.
+async fn send_upstream(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &Value,
+) -> std::result::Result<reqwest::Response, String> {
+    match client.post(url).json(payload).send().await {
+        Ok(r) if r.status().is_success() => Ok(r),
+        Ok(r) => Err(backend_error_message(r).await),
+        Err(e) => Err(format!("backend: {e}")),
+    }
 }
 
 /// Non-streaming 502 gate predicate: true when the backend's response is
@@ -2234,24 +2297,16 @@ async fn stream_response_anthropic(
         });
         yield Ok(Event::default().event("content_block_start").data(cb_start.to_string()));
 
-        let resp = match client.post(&backend_url).json(&payload).send().await {
+        // Transport failure / backend HTTP error → one Anthropic error event
+        // carrying the real message (send_upstream decodes error bodies).
+        let resp = match send_upstream(&client, &backend_url, &payload).await {
             Ok(r) => r,
-            Err(e) => {
-                let err = json!({
-                    "type": "error",
-                    "error": {"type":"backend_error","message": format!("{e}")}
-                });
+            Err(msg) => {
+                let err = json!({"type":"error","error":{"type":"backend_error","message": msg}});
                 yield Ok(Event::default().event("error").data(err.to_string()));
                 return;
             }
         };
-        // Backend HTTP error → surface the real message as an Anthropic error event.
-        if !resp.status().is_success() {
-            let msg = backend_error_message(resp).await;
-            let err = json!({"type":"error","error":{"type":"backend_error","message": msg}});
-            yield Ok(Event::default().event("error").data(err.to_string()));
-            return;
-        }
 
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -2276,52 +2331,47 @@ async fn stream_response_anthropic(
             // chunk corrupts a multibyte char split across chunk boundaries.
             buf.extend_from_slice(&bytes);
             while let Some(line) = lamu_core::sse::next_sse_line(&mut buf) {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("data: ") else { continue };
-                if rest == "[DONE]" { break 'read; }
-                let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
-                let choice = val.get("choices").and_then(|c| c.get(0));
-                if let Some(fr) = finish_reason_of(&val) {
-                    finish_reason = fr.to_string();
-                }
-                // ADR 0021: the include_usage final chunk carries prompt_tokens.
-                if let Some(pt) = val.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()) {
-                    prompt_tokens = pt;
-                }
-                let delta = choice.and_then(|c| c.get("delta"));
-
-                // Text token → text_delta on the index-0 text block, with
-                // reasoning stripped (M5). out_tokens counts raw generation;
-                // only the visible (post-strip) text is emitted.
-                if let Some(token) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
-                    if !token.is_empty() {
-                        out_tokens += 1;
-                        let visible = stripper.push(token);
-                        if !visible.is_empty() {
-                            let d = json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type":"text_delta","text": visible}
-                            });
-                            yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+                for ev in parse_upstream_line(&line) {
+                    match ev {
+                        UpstreamEvent::Done => break 'read,
+                        UpstreamEvent::Finish(fr) => finish_reason = fr,
+                        // ADR 0021: include_usage carries prompt_tokens (the
+                        // occupancy numerator); completion count is unused on
+                        // this surface (out_tokens counts raw generation).
+                        UpstreamEvent::Usage { prompt, .. } => {
+                            if let Some(pt) = prompt { prompt_tokens = pt; }
                         }
-                    }
-                }
-
-                // Tool-call deltas → accumulate by index; emitted as Anthropic
-                // tool_use blocks at close once fully assembled.
-                if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|v| v.as_array()) {
-                    for tc in tcs {
-                        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let slot = tool_acc.entry(idx).or_default();
-                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                            if !id.is_empty() { slot.id = id.to_string(); }
+                        // Text token → text_delta on the index-0 text block,
+                        // with reasoning stripped (M5). out_tokens counts raw
+                        // generation; only visible (post-strip) text is emitted.
+                        UpstreamEvent::Token(token) => {
+                            out_tokens += 1;
+                            let visible = stripper.push(&token);
+                            if !visible.is_empty() {
+                                let d = json!({
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type":"text_delta","text": visible}
+                                });
+                                yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+                            }
                         }
-                        if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
-                            if !name.is_empty() { slot.name = name.to_string(); }
-                        }
-                        if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
-                            slot.args.push_str(a);
+                        // Tool-call deltas → accumulate by index; emitted as
+                        // Anthropic tool_use blocks at close, fully assembled.
+                        UpstreamEvent::ToolDelta(tool_calls) => {
+                            for tc in tool_calls.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+                                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                let slot = tool_acc.entry(idx).or_default();
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() { slot.id = id.to_string(); }
+                                }
+                                if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                                    if !name.is_empty() { slot.name = name.to_string(); }
+                                }
+                                if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                                    slot.args.push_str(a);
+                                }
+                            }
                         }
                     }
                 }
@@ -2696,21 +2746,16 @@ async fn stream_response_ollama(
 
     let client = state.client.clone();
     let body_stream = async_stream::stream! {
-        let resp = match client.post(&backend_url).json(&payload).send().await {
+        // Transport failure / backend HTTP error → one Ollama error line
+        // carrying the real message (send_upstream decodes error bodies).
+        let resp = match send_upstream(&client, &backend_url, &payload).await {
             Ok(r) => r,
-            Err(e) => {
-                let err = json!({"error": format!("backend: {e}")});
+            Err(msg) => {
+                let err = json!({"error": msg});
                 yield Ok::<_, std::io::Error>(format!("{}\n", err).into_bytes());
                 return;
             }
         };
-        // Backend HTTP error → surface the real message as an Ollama error line.
-        if !resp.status().is_success() {
-            let msg = backend_error_message(resp).await;
-            let err = json!({"error": msg});
-            yield Ok::<_, std::io::Error>(format!("{}\n", err).into_bytes());
-            return;
-        }
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut out_tokens: u64 = 0;
@@ -2728,29 +2773,27 @@ async fn stream_response_ollama(
             // chunk corrupts a multibyte char split across chunk boundaries.
             buf.extend_from_slice(&bytes);
             while let Some(line) = lamu_core::sse::next_sse_line(&mut buf) {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("data: ") else { continue };
-                if rest == "[DONE]" { break 'read; }
-                let Ok(val) = serde_json::from_str::<Value>(rest) else { continue };
-                if let Some(fr) = finish_reason_of(&val) {
-                    finish_reason = fr.to_string();
+                for ev in parse_upstream_line(&line) {
+                    match ev {
+                        UpstreamEvent::Done => break 'read,
+                        UpstreamEvent::Finish(fr) => finish_reason = fr,
+                        // Ollama's NDJSON has no tool-call or usage surface;
+                        // dropping these is this bridge's documented contract.
+                        UpstreamEvent::ToolDelta(_) | UpstreamEvent::Usage { .. } => {}
+                        UpstreamEvent::Token(token) => {
+                            out_tokens += 1;
+                            let visible = stripper.push(&token);
+                            if visible.is_empty() { continue; }
+                            let chunk = json!({
+                                "model": model_name,
+                                "created_at": rfc3339_now(),
+                                "message": {"role":"assistant","content": visible},
+                                "done": false,
+                            });
+                            yield Ok(format!("{}\n", chunk).into_bytes());
+                        }
+                    }
                 }
-                let Some(token) = val.get("choices").and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                else { continue };
-                if token.is_empty() { continue; }
-                out_tokens += 1;
-                let visible = stripper.push(token);
-                if visible.is_empty() { continue; }
-                let chunk = json!({
-                    "model": model_name,
-                    "created_at": rfc3339_now(),
-                    "message": {"role":"assistant","content": visible},
-                    "done": false,
-                });
-                yield Ok(format!("{}\n", chunk).into_bytes());
             }
         }
         // Flush any buffered visible text before the final done:true line (M5).
@@ -2840,6 +2883,43 @@ mod compat_tests {
         let t = sanitize_field(&long, 50);
         assert_eq!(t.chars().count(), 51); // 50 + the '…' marker
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn upstream_parser_extracts_every_field_in_order() {
+        // The stream-core contract: one line can carry finish_reason +
+        // usage + tool deltas + content; events come out in the order the
+        // old hand-rolled loops processed them.
+        let line = r#"data: {"choices":[{"delta":{"content":"hi","tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
+        let evs = parse_upstream_line(line);
+        assert_eq!(evs.len(), 4);
+        assert_eq!(evs[0], UpstreamEvent::Finish("tool_calls".into()));
+        assert_eq!(evs[1], UpstreamEvent::Usage { prompt: Some(7), completion: Some(3) });
+        assert!(matches!(&evs[2], UpstreamEvent::ToolDelta(tc) if tc.is_array()));
+        assert_eq!(evs[3], UpstreamEvent::Token("hi".into()));
+    }
+
+    #[test]
+    fn upstream_parser_done_keepalive_garbage_and_empty() {
+        assert_eq!(parse_upstream_line("data: [DONE]"), vec![UpstreamEvent::Done]);
+        assert!(parse_upstream_line(": keepalive").is_empty());
+        assert!(parse_upstream_line("event: ping").is_empty());
+        assert!(parse_upstream_line("data: {not json").is_empty());
+        // Empty content token is filtered at the source (old `continue`).
+        assert!(parse_upstream_line(r#"data: {"choices":[{"delta":{"content":""}}]}"#).is_empty());
+        // Null finish_reason / null tool_calls are not events.
+        assert!(parse_upstream_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":null},"finish_reason":null}]}"#
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn upstream_parser_partial_usage_keeps_absent_keys_none() {
+        // A usage object with only completion_tokens must not zero a
+        // previously-captured prompt count — absent stays None.
+        let evs = parse_upstream_line(r#"data: {"usage":{"completion_tokens":5}}"#);
+        assert_eq!(evs, vec![UpstreamEvent::Usage { prompt: None, completion: Some(5) }]);
     }
 
     #[test]
