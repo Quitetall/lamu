@@ -32,7 +32,7 @@ cd ~/local-llm
 
 just install          # cargo install --path lamu-rs/lamu-cli --locked
 lamu pull qwen36-27b  # ~16 GB GGUF from HuggingFace → ~/models/
-lamu scan             # discover GGUFs → config/models.yaml
+lamu scan             # discover GGUFs → ~/.local/share/lamu/models.yaml
 lamu serve &          # OpenAI HTTP on :8020 (background)
 lamu run heretic      # one-shot: resolve, drop into chat
 ```
@@ -54,8 +54,13 @@ Full Ollama-shaped surface:
 | `lamu start` | MCP daemon on stdio (Claude Code) |
 | `lamu serve [port]` | OpenAI HTTP (default :8020) |
 | `lamu repl [url]` | Chat REPL against a running serve |
+| `lamu cookbook [--suggest]` | Rank models for YOUR hardware (roofline + composite score, per-device) |
+| `lamu research "<question>"` | Deep research: decompose → multi-source search → cited synthesis → follow-up chat |
+| `lamu clean --all [--yes]` | Retention for drafts/sessions/transcripts/media/logs — dry-run by default |
 
 That's the whole onboarding. `lamu` is your interface; everything else is plumbing.
+
+Run it as a service: [`lamu-rs/deploy/`](lamu-rs/deploy/) ships a user-level systemd unit + env template (`systemctl --user enable --now lamu-serve`).
 
 ---
 
@@ -123,8 +128,15 @@ Reload Claude Code, then `/mcp` should show `local-llm` connected. Tools exposed
 | `list_models` | Registry + load status + capabilities. |
 | `load_model` / `unload_model` | Manual VRAM control. |
 | `vram_status` | Snapshot of allocation. |
-| `scan_models` | Re-discover GGUFs on disk. |
+| `scan_models` | Re-discover GGUFs on disk (merges — curated fields survive). |
 | `queue_status` | Per-model queue depth + scheduling strategy. |
+| `cloud_query` / `parallel_query` / `council` | Cloud models (MiMo/DeepSeek/Claude via `~/.config/lamu/cloud-models.yaml`); fan-out; multi-model judged comparison. |
+| `review_commit` / `review_diff` | Code review by a cloud reviewer with bundled review policy. |
+| `research` / `deep_research` / `answer` / `web_search` | Grounded research: scraper fan-out, cited synthesis, keyless SearXNG lookup. |
+| `generate_image` / `text_to_speech` | Managed ComfyUI / fish-speech backends (modality-tiered eviction). |
+| `cookbook` | Hardware-fit model ranking (same engine as `lamu cookbook`). |
+
+…plus memory (remember/recall/consolidate), context occupancy (ADR 0021), routing mode, and warmup — `tools/list` is the full inventory.
 
 ---
 
@@ -142,7 +154,7 @@ Three dialects on one port:
 | Anthropic | `/v1/messages` (SSE + `tool_use`) | Claude Code, Crush, Hermes |
 | Ollama | `/api/chat`, `/api/tags` (NDJSON) | AnythingLLM, Open WebUI (Ollama mode) |
 
-- **Default model** — the `config/models.yaml` entry with `main: true`; aliases `default`/`main`/`lamu` resolve there, so harnesses need no model name. `lamu scan` auto-promotes the first model to `main` so a fresh registry is usable immediately; `lamu use <model>` re-points it (substring match) without hand-editing YAML.
+- **Default model** — the registry entry with `main: true`; aliases `default`/`main`/`lamu` resolve there, so harnesses need no model name. `lamu scan` auto-promotes the first model to `main` so a fresh registry is usable immediately; `lamu use <model>` re-points it (substring match) without hand-editing YAML.
 - **Auth** — off on a loopback bind; off-loopback (`LAMU_BIND_HOST=0.0.0.0`) requires a token (`lamu auth init`), ADR [0012](lamu-rs/docs/decisions/0012-minimal-bearer-auth.md). See API.md § Authentication.
 - **Extensions** — `enable_thinking: false` disables Qwen3.6 reasoning on all three surfaces; reasoning surfaces as `reasoning_content`. See API.md § LAMU extensions.
 - **Bifrost passthrough (optional)** — `LAMU_GATEWAY_URL=http://localhost:8080/v1` forwards chat completions through Bifrost (`just serve-bifrost`) for a unified cloud+local surface (~1.67% latency). Default off.
@@ -154,7 +166,14 @@ Registered harnesses live in `config/harnesses.yaml` (`just open [name]`, `just 
 
 ## Model Registry
 
-`lamu scan` walks `~/models/`, parses GGUF headers, writes `config/models.yaml`:
+`lamu scan` walks `~/models/`, parses GGUF headers, and writes the **live
+registry at `~/.local/share/lamu/models.yaml`** — outside the git work tree,
+because scans and load-status flips mutate it at runtime (ADR
+[0025](lamu-rs/docs/decisions/0025-registry-out-of-work-tree.md)). The repo
+tracks a read-only seed (`config/models_default.yaml`) that bootstraps the
+live file on first run; `$LAMU_REGISTRY` overrides the path for
+tests/sandboxes. Re-scans merge: curated fields (`main`, `speculative`,
+`sampling`, `notes`, `status`, `system_prompt`, `backend_kind`) survive.
 
 ```yaml
 models:
@@ -177,7 +196,17 @@ models:
       draft_max: 8
 ```
 
-Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` — chosen per-entry. Adding a new backend is one file in `lamu-rs/lamu-core/src/backends/` (mirrored in `lamu/backends/`) plus one `make_backend` arm.
+Optional per-entry extras: `system_prompt` (per-model default system prompt;
+precedence request > model > global, blank = explicitly disable) and
+`backend_kind` (string dispatch key, ADR
+[0026](lamu-rs/docs/decisions/0026-backend-kind-string-dispatch.md)).
+
+Backends: `llama_cpp`, `megakernel`, `dflash`, `dflash_lucebox` in core, plus
+module-provided kinds (`comfyui`, `fish_speech`) registered at startup (ADR
+[0023](lamu-rs/docs/decisions/0023-module-architecture.md)). Adding a module
+backend is one crate + one `register_backend("kind", …)` call at the
+composition root — core never names it; a drift test proves every kind
+resolves.
 
 ---
 
@@ -233,10 +262,14 @@ lamu               scan|status|start|serve|repl  # canonical
 
 ```bash
 pytest tests/ -q          # 288 unit + 14 integration, heavy deps stubbed
-cargo test --workspace    # 56 Rust tests across 9 crates
+cargo test --workspace    # 600+ Rust tests across 9 crates
 just test-contract        # Python ↔ Rust MCP wire-format parity
 ruff check lamu           # strict on lamu/, soft on legacy paths
 ```
+
+Agentic flows (research/answer/chat) test against a scripted `FakeCtx`
+seam double (`lamu-core` feature `test-support`) — no model, no GPU, the
+one networked step served by an in-test TCP stub.
 
 CI gates on coverage (`fail_under = 70`), strict ruff over `lamu/`, full Python + Rust suites, and the cross-language contract diff.
 
