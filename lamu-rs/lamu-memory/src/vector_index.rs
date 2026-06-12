@@ -155,15 +155,20 @@ pub(crate) enum VectorBackend {
 
 /// Resolve the active vector backend from the `LAMU_VECTOR_BACKEND` env var.
 ///
-/// - unset / `"brute"` / anything unrecognized → [`VectorBackend::Brute`]
+/// - `"brute"` → [`VectorBackend::Brute`] — the explicit escape hatch,
+///   honored in every build.
 /// - `"turbovec"` → [`VectorBackend::TurboVec`] **iff** the `turbovec`
 ///   feature was compiled in; otherwise [`VectorBackend::Brute`] plus a
 ///   one-time `warn!` that turbovec was requested but not built in.
-///
-/// Defaulting to brute keeps normal builds 100%-recall and behavior-stable;
-/// the env+feature gate makes turbovec strictly opt-in.
+/// - unset / anything unrecognized → the BUILD's default: TurboVec when
+///   the `turbovec` feature is compiled in (ADR 0031 — compiling the
+///   feature IS the opt-in; the persistent `.tv` lifecycle in
+///   `crate::tv_store` then maintains the index), Brute otherwise
+///   (feature-off behavior unchanged: brute is a full scan anyway, so a
+///   per-query rebuild loses nothing — there is nothing to persist).
 pub(crate) fn vector_backend() -> VectorBackend {
     match std::env::var("LAMU_VECTOR_BACKEND").ok().as_deref() {
+        Some("brute") => VectorBackend::Brute,
         Some("turbovec") => {
             #[cfg(feature = "turbovec")]
             {
@@ -175,8 +180,17 @@ pub(crate) fn vector_backend() -> VectorBackend {
                 VectorBackend::Brute
             }
         }
-        // "brute", unset, or any unrecognized value → brute.
-        _ => VectorBackend::Brute,
+        // Unset or unrecognized → the build's default.
+        _ => {
+            #[cfg(feature = "turbovec")]
+            {
+                VectorBackend::TurboVec
+            }
+            #[cfg(not(feature = "turbovec"))]
+            {
+                VectorBackend::Brute
+            }
+        }
     }
 }
 
@@ -205,10 +219,12 @@ fn warn_turbovec_unavailable() {
 /// every vector on `add` and the query on `search`; on unit inputs the
 /// returned score == cosine similarity (the seam's contract).
 ///
-/// This cut builds the underlying `TurboQuantIndex` lazily, from the buffered
-/// rows, on each `search` — mirroring how the recall sites rebuild a
-/// `BruteForceCosine` per query. A persistent on-disk `.tv` index lifecycle
-/// (add-on-remember, load-on-start) is a deliberate follow-up, not this cut.
+/// This impl builds the underlying `TurboQuantIndex` lazily, from the
+/// buffered rows, on each `search` — mirroring how the recall sites rebuild
+/// a `BruteForceCosine` per query. It remains the FALLBACK for queries the
+/// persistent path can't serve (dims not a multiple of 8); the persistent
+/// on-disk `.tv` lifecycle (load-or-rebuild, catch-up, throttled atomic
+/// persist) lives in `crate::tv_store` (ADR 0031).
 #[cfg(feature = "turbovec")]
 pub struct TurboVecIndex<P> {
     /// Buffered (already-normalized vector, payload) rows, parallel to the
@@ -422,8 +438,11 @@ mod tests {
         assert!(z.iter().all(|x| x.is_finite()), "never NaN/Inf");
     }
 
+    /// Feature OFF: brute is the default for unset/unrecognized AND the
+    /// forced value — unchanged pre-ADR-0031 behavior, byte-identical.
+    #[cfg(not(feature = "turbovec"))]
     #[test]
-    fn vector_backend_defaults_to_brute_when_env_unset() {
+    fn vector_backend_defaults_to_brute_when_feature_off() {
         // SAFETY: single-threaded test; we own the var for its scope.
         unsafe {
             std::env::remove_var("LAMU_VECTOR_BACKEND");
@@ -440,6 +459,38 @@ mod tests {
             vector_backend(),
             VectorBackend::Brute,
             "unrecognized value → brute"
+        );
+        unsafe {
+            std::env::remove_var("LAMU_VECTOR_BACKEND");
+        }
+    }
+
+    /// Feature ON: the default FLIPS to turbovec (ADR 0031 — compiling
+    /// the feature is the opt-in), while `brute` stays an explicit
+    /// escape hatch.
+    #[cfg(feature = "turbovec")]
+    #[test]
+    fn vector_backend_defaults_to_turbovec_when_feature_on() {
+        // SAFETY: single-threaded test; we own the var for its scope.
+        unsafe {
+            std::env::remove_var("LAMU_VECTOR_BACKEND");
+        }
+        assert_eq!(vector_backend(), VectorBackend::TurboVec, "unset → turbovec");
+        unsafe {
+            std::env::set_var("LAMU_VECTOR_BACKEND", "brute");
+        }
+        assert_eq!(
+            vector_backend(),
+            VectorBackend::Brute,
+            "explicit brute still forces brute"
+        );
+        unsafe {
+            std::env::set_var("LAMU_VECTOR_BACKEND", "nonsense");
+        }
+        assert_eq!(
+            vector_backend(),
+            VectorBackend::TurboVec,
+            "unrecognized value → the build default"
         );
         unsafe {
             std::env::remove_var("LAMU_VECTOR_BACKEND");

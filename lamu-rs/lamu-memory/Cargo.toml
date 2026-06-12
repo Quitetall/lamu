@@ -26,12 +26,16 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # turbovec). NOTE (Linux): turbovec links a system OpenBLAS via
 # openblas-src{features=["system"]}; the feature build requires OpenBLAS
 # dev libs (Arch: `pacman -S openblas`) and gfortran on the link path.
+# build.rs re-emits `-lopenblas` for the feature so TEST binaries link too
+# (openblas-src's own directive reached lib/bin targets but not tests).
 turbovec = { version = "0.7.0", optional = true }
 
 [features]
-# Enable the TurboVecIndex backend (TurboQuant 2-4 bit compressed search).
-# Brute-force cosine remains the DEFAULT; this only makes turbovec
-# AVAILABLE behind LAMU_VECTOR_BACKEND=turbovec at runtime.
+# Enable the TurboVec backend (TurboQuant 2-4 bit compressed search).
+# COMPILING the feature is the opt-in (ADR 0031): feature-on builds default
+# to the persistent .tv index lifecycle (`tv_store`); `LAMU_VECTOR_BACKEND=
+# brute` remains the runtime escape hatch. Feature-off builds keep the
+# brute-force cosine path byte-identical.
 turbovec = ["dep:turbovec"]
 
 [dev-dependencies]

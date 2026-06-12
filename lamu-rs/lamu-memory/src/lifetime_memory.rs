@@ -56,6 +56,9 @@ use crate::hybrid::{rrf_merge, sanitize_fts_query};
 use crate::rag::{blob_to_vec, vec_to_blob};
 use crate::vector_index::{cosine, vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 
+/// This module's persistent-index store id (ADR 0031).
+const TV_STORE: crate::tv_store::Store = crate::tv_store::Store::Memories;
+
 /// The PRE-ADR-0028 standalone `memory.db` schema. Kept ONLY for the
 /// legacy open path ([`open_legacy_memory_db`]) that normalizes an old
 /// file before its one-time import into `lamu.db` — the live schema is
@@ -297,20 +300,27 @@ async fn embed_via_chain(text: &str) -> Result<Option<(Vec<f32>, EmbedderId)>> {
 pub async fn remember(text: &str, kind: &str, source: &str) -> Result<i64> {
     let embedded = embed_via_chain(text).await?;
     let arc = memory_db()?;
-    let conn = arc.lock();
-    let now = now_secs();
-    let id = insert_memory(
-        &conn,
-        text,
-        embedded.as_ref().map(|(v, _)| v.as_slice()),
-        embedded.as_ref().map(|(_, ident)| ident.model.as_str()),
-        kind,
-        source,
-        now,
-    )?;
-    if let Some((v, ident)) = &embedded {
-        crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
-    }
+    let id = {
+        let conn = arc.lock();
+        let now = now_secs();
+        let id = insert_memory(
+            &conn,
+            text,
+            embedded.as_ref().map(|(v, _)| v.as_slice()),
+            embedded.as_ref().map(|(_, ident)| ident.model.as_str()),
+            kind,
+            source,
+            now,
+        )?;
+        if let Some((v, ident)) = &embedded {
+            crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
+            // ADR 0031: append to the live persistent index (no-op when
+            // the persistent path is inactive or the index isn't loaded).
+            crate::tv_store::note_added(&conn, TV_STORE, id, v, &ident.model);
+        }
+        id
+    }; // DB lock released — persist (file I/O) must not run under it.
+    crate::tv_store::maybe_persist(TV_STORE);
     Ok(id)
 }
 
@@ -479,38 +489,52 @@ pub(crate) fn recall_hybrid_conn(
     // The cosine score per id is kept so hydration can surface it.
     let mut cosine_by_id: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
     let leg1: Vec<(i64, f32)> = if let (Some(qvec), Some(model)) = (qvec, model) {
-        let where_clause = if valid.is_empty() {
-            "WHERE embedding IS NOT NULL AND embedding_model = ?1".to_string()
-        } else {
-            format!("WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}")
-        };
-        let sql =
-            format!("SELECT id, text, kind, source, ts, embedding FROM memories {where_clause}");
-        let rows: Vec<MemoryRow> = {
-            let mut stmt = conn.prepare(&sql)?;
-            let mapped = stmt.query_map(params![model], |r| {
-                let id: i64 = r.get(0)?;
-                let text: String = r.get(1)?;
-                let kind: String = r.get(2)?;
-                let source: Option<String> = r.get(3)?;
-                let ts: i64 = r.get(4)?;
-                let emb: Vec<u8> = r.get(5)?;
-                Ok((id, text, kind, source, ts, blob_to_vec(&emb)))
-            })?;
-            let mut rows = Vec::new();
-            for row in mapped {
-                rows.push(row?);
+        // ADR 0031: the persistent index serves the leg when active. Its
+        // raw hits are over-fetched (k * OVERFETCH) and post-filtered
+        // against SQLite (validity + model) — expired rows STAY in the
+        // .tv (invalidation-without-delete), the filter hides them.
+        // `None` (inactive / dims not %8 / error) → the per-query scan.
+        if let Some(raw) = crate::tv_store::search_persistent(conn, TV_STORE, qvec, model, k) {
+            let kept = filter_indexed_candidates(conn, &raw, model, &valid, k)?;
+            for (id, s) in &kept {
+                cosine_by_id.insert(*id, *s);
             }
-            rows
-        };
-        rank_memories(qvec, rows, k)
-            .into_iter()
-            .map(|h| {
-                let s = h.score.unwrap_or(0.0);
-                cosine_by_id.insert(h.id, s);
-                (h.id, s)
-            })
-            .collect()
+            kept
+        } else {
+            let where_clause = if valid.is_empty() {
+                "WHERE embedding IS NOT NULL AND embedding_model = ?1".to_string()
+            } else {
+                format!("WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}")
+            };
+            let sql = format!(
+                "SELECT id, text, kind, source, ts, embedding FROM memories {where_clause}"
+            );
+            let rows: Vec<MemoryRow> = {
+                let mut stmt = conn.prepare(&sql)?;
+                let mapped = stmt.query_map(params![model], |r| {
+                    let id: i64 = r.get(0)?;
+                    let text: String = r.get(1)?;
+                    let kind: String = r.get(2)?;
+                    let source: Option<String> = r.get(3)?;
+                    let ts: i64 = r.get(4)?;
+                    let emb: Vec<u8> = r.get(5)?;
+                    Ok((id, text, kind, source, ts, blob_to_vec(&emb)))
+                })?;
+                let mut rows = Vec::new();
+                for row in mapped {
+                    rows.push(row?);
+                }
+                rows
+            };
+            rank_memories(qvec, rows, k)
+                .into_iter()
+                .map(|h| {
+                    let s = h.score.unwrap_or(0.0);
+                    cosine_by_id.insert(h.id, s);
+                    (h.id, s)
+                })
+                .collect()
+        }
     } else {
         // No vector leg → recency list takes its slot in the fusion.
         let where_clause = if valid.is_empty() {
@@ -614,6 +638,100 @@ pub(crate) fn recall_hybrid_conn(
         .collect())
 }
 
+/// Post-filter raw persistent-index candidates against SQLite: keep ids
+/// that are still embedding-bearing under the CURRENT `model` AND pass
+/// the `valid` time clause (expired rows stay in the .tv — this filter is
+/// what hides them), preserve the index's score order, dedup by id
+/// (chunk-style rowid reuse can alias two slots onto one id; first =
+/// best-scored wins), truncate to `k` (ADR 0031).
+fn filter_indexed_candidates(
+    conn: &Connection,
+    raw: &[(i64, f32)],
+    model: &str,
+    valid: &str,
+    k: usize,
+) -> Result<Vec<(i64, f32)>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; raw.len()].join(",");
+    let and_valid = if valid.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {valid}")
+    };
+    let sql = format!(
+        "SELECT id FROM memories WHERE id IN ({placeholders}) \
+         AND embedding IS NOT NULL AND embedding_model = ?{model_pos}{and_valid}",
+        model_pos = raw.len() + 1
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind: Vec<rusqlite::types::Value> = raw
+        .iter()
+        .map(|(id, _)| rusqlite::types::Value::Integer(*id))
+        .chain(std::iter::once(rusqlite::types::Value::Text(model.to_string())))
+        .collect();
+    let mapped = stmt.query_map(rusqlite::params_from_iter(bind), |r| r.get::<_, i64>(0))?;
+    let mut keep = std::collections::HashSet::new();
+    for id in mapped {
+        keep.insert(id?);
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(raw
+        .iter()
+        .filter(|(id, _)| keep.contains(id) && seen.insert(*id))
+        .take(k)
+        .copied()
+        .collect())
+}
+
+/// Load the EXACT stored embeddings for a set of candidate ids
+/// (validity- and model-filtered). The novelty gate compares exact
+/// cosine against [`NOVELTY_THRESHOLD`] — quantized index scores are
+/// only used to pick WHICH rows to compare, never as the similarity.
+/// Keyed by rowid DELIBERATELY: SQLite returns IN-list rows in arbitrary
+/// order, and the caller's `raw` is score-ordered — a positional Vec would
+/// invite silent misalignment the moment anyone zips them. `is_novel`
+/// consumes the values as a bag, so today only the keys' SET matters.
+fn load_candidate_embeddings(
+    conn: &Connection,
+    raw: &[(i64, f32)],
+    model: &str,
+    valid: &str,
+) -> Result<std::collections::HashMap<i64, Vec<f32>>> {
+    if raw.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = vec!["?"; raw.len()].join(",");
+    let and_valid = if valid.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {valid}")
+    };
+    let sql = format!(
+        "SELECT id, embedding FROM memories WHERE id IN ({placeholders}) \
+         AND embedding IS NOT NULL AND embedding_model = ?{model_pos}{and_valid}",
+        model_pos = raw.len() + 1
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind: Vec<rusqlite::types::Value> = raw
+        .iter()
+        .map(|(id, _)| rusqlite::types::Value::Integer(*id))
+        .chain(std::iter::once(rusqlite::types::Value::Text(model.to_string())))
+        .collect();
+    let mapped = stmt.query_map(rusqlite::params_from_iter(bind), |r| {
+        let id: i64 = r.get(0)?;
+        let blob: Vec<u8> = r.get(1)?;
+        Ok((id, blob_to_vec(&blob)))
+    })?;
+    let mut out = std::collections::HashMap::new();
+    for row in mapped {
+        let (id, v) = row?;
+        out.insert(id, v);
+    }
+    Ok(out)
+}
+
 // ── Fact-extraction parsing (pure half of consolidation) ───────────
 
 /// Parse MiMo's extraction output into individual facts. One fact per
@@ -669,6 +787,11 @@ pub fn parse_extracted_facts(raw: &str) -> Vec<String> {
 /// judge can exclude near-duplicates from its candidate set.
 pub const NOVELTY_THRESHOLD: f32 = 0.92;
 
+/// How many nearest candidates the persistent-index novelty probe asks
+/// for (over-fetched ×4 by the index itself). Only the WHICH-rows choice
+/// — the novelty decision always runs exact cosine on stored embeddings.
+const NOVELTY_PROBE_K: usize = 16;
+
 /// PURE novelty test: a candidate embedding is novel iff its MAX cosine
 /// similarity against every `existing` embedding is strictly below
 /// `threshold`. Empty `existing` → always novel (true). Reuses
@@ -704,10 +827,6 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
     // dropped as a "duplicate" — but default recall hides the expired row,
     // so the now-current fact silently vanished.
     let valid = valid_time_clause(false, now);
-    let sql = format!(
-        "SELECT embedding FROM memories \
-         WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}"
-    );
     // Hold ONE guard across SELECT + is_novel + insert. is_novel (cosine)
     // and insert_memory are synchronous (no await), so this is safe and
     // closes the TOCTOU window where two concurrent autocapture threads
@@ -715,27 +834,51 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
     // and both inserted. Trade-off: the cosine scan now runs under the
     // lock, serializing concurrent novelty checks — fine while memory.db
     // is small + autocapture is bounded; revisit if the store grows large.
-    let conn = arc.lock();
-    let existing: Vec<Vec<f32>> = {
-        let mut stmt = conn.prepare(&sql)?;
-        let mapped = stmt.query_map(params![ident.model], |r| {
-            let blob: Vec<u8> = r.get(0)?;
-            Ok(blob_to_vec(&blob))
-        })?;
-        let mut rows = Vec::new();
-        for row in mapped {
-            rows.push(row?);
+    let inserted = {
+        let conn = arc.lock();
+        // ADR 0031: with the persistent index active, probe it for the
+        // nearest candidates instead of scanning every row — the novelty
+        // gate then runs EXACT cosine over just those rows' stored
+        // embeddings (quantized scores never decide novelty). The probe
+        // over-fetches ×4 internally; a ≥-threshold near-duplicate is by
+        // definition the nearest neighbor, so top-NOVELTY_PROBE_K cannot
+        // realistically miss it. Inactive/unusable → full scan as before.
+        let probe =
+            crate::tv_store::search_persistent(&conn, TV_STORE, &emb, &ident.model, NOVELTY_PROBE_K);
+        let existing: Vec<Vec<f32>> = match probe {
+            Some(raw) => load_candidate_embeddings(&conn, &raw, &ident.model, &valid)?
+                .into_values()
+                .collect(),
+            None => {
+                let sql = format!(
+                    "SELECT embedding FROM memories \
+                     WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mapped = stmt.query_map(params![ident.model], |r| {
+                    let blob: Vec<u8> = r.get(0)?;
+                    Ok(blob_to_vec(&blob))
+                })?;
+                let mut rows = Vec::new();
+                for row in mapped {
+                    rows.push(row?);
+                }
+                rows
+            }
+        };
+
+        if !is_novel(&emb, &existing, NOVELTY_THRESHOLD) {
+            None
+        } else {
+            let id =
+                insert_memory(&conn, text, Some(&emb), Some(&ident.model), kind, source, now)?;
+            crate::store::record_store_identity(&conn, "memories", &ident.model, emb.len(), now);
+            crate::tv_store::note_added(&conn, TV_STORE, id, &emb, &ident.model);
+            Some(id)
         }
-        rows
-    };
-
-    if !is_novel(&emb, &existing, NOVELTY_THRESHOLD) {
-        return Ok(None);
-    }
-
-    let id = insert_memory(&conn, text, Some(&emb), Some(&ident.model), kind, source, now)?;
-    crate::store::record_store_identity(&conn, "memories", &ident.model, emb.len(), now);
-    Ok(Some(id))
+    }; // DB lock released — persist (file I/O) must not run under it.
+    crate::tv_store::maybe_persist(TV_STORE);
+    Ok(inserted)
 }
 
 // ── Supersession + soft-delete (temporal) ──────────────────────────
@@ -757,20 +900,46 @@ pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) ->
     let embedded = embed_via_chain(new_text).await?;
     let now = now_secs();
     let arc = memory_db()?;
-    let mut conn = arc.lock();
-    let id = supersede_conn(
-        &mut conn,
-        old_id,
-        new_text,
-        embedded.as_ref().map(|(v, _)| v.as_slice()),
-        embedded.as_ref().map(|(_, ident)| ident.model.as_str()),
-        kind,
-        source,
-        now,
-    )?;
-    if let Some((v, ident)) = &embedded {
-        crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
-    }
+    let id = {
+        let mut conn = arc.lock();
+        // Will this call actually expire an INDEXED row? Checked under the
+        // same guard as the supersede itself, so it's race-free. Drives
+        // the stale-count bump below (ADR 0031): only rows that carry an
+        // embedding ever entered the .tv.
+        let old_indexed: bool = {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT embedding IS NOT NULL FROM memories \
+                 WHERE id = ?1 AND valid_until IS NULL",
+                params![old_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false)
+        };
+        let id = supersede_conn(
+            &mut conn,
+            old_id,
+            new_text,
+            embedded.as_ref().map(|(v, _)| v.as_slice()),
+            embedded.as_ref().map(|(_, ident)| ident.model.as_str()),
+            kind,
+            source,
+            now,
+        )?;
+        if let Some((v, ident)) = &embedded {
+            crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
+            crate::tv_store::note_added(&conn, TV_STORE, id, v, &ident.model);
+        }
+        if old_indexed {
+            // Invalidation WITHOUT delete: the expired row's vector stays
+            // in the .tv; searches post-filter it out, and the stale
+            // counter drives the >25% rebuild threshold.
+            crate::tv_store::note_stale(&conn, TV_STORE, 1);
+        }
+        id
+    }; // DB lock released — persist (file I/O) must not run under it.
+    crate::tv_store::maybe_persist(TV_STORE);
     Ok(id)
 }
 
@@ -825,7 +994,23 @@ pub fn forget(id: i64) -> Result<bool> {
     let now = now_secs();
     let arc = memory_db()?;
     let conn = arc.lock();
-    forget_conn(&conn, id, now)
+    // Indexed = currently valid AND embedding-bearing — only those rows
+    // ever entered the .tv, so only they count toward stale (ADR 0031).
+    let was_indexed: bool = {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT embedding IS NOT NULL FROM memories WHERE id = ?1 AND valid_until IS NULL",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false)
+    };
+    let affected = forget_conn(&conn, id, now)?;
+    if affected && was_indexed {
+        crate::tv_store::note_stale(&conn, TV_STORE, 1);
+    }
+    Ok(affected)
 }
 
 /// Connection-level core of [`forget`]: expire the row if it is currently

@@ -37,6 +37,9 @@ use std::sync::Arc;
 /// `crate::embedder::resolve()` returns instead.
 pub(crate) use crate::embedder::OPENAI_EMBED_MODEL as EMBED_MODEL;
 
+/// This module's persistent-index store id (ADR 0031).
+const TV_STORE: crate::tv_store::Store = crate::tv_store::Store::Chunks;
+
 /// Chunk size in characters. ~1KB hits a sweet spot: large enough to
 /// preserve local context, small enough to keep per-chunk embeddings
 /// meaningful + the index manageable.
@@ -243,16 +246,24 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
     let mut conn = arc.lock();
     let tx = conn.transaction()?;
     let mut cleared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Rows replaced by this re-index are STALE in the persistent .tv
+    // (their vectors stay; searches post-filter them) — count them for
+    // the stale accounting (ADR 0031).
+    let mut replaced = 0i64;
     for (path, _, _, _) in &to_embed {
         if cleared.insert(path.as_str()) {
-            tx.execute("DELETE FROM chunks WHERE path = ?", params![path])?;
+            replaced += tx.execute("DELETE FROM chunks WHERE path = ?", params![path])? as i64;
         }
     }
+    // Rowids of the fresh inserts, parallel to `embeddings` — the
+    // persistent-index hooks below need them.
+    let mut inserted_rowids: Vec<i64> = Vec::with_capacity(to_embed.len());
     for ((path, idx, content, mtime), emb) in to_embed.iter().zip(embeddings.iter()) {
         tx.execute(
             "INSERT OR REPLACE INTO chunks (path, chunk_idx, content, embedding, embedding_model, mtime) VALUES (?, ?, ?, ?, ?, ?)",
             params![path, *idx as i64, content, vec_to_blob(emb), model, mtime],
         )?;
+        inserted_rowids.push(tx.last_insert_rowid());
     }
     // Per-store identity bookkeeping (ADR 0030) — same transaction, so
     // the rows + the store row land atomically.
@@ -262,6 +273,16 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
         .unwrap_or(0);
     crate::store::record_store_identity(&tx, "chunks", &model, dims, now);
     tx.commit()?;
+
+    // Persistent-index hooks AFTER commit (rows are durable) but still
+    // under the conn guard — note_* writes vector_index_state through the
+    // same connection (lock order: DB first, index second; ADR 0031).
+    for (rowid, emb) in inserted_rowids.iter().zip(embeddings.iter()) {
+        crate::tv_store::note_added(&conn, TV_STORE, *rowid, emb, &model);
+    }
+    crate::tv_store::note_stale(&conn, TV_STORE, replaced);
+    drop(conn); // persist (file I/O) must not run under the DB lock
+    crate::tv_store::maybe_persist(TV_STORE);
 
     Ok(to_embed.len())
 }
@@ -318,41 +339,107 @@ pub async fn semantic_search(query: &str, k: usize) -> Result<Vec<SearchHit>> {
         .ok_or_else(|| anyhow!("embedder returned no vector for the query"))?;
     let model = embedder.identity().model;
     let arc = index_db()?;
-    let conn = arc.lock();
-    // Model filter (ADR 0030): only rank rows embedded with the CURRENT
-    // model — vectors from different models live in different spaces.
-    let mut stmt = conn.prepare(
-        "SELECT path, chunk_idx, content, embedding FROM chunks WHERE embedding_model = ?1",
-    )?;
-    let rows = stmt.query_map(params![model], |r| {
-        let path: String = r.get(0)?;
-        let content: String = r.get(2)?; // chunk_idx (col 1) not needed in SearchHit
-        let emb_blob: Vec<u8> = r.get(3)?;
-        Ok((path, content, emb_blob))
-    })?;
-    // SEAM: swap BruteForceCosine for an ANN/quantized index when the
-    // corpus outgrows brute-force (see crate::vector_index for the why).
-    // Load the rows once, then build whichever backend the selector picks;
-    // the result-mapping below is identical for both branches.
-    let mut loaded: Vec<(Vec<f32>, (String, String))> = Vec::new();
-    for row in rows {
-        let (path, content, emb_blob) = row?;
-        loaded.push((blob_to_vec(&emb_blob), (path, content)));
-    }
-    let hits = search_rows(loaded, &qvec, k);
-    Ok(hits
-        .into_iter()
-        .map(|hit| {
-            let (path, content) = hit.payload;
-            SearchHit {
-                path,
-                line: None,
-                snippet: truncate_utf8(&content, 400),
-                score: Some(hit.score),
-                source: "semantic",
+    let hits = {
+        let conn = arc.lock();
+        // ADR 0031: persistent index first — raw over-fetched candidates,
+        // hydrated + model-filtered by rowid below. `None` (persistent
+        // path inactive / dims not %8 / error) → the per-query scan.
+        if let Some(raw) =
+            crate::tv_store::search_persistent(&conn, TV_STORE, &qvec, &model, k)
+        {
+            hydrate_chunk_hits(&conn, &raw, &model, k)?
+        } else {
+            // Model filter (ADR 0030): only rank rows embedded with the
+            // CURRENT model — vectors from different models live in
+            // different spaces.
+            let mut stmt = conn.prepare(
+                "SELECT path, chunk_idx, content, embedding FROM chunks WHERE embedding_model = ?1",
+            )?;
+            let rows = stmt.query_map(params![model], |r| {
+                let path: String = r.get(0)?;
+                let content: String = r.get(2)?; // chunk_idx (col 1) not needed in SearchHit
+                let emb_blob: Vec<u8> = r.get(3)?;
+                Ok((path, content, emb_blob))
+            })?;
+            // SEAM: swap BruteForceCosine for an ANN/quantized index when the
+            // corpus outgrows brute-force (see crate::vector_index for the why).
+            // Load the rows once, then build whichever backend the selector picks;
+            // the result-mapping below is identical for both branches.
+            let mut loaded: Vec<(Vec<f32>, (String, String))> = Vec::new();
+            for row in rows {
+                let (path, content, emb_blob) = row?;
+                loaded.push((blob_to_vec(&emb_blob), (path, content)));
             }
-        })
-        .collect())
+            search_rows(loaded, &qvec, k)
+                .into_iter()
+                .map(|hit| {
+                    let (path, content) = hit.payload;
+                    SearchHit {
+                        path,
+                        line: None,
+                        snippet: truncate_utf8(&content, 400),
+                        score: Some(hit.score),
+                        source: "semantic",
+                    }
+                })
+                .collect()
+        }
+    }; // DB lock released — persist (file I/O) must not run under it.
+    crate::tv_store::maybe_persist(TV_STORE);
+    Ok(hits)
+}
+
+/// Hydrate raw persistent-index candidates `(rowid, score)` into
+/// [`SearchHit`]s: SELECT by rowid with the model filter (a stale rowid
+/// whose row was deleted by a re-index simply doesn't hydrate), keep the
+/// index's score order, dedup by rowid, truncate to `k` (ADR 0031).
+fn hydrate_chunk_hits(
+    conn: &Connection,
+    raw: &[(i64, f32)],
+    model: &str,
+    k: usize,
+) -> Result<Vec<SearchHit>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; raw.len()].join(",");
+    let sql = format!(
+        "SELECT rowid, path, content FROM chunks \
+         WHERE rowid IN ({placeholders}) AND embedding_model = ?{model_pos}",
+        model_pos = raw.len() + 1
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind: Vec<rusqlite::types::Value> = raw
+        .iter()
+        .map(|(id, _)| rusqlite::types::Value::Integer(*id))
+        .chain(std::iter::once(rusqlite::types::Value::Text(model.to_string())))
+        .collect();
+    let mapped = stmt.query_map(rusqlite::params_from_iter(bind), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })?;
+    let mut by_rowid: std::collections::HashMap<i64, (String, String)> =
+        std::collections::HashMap::new();
+    for row in mapped {
+        let (rowid, path, content) = row?;
+        by_rowid.insert(rowid, (path, content));
+    }
+    let mut hits = Vec::new();
+    for (rowid, score) in raw {
+        let Some((path, content)) = by_rowid.remove(rowid) else {
+            continue; // stale / wrong-model rowid — filtered out here
+        };
+        hits.push(SearchHit {
+            path,
+            line: None,
+            snippet: truncate_utf8(&content, 400),
+            score: Some(*score),
+            source: "semantic",
+        });
+        if hits.len() >= k {
+            break;
+        }
+    }
+    Ok(hits)
 }
 
 // ── Public dispatch ────────────────────────────────────────────────

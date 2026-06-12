@@ -40,6 +40,9 @@
 //!   semantic search.
 //! - [`vector_index`] — the vector-similarity seam (brute-force cosine
 //!   default, opt-in `turbovec` backend).
+//! - [`tv_store`] — the persistent `.tv` index lifecycle (ADR 0031):
+//!   load-or-rebuild, catch-up, throttled atomic persist, stale
+//!   accounting. Feature-on default; inert in a feature-off build.
 //!
 //! What does NOT live here (stays in the frontends): MCP tool handlers,
 //! cloud-judged orchestration (fact extraction, auto-contradiction —
@@ -55,4 +58,5 @@ pub mod migrate;
 pub mod rag;
 pub mod reembed;
 pub mod store;
+pub mod tv_store;
 pub mod vector_index;
