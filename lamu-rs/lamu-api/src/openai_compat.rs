@@ -109,6 +109,13 @@ pub struct ChatRequest {
     pub tools: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    /// llama-server prefix-cache control (ADR 0037): reuse the longest
+    /// common prompt prefix from the previous request on this slot.
+    /// `None` leaves the engine default; a harness that keeps stable
+    /// prompt prefixes (katana's S0-S2 stability classes) sets `true`
+    /// and reads the cached-token count back from usage.
+    #[serde(default)]
+    pub cache_prompt: Option<bool>,
 }
 
 fn default_max_tokens() -> u32 { 16384 }
@@ -768,6 +775,11 @@ async fn chat_completions(
     if let Some(tc) = req.tool_choice.as_ref() {
         payload["tool_choice"] = tc.clone();
     }
+    // ADR 0037: llama-server prefix-cache passthrough. Only emitted when
+    // the client asked — None keeps the engine default untouched.
+    if let Some(cp) = req.cache_prompt {
+        payload["cache_prompt"] = json!(cp);
+    }
 
     // Routing: by default, forward straight to the loaded backend on its
     // local port. If LAMU_GATEWAY_URL is set (e.g. a Bifrost endpoint),
@@ -1025,6 +1037,22 @@ async fn chat_completions(
     let ctx_max = state.entries.get(&model_name).map(|e| e.context_max).unwrap_or(0);
     let booted = state.scheduler.lock().booted_ctx(&model_name);
     augment_usage_with_context(&mut response, prompt_tokens, ctx_max, booted);
+    // ADR 0037: surface engine-reported cached prompt tokens (prefix cache)
+    // in the OpenAI shape. Omitted entirely when the engine is silent.
+    if let Some(ct) = cached_tokens_of(&response) {
+        if let Some(u) = response.get_mut("usage").and_then(|u| u.as_object_mut()) {
+            // Only synthesize the object when the engine didn't already emit
+            // it — a blind insert would drop sibling keys a newer engine
+            // might put beside cached_tokens.
+            let already_present = u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .is_some();
+            if !already_present {
+                u.insert("prompt_tokens_details".into(), json!({ "cached_tokens": ct }));
+            }
+        }
+    }
     // Debit the user's bucket by the tokens actually produced (ADR 0018 §4).
     state.quota.charge(principal_ref, completion_tokens);
     // Per-request audit event (ADR 0018 §5) — the durable who-did-what.
@@ -1105,6 +1133,35 @@ fn context_window_value(
     cw
 }
 
+/// Engine-reported cached prompt tokens, if the backend exposes them
+/// (ADR 0037). Two shapes, in preference order:
+///   1. `usage.prompt_tokens_details.cached_tokens` — OpenAI-convention
+///      field newer llama-server builds emit directly.
+///   2. llama-server `timings.prompt_n` = tokens actually EVALUATED this
+///      request; with prefix caching, `prompt_tokens - prompt_n` is the
+///      reused prefix.
+/// `None` when the engine reports nothing — callers must OMIT the field,
+/// never fabricate a count.
+fn cached_tokens_of(response: &Value) -> Option<u64> {
+    if let Some(ct) = response
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        return Some(ct);
+    }
+    let prompt_tokens = response
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())?;
+    let evaluated = response
+        .get("timings")
+        .and_then(|t| t.get("prompt_n"))
+        .and_then(|v| v.as_u64())?;
+    prompt_tokens.checked_sub(evaluated)
+}
+
 /// Insert the ADR 0021 `context_window` into a response's `usage` object
 /// (additive — existing OpenAI clients ignore unknown keys inside `usage`). If
 /// `usage` is absent/not an object (rare error path), create it so the signal
@@ -1168,6 +1225,8 @@ async fn stream_response(
         // ADR 0021: engine token counts from the final include_usage chunk.
         let mut prompt_tokens: u64 = 0;
         let mut comp_tokens: u64 = 0;
+        // ADR 0037: engine-reported prefix-cache reuse, when available.
+        let mut cached_tokens: Option<u64> = None;
 
         use futures_util::stream::StreamExt;
         while let Some(chunk_res) = byte_stream.next().await {
@@ -1218,7 +1277,7 @@ async fn stream_response(
                             // (include_usage). Clients that didn't ask for usage
                             // ignore the extra chunk.
                             if prompt_tokens > 0 {
-                                let usage_chunk = json!({
+                                let mut usage_chunk = json!({
                                     "id": completion_id, "object": "chat.completion.chunk",
                                     "created": created, "model": model_name, "choices": [],
                                     "usage": {
@@ -1228,6 +1287,11 @@ async fn stream_response(
                                         "context_window": build_context_window(prompt_tokens, ctx_max, booted_ctx),
                                     }
                                 });
+                                // ADR 0037: prefix-cache reuse, only when the
+                                // engine reported it.
+                                if let Some(ct) = cached_tokens {
+                                    usage_chunk["usage"]["prompt_tokens_details"] = json!({ "cached_tokens": ct });
+                                }
                                 yield Ok(Event::default().data(usage_chunk.to_string()));
                             }
                             yield Ok(Event::default().data("[DONE]"));
@@ -1235,9 +1299,10 @@ async fn stream_response(
                         }
                         UpstreamEvent::Finish(fr) => finish_reason = fr,
                         // ADR 0021: include_usage carries the token counts.
-                        UpstreamEvent::Usage { prompt, completion } => {
+                        UpstreamEvent::Usage { prompt, completion, cached } => {
                             if let Some(pt) = prompt { prompt_tokens = pt; }
                             if let Some(ct) = completion { comp_tokens = ct; }
+                            if cached.is_some() { cached_tokens = cached; }
                         }
                         // Forward streamed tool_call deltas verbatim — dropping
                         // them would silently eat a tool-calling completion (the
@@ -1378,8 +1443,9 @@ enum UpstreamEvent {
     /// Non-null `choices[0].finish_reason`.
     Finish(String),
     /// include_usage token counts. Absent keys stay `None` so a partial
-    /// usage object can never zero a previously-captured count.
-    Usage { prompt: Option<u64>, completion: Option<u64> },
+    /// usage object can never zero a previously-captured count. `cached` =
+    /// engine-reported prefix-cache reuse (ADR 0037), None when silent.
+    Usage { prompt: Option<u64>, completion: Option<u64>, cached: Option<u64> },
 }
 
 /// Parse one upstream line into events, in the order the old hand-rolled
@@ -1400,8 +1466,13 @@ fn parse_upstream_line(raw: &str) -> Vec<UpstreamEvent> {
     if let Some(u) = val.get("usage").filter(|u| !u.is_null()) {
         let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
         let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
+        let cached = cached_tokens_of(&val);
+        // Gating on the token counts is intentional: a chunk carrying ONLY
+        // cache details with no counts doesn't exist in practice (llama-server
+        // emits them together in the include_usage chunk) and would be
+        // meaningless to consumers without its prompt total.
         if prompt.is_some() || completion.is_some() {
-            out.push(UpstreamEvent::Usage { prompt, completion });
+            out.push(UpstreamEvent::Usage { prompt, completion, cached });
         }
     }
     let delta = val.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta"));
@@ -1756,6 +1827,10 @@ struct AnthropicRequest {
     /// out of the `<think>` block for latency-sensitive calls.
     #[serde(default)]
     enable_thinking: Option<bool>,
+    /// llama-server prefix-cache control (ADR 0037) — same lamu extension
+    /// as the OpenAI surface; reuse reported via cache_read_input_tokens.
+    #[serde(default)]
+    cache_prompt: Option<bool>,
 }
 
 fn anthropic_tools_to_openai(tools: &[Value]) -> Vec<Value> {
@@ -2069,6 +2144,7 @@ async fn anthropic_messages(
         enable_thinking: req.enable_thinking,
         tools: oai_tools,
         tool_choice: oai_tool_choice,
+        cache_prompt: req.cache_prompt,
     };
 
     let resp = chat_completions(State(state), principal, Json(oai_req)).await.into_response();
@@ -2319,6 +2395,8 @@ async fn stream_response_anthropic(
         let mut out_tokens: u64 = 0;
         // ADR 0021: engine prompt_tokens from the final include_usage chunk.
         let mut prompt_tokens: u64 = 0;
+        // ADR 0037: engine-reported prefix-cache reuse, when available.
+        let mut cached_tokens: Option<u64> = None;
         // Tool calls accumulated by their OpenAI delta index. BTreeMap so
         // the emitted tool_use blocks keep the backend's call order.
         let mut tool_acc: std::collections::BTreeMap<usize, ToolAcc> = std::collections::BTreeMap::new();
@@ -2345,8 +2423,9 @@ async fn stream_response_anthropic(
                         // ADR 0021: include_usage carries prompt_tokens (the
                         // occupancy numerator); completion count is unused on
                         // this surface (out_tokens counts raw generation).
-                        UpstreamEvent::Usage { prompt, .. } => {
+                        UpstreamEvent::Usage { prompt, cached, .. } => {
                             if let Some(pt) = prompt { prompt_tokens = pt; }
+                            if cached.is_some() { cached_tokens = cached; }
                         }
                         // Text token → split into thinking_delta / text_delta
                         // on lazily-opened blocks. out_tokens counts raw
@@ -2521,6 +2600,10 @@ async fn stream_response_anthropic(
         // ADR 0021: attach the un-fakeable occupancy block when the engine
         // reported prompt_tokens (include_usage final chunk).
         let mut delta_usage = json!({"output_tokens": out_tokens});
+        // ADR 0037: Anthropic's native cache-reuse field, engine-reported only.
+        if let Some(ct) = cached_tokens {
+            delta_usage["cache_read_input_tokens"] = json!(ct);
+        }
         if prompt_tokens > 0 {
             delta_usage["context_window"] = build_context_window(prompt_tokens, ctx_max, booted_ctx);
         }
@@ -2662,6 +2745,8 @@ async fn ollama_chat(
         enable_thinking: req.enable_thinking,
         tools: None,
         tool_choice: None,
+        // Ollama's surface has no cache knob; engine default applies.
+        cache_prompt: None,
     };
     let resp = chat_completions(State(state), principal, Json(oai_req)).await.into_response();
     let (parts, body) = resp.into_parts();
@@ -2965,7 +3050,7 @@ mod compat_tests {
         let evs = parse_upstream_line(line);
         assert_eq!(evs.len(), 4);
         assert_eq!(evs[0], UpstreamEvent::Finish("tool_calls".into()));
-        assert_eq!(evs[1], UpstreamEvent::Usage { prompt: Some(7), completion: Some(3) });
+        assert_eq!(evs[1], UpstreamEvent::Usage { prompt: Some(7), completion: Some(3), cached: None });
         assert!(matches!(&evs[2], UpstreamEvent::ToolDelta(tc) if tc.is_array()));
         assert_eq!(evs[3], UpstreamEvent::Token("hi".into()));
     }
@@ -2986,11 +3071,36 @@ mod compat_tests {
     }
 
     #[test]
+    fn cached_tokens_prefers_details_then_timings_never_fabricates() {
+        // 1. OpenAI-convention field wins.
+        let r = json!({"usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 80}},
+                       "timings": {"prompt_n": 50}});
+        assert_eq!(cached_tokens_of(&r), Some(80));
+        // 2. llama-server timings fallback: cached = prompt_tokens - prompt_n.
+        let r = json!({"usage": {"prompt_tokens": 100}, "timings": {"prompt_n": 30}});
+        assert_eq!(cached_tokens_of(&r), Some(70));
+        // 3. Engine silent → None (callers omit, never fabricate).
+        let r = json!({"usage": {"prompt_tokens": 100}});
+        assert_eq!(cached_tokens_of(&r), None);
+        assert_eq!(cached_tokens_of(&json!({})), None);
+        // 4. prompt_n > prompt_tokens (engine weirdness) → None, not underflow.
+        let r = json!({"usage": {"prompt_tokens": 10}, "timings": {"prompt_n": 99}});
+        assert_eq!(cached_tokens_of(&r), None);
+    }
+
+    #[test]
+    fn upstream_parser_usage_carries_cached_tokens() {
+        let line = r#"data: {"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":64}}}"#;
+        let evs = parse_upstream_line(line);
+        assert_eq!(evs, vec![UpstreamEvent::Usage { prompt: Some(100), completion: None, cached: Some(64) }]);
+    }
+
+    #[test]
     fn upstream_parser_partial_usage_keeps_absent_keys_none() {
         // A usage object with only completion_tokens must not zero a
         // previously-captured prompt count — absent stays None.
         let evs = parse_upstream_line(r#"data: {"usage":{"completion_tokens":5}}"#);
-        assert_eq!(evs, vec![UpstreamEvent::Usage { prompt: None, completion: Some(5) }]);
+        assert_eq!(evs, vec![UpstreamEvent::Usage { prompt: None, completion: Some(5), cached: None }]);
     }
 
     #[test]
