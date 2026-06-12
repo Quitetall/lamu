@@ -1,0 +1,25 @@
+[package]
+name = "lamu-inproc"
+version = "0.1.0"
+edition.workspace = true
+
+# IN-PROCESS backend shim (ADR 0033). Lets an inference engine that lives
+# INSIDE the lamu process serve through the existing port-proxy
+# architecture: the loader drops the `Box<dyn Backend>` right after load
+# and every subsequent request is proxied to `http://localhost:{port}`
+# (see lamu-core/src/backends/mod.rs + lamu-api openai_compat.rs). An
+# in-process engine therefore must BIND A PORT — a small axum server in a
+# tokio task — rather than shortcut the Backend trait.
+#
+# Deliberately independent of lamu-core: this crate knows nothing about
+# registries or schedulers, only "engine in, OpenAI-shaped HTTP out".
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { workspace = true, features = ["rt", "net", "macros"] }
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"], default-features = false }
+tokio = { workspace = true, features = ["full"] }

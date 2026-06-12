@@ -11,6 +11,24 @@ members = [
     "lamu-tts",
     "lamu-jart",
     "lamu-jart-frontend",
+    "lamu-inproc",
+    "lamu-onnx",
+]
+# A bare `cargo build` must NOT compile ort/onnxruntime (ADR 0034): the
+# default build excludes lamu-onnx; it builds via `--workspace`, `-p
+# lamu-onnx`, or as a dep of `lamu-cli --features onnx|full`.
+default-members = [
+    "lamu-core",
+    "lamu-memory",
+    "lamu-mcp",
+    "lamu-api",
+    "lamu-cli",
+    "lamu-providers",
+    "lamu-image",
+    "lamu-tts",
+    "lamu-jart",
+    "lamu-jart-frontend",
+    "lamu-inproc",
 ]
 
 # BLUT (Brian Lam's Universal Trainer) extracted to its own repo

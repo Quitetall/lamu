@@ -1,0 +1,38 @@
+[package]
+name = "lamu-onnx"
+version = "0.1.0"
+edition.workspace = true
+
+# ONNX MODULE (ADR 0034). Embeddings-first ort backend, served in-process
+# through lamu-inproc's port shim (ADR 0033). CPU execution provider only
+# in v1 → vram_mb 0, no scheduler interplay. Registered as backend_kind
+# "onnx" per the ADR 0023/0026 module pattern; feature-gated behind
+# lamu-cli's `onnx` feature so the default build never compiles ort.
+[dependencies]
+lamu-core.workspace = true
+lamu-inproc = { path = "../lamu-inproc" }
+# ort 2.x is still on rc semver (2.0.0-rc.12 wraps ONNX Runtime 1.24).
+# Cargo pre-release matching means `version = "2"` would NOT select an rc,
+# so pin the exact rc and bump deliberately. DEFAULT features are already
+# CPU-only — every execution provider (cuda, tensorrt, …) is an opt-in
+# feature — and they carry exactly what CPU inference needs:
+# `download-binaries` (+ its `tls-native`) fetches the upstream CPU
+# onnxruntime at build time (no system install), `copy-dylibs` places the
+# .so next to test/bin artifacts so `cargo test` finds it, `ndarray` for
+# tensor interop, `api-24` pins the ORT C API level. Do NOT add `cuda`
+# here; GPU EPs are a later ADR with scheduler interplay.
+ort = "=2.0.0-rc.12"
+tokenizers = "0.23"
+# MUST track ort's own ndarray major (rc.12 → 0.17): two ndarray versions
+# in the graph make ort's ArrayView types foreign to ours (E0277 soup).
+ndarray = "0.17"
+anyhow.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+futures-util = "0.3"
+tokio = { workspace = true, features = ["rt", "net", "time", "io-util", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+serde_json.workspace = true
+tempfile = "3"

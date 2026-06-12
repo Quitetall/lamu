@@ -321,6 +321,68 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
             });
             continue;
         }
+        // Multi-format: catalog `.onnx` embedding checkpoints for the
+        // in-process ort backend (ADR 0034). CPU EP only in v1 → vram_mb 0,
+        // invisible to the VRAM scheduler. Embedding-only capability so the
+        // entry is never chat-routed; it backs `/v1/embeddings` through the
+        // lamu-inproc port shim (ADR 0033).
+        if ext == "onnx" {
+            // HF ONNX exports are usually "<named-dir>/model.onnx" (often
+            // under an extra "onnx/" subdir) — name from the PARENT DIR
+            // unless that dir name is generic, then fall back to the stem.
+            let parent_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .filter(|n| !matches!(n.to_lowercase().as_str(), "model" | "models" | "onnx"));
+            let name = parent_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(filename)
+                        .to_string()
+                })
+                .to_lowercase()
+                .replace(' ', "-");
+            // The ort engine needs a `tokenizer.json` sidecar next to the
+            // .onnx file — flag its absence at scan time so the operator
+            // learns BEFORE a load fails.
+            let has_tokenizer = path
+                .parent()
+                .map(|p| p.join("tokenizer.json").is_file())
+                .unwrap_or(false);
+            let notes = if has_tokenizer {
+                "onnx embedding checkpoint — served in-process on the CPU execution provider (lamu-onnx module, build with --features onnx).".to_string()
+            } else {
+                "onnx checkpoint discovered by scan but MISSING its tokenizer.json sidecar — the onnx backend cannot load it; place the model's tokenizer.json next to the .onnx file.".to_string()
+            };
+            discovered.push(ModelEntry {
+                name,
+                path: path.to_path_buf(),
+                format: ModelFormat::Onnx,
+                backend: BackendType::Onnx,
+                backend_kind: None,
+                system_prompt: None,
+                arch: "unknown".to_string(),
+                params_b: 0.0,
+                quant: "fp32".to_string(),
+                vram_mb: 0, // CPU EP — no VRAM footprint (ADR 0034)
+                // Conservative BERT-family default; the engine discovers the
+                // tokenizer's real max at load and truncates to it.
+                context_max: 512,
+                capabilities: vec![Capability::Embedding],
+                reasoning_marker: None,
+                speculative: None,
+                sampling: None,
+                pinned: false,
+                main: false,
+                notes,
+                status: crate::types::ModelStatus::default(),
+                modality: crate::types::Modality::Llm,
+            });
+            continue;
+        }
         if ext != "gguf" {
             continue;
         }
@@ -775,6 +837,59 @@ mod tests {
         // Unknown stays None → context_max 0 → spawn defers to the engine,
         // never a guessed number.
         assert_eq!(meta.n_ctx_train, None);
+    }
+
+    #[test]
+    fn scan_discovers_onnx_with_tokenizer_sidecar() {
+        // <dir>/bge-small-en/model.onnx + tokenizer.json → one Onnx entry
+        // named from the parent dir (the file stem "model" is generic).
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("BGE Small-EN");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.onnx"), b"fake-onnx-bytes").unwrap();
+        std::fs::write(model_dir.join("tokenizer.json"), b"{}").unwrap();
+
+        let entries = scan_directory(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.name, "bge-small-en", "name from parent dir, lowercased + dashed");
+        assert_eq!(e.format, ModelFormat::Onnx);
+        assert_eq!(e.backend, BackendType::Onnx);
+        assert_eq!(e.vram_mb, 0, "CPU EP — invisible to the VRAM scheduler");
+        assert_eq!(e.capabilities, vec![Capability::Embedding], "embedding-only, never chat-routed");
+        assert_eq!(e.modality, crate::types::Modality::Llm);
+        assert_eq!(e.context_max, 512);
+        assert!(!e.notes.contains("MISSING"), "sidecar present must not be flagged: {}", e.notes);
+        assert!(!e.main, "embedding-only entries are never auto-promoted main");
+    }
+
+    #[test]
+    fn scan_flags_onnx_missing_tokenizer_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("gte-base");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.onnx"), b"fake").unwrap();
+
+        let entries = scan_directory(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].notes.contains("tokenizer.json"),
+            "missing sidecar must be called out in notes: {}",
+            entries[0].notes
+        );
+    }
+
+    #[test]
+    fn scan_onnx_generic_parent_dir_falls_back_to_stem() {
+        // <dir>/onnx/all-minilm.onnx — parent "onnx" is generic → stem names it.
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("onnx");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("all-minilm.onnx"), b"fake").unwrap();
+
+        let entries = scan_directory(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "all-minilm");
     }
 
     #[test]

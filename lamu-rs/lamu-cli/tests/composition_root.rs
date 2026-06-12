@@ -48,8 +48,11 @@ fn every_backend_kind_resolves_at_the_composition_root() {
     lamu_image::register();
     lamu_tts::register();
     lamu_jart::register();
+    // Same cfg as main(): the onnx module exists only behind the feature.
+    #[cfg(feature = "onnx")]
+    lamu_onnx::register();
 
-    let kinds = [
+    let mut kinds = vec![
         BackendType::LlamaCpp,
         BackendType::Megakernel,
         BackendType::Dflash,
@@ -57,6 +60,11 @@ fn every_backend_kind_resolves_at_the_composition_root() {
         BackendType::FishSpeech,
         BackendType::ComfyUI,
     ];
+    // BackendType::Onnx resolves only when the feature compiled its module
+    // in; the feature-OFF expectation is pinned by
+    // `onnx_kind_not_registered_without_feature` below.
+    #[cfg(feature = "onnx")]
+    kinds.push(BackendType::Onnx);
     for bt in kinds {
         let kind = bt.as_kind_str();
         match make_backend(&entry_for(kind)) {
@@ -79,5 +87,28 @@ fn unknown_kind_still_fails_loudly_after_registration() {
     match make_backend(&entry_for("nope_not_real")) {
         Ok(_) => panic!("unknown kind must error"),
         Err(e) => assert!(format!("{e}").contains("not registered")),
+    }
+}
+
+/// Feature-OFF half of the onnx drift contract (ADR 0034): a build without
+/// `--features onnx` never registers the module, so an "onnx" entry must
+/// die with the ADR 0023 "not registered" error — and that error must point
+/// the operator at the feature flag instead of leaving them guessing.
+#[cfg(not(feature = "onnx"))]
+#[test]
+fn onnx_kind_not_registered_without_feature() {
+    lamu_image::register();
+    lamu_tts::register();
+    lamu_jart::register();
+    match make_backend(&entry_for(BackendType::Onnx.as_kind_str())) {
+        Ok(_) => panic!("'onnx' must not resolve when the feature is off"),
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(msg.contains("not registered"), "got: {msg}");
+            assert!(
+                msg.contains("--features"),
+                "error must hint at the cargo feature gate: {msg}"
+            );
+        }
     }
 }

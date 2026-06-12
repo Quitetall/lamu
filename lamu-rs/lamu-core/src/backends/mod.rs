@@ -82,7 +82,9 @@ fn make_registered(kind: &str, entry: &ModelEntry) -> Result<Box<dyn Backend>> {
     match f {
         Some(factory) => factory(entry),
         None => Err(crate::Error::Backend(format!(
-            "backend kind '{kind}' is not registered — its module was not loaded at startup (ADR 0023)"
+            "backend kind '{kind}' is not registered — its module was not loaded at startup (ADR 0023). \
+             Note: module backends ship behind cargo features — rebuild lamu with --features full \
+             (or the specific feature, e.g. `onnx`) if this kind is feature-gated"
         ))),
     }
 }
@@ -400,6 +402,22 @@ pub async fn kill_pid_and_verify(pid: u32, port: u16) -> Result<()> {
     if port_released(port).await {
         return Ok(());
     }
+    // IN-PROCESS backend guard (ADR 0033): lamu-inproc backends report
+    // `std::process::id()` — lamu's OWN pid — because their "server" is a
+    // tokio task, not a child process. Signalling it would SIGTERM lamu
+    // itself (and, via signal_backend's group escalation, everything in
+    // lamu's process group). Fail closed instead: the caller keeps the
+    // model marked loaded, which is the truth — the in-process task is
+    // still bound to the port and lives until lamu exits (v1 has no
+    // pid-path teardown for in-process servers; only the owning
+    // `Backend::unload`, which aborts the task, can stop one).
+    if pid == std::process::id() {
+        return Err(Error::Backend(format!(
+            "pid {pid} is lamu itself — backend on port {port} runs IN-PROCESS (ADR 0033); \
+             refusing to signal own process. In-process servers cannot be killed by pid; \
+             they live until lamu exits"
+        )));
+    }
     // Port bound ⇒ backend alive ⇒ `pid` is the backend. SIGTERM the group.
     signal_backend(pid, nix::sys::signal::Signal::SIGTERM);
     if port_released(port).await {
@@ -478,6 +496,7 @@ mod tests {
             BackendType::DflashLucebox,
             BackendType::FishSpeech,
             BackendType::ComfyUI,
+            BackendType::Onnx,
         ] {
             let wire = serde_yaml::to_string(&bt).unwrap().trim().to_string();
             assert_eq!(wire, bt.as_kind_str(), "serde name and kind string drifted for {bt:?}");
@@ -617,5 +636,24 @@ mod tests {
         drop(l);
         let r = kill_pid_and_verify(999_999_999, port).await;
         assert!(r.is_ok(), "silent port ⇒ already dead ⇒ Ok: {r:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_pid_and_verify_refuses_own_pid_while_port_bound() {
+        // An in-process backend (ADR 0033) reports lamu's own pid. With its
+        // port still bound (here: a live listener standing in for the tokio
+        // server task), the pid path must fail closed — NEVER signal self.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let r = kill_pid_and_verify(std::process::id(), port).await;
+        drop(l);
+        match r {
+            Ok(_) => panic!("own-pid kill must be refused while the port is bound"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("IN-PROCESS"), "must explain the in-process refusal: {msg}");
+            }
+        }
     }
 }

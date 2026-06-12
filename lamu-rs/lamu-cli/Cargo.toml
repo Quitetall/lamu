@@ -22,6 +22,11 @@ lamu-image = { path = "../lamu-image" }
 lamu-tts = { path = "../lamu-tts" }
 lamu-jart = { path = "../lamu-jart" }
 lamu-jart-frontend = { path = "../lamu-jart-frontend" }
+# In-process ONNX embeddings (ADRs 0033/0034). OPTIONAL: ort + tokenizers
+# are heavy native deps (prebuilt ONNX Runtime download at build time) —
+# the default build must never compile them. `--features onnx` (or `full`)
+# opts in; main() registers the backend under the same cfg.
+lamu-onnx = { path = "../lamu-onnx", optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -41,6 +46,12 @@ getrandom = "0.2"
 termimad = "0.31"
 toml = "0.8"
 globset = "0.4"
+
+[features]
+# Module backends behind features (ADR 0034): heavy native deps opt in.
+onnx = ["dep:lamu-onnx"]
+# Everything optional at once — `cargo build --features full`.
+full = ["onnx"]
 
 [dev-dependencies]
 tempfile = "3"

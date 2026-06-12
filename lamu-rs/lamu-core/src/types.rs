@@ -44,6 +44,11 @@ pub enum BackendType {
     /// Local ComfyUI image-generation server. Non-LLM modality.
     #[serde(rename = "comfyui")]
     ComfyUI,
+    /// In-process ONNX (ort) backend — embeddings-first, CPU execution
+    /// provider only in v1 (vram_mb 0; ADR 0034). Serves through the
+    /// lamu-inproc port shim (ADR 0033). Module crate `lamu-onnx`,
+    /// feature-gated behind lamu-cli's `onnx` feature.
+    Onnx,
 }
 
 impl BackendType {
@@ -61,6 +66,7 @@ impl BackendType {
             BackendType::DflashLucebox => "dflash_lucebox",
             BackendType::FishSpeech => "fish_speech",
             BackendType::ComfyUI => "comfyui",
+            BackendType::Onnx => "onnx",
         }
     }
 }
