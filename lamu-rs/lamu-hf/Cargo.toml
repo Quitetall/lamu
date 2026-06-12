@@ -1,0 +1,53 @@
+[package]
+name = "lamu-hf"
+version = "0.1.0"
+edition.workspace = true
+
+# HF-CANDLE MODULE (ADR 0035). In-process candle runtime serving
+# safetensors checkpoints (Llama/Mistral/Qwen2 families) through the
+# lamu-inproc port shim (ADR 0033), registered as backend_kind
+# "hf_candle" per the ADR 0023/0026 module pattern. Feature-gated behind
+# lamu-cli's `hf-candle` feature so the default build never compiles
+# candle.
+#
+# Feature design (build-time economics): candle's CUDA kernels take
+# MINUTES to compile and need nvcc (`CUDAHOSTCXX=g++-14` on this box —
+# gcc-16 + nvcc don't link). The crate DEFAULT is therefore CPU-only
+# candle (pure Rust, builds fast, tests run anywhere); `cuda` opts the
+# kernels in. lamu-cli mirrors this: `hf-candle` = CPU candle,
+# `hf-candle-cuda` = + `lamu-hf/cuda`. `full` stays CPU so it builds
+# without nvcc.
+[dependencies]
+lamu-core.workspace = true
+lamu-inproc = { path = "../lamu-inproc" }
+# candle defaults are already CPU-only — every accelerator (cuda, metal,
+# mkl, …) is an opt-in feature. The three crates MUST share one version:
+# mixed versions make candle_core::Tensor foreign across the boundary.
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+# Same major as lamu-onnx — two tokenizers versions would double-compile.
+tokenizers = "0.23"
+# Chat templating: render tokenizer_config.json's `chat_template` (Jinja).
+# minijinja-contrib's pycompat layer supplies the Python-isms HF templates
+# lean on (`.strip()`, `.split()`, …).
+minijinja = { version = "2", features = ["loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+serde = { workspace = true }
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+futures-util = "0.3"
+tokio = { workspace = true, features = ["rt", "net", "time", "io-util", "macros", "sync"] }
+
+[features]
+default = []
+# GPU inference. Requires nvcc; on this box export CUDAHOSTCXX=g++-14.
+# Kernel compilation takes minutes — never make this a default anywhere.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"], default-features = false }
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3"

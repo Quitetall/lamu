@@ -49,6 +49,12 @@ pub enum BackendType {
     /// lamu-inproc port shim (ADR 0033). Module crate `lamu-onnx`,
     /// feature-gated behind lamu-cli's `onnx` feature.
     Onnx,
+    /// In-process HuggingFace-candle runtime — safetensors checkpoints of
+    /// the Llama/Mistral/Qwen2 families (ADR 0035). Serves through the
+    /// lamu-inproc port shim (ADR 0033). Module crate `lamu-hf`,
+    /// feature-gated behind lamu-cli's `hf-candle` feature (`hf-candle-cuda`
+    /// for GPU).
+    HfCandle,
 }
 
 impl BackendType {
@@ -67,6 +73,7 @@ impl BackendType {
             BackendType::FishSpeech => "fish_speech",
             BackendType::ComfyUI => "comfyui",
             BackendType::Onnx => "onnx",
+            BackendType::HfCandle => "hf_candle",
         }
     }
 }

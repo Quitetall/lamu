@@ -334,10 +334,14 @@ async fn main() -> Result<()> {
     lamu_tts::register();
     lamu_jart::register();
     // Feature-gated modules (heavy native deps stay out of the default
-    // build): `onnx` compiles ort + tokenizers (ADR 0034). Keep the cfg in
-    // lockstep with lamu-cli/tests/composition_root.rs.
+    // build): `onnx` compiles ort + tokenizers (ADR 0034); `hf-candle`
+    // compiles candle (ADR 0035; CPU by default — `hf-candle-cuda` for the
+    // GPU kernels). Keep the cfgs in lockstep with
+    // lamu-cli/tests/composition_root.rs.
     #[cfg(feature = "onnx")]
     lamu_onnx::register();
+    #[cfg(feature = "hf-candle")]
+    lamu_hf::register();
     // Default to `warn` when RUST_LOG is unset so operationally-relevant
     // warnings (zombie children, dropped thinking blocks, etc.) are
     // visible without the user having to opt in. RUST_LOG=info or debug

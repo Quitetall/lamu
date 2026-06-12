@@ -30,6 +30,11 @@ lamu-jart-frontend = { path = "../lamu-jart-frontend" }
 # the default build must never compile them. `--features onnx` (or `full`)
 # opts in; main() registers the backend under the same cfg.
 lamu-onnx = { path = "../lamu-onnx", optional = true }
+# In-process HF-candle chat runtime (ADR 0035). OPTIONAL: candle is a
+# heavy dep tree — the default build must never compile it. CPU candle by
+# default (`hf-candle`); `hf-candle-cuda` opts into the nvcc kernel build
+# (minutes; needs CUDAHOSTCXX=g++-14 on gcc-16 hosts).
+lamu-hf = { path = "../lamu-hf", optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -53,8 +58,15 @@ globset = "0.4"
 [features]
 # Module backends behind features (ADR 0034): heavy native deps opt in.
 onnx = ["dep:lamu-onnx"]
-# Everything optional at once — `cargo build --features full`.
-full = ["onnx"]
+# HF-candle chat runtime (ADR 0035), CPU inference — builds without nvcc.
+hf-candle = ["dep:lamu-hf"]
+# + candle's CUDA kernels for GPU inference. nvcc required; kernel
+# compilation takes MINUTES (on this class of host: CUDAHOSTCXX=g++-14).
+hf-candle-cuda = ["hf-candle", "lamu-hf/cuda"]
+# Everything optional at once — `cargo build --features full`. CPU candle
+# on purpose: `full` must stay buildable without nvcc. GPU users add
+# hf-candle-cuda explicitly.
+full = ["onnx", "hf-candle"]
 
 [dev-dependencies]
 tempfile = "3"

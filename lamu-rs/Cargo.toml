@@ -13,10 +13,12 @@ members = [
     "lamu-jart-frontend",
     "lamu-inproc",
     "lamu-onnx",
+    "lamu-hf",
 ]
-# A bare `cargo build` must NOT compile ort/onnxruntime (ADR 0034): the
-# default build excludes lamu-onnx; it builds via `--workspace`, `-p
-# lamu-onnx`, or as a dep of `lamu-cli --features onnx|full`.
+# A bare `cargo build` must NOT compile ort/onnxruntime (ADR 0034) or
+# candle (ADR 0035): the default build excludes lamu-onnx and lamu-hf;
+# they build via `--workspace`, `-p <crate>`, or as deps of
+# `cargo build -p lamu-cli --features onnx|hf-candle|full`.
 default-members = [
     "lamu-core",
     "lamu-memory",

@@ -26,6 +26,9 @@ static ARCH_CAPABILITIES: Lazy<HashMap<&'static str, Vec<Capability>>> = Lazy::n
     m.insert("llama", vec![Chat, Code]);
     m.insert("gemma", vec![Chat]);
     m.insert("dflash", vec![Chat, Code, Reasoning]);
+    // HF config.json model_type spellings (safetensors scan, ADR 0035).
+    m.insert("qwen2", vec![Chat, Code]);
+    m.insert("mistral", vec![Chat]);
     m
 });
 
@@ -259,6 +262,85 @@ fn estimate_vram_mb(file_size_mb: u32) -> u32 {
     (file_size_mb as f64 * 1.1) as u32
 }
 
+/// model_type values lamu-hf's candle engine serves (ADR 0035 5a/5b).
+/// KEEP IN SYNC with `lamu_hf::SUPPORTED_MODEL_TYPES` — lamu-core cannot
+/// depend on the feature-gated module crate, so the list is mirrored; the
+/// failure mode of drift is benign (entry stays a placeholder, or load
+/// errors with the engine's "not served" message).
+const HF_CANDLE_MODEL_TYPES: [&str; 3] = ["llama", "mistral", "qwen2"];
+
+/// The subset of an HF `config.json` the scan prices a checkpoint with.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct HfConfigMeta {
+    model_type: String,
+    #[serde(default)]
+    max_position_embeddings: u32,
+    #[serde(default)]
+    num_hidden_layers: u32,
+    #[serde(default)]
+    num_attention_heads: u32,
+    #[serde(default)]
+    num_key_value_heads: Option<u32>,
+    #[serde(default)]
+    head_dim: Option<u32>,
+    #[serde(default)]
+    hidden_size: u32,
+    #[serde(default)]
+    torch_dtype: Option<String>,
+}
+
+/// Read `dir/config.json` → the scan's HF metadata. `None` when absent,
+/// unparseable, or missing `model_type` — callers keep pre-0035 behavior.
+fn parse_hf_config(dir: &Path) -> Option<HfConfigMeta> {
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let meta: HfConfigMeta = serde_json::from_str(&text).ok()?;
+    if meta.model_type.is_empty() {
+        return None;
+    }
+    Some(meta)
+}
+
+/// Total MB of every `.safetensors` file in `primary`'s directory — a
+/// sharded checkpoint loads as a set, so the footprint is the SUM.
+fn sum_safetensors_dir_mb(primary: &Path) -> u32 {
+    let Some(dir) = primary.parent() else {
+        return std::fs::metadata(primary)
+            .map(|m| (m.len() / 1_048_576) as u32)
+            .unwrap_or(0);
+    };
+    let mut total: u64 = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("safetensors") {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    (total / 1_048_576) as u32
+}
+
+/// KV-cache headroom for an hf_candle entry, in MB:
+/// `n_layers × n_kv_heads × head_dim × 2 (K+V) × 2 bytes (fp16) ×
+/// min(context_max, 8192)`. Capped at 8192 ctx because the scheduler
+/// budgets for a REASONABLE session, not the theoretical max (a 128k
+/// window would price every 7B model like a 70B). `num_key_value_heads`
+/// falls back to `num_attention_heads` (no GQA), `head_dim` to
+/// `hidden_size / num_attention_heads` — the transformers defaults.
+fn hf_kv_headroom_mb(meta: &HfConfigMeta) -> u32 {
+    let n_kv = meta.num_key_value_heads.unwrap_or(meta.num_attention_heads) as u64;
+    let head_dim = meta.head_dim.unwrap_or(if meta.num_attention_heads > 0 {
+        meta.hidden_size / meta.num_attention_heads
+    } else {
+        0
+    }) as u64;
+    let ctx = meta.max_position_embeddings.min(8192) as u64;
+    let bytes = (meta.num_hidden_layers as u64) * n_kv * head_dim * 2 * 2 * ctx;
+    (bytes / 1_048_576) as u32
+}
+
 /// Scan directory recursively for .gguf files.
 pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
     let mut discovered: Vec<ModelEntry> = Vec::new();
@@ -271,18 +353,21 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        // Multi-format: also catalog `.safetensors` checkpoints. No built-in
-        // backend SERVES them (llama.cpp is GGUF-only), but discovering them
-        // beats hand-writing a registry entry — the user assigns a backend.
+        // Multi-format: also catalog `.safetensors` checkpoints. With a
+        // sibling config.json naming a candle-served family the entry is
+        // SERVABLE via lamu-hf (backend hf_candle, ADR 0035); otherwise it
+        // stays the pre-0035 "assign a backend" placeholder.
         if ext == "safetensors" {
             // Skip non-primary shards (model-00002-of-…) + index sidecars;
             // catalog one entry per model from its first shard / single file.
             if filename.contains("-of-") && !filename.contains("00001-of-") {
                 continue;
             }
-            let size_mb = std::fs::metadata(path)
-                .map(|m| (m.len() / 1_048_576) as u32)
-                .unwrap_or(0);
+            // SUM all sibling shards: a sharded checkpoint loads as a SET.
+            // (Sizing only the first shard under-estimated multi-shard
+            // models by roughly the shard count — fixed for every
+            // safetensors entry, hf_candle or not.)
+            let size_mb = sum_safetensors_dir_mb(path);
             // HF checkpoints are always "model[.…].safetensors" inside a
             // named dir — name from the PARENT DIR so sibling dirs each
             // holding a "model.safetensors" don't all collapse to "model".
@@ -297,6 +382,63 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
                         .unwrap_or(filename)
                         .to_lowercase()
                 });
+
+            // ADR 0035: a sibling config.json with a model_type lamu-hf
+            // serves upgrades this to a real hf_candle entry.
+            let hf_meta = path.parent().and_then(parse_hf_config);
+            match hf_meta {
+                Some(meta) if HF_CANDLE_MODEL_TYPES.contains(&meta.model_type.as_str()) => {
+                    let mut capabilities = ARCH_CAPABILITIES
+                        .get(meta.model_type.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| vec![Capability::Chat]);
+                    let context_max = meta.max_position_embeddings;
+                    if context_max > 65536 {
+                        capabilities.push(Capability::LongContext);
+                    }
+                    let quant = match meta.torch_dtype.as_deref() {
+                        Some("bfloat16") => "bf16".to_string(),
+                        Some("float32") => "fp32".to_string(),
+                        _ => "fp16".to_string(),
+                    };
+                    // Unquantized checkpoints: bytes-per-param follows the
+                    // dtype, so params fall straight out of the total size.
+                    let bytes_per_param: f64 = if quant == "fp32" { 4.0 } else { 2.0 };
+                    let params_b = (((size_mb as f64) * 1_048_576.0 / bytes_per_param / 1e9)
+                        * 10.0)
+                        .round()
+                        / 10.0;
+                    discovered.push(ModelEntry {
+                        name,
+                        path: path.to_path_buf(),
+                        format: ModelFormat::Safetensors,
+                        backend: BackendType::HfCandle,
+                        backend_kind: None,
+                        system_prompt: None,
+                        arch: meta.model_type.clone(),
+                        params_b: params_b as f32,
+                        quant,
+                        // Weights ×1.1 (same margin as GGUF) + fp16 KV
+                        // headroom — candle has no quantized KV cache.
+                        vram_mb: estimate_vram_mb(size_mb) + hf_kv_headroom_mb(&meta),
+                        context_max,
+                        capabilities,
+                        reasoning_marker: None,
+                        speculative: None,
+                        sampling: None,
+                        pinned: false,
+                        main: false,
+                        notes: "safetensors checkpoint served in-process by candle (lamu-hf module, build with --features hf-candle; hf-candle-cuda for GPU).".to_string(),
+                        status: crate::types::ModelStatus::default(),
+                        modality: crate::types::Modality::Llm,
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Pre-0035 behavior for everything else (unsupported
+            // model_type, missing/unparseable config.json).
             discovered.push(ModelEntry {
                 name,
                 path: path.to_path_buf(),
@@ -315,7 +457,7 @@ pub fn scan_directory(models_dir: &Path) -> Result<Vec<ModelEntry>> {
                 sampling: None,
                 pinned: false,
                 main: false,
-                notes: "safetensors checkpoint discovered by scan — assign a backend before use (no built-in safetensors LLM loader; llama.cpp serves GGUF).".to_string(),
+                notes: "safetensors checkpoint discovered by scan — assign a backend before use (lamu-hf serves llama/mistral/qwen2 via config.json; llama.cpp serves GGUF).".to_string(),
                 status: crate::types::ModelStatus::default(),
                 modality: crate::types::Modality::Llm,
             });
@@ -1121,6 +1263,134 @@ mod tests {
         assert_eq!(st.len(), 2, "one entry per model dir; got {names:?}");
         assert!(names.iter().any(|n| n.as_str() == "modela"));
         assert!(names.iter().any(|n| n.as_str() == "modelb"));
+    }
+
+    // ── safetensors + config.json → hf_candle (ADR 0035) ───────────────
+
+    /// Small-but-real numbers: 2 layers × 2 kv heads × head_dim 16 ×
+    /// 2 (K+V) × 2 bytes × 8192 ctx = exactly 2 MiB of KV headroom.
+    fn hf_config_json(model_type: &str) -> String {
+        serde_json::json!({
+            "model_type": model_type,
+            "max_position_embeddings": 8192,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "hidden_size": 64,
+            "torch_dtype": "bfloat16",
+        })
+        .to_string()
+    }
+
+    const MIB: usize = 1_048_576;
+
+    #[test]
+    fn scan_safetensors_with_llama_config_becomes_hf_candle() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("tinyllama");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), hf_config_json("llama")).unwrap();
+        std::fs::write(dir.join("model.safetensors"), vec![0u8; MIB]).unwrap();
+        let found = scan_directory(root.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        let e = &found[0];
+        assert_eq!(e.name, "tinyllama");
+        assert_eq!(e.backend, BackendType::HfCandle);
+        assert_eq!(e.arch, "llama");
+        assert_eq!(e.context_max, 8192, "context from max_position_embeddings");
+        assert_eq!(e.quant, "bf16", "quant from torch_dtype");
+        // 1 MiB of weights × 1.1 → 1, + 2 MiB KV headroom.
+        assert_eq!(e.vram_mb, 3, "weights*1.1 + kv headroom");
+        assert!(e.capabilities.contains(&Capability::Chat));
+        assert!(e.notes.contains("hf-candle"), "notes point at the feature: {}", e.notes);
+    }
+
+    #[test]
+    fn scan_safetensors_qwen2_multi_shard_sums_all_shards() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("tinyqwen");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), hf_config_json("qwen2")).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), vec![0u8; MIB]).unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), vec![0u8; MIB]).unwrap();
+        let found = scan_directory(root.path()).unwrap();
+        assert_eq!(found.len(), 1, "one entry per sharded checkpoint");
+        let e = &found[0];
+        assert_eq!(e.backend, BackendType::HfCandle);
+        assert_eq!(e.arch, "qwen2");
+        // BOTH shards: 2 MiB × 1.1 → 2, + 2 MiB KV. The old first-shard
+        // sizing would have read 1 MiB and priced this at 3.
+        assert_eq!(e.vram_mb, 4, "vram must price the SUM of all shards");
+    }
+
+    #[test]
+    fn scan_safetensors_unknown_model_type_keeps_legacy_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("somebert");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), hf_config_json("bert")).unwrap();
+        std::fs::write(dir.join("model.safetensors"), vec![0u8; 2 * MIB]).unwrap();
+        let found = scan_directory(root.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        let e = &found[0];
+        assert_eq!(e.backend, BackendType::LlamaCpp, "pre-0035 placeholder assignment");
+        assert_eq!(e.arch, "unknown");
+        assert_eq!(e.context_max, 0);
+        assert!(e.capabilities.is_empty());
+        // The shard-sum vram fix applies to placeholders too: 2 MiB × 1.1.
+        assert_eq!(e.vram_mb, 2);
+        assert!(e.notes.contains("assign a backend"), "got: {}", e.notes);
+    }
+
+    #[test]
+    fn scan_safetensors_missing_config_keeps_legacy_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bare");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), vec![0u8; MIB]).unwrap();
+        let found = scan_directory(root.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        let e = &found[0];
+        assert_eq!(e.backend, BackendType::LlamaCpp);
+        assert_eq!(e.arch, "unknown");
+        assert_eq!(e.context_max, 0);
+    }
+
+    #[test]
+    fn hf_kv_headroom_caps_context_and_defaults_gqa_fields() {
+        // No num_key_value_heads / head_dim → fall back to MHA + hidden/heads.
+        let meta = HfConfigMeta {
+            model_type: "llama".into(),
+            max_position_embeddings: 131072, // must cap at 8192
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: None,
+            head_dim: None,
+            hidden_size: 64,
+            torch_dtype: None,
+        };
+        // 2 layers × 4 heads × 16 dim × 2 × 2 × 8192 = 4 MiB.
+        assert_eq!(hf_kv_headroom_mb(&meta), 4);
+    }
+
+    #[test]
+    fn scan_safetensors_long_context_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("longctx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = serde_json::json!({
+            "model_type": "llama",
+            "max_position_embeddings": 131072,
+            "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "hidden_size": 64,
+        });
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        std::fs::write(dir.join("model.safetensors"), vec![0u8; MIB]).unwrap();
+        let found = scan_directory(root.path()).unwrap();
+        let e = &found[0];
+        assert_eq!(e.context_max, 131072);
+        assert!(e.capabilities.contains(&Capability::LongContext));
+        assert_eq!(e.quant, "fp16", "absent torch_dtype defaults fp16");
     }
 
     #[test]

@@ -48,9 +48,11 @@ fn every_backend_kind_resolves_at_the_composition_root() {
     lamu_image::register();
     lamu_tts::register();
     lamu_jart::register();
-    // Same cfg as main(): the onnx module exists only behind the feature.
+    // Same cfgs as main(): feature-gated modules exist only when compiled.
     #[cfg(feature = "onnx")]
     lamu_onnx::register();
+    #[cfg(feature = "hf-candle")]
+    lamu_hf::register();
 
     let mut kinds = vec![
         BackendType::LlamaCpp,
@@ -60,11 +62,13 @@ fn every_backend_kind_resolves_at_the_composition_root() {
         BackendType::FishSpeech,
         BackendType::ComfyUI,
     ];
-    // BackendType::Onnx resolves only when the feature compiled its module
-    // in; the feature-OFF expectation is pinned by
-    // `onnx_kind_not_registered_without_feature` below.
+    // BackendType::Onnx / BackendType::HfCandle resolve only when their
+    // feature compiled the module in; the feature-OFF expectations are
+    // pinned by the `*_not_registered_without_feature` tests below.
     #[cfg(feature = "onnx")]
     kinds.push(BackendType::Onnx);
+    #[cfg(feature = "hf-candle")]
+    kinds.push(BackendType::HfCandle);
     for bt in kinds {
         let kind = bt.as_kind_str();
         match make_backend(&entry_for(kind)) {
@@ -102,6 +106,27 @@ fn onnx_kind_not_registered_without_feature() {
     lamu_jart::register();
     match make_backend(&entry_for(BackendType::Onnx.as_kind_str())) {
         Ok(_) => panic!("'onnx' must not resolve when the feature is off"),
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(msg.contains("not registered"), "got: {msg}");
+            assert!(
+                msg.contains("--features"),
+                "error must hint at the cargo feature gate: {msg}"
+            );
+        }
+    }
+}
+
+/// Feature-OFF half of the hf-candle drift contract (ADR 0035) — same
+/// shape as the onnx one above.
+#[cfg(not(feature = "hf-candle"))]
+#[test]
+fn hf_candle_kind_not_registered_without_feature() {
+    lamu_image::register();
+    lamu_tts::register();
+    lamu_jart::register();
+    match make_backend(&entry_for(BackendType::HfCandle.as_kind_str())) {
+        Ok(_) => panic!("'hf_candle' must not resolve when the feature is off"),
         Err(e) => {
             let msg = format!("{e}");
             assert!(msg.contains("not registered"), "got: {msg}");

@@ -497,6 +497,7 @@ mod tests {
             BackendType::FishSpeech,
             BackendType::ComfyUI,
             BackendType::Onnx,
+            BackendType::HfCandle,
         ] {
             let wire = serde_yaml::to_string(&bt).unwrap().trim().to_string();
             assert_eq!(wire, bt.as_kind_str(), "serde name and kind string drifted for {bt:?}");
