@@ -1,16 +1,18 @@
-//! Repo retrieval (RAG): ripgrep + optional cloud-embedding fallback.
+//! Repo retrieval (RAG): ripgrep + optional embedding fallback.
 //!
 //! ## Modes
 //!
 //! - **ripgrep** — fixed-string / regex grep across `git ls-files`.
 //!   Instant, zero-setup, lossy on semantic recall but 90% of typical
 //!   "find the function" queries are spelled exactly.
-//! - **semantic** — query embedding via OpenAI's
-//!   `text-embedding-3-small` (cheap, ~$0.02/M tokens). Brute-force
-//!   cosine-sim against the `chunks` table of the unified `lamu.db`
-//!   (ADR 0028; previously its own `embeddings.db`). Index is built
-//!   on first semantic query if missing; explicit `index_repo` tool
-//!   also builds it on demand.
+//! - **semantic** — query embedding via the embedder chain (ADR 0030:
+//!   local registry model first, OpenAI escape hatch / fallback — see
+//!   `crate::embedder::resolve`). Brute-force cosine-sim against the
+//!   `chunks` table of the unified `lamu.db` (ADR 0028; previously its
+//!   own `embeddings.db`), filtered to rows embedded with the CURRENT
+//!   embedder's model so mixed-model vectors never rank against each
+//!   other. Index is built on first semantic query if missing; explicit
+//!   `index_repo` tool also builds it on demand.
 //! - **auto** — ripgrep first; if it returns < k hits, augment with
 //!   semantic. Default.
 //!
@@ -25,16 +27,15 @@ use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use crate::vector_index::{vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
-use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-/// Embedding model + dimension. Hardcoded to OpenAI's
-/// text-embedding-3-small (1536 dims, $0.02/M tokens). If we ever
-/// support multiple models, every embedding row has the same shape so
-/// they're never mixed within one DB.
-pub(crate) const EMBED_MODEL: &str = "text-embedding-3-small";
+/// The pre-ADR-0030 hardcoded model — every legacy row was embedded
+/// with it, so the one-time import (store.rs) backfills
+/// `embedding_model` with this. Live writes stamp whatever
+/// `crate::embedder::resolve()` returns instead.
+pub(crate) use crate::embedder::OPENAI_EMBED_MODEL as EMBED_MODEL;
 
 /// Chunk size in characters. ~1KB hits a sweet spot: large enough to
 /// preserve local context, small enough to keep per-chunk embeddings
@@ -130,79 +131,10 @@ pub fn ripgrep_search(query: &str, repo: &Path, k: usize) -> Result<Vec<SearchHi
 }
 
 // ── Semantic mode ──────────────────────────────────────────────────
-
-/// Resolve the OpenAI API key. If unset, semantic mode is unavailable.
-pub(crate) fn openai_key() -> Option<String> {
-    std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty())
-}
-
-/// Pooled embeddings client (no default timeout — set per request). A fresh
-/// Client per embed meant a new TLS handshake to api.openai.com on every
-/// remember/recall/supersede — this reuses one connection pool. Shared with
-/// memory::recall_ranked (same destination) so there's exactly one pool.
-pub(crate) fn embed_client() -> &'static reqwest::Client {
-    static EMBED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    EMBED_CLIENT.get_or_init(reqwest::Client::new)
-}
-
-/// POST a single string to OpenAI's `/embeddings` endpoint. Returns
-/// the 1536-dim vector for text-embedding-3-small.
-pub(crate) async fn embed_one(text: &str, key: &str) -> Result<Vec<f32>> {
-    let body = json!({
-        "model": EMBED_MODEL,
-        "input": text,
-    });
-    let resp = embed_client()
-        .post("https://api.openai.com/v1/embeddings")
-        .timeout(std::time::Duration::from_secs(60))
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await?;
-    let v: Value = resp.json().await?;
-    let arr = v["data"][0]["embedding"]
-        .as_array()
-        .ok_or_else(|| anyhow!("embeddings response missing data[0].embedding"))?;
-    let mut out = Vec::with_capacity(arr.len());
-    for x in arr {
-        out.push(x.as_f64().unwrap_or(0.0) as f32);
-    }
-    Ok(out)
-}
-
-/// Batch-embed many strings. OpenAI accepts an `input` array up to
-/// 2048 items per call. We cap at 96 for safety + smaller payloads.
-async fn embed_batch(texts: &[String], key: &str) -> Result<Vec<Vec<f32>>> {
-    let mut all = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(96) {
-        let body = json!({
-            "model": EMBED_MODEL,
-            "input": chunk,
-        });
-        let resp = embed_client()
-            .post("https://api.openai.com/v1/embeddings")
-            .timeout(std::time::Duration::from_secs(120))
-            .bearer_auth(key)
-            .json(&body)
-            .send()
-            .await?;
-        let v: Value = resp.json().await?;
-        let arr = v["data"]
-            .as_array()
-            .ok_or_else(|| anyhow!("embeddings response missing data"))?;
-        for entry in arr {
-            let emb = entry["embedding"]
-                .as_array()
-                .ok_or_else(|| anyhow!("missing entry.embedding"))?;
-            let mut out = Vec::with_capacity(emb.len());
-            for x in emb {
-                out.push(x.as_f64().unwrap_or(0.0) as f32);
-            }
-            all.push(out);
-        }
-    }
-    Ok(all)
-}
+//
+// The OpenAI plumbing (key resolution, pooled client, embed_one /
+// embed_batch) moved to `crate::embedder` (ADR 0030); semantic mode now
+// resolves whatever the embedder chain provides.
 
 pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(v.len() * 4);
@@ -223,9 +155,16 @@ pub(crate) fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 /// Walk `git ls-files` from `repo`, chunk each text file, and embed
 /// the chunks. Existing chunks for unchanged files (matching mtime)
 /// are skipped. Returns count of chunks indexed.
+///
+/// Each row is stamped with the current embedder's model
+/// (`embedding_model`), and the `embedding_stores` bookkeeping is
+/// upserted for the 'chunks' store (ADR 0030).
 pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
-    let key = openai_key().ok_or_else(|| {
-        anyhow!("OPENAI_API_KEY unset — semantic indexing requires it. Use mode='ripgrep' for grep-only search.")
+    let embedder = crate::embedder::resolve().ok_or_else(|| {
+        anyhow!(
+            "no embedder available — register a local embedding model (capability \
+             'embedding') or set OPENAI_API_KEY. Use mode='ripgrep' for grep-only search."
+        )
     })?;
     let files = git_ls_files(repo)?;
     let arc = index_db()?;
@@ -282,9 +221,9 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
         return Ok(0);
     }
 
-    // Batch embed.
+    // Batch embed via the chain (each impl handles its own batching).
     let texts: Vec<String> = to_embed.iter().map(|(_, _, c, _)| c.clone()).collect();
-    let embeddings = embed_batch(&texts, &key).await?;
+    let embeddings = embedder.embed(&texts).await?;
     if embeddings.len() != to_embed.len() {
         return Err(anyhow!(
             "embed count mismatch: requested {}, got {}",
@@ -292,6 +231,8 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
             embeddings.len()
         ));
     }
+    let model = embedder.identity().model;
+    let dims = embeddings.first().map(|e| e.len()).unwrap_or(0);
 
     // Bulk replace under one transaction: clear each affected path's old
     // chunks, THEN insert the freshly embedded ones — atomic with embed
@@ -310,9 +251,16 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
     for ((path, idx, content, mtime), emb) in to_embed.iter().zip(embeddings.iter()) {
         tx.execute(
             "INSERT OR REPLACE INTO chunks (path, chunk_idx, content, embedding, embedding_model, mtime) VALUES (?, ?, ?, ?, ?, ?)",
-            params![path, *idx as i64, content, vec_to_blob(emb), EMBED_MODEL, mtime],
+            params![path, *idx as i64, content, vec_to_blob(emb), model, mtime],
         )?;
     }
+    // Per-store identity bookkeeping (ADR 0030) — same transaction, so
+    // the rows + the store row land atomically.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    crate::store::record_store_identity(&tx, "chunks", &model, dims, now);
     tx.commit()?;
 
     Ok(to_embed.len())
@@ -358,15 +306,25 @@ fn search_rows(
 }
 
 pub async fn semantic_search(query: &str, k: usize) -> Result<Vec<SearchHit>> {
-    let key = openai_key().ok_or_else(|| {
-        anyhow!("OPENAI_API_KEY unset — semantic search requires it.")
+    let embedder = crate::embedder::resolve().ok_or_else(|| {
+        anyhow!(
+            "no embedder available — register a local embedding model (capability \
+             'embedding') or set OPENAI_API_KEY."
+        )
     })?;
-    let qvec = embed_one(query, &key).await?;
+    let mut qvecs = embedder.embed(std::slice::from_ref(&query.to_string())).await?;
+    let qvec = qvecs
+        .pop()
+        .ok_or_else(|| anyhow!("embedder returned no vector for the query"))?;
+    let model = embedder.identity().model;
     let arc = index_db()?;
     let conn = arc.lock();
-    let mut stmt =
-        conn.prepare("SELECT path, chunk_idx, content, embedding FROM chunks")?;
-    let rows = stmt.query_map([], |r| {
+    // Model filter (ADR 0030): only rank rows embedded with the CURRENT
+    // model — vectors from different models live in different spaces.
+    let mut stmt = conn.prepare(
+        "SELECT path, chunk_idx, content, embedding FROM chunks WHERE embedding_model = ?1",
+    )?;
+    let rows = stmt.query_map(params![model], |r| {
         let path: String = r.get(0)?;
         let content: String = r.get(2)?; // chunk_idx (col 1) not needed in SearchHit
         let emb_blob: Vec<u8> = r.get(3)?;
@@ -410,7 +368,7 @@ pub async fn search(
         SearchMode::Semantic => semantic_search(query, k).await,
         SearchMode::Auto => {
             let mut hits = ripgrep_search(query, repo, k)?;
-            if hits.len() < k && openai_key().is_some() {
+            if hits.len() < k && crate::embedder::resolve().is_some() {
                 if let Ok(extra) = semantic_search(query, k - hits.len()).await {
                     // Avoid path collisions — semantic chunks may
                     // already appear in the ripgrep results; dedupe by

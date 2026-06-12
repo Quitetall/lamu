@@ -74,6 +74,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0027](./0027-typed-toolctx-error-seam.md) | Typed `ToolCtxError` at the ToolCtx seam; "error:" strings stay wire-only | Accepted |
 | [0028](./0028-unified-lamu-db.md) | One schema-versioned `lamu.db` with versioned migrations + legacy import | Accepted |
 | [0029](./0029-lamu-memory-module-crate.md) | `lamu-memory` module crate — storage out of the MCP frontend | Accepted |
+| [0030](./0030-local-first-embedding.md) | Local-first embedding with per-store embedder identity | Accepted |
 | [0033](./0033-inproc-engine-shim.md) | In-process engine backends behind a loopback HTTP shim (`lamu-inproc`) | Accepted |
 | [0034](./0034-onnx-embeddings-backend.md) | ONNX embeddings-first backend (`lamu-onnx`, ort, CPU EP v1) | Accepted |
 | [0037](./0037-provider-grade-serving.md) | Provider-grade serving: structured reasoning on all bridges, prefix-cache exposure, caps discovery | Accepted |

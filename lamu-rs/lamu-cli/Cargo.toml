@@ -14,6 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 lamu-core.workspace = true
+# ADR 0030: `lamu memory reembed` drives lamu-memory's lib-level
+# plan/run + the CLI embedder chain (env override -> running serve -> OpenAI).
+lamu-memory.workspace = true
 lamu-providers.workspace = true
 lamu-mcp = { path = "../lamu-mcp" }
 lamu-api = { path = "../lamu-api" }

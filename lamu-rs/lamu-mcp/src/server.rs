@@ -22,6 +22,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
+/// Clone is shallow — every field is an `Arc` (or `Copy`), so clones
+/// share ALL state (scheduler, queues, routing mode). Used by the
+/// ADR 0030 embedder adapter, which needs a process-lifetime handle to
+/// the server's embed path.
+#[derive(Clone)]
 pub struct LamuMcpServer {
     pub state: Arc<Mutex<ServerState>>,
     /// Per-model request queues (separate from parking_lot state — async).
@@ -82,7 +87,7 @@ impl LamuMcpServer {
         let queue_concurrency: usize = std::env::var("LAMU_QUEUE_CONCURRENCY")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
 
-        Ok(Self {
+        let server = Self {
             state: Arc::new(Mutex::new(ServerState {
                 models_dir,
                 registry_path,
@@ -111,7 +116,41 @@ impl LamuMcpServer {
                     }
                 }
             )),
-        })
+        };
+        server.register_local_embedder();
+        Ok(server)
+    }
+
+    /// ADR 0030: register the process-global LOCAL embedder over this
+    /// server's embed path (`ToolCtx::embed`: resolve the registry's
+    /// `Capability::Embedding` model, ensure-load, POST its port).
+    ///
+    /// The memory MCP tools are `HandlerKind::Free` (no server ref) and
+    /// the detached autocapture/reconcile tasks have no server either,
+    /// so the registration must be process-global — `lamu_memory`'s
+    /// embedder chain resolves it from any context.
+    ///
+    /// The chain stays STATIC: the adapter is registered only when the
+    /// registry has an embedding-capable model AT STARTUP. Adding one
+    /// later (scan_models / registry edit) requires a server restart to
+    /// be picked up. With NO embedding-capable model, nothing is
+    /// registered and the chain falls through to the keyed OpenAI leg.
+    fn register_local_embedder(&self) {
+        let model = self
+            .state
+            .lock()
+            .entries
+            .values()
+            .filter(|e| e.capabilities.contains(&lamu_core::types::Capability::Embedding))
+            .map(|e| e.name.clone())
+            .min(); // deterministic when >1 embedding entry
+        let Some(model) = model else { return };
+        tracing::info!("ADR 0030: registering local embedder '{model}' (MCP embed path)");
+        lamu_memory::embedder::set_global(Arc::new(McpServerEmbedder {
+            server: self.clone(),
+            model,
+            dims: std::sync::atomic::AtomicUsize::new(0),
+        }));
     }
 
     pub async fn run(self) -> Result<()> {
@@ -419,13 +458,17 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
         // Resolve the embedding model from the registry (capability Embedding)
         // and clone the pooled HTTP client (reuse the connection pool + the
         // configured timeout) — both under one short lock, dropped before await.
+        // min() (not find over HashMap order) so the pick is DETERMINISTIC and
+        // always matches the model name `register_local_embedder` stamped into
+        // the ADR 0030 identity.
         let (name, client) = {
             let st = self.state.lock();
             let name = st
                 .entries
                 .values()
-                .find(|e| e.capabilities.contains(&lamu_core::types::Capability::Embedding))
-                .map(|e| e.name.clone());
+                .filter(|e| e.capabilities.contains(&lamu_core::types::Capability::Embedding))
+                .map(|e| e.name.clone())
+                .min();
             (name, st.client.clone())
         }; // parking_lot guard dropped before any await
         let Some(name) = name else {
@@ -469,6 +512,59 @@ impl lamu_core::tools_ext::ToolCtx for LamuMcpServer {
                 .and_then(|e| e.as_array())
                 .ok_or_else(|| embed_err("embeddings item missing embedding[]".to_string()))?;
             out.push(emb.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect());
+        }
+        Ok(out)
+    }
+}
+
+/// ADR 0030: [`lamu_memory::embedder::Embedder`] over the SERVER's
+/// embed path. Holds a (shallow) clone of the server — every field is
+/// an Arc, so the adapter shares the live scheduler/registry/queues —
+/// and delegates to `ToolCtx::embed` (ensure-load the registry's
+/// embedding model, POST its port's `/v1/embeddings`).
+///
+/// `model` is the registry embedding model's name resolved at startup;
+/// `dims` is probed on the first successful embed (0 until then —
+/// harmless: the storage layer records dims from the actual vectors,
+/// never from the identity).
+struct McpServerEmbedder {
+    server: LamuMcpServer,
+    model: String,
+    dims: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl lamu_memory::embedder::Embedder for McpServerEmbedder {
+    fn identity(&self) -> lamu_memory::embedder::EmbedderId {
+        lamu_memory::embedder::EmbedderId {
+            model: self.model.clone(),
+            dims: self.dims.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        use lamu_core::tools_ext::ToolCtx;
+        let mut out = Vec::with_capacity(texts.len());
+        // Chunk so a big index_repo doesn't ship one giant payload to
+        // the local backend.
+        for chunk in texts.chunks(64) {
+            let vecs = self
+                .server
+                .embed(chunk)
+                .await
+                .map_err(|e| anyhow::anyhow!("local embed: {e}"))?;
+            out.extend(vecs);
+        }
+        if out.len() != texts.len() {
+            return Err(anyhow::anyhow!(
+                "local embed count mismatch: requested {}, got {}",
+                texts.len(),
+                out.len()
+            ));
+        }
+        if let Some(first) = out.first() {
+            self.dims
+                .store(first.len(), std::sync::atomic::Ordering::Relaxed);
         }
         Ok(out)
     }

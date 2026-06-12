@@ -13,6 +13,10 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# Embedder trait is async (ADR 0030) — matches the existing async storage
+# fns (remember/recall/index already await their embeds) and lets the
+# frontends' local adapters await ensure-load + HTTP without block_on.
+async-trait = "0.1"
 parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 dirs = "5"
@@ -32,3 +36,5 @@ turbovec = ["dep:turbovec"]
 
 [dev-dependencies]
 tempfile = "3"
+# Async tests for the embedder chain / hybrid recall / reembed paths.
+tokio = { workspace = true }

@@ -287,52 +287,30 @@ async fn embeddings(
         );
         return over_quota("/v1/embeddings", limit);
     }
-    let is_embed = |e: &ModelEntry| {
-        e.capabilities.contains(&lamu_core::types::Capability::Embedding)
-    };
     let req_model = body.get("model").and_then(|m| m.as_str());
-    let name = req_model
-        .filter(|m| state.entries.get(*m).map(is_embed).unwrap_or(false))
-        .map(|m| m.to_string())
-        .or_else(|| state.entries.values().find(|e| is_embed(e)).map(|e| e.name.clone()));
-    let Some(name) = name else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {
-                "message": "no embedding model in registry — add one with capability 'embedding' (llama-server --embedding)",
-                "type": "model_not_available",
-            }})),
-        )
-            .into_response();
-    };
-
-    let port = {
-        let already = state.scheduler.lock().get_loaded(&name).and_then(|m| {
-            if m.port != 0 { Some(m.port) } else { None }
-        });
-        match already {
-            Some(p) => p,
-            None => match lamu_core::loader::ensure_loaded(
-                &name,
-                state.entries.as_ref(),
-                &state.scheduler,
-                &state.health,
-                Some(state.http_port),
+    // The resolved name is a routing detail here — the body is proxied
+    // verbatim, so only the port matters.
+    let (_name, port) = match resolve_embedding_backend(&state, req_model).await {
+        Ok(np) => np,
+        Err(EmbedBackendError::NoModel) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {
+                    "message": "no embedding model in registry — add one with capability 'embedding' (llama-server --embedding)",
+                    "type": "model_not_available",
+                }})),
             )
-            .await
-            {
-                Ok(lm) => lm.port,
-                Err(e) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error": {
-                            "message": format!("failed to load embedding model '{name}': {e}"),
-                            "type": "spawn_failed",
-                        }})),
-                    )
-                        .into_response();
-                }
-            },
+                .into_response();
+        }
+        Err(EmbedBackendError::Load { model, err }) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {
+                    "message": format!("failed to load embedding model '{model}': {err}"),
+                    "type": "spawn_failed",
+                }})),
+            )
+                .into_response();
         }
     };
 
@@ -378,6 +356,137 @@ async fn embeddings(
             Json(json!({"error": {"message": format!("embeddings backend: {e}")}})),
         )
             .into_response(),
+    }
+}
+
+/// Why the embeddings backend couldn't be resolved (factored from the
+/// `embeddings` handler so the ADR 0030 adapter reuses the same path).
+pub(crate) enum EmbedBackendError {
+    /// No embedding-capable entry in the registry.
+    NoModel,
+    /// The resolved model failed to ensure-load.
+    Load { model: String, err: String },
+}
+
+/// Resolve the embedding model (the request's `model` if it's an
+/// embedding entry, else the first registry entry with
+/// `Capability::Embedding`, deterministic by name) and ensure it is
+/// loaded; returns `(model_name, port)`. Shared by the
+/// `/v1/embeddings` handler and the ADR 0030 [`ApiEmbedder`] adapter.
+pub(crate) async fn resolve_embedding_backend(
+    state: &AppState,
+    req_model: Option<&str>,
+) -> std::result::Result<(String, u16), EmbedBackendError> {
+    let is_embed =
+        |e: &ModelEntry| e.capabilities.contains(&lamu_core::types::Capability::Embedding);
+    let name = req_model
+        .filter(|m| state.entries.get(*m).map(is_embed).unwrap_or(false))
+        .map(|m| m.to_string())
+        .or_else(|| {
+            state
+                .entries
+                .values()
+                .filter(|e| is_embed(e))
+                .map(|e| e.name.clone())
+                .min() // deterministic when >1 embedding entry
+        });
+    let Some(name) = name else {
+        return Err(EmbedBackendError::NoModel);
+    };
+    let already = state
+        .scheduler
+        .lock()
+        .get_loaded(&name)
+        .and_then(|m| if m.port != 0 { Some(m.port) } else { None });
+    let port = match already {
+        Some(p) => p,
+        None => match lamu_core::loader::ensure_loaded(
+            &name,
+            state.entries.as_ref(),
+            &state.scheduler,
+            &state.health,
+            Some(state.http_port),
+        )
+        .await
+        {
+            Ok(lm) => lm.port,
+            Err(e) => {
+                return Err(EmbedBackendError::Load {
+                    model: name,
+                    err: e.to_string(),
+                })
+            }
+        },
+    };
+    Ok((name, port))
+}
+
+/// ADR 0030: [`lamu_memory::embedder::Embedder`] over `lamu serve`'s
+/// own in-process embedding resolution ([`resolve_embedding_backend`] +
+/// a POST to the backend's port). Registered by [`build_state`] when
+/// the registry has an embedding-capable model at startup (the chain
+/// is static — registry changes need a restart to be picked up).
+///
+/// `dims` is probed on the first successful embed (0 until then; the
+/// storage layer records dims from the actual vectors).
+struct ApiEmbedder {
+    state: AppState,
+    model: String,
+    dims: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl lamu_memory::embedder::Embedder for ApiEmbedder {
+    fn identity(&self) -> lamu_memory::embedder::EmbedderId {
+        lamu_memory::embedder::EmbedderId {
+            model: self.model.clone(),
+            dims: self.dims.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (name, port) = resolve_embedding_backend(&self.state, Some(&self.model))
+            .await
+            .map_err(|e| match e {
+                EmbedBackendError::NoModel => {
+                    anyhow::anyhow!("no embedding model in registry")
+                }
+                EmbedBackendError::Load { model, err } => {
+                    anyhow::anyhow!("load embedding model '{model}': {err}")
+                }
+            })?;
+        let url = format!("http://localhost:{port}/v1/embeddings");
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(64) {
+            let resp = self
+                .state
+                .client
+                .post(&url)
+                .json(&json!({ "model": name, "input": chunk }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "embeddings backend {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            let v: Value = resp.json().await?;
+            out.extend(lamu_memory::embedder::parse_embeddings_data(&v)?);
+        }
+        if out.len() != texts.len() {
+            return Err(anyhow::anyhow!(
+                "embed count mismatch: requested {}, got {}",
+                texts.len(),
+                out.len()
+            ));
+        }
+        if let Some(first) = out.first() {
+            self.dims
+                .store(first.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(out)
     }
 }
 
@@ -1783,7 +1892,7 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
     } else {
         None
     };
-    Ok(AppState {
+    let state = AppState {
         scheduler: Arc::new(Mutex::new(scheduler)),
         router: Arc::new(Mutex::new(router)),
         entries: Arc::new(entries),
@@ -1794,7 +1903,26 @@ pub fn build_state(registry_path: &Path, http_port: u16) -> anyhow::Result<AppSt
         auth: Arc::new(crate::auth::resolve_auth_mode()),
         quota: Arc::new(QuotaManager::new()),
         priority_queue,
-    })
+    };
+    // ADR 0030: register the process-global local embedder over this
+    // state's in-process embeddings resolution — only when the registry
+    // HAS an embedding-capable model at startup (the chain is static;
+    // a registry change needs a `lamu serve` restart to be picked up).
+    let embed_model = state
+        .entries
+        .values()
+        .filter(|e| e.capabilities.contains(&lamu_core::types::Capability::Embedding))
+        .map(|e| e.name.clone())
+        .min(); // deterministic when >1 embedding entry
+    if let Some(model) = embed_model {
+        tracing::info!("ADR 0030: registering local embedder '{model}' (lamu serve embed path)");
+        lamu_memory::embedder::set_global(Arc::new(ApiEmbedder {
+            state: state.clone(),
+            model,
+            dims: std::sync::atomic::AtomicUsize::new(0),
+        }));
+    }
+    Ok(state)
 }
 
 // ── Anthropic Messages API shim ─────────────────────────────────────

@@ -10,6 +10,11 @@ description = "OpenAI-compatible HTTP API"
 
 [dependencies]
 lamu-core.workspace = true
+# ADR 0030: build_state registers the local embedder adapter into
+# lamu-memory's process-global chain (memory is a shared capability a
+# frontend may depend on — ADR 0029; never the other way around).
+lamu-memory.workspace = true
+async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }

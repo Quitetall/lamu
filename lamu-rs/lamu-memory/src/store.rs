@@ -113,6 +113,76 @@ pub fn shared_handle() -> Result<Arc<Mutex<Connection>>> {
     Ok(arc.clone())
 }
 
+// ── Per-store embedder identity (ADR 0030) ──────────────────────────
+
+/// Upsert the `embedding_stores` bookkeeping after a write embedded
+/// rows for `store` ('memories' | 'chunks') with `model`/`dims`.
+///
+/// - No row yet → INSERT (the store adopts this identity).
+/// - Row matches `model` → refresh `dims` + `updated_at`.
+/// - Row carries a DIFFERENT model → the new rows were still written
+///   (with their own per-row `embedding_model` tag), but the store row
+///   keeps pointing at the OLD model until a `lamu memory reembed`
+///   converges the rows; warn once per process per store so the split
+///   is visible. Vector recall is model-filtered, so mixed-model rows
+///   never rank against each other — the FTS leg covers the rest.
+///
+/// Best-effort: bookkeeping failure must never abort the write that
+/// produced the rows, so errors are warned, not returned.
+pub(crate) fn record_store_identity(
+    conn: &Connection,
+    store: &str,
+    model: &str,
+    dims: usize,
+    now: i64,
+) {
+    use rusqlite::OptionalExtension;
+    let existing: Option<String> = match conn
+        .query_row(
+            "SELECT model FROM embedding_stores WHERE store = ?1",
+            rusqlite::params![store],
+            |r| r.get(0),
+        )
+        .optional()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("embedding_stores read ({store}): {e}");
+            return;
+        }
+    };
+    let res = match existing.as_deref() {
+        None => conn.execute(
+            "INSERT INTO embedding_stores (store, model, dims, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![store, model, dims as i64, now],
+        ),
+        Some(m) if m == model => conn.execute(
+            "UPDATE embedding_stores SET dims = ?2, updated_at = ?3 WHERE store = ?1",
+            rusqlite::params![store, dims as i64, now],
+        ),
+        Some(old) => {
+            warn_once_store_mismatch(store, old, model);
+            return; // leave the store row pinned to the OLD model
+        }
+    };
+    if let Err(e) = res {
+        tracing::warn!("embedding_stores upsert ({store}): {e}");
+    }
+}
+
+fn warn_once_store_mismatch(store: &str, old: &str, new: &str) {
+    static WARNED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let mut g = WARNED.lock();
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    if set.insert(store.to_string()) {
+        tracing::warn!(
+            "embedding store '{store}' is pinned to model '{old}' but new rows are embedded \
+             with '{new}' — vector recall covers only '{new}' rows until you run \
+             `lamu memory reembed --store {store} --yes`"
+        );
+    }
+}
+
 // ── Legacy import ───────────────────────────────────────────────────
 
 fn now_secs() -> i64 {
@@ -309,7 +379,11 @@ mod tests {
 
     #[test]
     fn lamu_db_path_respects_env_override() {
-        // SAFETY: single test owns LAMU_DB; no other test reads it.
+        // Serialize with every other test that mutates chain/store env
+        // (the ADR 0030 e2e test also sets LAMU_DB).
+        let _g = crate::embedder::testutil::chain_lock();
+        // SAFETY: serialized by chain_lock; no other test reads it
+        // concurrently.
         unsafe {
             std::env::set_var("LAMU_DB", "/tmp/somewhere/else.db");
         }
@@ -600,6 +674,7 @@ mod tests {
             &conn,
             "fresh zanzibar fact",
             Some(&[0.5f32, 0.5, 0.0]),
+            Some("test-model"),
             "fact",
             "manual",
             999,

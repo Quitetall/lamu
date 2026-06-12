@@ -1924,11 +1924,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "dirs 5.0.1",
  "futures-util",
  "getrandom 0.2.17",
  "lamu-core",
+ "lamu-memory",
  "nix 0.29.0",
  "parking_lot",
  "prometheus",
@@ -1967,6 +1969,7 @@ dependencies = [
  "lamu-jart",
  "lamu-jart-frontend",
  "lamu-mcp",
+ "lamu-memory",
  "lamu-onnx",
  "lamu-providers",
  "lamu-tts",
@@ -2103,6 +2106,7 @@ name = "lamu-memory"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
  "parking_lot",
  "reqwest",
@@ -2110,6 +2114,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "turbovec",
 ]

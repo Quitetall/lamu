@@ -8,6 +8,7 @@ mod favorites;
 mod lamu_config;
 mod mcp_servers;
 mod md_stream;
+mod memory_admin;
 mod providers;
 mod repl;
 mod sandbox;
@@ -246,6 +247,28 @@ enum Command {
         #[command(subcommand)]
         action: CloudAction,
     },
+    /// Lifetime-memory maintenance on the unified lamu.db (ADR 0030).
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum MemoryAction {
+    /// Re-embed rows whose embedding model differs from the current
+    /// embedder (including rows that were never embedded). DRY-RUN by
+    /// default — pass --yes to actually re-embed. Embedder resolution:
+    /// LAMU_EMBED_PROVIDER override → a running `lamu serve`
+    /// (127.0.0.1:8020, override with LAMU_SERVE_URL) → OPENAI_API_KEY.
+    Reembed {
+        /// Store to re-embed: memories | chunks | all (default all).
+        #[arg(long)]
+        store: Option<String>,
+        /// Actually re-embed (without this: dry-run report).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -429,6 +452,11 @@ async fn main() -> Result<()> {
         Some(Command::Cloud { action }) => match action {
             CloudAction::Sync { no_ping, no_openrouter, dry_run } => {
                 cmd_cloud_sync(no_ping, no_openrouter, dry_run).await
+            }
+        },
+        Some(Command::Memory { action }) => match action {
+            MemoryAction::Reembed { store, yes } => {
+                memory_admin::cmd_memory_reembed(store, yes).await
             }
         },
     }

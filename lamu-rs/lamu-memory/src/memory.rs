@@ -269,10 +269,13 @@ pub fn shared() -> Result<&'static Memory> {
 
 /// V4 Batch 4: rank turns by semantic similarity to a query, return
 /// the top-K most relevant + the most-recent few. Falls back to
-/// chronological "last K" when OPENAI_API_KEY is unset or embedding
-/// fails. Used by cloud_query when conversation_id has many turns —
-/// raw chronological recall buries relevant prior turns under
-/// recency. Only kicks in when total turns > KEEP_RECENT + KEEP_TOP.
+/// chronological "last K" when no embedder resolves (ADR 0030 chain:
+/// local registry model → OpenAI fallback) or embedding fails. Used by
+/// cloud_query when conversation_id has many turns — raw chronological
+/// recall buries relevant prior turns under recency. Only kicks in
+/// when total turns > KEEP_RECENT + KEEP_TOP. Turn embeddings are
+/// computed fresh per call (never persisted), so no model-tag
+/// filtering applies here.
 pub async fn recall_ranked(
     mem: &Memory,
     conversation_id: &str,
@@ -285,66 +288,47 @@ pub async fn recall_ranked(
     if total <= keep_top + keep_recent {
         return Ok(all);
     }
-    let key = match std::env::var("OPENAI_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            // No embeddings available — fall back to chronological tail.
-            // Log once so degraded (non-semantic) recall is visible.
-            static LOGGED: std::sync::Once = std::sync::Once::new();
-            LOGGED.call_once(|| {
-                tracing::info!(
-                    "conversation recall: OPENAI_API_KEY unset — chronological tail, not semantic ranking"
-                )
-            });
-            return mem.recall(conversation_id, keep_top + keep_recent);
-        }
+    let Some(embedder) = crate::embedder::resolve() else {
+        // No embedder available — fall back to chronological tail.
+        // Log once so degraded (non-semantic) recall is visible.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                "conversation recall: no embedder resolved — chronological tail, not semantic ranking"
+            )
+        });
+        return mem.recall(conversation_id, keep_top + keep_recent);
     };
 
-    // Embed the query + each prior turn. Reuse the rag module's
-    // helpers via a thin shim: build the same payload it builds.
+    // Embed the query + each prior turn via the chain.
     let mut texts: Vec<String> = Vec::with_capacity(total + 1);
     texts.push(query.to_string());
     for t in &all {
         texts.push(format!("{}: {}", t.role, t.content));
     }
-
-    let body = serde_json::json!({
-        "model": "text-embedding-3-small",
-        "input": texts,
-    });
-    // Pooled client (one shared pool to api.openai.com) with a per-request
-    // timeout — see rag::embed_client.
-    let resp = crate::rag::embed_client()
-        .post("https://api.openai.com/v1/embeddings")
-        .timeout(std::time::Duration::from_secs(60))
-        .bearer_auth(&key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!(e))?;
-    let arr = v["data"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("embeddings missing data"))?;
-    if arr.len() != texts.len() {
-        return mem.recall(conversation_id, keep_top + keep_recent);
-    }
-
-    let parse_vec = |val: &serde_json::Value| -> Vec<f32> {
-        val["embedding"]
-            .as_array()
-            .map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
-            .unwrap_or_default()
+    let embs = match embedder.embed(&texts).await {
+        Ok(e) if e.len() == texts.len() => e,
+        Ok(e) => {
+            tracing::warn!(
+                "conversation recall: embed count mismatch ({} != {}) — chronological tail",
+                e.len(),
+                texts.len()
+            );
+            return mem.recall(conversation_id, keep_top + keep_recent);
+        }
+        Err(e) => {
+            tracing::warn!("conversation recall: embed failed ({e}) — chronological tail");
+            return mem.recall(conversation_id, keep_top + keep_recent);
+        }
     };
-    let q_vec = parse_vec(&arr[0]);
+    let q_vec = &embs[0];
 
     // Score each turn (skip the most-recent KEEP_RECENT — those
     // always make the cut regardless of score).
     let cutoff_recent_start = total.saturating_sub(keep_recent);
     let mut scored: Vec<(f32, usize)> = (0..cutoff_recent_start)
         .map(|i| {
-            let t_vec = parse_vec(&arr[i + 1]); // arr[0] is query
-            let score = cosine_local(&q_vec, &t_vec);
+            let score = cosine_local(q_vec, &embs[i + 1]); // embs[0] is query
             (score, i)
         })
         .collect();

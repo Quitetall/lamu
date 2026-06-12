@@ -208,7 +208,7 @@ fn autocontradict_enabled() -> bool {
 /// candidate set are acted on (guards against hallucinated ids). Near-
 /// identical neighbors (cosine ≥ NOVELTY_THRESHOLD) are skipped — those are
 /// duplicates, not contradictions. Returns the count expired. Needs an
-/// OPENAI key (neighbor search) + a reachable cloud model.
+/// embedder (ADR 0030 chain; neighbor search) + a reachable cloud model.
 pub async fn reconcile_memory(new_id: i64, new_text: &str) -> Result<usize> {
     let neighbors = recall_memory(new_text, 8, false).await?;
     let candidates: Vec<&MemoryHit> = neighbors
@@ -305,8 +305,9 @@ pub(crate) async fn handle_remember(args: serde_json::Value) -> String {
     }
 }
 
-/// `recall_memory` tool handler. Local read; degrades to recency
-/// without a key. Args: `query` (required), `k` (default 8).
+/// `recall_memory` tool handler. Local read; hybrid vector+FTS recall
+/// (ADR 0030), degrading to FTS + recency when no embedder resolves.
+/// Args: `query` (required), `k` (default 8).
 pub(crate) async fn handle_recall_memory(args: serde_json::Value) -> String {
     let query = args["query"].as_str().unwrap_or("").trim();
     if query.is_empty() {

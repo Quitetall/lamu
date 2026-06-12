@@ -4,10 +4,12 @@
 //! per-conversation), this module is a GLOBAL fact store that spans
 //! every conversation. Facts are extracted from conversations (via
 //! MiMo — that orchestration lives in the lamu-mcp frontend, ADR 0029)
-//! or added explicitly, embedded with OpenAI's
-//! `text-embedding-3-small`, and recalled by cross-session semantic
-//! search over the existing `crate::vector_index::BruteForceCosine`
-//! seam — this is the seam's first cross-session consumer.
+//! or added explicitly, embedded via the embedder chain (ADR 0030:
+//! local registry model first, OpenAI escape hatch / fallback — see
+//! `crate::embedder::resolve`), and recalled by HYBRID cross-session
+//! search: a model-filtered vector leg over the existing
+//! `crate::vector_index::BruteForceCosine` seam fused with an FTS5
+//! lexical leg via reciprocal-rank fusion (`crate::hybrid`).
 //!
 //! ADR 0029: this crate holds only the storage capability (schema +
 //! temporal migration, remember / recall / supersede / forget, novelty
@@ -25,13 +27,23 @@
 //! [`migrate_temporal_columns`], [`open_legacy_memory_db`]) survive
 //! only to normalize a legacy `memory.db` before its one-time import.
 //!
-//! ## Degradation without an embedding key
+//! ## Degradation without an embedder
 //!
-//! `remember` stores the memory with `embedding = NULL` when there is
-//! no `OPENAI_API_KEY` — it never fails on a missing key. `recall_memory`
-//! ranks embedding-bearing rows semantically when a key is present, and
-//! falls back to most-recent-k by `ts` when no key is available at all
-//! (so the query itself cannot be embedded).
+//! `remember` stores the memory with `embedding = NULL` when the chain
+//! resolves no embedder — it never fails on a missing backend.
+//! `recall_memory` ranks embedding-bearing rows semantically (vector
+//! leg, filtered to the current embedder's model) fused with the FTS5
+//! lexical leg; with no embedder at all it degrades to FTS + recency
+//! (pre-0030 it was recency-only — strictly better now).
+//!
+//! ## Per-store identity (ADR 0030)
+//!
+//! Every embedded row records its `embedding_model`; the vector leg
+//! ranks ONLY rows matching the current embedder's model (vectors from
+//! different models live in different spaces). The `embedding_stores`
+//! row for 'memories' tracks the store's adopted identity; on a model
+//! switch the old row is kept (warn once) until `lamu memory reembed`
+//! converges the rows.
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -39,7 +51,9 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::rag::{blob_to_vec, embed_one, openai_key, vec_to_blob, EMBED_MODEL};
+use crate::embedder::EmbedderId;
+use crate::hybrid::{rrf_merge, sanitize_fts_query};
+use crate::rag::{blob_to_vec, vec_to_blob};
 use crate::vector_index::{cosine, vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 
 /// The PRE-ADR-0028 standalone `memory.db` schema. Kept ONLY for the
@@ -212,18 +226,22 @@ pub(crate) struct MemoryPayload {
 
 /// Insert one memory row, returning its rowid. Factored out of
 /// `remember` so tests can store a row with a KNOWN embedding (or none)
-/// against an in-memory connection without hitting OpenAI.
+/// against an in-memory connection without touching any embedder.
+/// `embedding_model` tags the row's provenance (ADR 0030) — pass the
+/// embedder's identity model when `embedding` is `Some`, `None` when
+/// the row carries no embedding.
 pub(crate) fn insert_memory(
     conn: &Connection,
     text: &str,
     embedding: Option<&[f32]>,
+    embedding_model: Option<&str>,
     kind: &str,
     source: &str,
     ts: i64,
 ) -> Result<i64> {
     // A brand-new fact is valid from `ts`, has no expiry, and supersedes
     // nothing. supersede() uses insert_memory_full to set `supersedes`.
-    insert_memory_full(conn, text, embedding, kind, source, ts, ts, None)
+    insert_memory_full(conn, text, embedding, embedding_model, kind, source, ts, ts, None)
 }
 
 /// Insert one memory row with full control over the temporal columns,
@@ -236,6 +254,7 @@ pub(crate) fn insert_memory_full(
     conn: &Connection,
     text: &str,
     embedding: Option<&[f32]>,
+    embedding_model: Option<&str>,
     kind: &str,
     source: &str,
     ts: i64,
@@ -243,12 +262,12 @@ pub(crate) fn insert_memory_full(
     supersedes: Option<i64>,
 ) -> Result<i64> {
     let blob = embedding.map(vec_to_blob);
-    // Provenance: every embedding this module produces comes from
-    // EMBED_MODEL (rag::embed_one), so the model column is derived from
-    // the embedding's presence. `owner` is intentionally NOT named —
-    // the schema default ('local') covers it until the multi-owner
-    // plumb-through lands (ADR 0028 NEXT wave).
-    let model = embedding.map(|_| EMBED_MODEL);
+    // Only stamp a model when an embedding is actually present — a NULL
+    // embedding with a model tag would look reembeddable-but-done.
+    // `owner` is intentionally NOT named — the schema default ('local')
+    // covers it until the multi-owner plumb-through lands (ADR 0028
+    // NEXT wave).
+    let model = embedding.and(embedding_model);
     conn.execute(
         "INSERT INTO memories (text, embedding, embedding_model, kind, source, ts, valid_from, valid_until, supersedes) \
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
@@ -257,24 +276,42 @@ pub(crate) fn insert_memory_full(
     Ok(conn.last_insert_rowid())
 }
 
-/// Store a fact in the lifetime memory. Embeds via OpenAI when a key is
-/// present; stores `embedding = NULL` otherwise (never fails on a
-/// missing key). Returns the new rowid.
-pub async fn remember(text: &str, kind: &str, source: &str) -> Result<i64> {
-    let embedding = match openai_key() {
-        Some(key) => Some(embed_one(text, &key).await?),
-        None => None,
+/// Embed `text` via the chain. `Ok(None)` when no embedder resolves
+/// (store unembedded — never fail on a missing backend); `Err` when an
+/// embedder exists but the embed itself fails (same contract the keyed
+/// OpenAI path had).
+async fn embed_via_chain(text: &str) -> Result<Option<(Vec<f32>, EmbedderId)>> {
+    let Some(embedder) = crate::embedder::resolve() else {
+        return Ok(None);
     };
+    let mut vecs = embedder.embed(std::slice::from_ref(&text.to_string())).await?;
+    let v = vecs
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+    Ok(Some((v, embedder.identity())))
+}
+
+/// Store a fact in the lifetime memory. Embeds via the embedder chain
+/// when one resolves; stores `embedding = NULL` otherwise (never fails
+/// on a missing backend). Returns the new rowid.
+pub async fn remember(text: &str, kind: &str, source: &str) -> Result<i64> {
+    let embedded = embed_via_chain(text).await?;
     let arc = memory_db()?;
     let conn = arc.lock();
-    insert_memory(
+    let now = now_secs();
+    let id = insert_memory(
         &conn,
         text,
-        embedding.as_deref(),
+        embedded.as_ref().map(|(v, _)| v.as_slice()),
+        embedded.as_ref().map(|(_, ident)| ident.model.as_str()),
         kind,
         source,
-        now_secs(),
-    )
+        now,
+    )?;
+    if let Some((v, ident)) = &embedded {
+        crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
+    }
+    Ok(id)
 }
 
 // ── Recall ─────────────────────────────────────────────────────────
@@ -365,13 +402,22 @@ pub(crate) fn rank_memories(
         .collect()
 }
 
-/// Recall the top-`k` memories most relevant to `query`.
+/// Recall the top-`k` memories most relevant to `query` — HYBRID
+/// vector + FTS5 recall fused by reciprocal-rank fusion (ADR 0030).
 ///
-/// - With an `OPENAI_API_KEY`: embed the query, load all rows, rank the
-///   embedding-bearing rows via the seam (NULL-embedding rows are
-///   skipped in the ranked path).
-/// - Without a key (the query itself cannot be embedded): fall back to
-///   the most-recent `k` rows by `ts`, descending, with `score = None`.
+/// - With an embedder: the vector leg embeds the query and cosine-ranks
+///   the embedding-bearing rows WHOSE `embedding_model` MATCHES the
+///   current embedder's model (mixed-model vectors never rank against
+///   each other); the FTS leg bm25-ranks `memories_fts`; the two ranked
+///   lists are RRF-merged. `score` carries the COSINE similarity for
+///   hits the vector leg scored (preserving the pre-0030 score
+///   semantics — `lamu-mcp`'s reconcile compares it against the novelty
+///   threshold) and `None` for FTS-only hits.
+/// - Without an embedder: the recency list substitutes for the vector
+///   leg, so recall degrades to FTS + recency (`score = None`) —
+///   strictly better than the pre-0030 recency-only fallback. An embed
+///   FAILURE (backend down mid-flight) degrades the same way with a
+///   warning instead of failing the whole recall.
 ///
 /// VALID-TIME SEMANTICS: by default (`include_expired = false`) recall
 /// returns ONLY currently-valid facts — rows whose `valid_until` is NULL
@@ -380,77 +426,192 @@ pub(crate) fn rank_memories(
 /// out of default recall but are NEVER removed from the store. Pass
 /// `include_expired = true` for historical recall over the full timeline.
 pub async fn recall_memory(query: &str, k: usize, include_expired: bool) -> Result<Vec<MemoryHit>> {
+    // Embed BEFORE taking the lock (network/backend await must not hold
+    // the shared store mutex).
+    let embedded = match crate::embedder::resolve() {
+        Some(e) => match e.embed(std::slice::from_ref(&query.to_string())).await {
+            Ok(mut v) if !v.is_empty() => Some((v.remove(0), e.identity().model)),
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!("recall: query embed failed ({err}) — degrading to FTS + recency");
+                None
+            }
+        },
+        None => None,
+    };
     let arc = memory_db()?;
     let now = now_secs();
+    let conn = arc.lock();
+    recall_hybrid_conn(
+        &conn,
+        query,
+        embedded.as_ref().map(|(v, _)| v.as_slice()),
+        embedded.as_ref().map(|(_, m)| m.as_str()),
+        k,
+        include_expired,
+        now,
+    )
+}
+
+/// Connection-level core of [`recall_memory`]: vector leg (when
+/// `qvec`/`model` are present) + FTS leg, RRF-merged, hydrated in merge
+/// order. Factored out so tests drive it against a tempdir connection
+/// with known embeddings and `now`.
+///
+/// NOTE: the cosine pass runs under the caller's lock — same trade-off
+/// `remember_if_novel` already accepted: fine while the store is small;
+/// revisit if it grows large.
+pub(crate) fn recall_hybrid_conn(
+    conn: &Connection,
+    query: &str,
+    qvec: Option<&[f32]>,
+    model: Option<&str>,
+    k: usize,
+    include_expired: bool,
+    now: i64,
+) -> Result<Vec<MemoryHit>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
     let valid = valid_time_clause(include_expired, now);
 
-    match openai_key() {
-        Some(key) => {
-            let qvec = embed_one(query, &key).await?;
-            // Collect rows into a Vec, then release the lock BEFORE
-            // ranking — never hold the mutex across the cosine pass, so
-            // concurrent remember/recall don't serialize behind it.
-            // `embedding IS NOT NULL` skips embedding-less rows in SQL
-            // (the ranked path can't use them anyway); the valid-time
-            // clause (when not include_expired) hides expired facts.
-            let where_clause = if valid.is_empty() {
-                "WHERE embedding IS NOT NULL".to_string()
-            } else {
-                format!("WHERE embedding IS NOT NULL AND {valid}")
-            };
-            let sql = format!(
-                "SELECT id, text, kind, source, ts, embedding FROM memories {where_clause}"
-            );
-            let rows: Vec<MemoryRow> = {
-                let conn = arc.lock();
-                let mut stmt = conn.prepare(&sql)?;
-                let mapped = stmt.query_map([], |r| {
-                    let id: i64 = r.get(0)?;
-                    let text: String = r.get(1)?;
-                    let kind: String = r.get(2)?;
-                    let source: Option<String> = r.get(3)?;
-                    let ts: i64 = r.get(4)?;
-                    let emb: Vec<u8> = r.get(5)?;
-                    Ok((id, text, kind, source, ts, blob_to_vec(&emb)))
-                })?;
-                let mut rows = Vec::new();
-                for row in mapped {
-                    rows.push(row?);
-                }
-                rows
-            };
-            Ok(rank_memories(&qvec, rows, k))
+    // ── Leg 1: vector (model-filtered) or recency substitute ───────
+    // The cosine score per id is kept so hydration can surface it.
+    let mut cosine_by_id: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+    let leg1: Vec<(i64, f32)> = if let (Some(qvec), Some(model)) = (qvec, model) {
+        let where_clause = if valid.is_empty() {
+            "WHERE embedding IS NOT NULL AND embedding_model = ?1".to_string()
+        } else {
+            format!("WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}")
+        };
+        let sql =
+            format!("SELECT id, text, kind, source, ts, embedding FROM memories {where_clause}");
+        let rows: Vec<MemoryRow> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let mapped = stmt.query_map(params![model], |r| {
+                let id: i64 = r.get(0)?;
+                let text: String = r.get(1)?;
+                let kind: String = r.get(2)?;
+                let source: Option<String> = r.get(3)?;
+                let ts: i64 = r.get(4)?;
+                let emb: Vec<u8> = r.get(5)?;
+                Ok((id, text, kind, source, ts, blob_to_vec(&emb)))
+            })?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                rows.push(row?);
+            }
+            rows
+        };
+        rank_memories(qvec, rows, k)
+            .into_iter()
+            .map(|h| {
+                let s = h.score.unwrap_or(0.0);
+                cosine_by_id.insert(h.id, s);
+                (h.id, s)
+            })
+            .collect()
+    } else {
+        // No vector leg → recency list takes its slot in the fusion.
+        let where_clause = if valid.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {valid} ")
+        };
+        let sql = format!(
+            "SELECT id FROM memories {where_clause}ORDER BY ts DESC, id DESC LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mapped = stmt.query_map(params![k as i64], |r| r.get::<_, i64>(0))?;
+        let mut ids = Vec::new();
+        for id in mapped {
+            ids.push((id?, 0.0_f32));
         }
-        None => {
-            // No key — query can't be embedded; fall back to recency.
-            let where_clause = if valid.is_empty() {
+        ids
+    };
+
+    // ── Leg 2: FTS5 bm25 over memories_fts ─────────────────────────
+    // bm25() is "smaller is better" (negative for good matches), so
+    // ascending ORDER BY puts the best first — RRF only needs the rank.
+    // The leg fetches more than k candidates so fusion has room.
+    let fts_leg: Vec<(i64, f64)> = match sanitize_fts_query(query) {
+        None => Vec::new(),
+        Some(match_expr) => {
+            let and_valid = if valid.is_empty() {
                 String::new()
             } else {
-                format!("WHERE {valid} ")
+                format!("AND {valid} ")
             };
             let sql = format!(
-                "SELECT id, text, kind, source, ts FROM memories \
-                 {where_clause}ORDER BY ts DESC, id DESC LIMIT ?"
+                "SELECT memories_fts.rowid, bm25(memories_fts) \
+                 FROM memories_fts JOIN memories ON memories.id = memories_fts.rowid \
+                 WHERE memories_fts MATCH ?1 {and_valid}\
+                 ORDER BY bm25(memories_fts) ASC LIMIT ?2"
             );
-            let conn = arc.lock();
-            let mut stmt = conn.prepare(&sql)?;
-            let mapped = stmt.query_map(params![k as i64], |r| {
-                Ok(MemoryHit {
-                    id: r.get(0)?,
-                    text: r.get(1)?,
-                    kind: r.get(2)?,
-                    source: r.get(3)?,
-                    ts: r.get(4)?,
-                    score: None,
-                })
-            })?;
-            let mut hits = Vec::new();
-            for h in mapped {
-                hits.push(h?);
+            let limit = (k * 4).max(16) as i64;
+            let run = || -> Result<Vec<(i64, f64)>> {
+                let mut stmt = conn.prepare(&sql)?;
+                let mapped = stmt.query_map(params![match_expr, limit], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+                })?;
+                let mut out = Vec::new();
+                for row in mapped {
+                    out.push(row?);
+                }
+                Ok(out)
+            };
+            match run() {
+                Ok(v) => v,
+                Err(e) => {
+                    // The sanitizer should make MATCH syntax-safe; if a
+                    // pathological query still errors, drop the leg
+                    // rather than the whole recall.
+                    tracing::warn!("recall: FTS leg failed ({e}) — vector/recency leg only");
+                    Vec::new()
+                }
             }
-            Ok(hits)
         }
+    };
+
+    // ── Fuse + hydrate in merge order ───────────────────────────────
+    let merged = rrf_merge(&leg1, &fts_leg, k);
+    if merged.is_empty() {
+        return Ok(Vec::new());
     }
+    let placeholders = vec!["?"; merged.len()].join(",");
+    let and_valid = if valid.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {valid}")
+    };
+    let sql = format!(
+        "SELECT id, text, kind, source, ts FROM memories WHERE id IN ({placeholders}){and_valid}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let id_params: Vec<i64> = merged.iter().map(|(id, _)| *id).collect();
+    let mapped = stmt.query_map(rusqlite::params_from_iter(id_params.iter()), |r| {
+        Ok(MemoryHit {
+            id: r.get(0)?,
+            text: r.get(1)?,
+            kind: r.get(2)?,
+            source: r.get(3)?,
+            ts: r.get(4)?,
+            score: None,
+        })
+    })?;
+    let mut by_id: std::collections::HashMap<i64, MemoryHit> = std::collections::HashMap::new();
+    for h in mapped {
+        let h = h?;
+        by_id.insert(h.id, h);
+    }
+    Ok(merged
+        .iter()
+        .filter_map(|(id, _)| by_id.remove(id))
+        .map(|mut h| {
+            h.score = cosine_by_id.get(&h.id).copied();
+            h
+        })
+        .collect())
 }
 
 // ── Fact-extraction parsing (pure half of consolidation) ───────────
@@ -522,20 +683,19 @@ pub(crate) fn is_novel(new_emb: &[f32], existing: &[Vec<f32>], threshold: f32) -
 /// already remembered, returning the new rowid on insert or `None` when
 /// it was skipped as a near-duplicate.
 ///
-/// - Without an `OPENAI_API_KEY`: dedup is impossible (no embeddings), so
-///   fall back to an unconditional [`remember`] and return `Ok(Some(id))`.
-/// - With a key: embed `text`, load every embedding-bearing row (same
-///   SELECT + `blob_to_vec` the recall path uses), and if
-///   [`is_novel`] is false return `Ok(None)`. Otherwise insert the row
-///   WITH its embedding and return `Ok(Some(id))`.
+/// - Without an embedder: dedup is impossible (no embeddings), so fall
+///   back to an unconditional [`remember`] and return `Ok(Some(id))`.
+/// - With one: embed `text`, load every embedding-bearing row WHOSE
+///   `embedding_model` matches the current embedder (cosine across
+///   models is meaningless — ADR 0030), and if [`is_novel`] is false
+///   return `Ok(None)`. Otherwise insert the row WITH its embedding +
+///   model tag and return `Ok(Some(id))`.
 pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<Option<i64>> {
-    let key = match openai_key() {
-        // No key → can't embed/dedup; store unconditionally.
-        None => return remember(text, kind, source).await.map(Some),
-        Some(k) => k,
+    let Some((emb, ident)) = embed_via_chain(text).await? else {
+        // No embedder → can't embed/dedup; store unconditionally.
+        return remember(text, kind, source).await.map(Some);
     };
 
-    let emb = embed_one(text, &key).await?; // embed BEFORE taking the lock
     let arc = memory_db()?;
     let now = now_secs();
     // Dedup only against CURRENTLY-VALID facts. The old SELECT had no
@@ -544,8 +704,10 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
     // dropped as a "duplicate" — but default recall hides the expired row,
     // so the now-current fact silently vanished.
     let valid = valid_time_clause(false, now);
-    let sql =
-        format!("SELECT embedding FROM memories WHERE embedding IS NOT NULL AND {valid}");
+    let sql = format!(
+        "SELECT embedding FROM memories \
+         WHERE embedding IS NOT NULL AND embedding_model = ?1 AND {valid}"
+    );
     // Hold ONE guard across SELECT + is_novel + insert. is_novel (cosine)
     // and insert_memory are synchronous (no await), so this is safe and
     // closes the TOCTOU window where two concurrent autocapture threads
@@ -556,7 +718,7 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
     let conn = arc.lock();
     let existing: Vec<Vec<f32>> = {
         let mut stmt = conn.prepare(&sql)?;
-        let mapped = stmt.query_map([], |r| {
+        let mapped = stmt.query_map(params![ident.model], |r| {
             let blob: Vec<u8> = r.get(0)?;
             Ok(blob_to_vec(&blob))
         })?;
@@ -571,7 +733,8 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
         return Ok(None);
     }
 
-    let id = insert_memory(&conn, text, Some(&emb), kind, source, now)?;
+    let id = insert_memory(&conn, text, Some(&emb), Some(&ident.model), kind, source, now)?;
+    crate::store::record_store_identity(&conn, "memories", &ident.model, emb.len(), now);
     Ok(Some(id))
 }
 
@@ -589,16 +752,26 @@ pub async fn remember_if_novel(text: &str, kind: &str, source: &str) -> Result<O
 /// an already-expired fact leaves its earlier `valid_until` intact.
 ///
 /// Embeds `new_text` exactly like [`remember`] (NULL embedding when no
-/// `OPENAI_API_KEY`), so the new fact is semantically recallable.
+/// embedder resolves), so the new fact is semantically recallable.
 pub async fn supersede(old_id: i64, new_text: &str, kind: &str, source: &str) -> Result<i64> {
-    let embedding = match openai_key() {
-        Some(key) => Some(embed_one(new_text, &key).await?),
-        None => None,
-    };
+    let embedded = embed_via_chain(new_text).await?;
     let now = now_secs();
     let arc = memory_db()?;
     let mut conn = arc.lock();
-    supersede_conn(&mut conn, old_id, new_text, embedding.as_deref(), kind, source, now)
+    let id = supersede_conn(
+        &mut conn,
+        old_id,
+        new_text,
+        embedded.as_ref().map(|(v, _)| v.as_slice()),
+        embedded.as_ref().map(|(_, ident)| ident.model.as_str()),
+        kind,
+        source,
+        now,
+    )?;
+    if let Some((v, ident)) = &embedded {
+        crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
+    }
+    Ok(id)
 }
 
 /// Connection-level core of [`supersede`]: insert the new fact with
@@ -617,12 +790,23 @@ pub(crate) fn supersede_conn(
     old_id: i64,
     new_text: &str,
     embedding: Option<&[f32]>,
+    embedding_model: Option<&str>,
     kind: &str,
     source: &str,
     now: i64,
 ) -> Result<i64> {
     let tx = conn.transaction()?;
-    let new_id = insert_memory_full(&tx, new_text, embedding, kind, source, now, now, Some(old_id))?;
+    let new_id = insert_memory_full(
+        &tx,
+        new_text,
+        embedding,
+        embedding_model,
+        kind,
+        source,
+        now,
+        now,
+        Some(old_id),
+    )?;
     tx.execute(
         "UPDATE memories SET valid_until = ? WHERE id = ? AND valid_until IS NULL",
         params![now, old_id],
@@ -862,12 +1046,12 @@ mod tests {
     fn insert_and_rank_with_known_embeddings() {
         let conn = open_test_db();
         // Hand-crafted 3-dim embeddings.
-        let id_x = insert_memory(&conn, "x-axis fact", Some(&[1.0, 0.0, 0.0]), "fact", "manual", 100)
+        let id_x = insert_memory(&conn, "x-axis fact", Some(&[1.0, 0.0, 0.0]), Some("test-model"), "fact", "manual", 100)
             .unwrap();
-        let id_y = insert_memory(&conn, "y-axis fact", Some(&[0.0, 1.0, 0.0]), "fact", "manual", 200)
+        let id_y = insert_memory(&conn, "y-axis fact", Some(&[0.0, 1.0, 0.0]), Some("test-model"), "fact", "manual", 200)
             .unwrap();
         let id_near =
-            insert_memory(&conn, "near-x fact", Some(&[0.9, 0.1, 0.0]), "fact", "manual", 300)
+            insert_memory(&conn, "near-x fact", Some(&[0.9, 0.1, 0.0]), Some("test-model"), "fact", "manual", 300)
                 .unwrap();
         assert_eq!(id_x, 1);
         assert_eq!(id_y, 2);
@@ -914,7 +1098,7 @@ mod tests {
     #[test]
     fn null_embedding_round_trip() {
         let conn = open_test_db();
-        let id = insert_memory(&conn, "no-embedding fact", None, "fact", "manual", 42).unwrap();
+        let id = insert_memory(&conn, "no-embedding fact", None, None, "fact", "manual", 42).unwrap();
         let emb: Option<Vec<u8>> = conn
             .query_row("SELECT embedding FROM memories WHERE id = ?", params![id], |r| {
                 r.get(0)
@@ -1120,10 +1304,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         let conn = open_test_db();
         // Current fact (valid_until NULL via insert_memory).
         let id_current =
-            insert_memory(&conn, "current fact", None, "fact", "manual", 100).unwrap();
+            insert_memory(&conn, "current fact", None, None, "fact", "manual", 100).unwrap();
         // Expired fact: insert then expire it with valid_until in the past.
         let id_expired =
-            insert_memory(&conn, "expired fact", None, "fact", "manual", 50).unwrap();
+            insert_memory(&conn, "expired fact", None, None, "fact", "manual", 50).unwrap();
         conn.execute(
             "UPDATE memories SET valid_until = ? WHERE id = ?",
             params![60i64, id_expired],
@@ -1148,11 +1332,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn supersede_expires_old_and_links_new() {
         let mut conn = open_test_db();
-        let old_id = insert_memory(&conn, "lives in SF", None, "fact", "manual", 100).unwrap();
+        let old_id = insert_memory(&conn, "lives in SF", None, None, "fact", "manual", 100).unwrap();
 
         // Supersede at now = 500.
         let new_id =
-            supersede_conn(&mut conn, old_id, "lives in NYC", None, "fact", "manual", 500).unwrap();
+            supersede_conn(&mut conn, old_id, "lives in NYC", None, None, "fact", "manual", 500).unwrap();
         assert_ne!(old_id, new_id);
 
         // Old row: valid_until now set to 500.
@@ -1215,7 +1399,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn forget_soft_deletes_then_is_idempotent_noop() {
         let conn = open_test_db();
-        let id = insert_memory(&conn, "transient", None, "fact", "manual", 100).unwrap();
+        let id = insert_memory(&conn, "transient", None, None, "fact", "manual", 100).unwrap();
 
         // First forget: row is currently valid → affected → true.
         assert!(forget_conn(&conn, id, 777).unwrap());
@@ -1253,9 +1437,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     fn export_graph_corpus_writes_frontmatter_and_respects_include_expired() {
         let conn = open_test_db();
         let id_current =
-            insert_memory(&conn, "current fact", None, "preference", "manual", 100).unwrap();
+            insert_memory(&conn, "current fact", None, None, "preference", "manual", 100).unwrap();
         let id_expired =
-            insert_memory(&conn, "expired fact", None, "fact", "sess-1", 50).unwrap();
+            insert_memory(&conn, "expired fact", None, None, "fact", "sess-1", 50).unwrap();
         conn.execute(
             "UPDATE memories SET valid_until = ? WHERE id = ?",
             params![60i64, id_expired],
@@ -1302,7 +1486,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn export_graph_corpus_creates_missing_dir() {
         let conn = open_test_db();
-        insert_memory(&conn, "a fact", None, "fact", "manual", 100).unwrap();
+        insert_memory(&conn, "a fact", None, None, "fact", "manual", 100).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("does").join("not").join("exist");
         let rows = load_corpus_rows(&conn, false, 1000).unwrap();
@@ -1314,9 +1498,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
     #[test]
     fn export_prunes_stale_files_but_keeps_foreign() {
         let conn = open_test_db();
-        let id1 = insert_memory(&conn, "fact one", None, "fact", "manual", 100).unwrap();
-        let id2 = insert_memory(&conn, "fact two", None, "fact", "manual", 100).unwrap();
-        let id3 = insert_memory(&conn, "fact three", None, "fact", "manual", 100).unwrap();
+        let id1 = insert_memory(&conn, "fact one", None, None, "fact", "manual", 100).unwrap();
+        let id2 = insert_memory(&conn, "fact two", None, None, "fact", "manual", 100).unwrap();
+        let id3 = insert_memory(&conn, "fact three", None, None, "fact", "manual", 100).unwrap();
         let tmp = tempfile::tempdir().unwrap();
 
         // First export: all three written.
@@ -1344,5 +1528,268 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             tmp.path().join("README.md").exists(),
             "foreign file must be left alone"
         );
+    }
+
+    // ── ADR 0030: identity enforcement + hybrid recall ─────────────
+
+    /// Tempdir lamu.db with the FULL unified schema — the FTS leg needs
+    /// the real `memories_fts` virtual table + triggers (which the
+    /// migrations create); file-backed per the e2e spec.
+    fn open_tmp_lamu_db() -> (tempfile::TempDir, Connection) {
+        let td = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_at(&td.path().join("lamu.db")).unwrap();
+        (td, conn)
+    }
+
+    #[test]
+    fn vector_recall_ranks_only_current_model_rows() {
+        let (_td, conn) = open_tmp_lamu_db();
+        // Two rows under model A, two under model B — all near the same
+        // query vector so ANY of them would rank if not filtered.
+        let a1 = insert_memory(&conn, "alpha one", Some(&[1.0, 0.0]), Some("model-a"), "fact", "manual", 10).unwrap();
+        let a2 = insert_memory(&conn, "alpha two", Some(&[0.9, 0.1]), Some("model-a"), "fact", "manual", 20).unwrap();
+        let b1 = insert_memory(&conn, "bravo one", Some(&[1.0, 0.0]), Some("model-b"), "fact", "manual", 30).unwrap();
+        let b2 = insert_memory(&conn, "bravo two", Some(&[0.8, 0.2]), Some("model-b"), "fact", "manual", 40).unwrap();
+
+        // Query text shares no tokens with any fact → the FTS leg is
+        // empty and the result isolates the vector leg.
+        let hits = recall_hybrid_conn(
+            &conn,
+            "zzzqqq",
+            Some(&[1.0, 0.0]),
+            Some("model-b"),
+            10,
+            false,
+            1000,
+        )
+        .unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&b1) && ids.contains(&b2), "both B rows rank");
+        assert!(
+            !ids.contains(&a1) && !ids.contains(&a2),
+            "A rows must not rank under model B"
+        );
+        // Vector-leg hits carry their cosine score.
+        assert!(hits.iter().all(|h| h.score.is_some()));
+
+        // Switch identity to model A → only A rows rank.
+        let hits_a = recall_hybrid_conn(
+            &conn,
+            "zzzqqq",
+            Some(&[1.0, 0.0]),
+            Some("model-a"),
+            10,
+            false,
+            1000,
+        )
+        .unwrap();
+        let ids_a: std::collections::HashSet<i64> = hits_a.iter().map(|h| h.id).collect();
+        assert_eq!(ids_a, [a1, a2].into_iter().collect());
+    }
+
+    #[test]
+    fn hybrid_recall_surfaces_lexical_and_semantic_hits() {
+        let (_td, conn) = open_tmp_lamu_db();
+        // Lexical fact: matches the query text via FTS but its vector is
+        // orthogonal to the query embedding.
+        let lex = insert_memory(
+            &conn,
+            "the zanzibar deployment protocol",
+            Some(&[0.0, 1.0, 0.0]),
+            Some("fake"),
+            "fact",
+            "manual",
+            10,
+        )
+        .unwrap();
+        // Semantic fact: no token overlap with the query, but its vector
+        // is what the (fake) query embedding points at.
+        let sem = insert_memory(
+            &conn,
+            "ship the island rollout plan",
+            Some(&[1.0, 0.0, 0.0]),
+            Some("fake"),
+            "fact",
+            "manual",
+            20,
+        )
+        .unwrap();
+        // Noise that matches neither leg well.
+        insert_memory(&conn, "unrelated grocery list", Some(&[0.0, 0.0, 1.0]), Some("fake"), "fact", "manual", 30).unwrap();
+
+        let hits = recall_hybrid_conn(
+            &conn,
+            "zanzibar",             // FTS finds `lex`
+            Some(&[1.0, 0.0, 0.0]), // cosine ranks `sem` first
+            Some("fake"),
+            2,
+            false,
+            1000,
+        )
+        .unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&lex), "lexical (FTS) hit must surface");
+        assert!(ids.contains(&sem), "semantic (vector) hit must surface");
+        // Score semantics preserved: vector-scored hits carry cosine.
+        let sem_hit = hits.iter().find(|h| h.id == sem).unwrap();
+        assert!(sem_hit.score.unwrap() > 0.99, "cosine of identical vectors ≈ 1");
+    }
+
+    #[test]
+    fn hybrid_recall_without_embedder_is_fts_plus_recency() {
+        let (_td, conn) = open_tmp_lamu_db();
+        // Old lexical match vs newer unrelated facts. Pre-0030 the
+        // no-key fallback was recency-only and would bury the match.
+        let lex = insert_memory(&conn, "the zanzibar deployment protocol", None, None, "fact", "manual", 10).unwrap();
+        for i in 0..5 {
+            insert_memory(&conn, &format!("filler fact {i}"), None, None, "fact", "manual", 100 + i).unwrap();
+        }
+        let hits = recall_hybrid_conn(&conn, "zanzibar", None, None, 3, false, 1000).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == lex),
+            "FTS leg must surface the lexical match even without an embedder"
+        );
+        // Degraded path: no cosine scores anywhere.
+        assert!(hits.iter().all(|h| h.score.is_none()));
+    }
+
+    #[test]
+    fn hybrid_recall_hides_expired_in_both_legs() {
+        let (_td, conn) = open_tmp_lamu_db();
+        let id = insert_memory(&conn, "zanzibar expired fact", Some(&[1.0, 0.0]), Some("fake"), "fact", "manual", 10).unwrap();
+        conn.execute("UPDATE memories SET valid_until = 50 WHERE id = ?", params![id]).unwrap();
+        let hits =
+            recall_hybrid_conn(&conn, "zanzibar", Some(&[1.0, 0.0]), Some("fake"), 5, false, 1000)
+                .unwrap();
+        assert!(hits.is_empty(), "expired fact hidden from both legs");
+        let hits_all =
+            recall_hybrid_conn(&conn, "zanzibar", Some(&[1.0, 0.0]), Some("fake"), 5, true, 1000)
+                .unwrap();
+        assert_eq!(hits_all.len(), 1, "include_expired surfaces it");
+    }
+
+    #[test]
+    fn hybrid_recall_query_with_fts_operators_does_not_error() {
+        let (_td, conn) = open_tmp_lamu_db();
+        insert_memory(&conn, "plain fact", None, None, "fact", "manual", 10).unwrap();
+        // Raw quotes/operators would be FTS5 syntax errors un-sanitized.
+        for q in ["\"unbalanced", "NEAR(", "a -b OR (c", "*"] {
+            let r = recall_hybrid_conn(&conn, q, None, None, 5, false, 1000);
+            assert!(r.is_ok(), "query {q:?} must not error: {r:?}");
+        }
+    }
+
+    /// Full public-API e2e through the GLOBAL chain: register a
+    /// FakeEmbedder, `remember()` facts, `recall_memory()` them back.
+    /// This test CLAIMS the process-wide store singleton by pointing
+    /// `$LAMU_DB` at a tempdir BEFORE first touch — it is the only test
+    /// in this binary that touches `shared_handle` (everything else is
+    /// connection-level), and it holds the chain lock so the env
+    /// mutation can't race the other env-touching tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn remember_and_recall_e2e_through_global_chain() {
+        use crate::embedder::testutil::{chain_lock, reset_chain, FakeEmbedder};
+        let _g = chain_lock();
+        reset_chain();
+        let td = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by chain_lock.
+        unsafe { std::env::set_var("LAMU_DB", td.path().join("lamu.db")) };
+
+        let fake = FakeEmbedder::new("fake-e2e", vec![0.0, 1.0])
+            .with("the zanzibar deployment protocol", vec![0.0, 1.0])
+            .with("ship the island rollout plan", vec![1.0, 0.0])
+            .with("rollout", vec![1.0, 0.0]); // query → semantic neighbor of `sem`
+        crate::embedder::set_global(std::sync::Arc::new(fake));
+
+        let lex = remember("the zanzibar deployment protocol", "fact", "manual")
+            .await
+            .unwrap();
+        let sem = remember("ship the island rollout plan", "fact", "manual")
+            .await
+            .unwrap();
+
+        // Rows carry the chain identity; embedding_stores adopted it.
+        {
+            let arc = memory_db().unwrap();
+            let conn = arc.lock();
+            let models: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT embedding_model FROM memories ORDER BY id")
+                    .unwrap();
+                let mapped = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+                mapped.map(|r| r.unwrap()).collect()
+            };
+            assert_eq!(models, vec!["fake-e2e".to_string(), "fake-e2e".to_string()]);
+            let (store_model, dims): (String, i64) = conn
+                .query_row(
+                    "SELECT model, dims FROM embedding_stores WHERE store = 'memories'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(store_model, "fake-e2e");
+            assert_eq!(dims, 2);
+        }
+
+        // Hybrid recall: "rollout" embeds onto `sem`'s vector (semantic
+        // leg) AND lexically matches `sem`'s text; "zanzibar" would be
+        // FTS-only. Query "rollout zanzibar" surfaces BOTH.
+        let mut fake2 = FakeEmbedder::new("fake-e2e", vec![0.0, 0.0]);
+        fake2.map.insert("rollout zanzibar".into(), vec![1.0, 0.0]);
+        crate::embedder::set_global(std::sync::Arc::new(fake2));
+        let hits = recall_memory("rollout zanzibar", 2, false).await.unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
+        assert!(ids.contains(&sem), "vector leg surfaces the semantic hit");
+        assert!(ids.contains(&lex), "FTS leg surfaces the lexical hit");
+
+        // No embedder at all → FTS still finds the lexical match.
+        crate::embedder::clear_global();
+        let hits = recall_memory("zanzibar", 2, false).await.unwrap();
+        assert!(hits.iter().any(|h| h.id == lex));
+        assert!(hits.iter().all(|h| h.score.is_none()));
+
+        reset_chain();
+        unsafe { std::env::remove_var("LAMU_DB") };
+        // NOTE: the singleton stays pinned to the (now-removed) tempdir
+        // db for the rest of the process — fine: no other test in this
+        // binary touches shared_handle.
+    }
+
+    #[test]
+    fn record_store_identity_upserts_and_pins_on_mismatch() {
+        let (_td, conn) = open_tmp_lamu_db();
+        // Absent → insert.
+        crate::store::record_store_identity(&conn, "memories", "model-a", 384, 100);
+        let (model, dims, at): (String, i64, i64) = conn
+            .query_row(
+                "SELECT model, dims, updated_at FROM embedding_stores WHERE store = 'memories'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((model.as_str(), dims, at), ("model-a", 384, 100));
+        // Matching model → refresh dims + updated_at.
+        crate::store::record_store_identity(&conn, "memories", "model-a", 512, 200);
+        let (dims2, at2): (i64, i64) = conn
+            .query_row(
+                "SELECT dims, updated_at FROM embedding_stores WHERE store = 'memories'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((dims2, at2), (512, 200));
+        // Mismatch → row STAYS pinned to the old model (warn-once path).
+        crate::store::record_store_identity(&conn, "memories", "model-b", 768, 300);
+        let (model3, at3): (String, i64) = conn
+            .query_row(
+                "SELECT model, updated_at FROM embedding_stores WHERE store = 'memories'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model3, "model-a", "mismatch must not flip the store row");
+        assert_eq!(at3, 200, "mismatch must not touch updated_at");
+        // Exercise the warn path a second time (covers the once-per-store set).
+        crate::store::record_store_identity(&conn, "memories", "model-b", 768, 400);
     }
 }
