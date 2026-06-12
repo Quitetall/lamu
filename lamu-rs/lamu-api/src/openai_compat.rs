@@ -1157,12 +1157,9 @@ async fn stream_response(
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
 
-        let open_tag = marker.as_ref().map(|m| m.open_tag.clone()).unwrap_or_else(|| "<think>".to_string());
-        let close_tag = marker.as_ref().map(|m| m.close_tag.clone()).unwrap_or_else(|| "</think>".to_string());
-
-        let mut pending = String::new();
-        let mut in_reasoning = false;
-        let mut reasoning_done = false;
+        // ADR 0037: one shared splitter; visible → content deltas,
+        // reasoning → reasoning_content deltas (never dropped).
+        let mut splitter = ReasoningSplitter::new(marker.as_ref());
         // Empty-backend gate state: did the backend yield ANY non-empty
         // token, and what finish_reason (if any) did it report? Mirrors
         // the non-streaming 502 backend_returned_empty gate.
@@ -1183,17 +1180,18 @@ async fn stream_response(
                 for ev in parse_upstream_line(&line) {
                     match ev {
                         UpstreamEvent::Done => {
-                            // Flush whatever's buffered. The reasoning-tag scan
-                            // buffers tokens until either (a) it spots `<think>`
-                            // and routes to reasoning, or (b) ~24 chars arrive
-                            // without one and we declare reasoning_done. Short
-                            // outputs (e.g. "ok\n") never hit either branch, so
-                            // we have to flush at end-of-stream. Buffered content
-                            // is only safe to drop if we're MID-reasoning — in
-                            // that case the close_tag never arrived and emitting
-                            // the partial think-block would leak it to the user.
-                            if !pending.trim().is_empty() && !in_reasoning {
-                                let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+                            // Flush the splitter. The tag scan buffers tokens
+                            // until it can classify them; short outputs (e.g.
+                            // "ok\n") never trip either branch, so flush at
+                            // end-of-stream. An unclosed think block flushes to
+                            // the REASONING side — never leaks into content.
+                            let tail = splitter.finish();
+                            if !tail.visible.is_empty() {
+                                let chunk = make_chunk(&completion_id, created, &model_name, &tail.visible);
+                                yield Ok(Event::default().data(chunk.to_string()));
+                            }
+                            if !tail.reasoning.is_empty() {
+                                let chunk = make_reasoning_chunk(&completion_id, created, &model_name, &tail.reasoning);
                                 yield Ok(Event::default().data(chunk.to_string()));
                             }
                             if streaming_backend_empty(any_content, &finish_reason) {
@@ -1257,57 +1255,18 @@ async fn stream_response(
                         }
                         UpstreamEvent::Token(token) => {
                             any_content = true;
-                            pending.push_str(&token);
-
-                            if !in_reasoning && !reasoning_done {
-                                if let Some(idx) = pending.find(open_tag.as_str()) {
-                                    in_reasoning = true;
-                                    let pre = pending[..idx].to_string();
-                                    let after = pending[idx + open_tag.len()..].to_string();
-                                    pending = after;
-                                    if !pre.trim().is_empty() {
-                                        let chunk = make_chunk(&completion_id, created, &model_name, &pre);
-                                        yield Ok(Event::default().data(chunk.to_string()));
-                                    }
-                                } else if pending.len() > open_tag.len() * 3 {
-                                    reasoning_done = true;
-                                    let chunk = make_chunk(&completion_id, created, &model_name, &pending);
-                                    yield Ok(Event::default().data(chunk.to_string()));
-                                    pending.clear();
-                                }
-                            } else if in_reasoning && !reasoning_done {
-                                if let Some(idx) = pending.find(close_tag.as_str()) {
-                                    reasoning_done = true;
-                                    in_reasoning = false;
-                                    pending = pending[idx + close_tag.len()..].to_string();
-                                    if !pending.trim().is_empty() {
-                                        let chunk = make_chunk(&completion_id, created, &model_name, &pending);
-                                        yield Ok(Event::default().data(chunk.to_string()));
-                                        pending.clear();
-                                    }
-                                } else {
-                                    // close_tag may be split across tokens
-                                    // (`</`,`think`,`>`). Keep only the trailing
-                                    // close_tag.len()-1 bytes so a split tag
-                                    // matches on the next token; the rest is
-                                    // reasoning content we intentionally discard.
-                                    // The old `pending.clear()` here meant a split
-                                    // close tag NEVER matched → in_reasoning stuck
-                                    // → every post-</think> answer token dropped →
-                                    // empty completion to the client.
-                                    let keep = close_tag.len().saturating_sub(1);
-                                    if pending.len() > keep {
-                                        let mut cut = pending.len() - keep;
-                                        while cut < pending.len() && !pending.is_char_boundary(cut) {
-                                            cut += 1;
-                                        }
-                                        pending.drain(..cut);
-                                    }
-                                }
-                            } else if reasoning_done {
-                                let chunk = make_chunk(&completion_id, created, &model_name, &token);
+                            // ADR 0037: one shared state machine. Visible text
+                            // streams as content; reasoning streams as
+                            // structured reasoning_content instead of being
+                            // dropped (the pre-0037 behavior).
+                            let split = splitter.push(&token);
+                            if !split.visible.is_empty() {
+                                let chunk = make_chunk(&completion_id, created, &model_name, &split.visible);
                                 yield Ok(Event::default().data(chunk.to_string()));
-                                pending.clear();
+                            }
+                            if !split.reasoning.is_empty() {
+                                let chunk = make_reasoning_chunk(&completion_id, created, &model_name, &split.reasoning);
+                                yield Ok(Event::default().data(chunk.to_string()));
                             }
                         }
                     }
@@ -1317,11 +1276,15 @@ async fn stream_response(
 
         // Stream ended without an explicit [DONE] line (some backends
         // just close the connection). Flush the same way the [DONE]
-        // branch does: emit pending if not still mid-reasoning, then
-        // emit the synthetic close envelope so clients see a proper
-        // finish_reason.
-        if !pending.trim().is_empty() && !in_reasoning {
-            let chunk = make_chunk(&completion_id, created, &model_name, &pending);
+        // branch does, then emit the synthetic close envelope so clients
+        // see a proper finish_reason.
+        let tail = splitter.finish();
+        if !tail.visible.is_empty() {
+            let chunk = make_chunk(&completion_id, created, &model_name, &tail.visible);
+            yield Ok(Event::default().data(chunk.to_string()));
+        }
+        if !tail.reasoning.is_empty() {
+            let chunk = make_reasoning_chunk(&completion_id, created, &model_name, &tail.reasoning);
             yield Ok(Event::default().data(chunk.to_string()));
         }
         if streaming_backend_empty(any_content, &finish_reason) {
@@ -1506,14 +1469,38 @@ fn make_chunk(id: &str, created: u64, model: &str, content: &str) -> Value {
     })
 }
 
-/// Streaming reasoning-tag stripper (M5). Mirrors the inline `<think>`/`</think>`
-/// state machine in `stream_response` (the OpenAI path) so the Ollama + Anthropic
-/// streaming generators don't leak a thinking-capable model's chain-of-thought
-/// into the visible message — vanilla Ollama/Anthropic clients can't send the
-/// lamu-only `enable_thinking:false` opt-out, so streaming would otherwise dump
-/// raw `<think>…</think>` to the user. `push` returns the visible (non-reasoning)
-/// text for a token; `finish` flushes any safe-to-emit tail at stream end.
-struct ReasoningStripper {
+/// Streaming chunk carrying reasoning as structured data (ADR 0037) — the
+/// DeepSeek `delta.reasoning_content` convention; clients that don't know the
+/// field ignore the delta. Mirrors the non-stream `message.reasoning_content`.
+fn make_reasoning_chunk(id: &str, created: u64, model: &str, reasoning: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]
+    })
+}
+
+/// One splitter step's output: text destined for the visible message vs text
+/// destined for the structured reasoning channel. Either side may be empty.
+#[derive(Debug, Default, PartialEq)]
+struct Split {
+    visible: String,
+    reasoning: String,
+}
+
+/// Streaming reasoning-tag SPLITTER (ADR 0037, supersedes the M5 stripper).
+/// One `<think>`/`</think>` state machine shared by all three streaming
+/// bridges. Where the old stripper DROPPED reasoning bytes, this routes them:
+/// `push` returns the visible text and the reasoning text a token contributed,
+/// so each surface can emit reasoning as structured data (OpenAI
+/// `delta.reasoning_content`, Anthropic `thinking` blocks, Ollama
+/// `message.thinking`) instead of either leaking it into the message or
+/// silently losing it. `finish` flushes the tail at stream end — an UNCLOSED
+/// think block flushes to the reasoning side (it provably was reasoning),
+/// never to the visible side.
+struct ReasoningSplitter {
     open_tag: String,
     close_tag: String,
     pending: String,
@@ -1521,9 +1508,9 @@ struct ReasoningStripper {
     reasoning_done: bool,
 }
 
-impl ReasoningStripper {
+impl ReasoningSplitter {
     fn new(marker: Option<&ReasoningMarker>) -> Self {
-        ReasoningStripper {
+        ReasoningSplitter {
             open_tag: marker.map(|m| m.open_tag.clone()).unwrap_or_else(|| "<think>".to_string()),
             close_tag: marker.map(|m| m.close_tag.clone()).unwrap_or_else(|| "</think>".to_string()),
             pending: String::new(),
@@ -1532,16 +1519,14 @@ impl ReasoningStripper {
         }
     }
 
-    /// Feed one content token; return the visible text to emit (may be empty
-    /// while buffering or while inside a reasoning block).
-    fn push(&mut self, token: &str) -> String {
-        let mut out = String::new();
+    /// Feed one content token; returns the visible + reasoning text it
+    /// released (either may be empty while buffering for a possible tag).
+    fn push(&mut self, token: &str) -> Split {
+        let mut out = Split::default();
         self.pending.push_str(token);
         // Loop so a single token carrying a whole `<think>…</think>answer`
-        // block transitions open→close→done in one call (the inline OpenAI
-        // version only does one transition per token; this is strictly more
-        // robust). Each branch either `continue`s after a state change or
-        // `break`s when it must wait for more bytes.
+        // block transitions open→close→done in one call. Each branch either
+        // `continue`s after a state change or `break`s to wait for more bytes.
         loop {
             if !self.in_reasoning && !self.reasoning_done {
                 if let Some(idx) = self.pending.find(self.open_tag.as_str()) {
@@ -1549,14 +1534,14 @@ impl ReasoningStripper {
                     let pre = self.pending[..idx].to_string();
                     self.pending = self.pending[idx + self.open_tag.len()..].to_string();
                     if !pre.is_empty() {
-                        out.push_str(&pre);
+                        out.visible.push_str(&pre);
                     }
                     continue; // pending may already hold the close tag
                 } else if self.pending.len() > self.open_tag.len() * 3 {
                     // No open tag after ~3×tag bytes → no reasoning block;
                     // flush + stream straight through from here.
                     self.reasoning_done = true;
-                    out.push_str(&self.pending);
+                    out.visible.push_str(&self.pending);
                     self.pending.clear();
                 }
                 break;
@@ -1564,25 +1549,28 @@ impl ReasoningStripper {
                 if let Some(idx) = self.pending.find(self.close_tag.as_str()) {
                     self.reasoning_done = true;
                     self.in_reasoning = false;
+                    out.reasoning.push_str(&self.pending[..idx]);
                     self.pending = self.pending[idx + self.close_tag.len()..].to_string();
                     continue; // emit the post-</think> tail via the done branch
                 }
                 // close_tag may be split across tokens — keep only the trailing
-                // close_tag.len()-1 bytes so a split tag still matches next token;
-                // the rest is reasoning content we drop. (char-boundary-safe.)
+                // close_tag.len()-1 bytes buffered so a split tag still matches
+                // on the next token; everything before the kept tail is
+                // reasoning content, released now. (char-boundary-safe.)
                 let keep = self.close_tag.len().saturating_sub(1);
                 if self.pending.len() > keep {
                     let mut cut = self.pending.len() - keep;
                     while cut < self.pending.len() && !self.pending.is_char_boundary(cut) {
                         cut += 1;
                     }
+                    out.reasoning.push_str(&self.pending[..cut]);
                     self.pending.drain(..cut);
                 }
                 break;
             } else {
                 // reasoning_done → everything buffered is visible.
                 if !self.pending.is_empty() {
-                    out.push_str(&self.pending);
+                    out.visible.push_str(&self.pending);
                     self.pending.clear();
                 }
                 break;
@@ -1591,14 +1579,25 @@ impl ReasoningStripper {
         out
     }
 
-    /// Flush at stream end: emit buffered visible text only if we're not still
-    /// mid-reasoning (an unclosed think block must not leak).
-    fn finish(&mut self) -> String {
-        if !self.pending.trim().is_empty() && !self.in_reasoning {
-            std::mem::take(&mut self.pending)
-        } else {
-            String::new()
+    /// Flush at stream end. Mid-reasoning (close tag never arrived) → the
+    /// buffer was reasoning, flush it there; otherwise it's visible text the
+    /// open-tag scan was still buffering. TERMINAL: the splitter is spent
+    /// after finish() — make a new one per stream. Whitespace-only tails are
+    /// dropped (deliberate asymmetry with push(), which streams whitespace:
+    /// the tail buffer is ≤ tag-length bytes of maybe-tag lookahead, and a
+    /// whitespace-only fragment of that is noise, not content).
+    fn finish(&mut self) -> Split {
+        let tail = std::mem::take(&mut self.pending);
+        let mut out = Split::default();
+        if tail.trim().is_empty() {
+            return out;
         }
+        if self.in_reasoning {
+            out.reasoning = tail;
+        } else {
+            out.visible = tail;
+        }
+        out
     }
 }
 
@@ -1957,16 +1956,21 @@ fn anthropic_content_blocks(oai_msg: Option<&Value>) -> Vec<Value> {
         .and_then(|m| m.get("content"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let reasoning = oai_msg
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // ADR 0037: reasoning surfaces as a proper `thinking` block (before the
+    // text, matching Anthropic's native shape) instead of the pre-0037
+    // behavior of dropping it when content existed / passing it off as text
+    // when content was empty. A reasoning-only completion (thinking model hit
+    // max_tokens mid-think) yields a lone thinking block — non-empty, so the
+    // caller's 502 empty-gate stays quiet, preserving that fix.
+    if !reasoning.is_empty() {
+        blocks.push(json!({"type": "thinking", "thinking": reasoning}));
+    }
     if !content.is_empty() {
         blocks.push(json!({"type": "text", "text": content}));
-    } else {
-        let reasoning = oai_msg
-            .and_then(|m| m.get("reasoning_content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !reasoning.is_empty() {
-            blocks.push(json!({"type": "text", "text": reasoning}));
-        }
     }
     if let Some(tcs) = oai_msg.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()) {
         for tc in tcs {
@@ -2289,13 +2293,15 @@ async fn stream_response_anthropic(
         });
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(start.to_string()));
 
-        // content_block_start (single text block)
-        let cb_start = json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        });
-        yield Ok(Event::default().event("content_block_start").data(cb_start.to_string()));
+        // ADR 0037 block lifecycle: blocks open LAZILY — a `thinking` block on
+        // the first reasoning delta, a `text` block on the first visible delta
+        // — and exactly one block is open at a time (the other closes first).
+        // Strict Anthropic clients require ordered, properly closed blocks;
+        // the pre-0037 code pre-opened a single text block and DROPPED
+        // reasoning entirely.
+        let mut next_block: usize = 0;
+        let mut thinking_idx: Option<usize> = None;
+        let mut text_idx: Option<usize> = None;
 
         // Transport failure / backend HTTP error → one Anthropic error event
         // carrying the real message (send_upstream decodes error bodies).
@@ -2319,10 +2325,11 @@ async fn stream_response_anthropic(
         // Last finish_reason seen in the stream — drives the empty-backend
         // gate at close. Empty = stream closed without one.
         let mut finish_reason = String::new();
-        // M5: strip <think>…</think> reasoning out of the visible text_delta
-        // stream so a thinking-on model doesn't dump chain-of-thought to
-        // vanilla Anthropic clients that can't send enable_thinking:false.
-        let mut stripper = ReasoningStripper::new(marker.as_ref());
+        // ADR 0037: split <think>…</think> reasoning out of the visible
+        // text_delta stream and surface it as proper `thinking` blocks —
+        // vanilla Anthropic clients can't send enable_thinking:false, and
+        // pre-0037 their reasoning was silently discarded.
+        let mut splitter = ReasoningSplitter::new(marker.as_ref());
 
         use futures_util::stream::StreamExt;
         'read: while let Some(chunk_res) = byte_stream.next().await {
@@ -2341,18 +2348,38 @@ async fn stream_response_anthropic(
                         UpstreamEvent::Usage { prompt, .. } => {
                             if let Some(pt) = prompt { prompt_tokens = pt; }
                         }
-                        // Text token → text_delta on the index-0 text block,
-                        // with reasoning stripped (M5). out_tokens counts raw
-                        // generation; only visible (post-strip) text is emitted.
+                        // Text token → split into thinking_delta / text_delta
+                        // on lazily-opened blocks. out_tokens counts raw
+                        // generation (reasoning included), matching pre-0037.
                         UpstreamEvent::Token(token) => {
                             out_tokens += 1;
-                            let visible = stripper.push(&token);
-                            if !visible.is_empty() {
-                                let d = json!({
-                                    "type": "content_block_delta",
-                                    "index": 0,
-                                    "delta": {"type":"text_delta","text": visible}
-                                });
+                            let split = splitter.push(&token);
+                            if !split.reasoning.is_empty() {
+                                if let Some(i) = text_idx.take() {
+                                    yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index": i}).to_string()));
+                                }
+                                if thinking_idx.is_none() {
+                                    let cbs = json!({"type":"content_block_start","index": next_block,"content_block": {"type":"thinking","thinking":""}});
+                                    yield Ok(Event::default().event("content_block_start").data(cbs.to_string()));
+                                    thinking_idx = Some(next_block);
+                                    next_block += 1;
+                                }
+                                let i = thinking_idx.expect("opened above");
+                                let d = json!({"type":"content_block_delta","index": i,"delta": {"type":"thinking_delta","thinking": split.reasoning}});
+                                yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+                            }
+                            if !split.visible.is_empty() {
+                                if let Some(i) = thinking_idx.take() {
+                                    yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index": i}).to_string()));
+                                }
+                                if text_idx.is_none() {
+                                    let cbs = json!({"type":"content_block_start","index": next_block,"content_block": {"type":"text","text":""}});
+                                    yield Ok(Event::default().event("content_block_start").data(cbs.to_string()));
+                                    text_idx = Some(next_block);
+                                    next_block += 1;
+                                }
+                                let i = text_idx.expect("opened above");
+                                let d = json!({"type":"content_block_delta","index": i,"delta": {"type":"text_delta","text": split.visible}});
                                 yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
                             }
                         }
@@ -2384,10 +2411,12 @@ async fn stream_response_anthropic(
         // silently failed. Emit an Anthropic `error` event instead of
         // reporting a clean (but empty) completion.
         if streaming_backend_empty(out_tokens > 0 || !tool_acc.is_empty(), &finish_reason) {
-            // Close the index-0 text block (opened pre-loop) before the
-            // error so block-lifecycle-tracking clients see valid SSE.
-            let cb_stop = json!({"type":"content_block_stop","index":0});
-            yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
+            // Close whatever block is open (blocks are lazy now — an empty
+            // stream usually opened none) so lifecycle-tracking clients see
+            // valid SSE, then surface the failure.
+            if let Some(i) = thinking_idx.take().or_else(|| text_idx.take()) {
+                yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index": i}).to_string()));
+            }
             let err = json!({
                 "type": "error",
                 "error": {
@@ -2401,28 +2430,50 @@ async fn stream_response_anthropic(
             return;
         }
 
-        // Flush any buffered visible text the stripper held (short tagless
-        // outputs, or text after </think>) before closing the text block (M5).
-        let tail = stripper.finish();
-        if !tail.is_empty() {
-            let d = json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type":"text_delta","text": tail}
-            });
+        // Flush the splitter tail (short tagless outputs, text after
+        // </think>, or an unclosed think block → reasoning side) through the
+        // same lazy-block logic, then close whatever block is open.
+        let tail = splitter.finish();
+        if !tail.reasoning.is_empty() {
+            if let Some(i) = text_idx.take() {
+                yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index": i}).to_string()));
+            }
+            if thinking_idx.is_none() {
+                let cbs = json!({"type":"content_block_start","index": next_block,"content_block": {"type":"thinking","thinking":""}});
+                yield Ok(Event::default().event("content_block_start").data(cbs.to_string()));
+                thinking_idx = Some(next_block);
+                next_block += 1;
+            }
+            let i = thinking_idx.expect("opened above");
+            let d = json!({"type":"content_block_delta","index": i,"delta": {"type":"thinking_delta","thinking": tail.reasoning}});
             yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
         }
-
-        // Close the index-0 text block.
-        let cb_stop = json!({"type":"content_block_stop","index":0});
-        yield Ok(Event::default().event("content_block_stop").data(cb_stop.to_string()));
+        if !tail.visible.is_empty() {
+            if let Some(i) = thinking_idx.take() {
+                yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index": i}).to_string()));
+            }
+            if text_idx.is_none() {
+                let cbs = json!({"type":"content_block_start","index": next_block,"content_block": {"type":"text","text":""}});
+                yield Ok(Event::default().event("content_block_start").data(cbs.to_string()));
+                text_idx = Some(next_block);
+                next_block += 1;
+            }
+            let i = text_idx.expect("opened above");
+            let d = json!({"type":"content_block_delta","index": i,"delta": {"type":"text_delta","text": tail.visible}});
+            yield Ok(Event::default().event("content_block_delta").data(d.to_string()));
+        }
+        if let Some(i) = thinking_idx.take().or_else(|| text_idx.take()) {
+            yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index": i}).to_string()));
+        }
 
         // Emit one tool_use content block per accumulated call (start +
         // a single input_json_delta carrying the full args + stop).
         // stop_reason tracks blocks ACTUALLY emitted, so a malformed call
         // (empty name) that we skip doesn't yield a phantom tool_use verdict.
         let mut emitted_tools = false;
-        let mut next_index = 1;
+        // Tool blocks continue the dynamic index sequence (blocks are lazy
+        // now — there may have been 0, 1, or 2 content blocks before these).
+        let mut next_index = next_block;
         for (_oai_idx, acc) in tool_acc {
             if acc.name.is_empty() {
                 tracing::warn!("anthropic stream: dropping tool_call with empty function name");
@@ -2761,10 +2812,10 @@ async fn stream_response_ollama(
         let mut out_tokens: u64 = 0;
         // Empty-backend gate state (mirrors the non-streaming 502).
         let mut finish_reason = String::new();
-        // M5: strip <think>…</think> out of the visible NDJSON content so a
-        // thinking-on model's chain-of-thought doesn't leak to vanilla Ollama
-        // clients (Open WebUI / AnythingLLM stream by default).
-        let mut stripper = ReasoningStripper::new(marker.as_ref());
+        // ADR 0037: split <think>…</think> out of the visible NDJSON content
+        // and surface it as Ollama's native `message.thinking` field —
+        // pre-0037 it was silently dropped.
+        let mut splitter = ReasoningSplitter::new(marker.as_ref());
 
         use futures_util::stream::StreamExt;
         'read: while let Some(chunk_res) = byte_stream.next().await {
@@ -2782,27 +2833,47 @@ async fn stream_response_ollama(
                         UpstreamEvent::ToolDelta(_) | UpstreamEvent::Usage { .. } => {}
                         UpstreamEvent::Token(token) => {
                             out_tokens += 1;
-                            let visible = stripper.push(&token);
-                            if visible.is_empty() { continue; }
-                            let chunk = json!({
-                                "model": model_name,
-                                "created_at": rfc3339_now(),
-                                "message": {"role":"assistant","content": visible},
-                                "done": false,
-                            });
-                            yield Ok(format!("{}\n", chunk).into_bytes());
+                            let split = splitter.push(&token);
+                            if !split.reasoning.is_empty() {
+                                let chunk = json!({
+                                    "model": model_name,
+                                    "created_at": rfc3339_now(),
+                                    "message": {"role":"assistant","content":"","thinking": split.reasoning},
+                                    "done": false,
+                                });
+                                yield Ok(format!("{}\n", chunk).into_bytes());
+                            }
+                            if !split.visible.is_empty() {
+                                let chunk = json!({
+                                    "model": model_name,
+                                    "created_at": rfc3339_now(),
+                                    "message": {"role":"assistant","content": split.visible},
+                                    "done": false,
+                                });
+                                yield Ok(format!("{}\n", chunk).into_bytes());
+                            }
                         }
                     }
                 }
             }
         }
-        // Flush any buffered visible text before the final done:true line (M5).
-        let tail = stripper.finish();
-        if !tail.is_empty() {
+        // Flush the splitter tail before the final done:true line — an
+        // unclosed think block lands in `thinking`, never in content.
+        let tail = splitter.finish();
+        if !tail.reasoning.is_empty() {
             let chunk = json!({
                 "model": model_name,
                 "created_at": rfc3339_now(),
-                "message": {"role":"assistant","content": tail},
+                "message": {"role":"assistant","content":"","thinking": tail.reasoning},
+                "done": false,
+            });
+            yield Ok(format!("{}\n", chunk).into_bytes());
+        }
+        if !tail.visible.is_empty() {
+            let chunk = json!({
+                "model": model_name,
+                "created_at": rfc3339_now(),
+                "message": {"role":"assistant","content": tail.visible},
                 "done": false,
             });
             yield Ok(format!("{}\n", chunk).into_bytes());
@@ -3005,23 +3076,28 @@ mod compat_tests {
     }
 
     #[test]
-    fn anthropic_blocks_text_when_content_present() {
-        let m = json!({"content": "hello", "reasoning_content": "ignored"});
+    fn anthropic_blocks_thinking_then_text_when_both_present() {
+        // ADR 0037: reasoning is no longer dropped when content exists — it
+        // leads as a thinking block, Anthropic's native shape.
+        let m = json!({"content": "hello", "reasoning_content": "hmm"});
         let b = anthropic_content_blocks(Some(&m));
-        assert_eq!(b.len(), 1);
-        assert_eq!(b[0]["type"], "text");
-        assert_eq!(b[0]["text"], "hello");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["type"], "thinking");
+        assert_eq!(b[0]["thinking"], "hmm");
+        assert_eq!(b[1]["type"], "text");
+        assert_eq!(b[1]["text"], "hello");
     }
 
     #[test]
-    fn anthropic_blocks_reasoning_fallback_when_content_empty() {
-        // THE FIX: a reasoning-only completion (thinking model truncated
-        // mid-<think>) must surface the reasoning as text, NOT 502.
+    fn anthropic_blocks_reasoning_only_yields_thinking_not_502() {
+        // A reasoning-only completion (thinking model truncated mid-<think>)
+        // surfaces as a lone thinking block — non-empty, so the caller's 502
+        // empty-gate stays quiet (the original fix, now spec-shaped).
         let m = json!({"content": "", "reasoning_content": "let me think..."});
         let b = anthropic_content_blocks(Some(&m));
         assert_eq!(b.len(), 1);
-        assert_eq!(b[0]["type"], "text");
-        assert_eq!(b[0]["text"], "let me think...");
+        assert_eq!(b[0]["type"], "thinking");
+        assert_eq!(b[0]["thinking"], "let me think...");
     }
 
     #[test]
@@ -3049,8 +3125,8 @@ mod compat_tests {
 
     #[test]
     fn anthropic_blocks_reasoning_and_tool_use_together() {
-        // Combinatorial: empty content + reasoning + a tool_call → reasoning
-        // surfaced as text THEN the tool_use block.
+        // Combinatorial: empty content + reasoning + a tool_call → thinking
+        // block THEN the tool_use block.
         let m = json!({
             "content": "",
             "reasoning_content": "thinking",
@@ -3058,8 +3134,8 @@ mod compat_tests {
         });
         let b = anthropic_content_blocks(Some(&m));
         assert_eq!(b.len(), 2);
-        assert_eq!(b[0]["type"], "text");
-        assert_eq!(b[0]["text"], "thinking");
+        assert_eq!(b[0]["type"], "thinking");
+        assert_eq!(b[0]["thinking"], "thinking");
         assert_eq!(b[1]["type"], "tool_use");
     }
 
@@ -3099,27 +3175,50 @@ mod compat_tests {
     }
 
     #[test]
-    fn reasoning_stripper_removes_think_blocks() {
-        // M5: <think>…</think> must not reach visible output; the answer after
-        // </think> must survive (even split across tokens).
-        let drive = |tokens: &[&str]| -> String {
-            let mut s = ReasoningStripper::new(None);
-            let mut out = String::new();
+    fn reasoning_splitter_routes_think_blocks() {
+        // ADR 0037: <think>…</think> must never reach visible output AND must
+        // arrive intact on the reasoning side; the answer after </think> must
+        // survive (even split across tokens).
+        let drive = |tokens: &[&str]| -> (String, String) {
+            let mut s = ReasoningSplitter::new(None);
+            let mut vis = String::new();
+            let mut rea = String::new();
             for t in tokens {
-                out.push_str(&s.push(t));
+                let out = s.push(t);
+                vis.push_str(&out.visible);
+                rea.push_str(&out.reasoning);
             }
-            out.push_str(&s.finish());
-            out
+            let tail = s.finish();
+            vis.push_str(&tail.visible);
+            rea.push_str(&tail.reasoning);
+            (vis, rea)
         };
         // whole-block then answer
-        assert_eq!(drive(&["<think>secret reasoning</think>the answer"]), "the answer");
-        // split across tokens (open, body, close, answer)
-        assert_eq!(drive(&["<th", "ink>plan", " more plan</thi", "nk>visible"]), "visible");
+        assert_eq!(
+            drive(&["<think>secret reasoning</think>the answer"]),
+            ("the answer".into(), "secret reasoning".into())
+        );
+        // split across tokens (open, body, close, answer) — reasoning
+        // reassembles byte-exact despite the split-tag retention buffer
+        assert_eq!(
+            drive(&["<th", "ink>plan", " more plan</thi", "nk>visible"]),
+            ("visible".into(), "plan more plan".into())
+        );
         // no reasoning at all → passthrough (short tagless output flushed at end)
-        assert_eq!(drive(&["ok"]), "ok");
-        assert_eq!(drive(&["hello ", "world this is a longer answer"]), "hello world this is a longer answer");
-        // unclosed think block must NOT leak its content
-        assert_eq!(drive(&["<think>still thinking and never closed"]), "");
+        assert_eq!(drive(&["ok"]), ("ok".into(), String::new()));
+        assert_eq!(
+            drive(&["hello ", "world this is a longer answer"]),
+            ("hello world this is a longer answer".into(), String::new())
+        );
+        // unclosed think block: never leaks into visible, lands in reasoning
+        let (vis, rea) = drive(&["<think>still thinking and never closed"]);
+        assert_eq!(vis, "");
+        assert_eq!(rea, "still thinking and never closed");
+        // text BEFORE the think block stays visible, in order
+        assert_eq!(
+            drive(&["Hello <think>hmm</think> world"]),
+            ("Hello  world".into(), "hmm".into())
+        );
     }
 
     #[test]
