@@ -18,12 +18,12 @@
 //!
 //! ## Storage
 //!
-//! A separate SQLite at `~/.local/share/lamu/memory.db` (NOT
-//! `conversations.db`). We mirror `rag.rs`'s
-//! `OnceLock<Arc<Mutex<Connection>>>` + WAL pattern with our own
-//! static + accessor; the established codebase convention is
-//! per-module duplication of the connection singleton rather than a
-//! shared helper.
+//! The `memories` table of the unified `lamu.db` (ADR 0028;
+//! previously its own `memory.db`). The schema is owned by
+//! `crate::migrate`; the connection is the shared `crate::store`
+//! singleton. The pre-0028 in-place helpers ([`LEGACY_SCHEMA`],
+//! [`migrate_temporal_columns`], [`open_legacy_memory_db`]) survive
+//! only to normalize a legacy `memory.db` before its one-time import.
 //!
 //! ## Degradation without an embedding key
 //!
@@ -33,16 +33,26 @@
 //! falls back to most-recent-k by `ts` when no key is available at all
 //! (so the query itself cannot be embedded).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::Arc;
 
-use crate::rag::{blob_to_vec, embed_one, openai_key, vec_to_blob};
+use crate::rag::{blob_to_vec, embed_one, openai_key, vec_to_blob, EMBED_MODEL};
 use crate::vector_index::{cosine, vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 
-const SCHEMA: &str = "
+/// The PRE-ADR-0028 standalone `memory.db` schema. Kept ONLY for the
+/// legacy open path ([`open_legacy_memory_db`]) that normalizes an old
+/// file before its one-time import into `lamu.db` — the live schema is
+/// owned by `crate::migrate` (migration 001 adds `owner` +
+/// `embedding_model` on top of this shape).
+///
+/// `idx_memories_valid` is deliberately NOT in this batch: on a
+/// pre-temporal file the `valid_until` column doesn't exist yet, so
+/// creating the index here would fail before [`migrate_temporal_columns`]
+/// (which adds the column AND creates that index) gets to run.
+const LEGACY_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL,
@@ -55,7 +65,6 @@ CREATE TABLE IF NOT EXISTS memories (
     supersedes INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
-CREATE INDEX IF NOT EXISTS idx_memories_valid ON memories(valid_until);
 ";
 
 /// Idempotent valid-time migration for an EXISTING `memories` table.
@@ -136,40 +145,29 @@ pub(crate) fn valid_time_clause(include_expired: bool, now: i64) -> String {
 
 // ── Memory DB handle ───────────────────────────────────────────────
 
-fn memory_db_path() -> Result<PathBuf> {
-    let dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("no data_local_dir"))?
-        .join("lamu");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    Ok(dir.join("memory.db"))
-}
-
-fn open_memory_db(path: &Path) -> Result<Connection> {
+/// Open a PRE-ADR-0028 standalone `memory.db` through its historical
+/// open path: legacy schema applied idempotently, then
+/// [`migrate_temporal_columns`] normalizes a pre-temporal file. Used
+/// only by `crate::store`'s one-time legacy import (so the
+/// INSERT…SELECT can name the valid-time columns unconditionally) —
+/// the live store opens via `crate::store` instead.
+pub(crate) fn open_legacy_memory_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.execute_batch(SCHEMA)?;
-    // SCHEMA's CREATE TABLE IF NOT EXISTS only adds the temporal columns
-    // to a FRESH db; bring an existing memory.db up to the valid-time
-    // schema (idempotent, safe to run every startup).
+    conn.execute_batch(LEGACY_SCHEMA)?;
+    // LEGACY_SCHEMA's CREATE TABLE IF NOT EXISTS only adds the temporal
+    // columns to a FRESH db; bring an existing memory.db up to the
+    // valid-time schema (idempotent, safe to run on every open).
     migrate_temporal_columns(&conn)?;
     Ok(conn)
 }
 
-static MEMORY_DB: OnceLock<Arc<Mutex<Connection>>> = OnceLock::new();
-
+/// The fact store's connection — a thin delegate to the unified
+/// `lamu.db` singleton (`crate::store`, ADR 0028). Kept under its
+/// historical name so the storage fns below read unchanged.
 fn memory_db() -> Result<Arc<Mutex<Connection>>> {
-    // Fast path: already initialized.
-    if let Some(d) = MEMORY_DB.get() {
-        return Ok(d.clone());
-    }
-    // Open outside the OnceLock so a failed open doesn't poison the
-    // cell, then publish via get_or_init — under a race the loser's
-    // connection is dropped (not leaked) and everyone shares the winner.
-    let path = memory_db_path()?;
-    let conn = open_memory_db(&path)?;
-    let arc = MEMORY_DB.get_or_init(|| Arc::new(Mutex::new(conn)));
-    Ok(arc.clone())
+    crate::store::shared_handle()
 }
 
 fn now_secs() -> i64 {
@@ -245,10 +243,16 @@ pub(crate) fn insert_memory_full(
     supersedes: Option<i64>,
 ) -> Result<i64> {
     let blob = embedding.map(vec_to_blob);
+    // Provenance: every embedding this module produces comes from
+    // EMBED_MODEL (rag::embed_one), so the model column is derived from
+    // the embedding's presence. `owner` is intentionally NOT named —
+    // the schema default ('local') covers it until the multi-owner
+    // plumb-through lands (ADR 0028 NEXT wave).
+    let model = embedding.map(|_| EMBED_MODEL);
     conn.execute(
-        "INSERT INTO memories (text, embedding, kind, source, ts, valid_from, valid_until, supersedes) \
-         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-        params![text, blob, kind, source, ts, valid_from, supersedes],
+        "INSERT INTO memories (text, embedding, embedding_model, kind, source, ts, valid_from, valid_until, supersedes) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        params![text, blob, model, kind, source, ts, valid_from, supersedes],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -845,9 +849,12 @@ pub(crate) fn write_corpus_rows(dir: &Path, rows: &[CorpusRow]) -> Result<usize>
 mod tests {
     use super::*;
 
+    /// In-memory db on the UNIFIED schema (ADR 0028) — what every
+    /// storage fn now runs against. Legacy-shape fixtures (for the
+    /// temporal migration) build [`OLD_SCHEMA`] explicitly instead.
     fn open_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate::migrate(&mut conn).unwrap();
         conn
     }
 

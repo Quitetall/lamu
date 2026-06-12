@@ -1,5 +1,6 @@
 //! Conversation memory — append-only per-`conversation_id` log
-//! backed by SQLite at `~/.local/share/lamu/conversations.db`.
+//! backed by the `conversations` / `turns` tables of the unified
+//! `lamu.db` (ADR 0028; previously its own `conversations.db`).
 //!
 //! ## Why SQLite
 //!
@@ -7,42 +8,26 @@
 //! we get filter-by-role / time-range queries cheap, and the file-size
 //! cap can be enforced via `LIMIT N` on read instead of streaming the
 //! whole log. One DB file holds every conversation; tables are
-//! `conversations(id, created_at)` + `turns(conversation_id, idx,
-//! role, content, ts, metadata)`.
+//! `conversations(id, owner, created_at)` + `turns(conversation_id,
+//! idx, role, content, ts, metadata)`. Schema is owned by
+//! `crate::migrate` (ADR 0028).
 //!
 //! ## API
 //!
 //! - `Memory::open(path)` — explicit path; used by tests with
-//!   tempfiles.
-//! - `memory::shared()` — process-wide instance pointing at the
-//!   production data dir; used by handlers.
+//!   tempfiles. Runs the full migration set on that path, so a temp
+//!   `lamu.db` gets the complete unified schema.
+//! - `memory::shared()` — process-wide instance over the shared
+//!   `crate::store` connection; used by handlers.
 //!
 //! Per-call work is a single INSERT or a single SELECT. We hold the
 //! parking_lot::Mutex briefly; never across .await.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS turns (
-    conversation_id TEXT NOT NULL,
-    idx INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    ts INTEGER NOT NULL,
-    metadata TEXT,
-    PRIMARY KEY (conversation_id, idx),
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-);
-CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(conversation_id, ts);
-";
 
 /// `conversation_id` allowlist. Matches `validate_session_id` in
 /// `lamu_core::sandbox::journal` — the same threat (caller-controlled
@@ -63,14 +48,6 @@ fn validate_conversation_id(id: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn db_path() -> Result<PathBuf> {
-    let dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("no data_local_dir on this platform"))?
-        .join("lamu");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    Ok(dir.join("conversations.db"))
 }
 
 fn now_secs() -> u64 {
@@ -97,23 +74,14 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Open (or create) the conversation database at `path`. Schema
-    /// is applied idempotently.
-    ///
-    /// Pragmas applied at open:
-    /// - `journal_mode=WAL` — concurrent readers + one writer. Lamu's
-    ///   MCP server and a separate `lamu` CLI invocation can both read
-    ///   the conversations log without serializing on a global lock.
-    ///   ~10× write throughput vs the default rollback-journal mode.
-    /// - `synchronous=NORMAL` — fdatasync at commit instead of fsync
-    ///   at every write. Worst-case crash loss = the most recent
-    ///   uncommitted turn. Acceptable for conversation logs (not for
-    ///   financial ledgers). ~2× faster writes.
+    /// Open (or create) a lamu database at `path` and wrap a
+    /// conversation-memory handle around it. The full migration set is
+    /// applied idempotently (`crate::store::open_at`), so a tempfile
+    /// here carries the complete unified schema — WAL +
+    /// `synchronous=NORMAL` pragmas included (see `store::open_at` for
+    /// the rationale).
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
+        let conn = crate::store::open_at(path)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -284,17 +252,18 @@ fn apply_supersedes(turns: Vec<Turn>) -> Vec<Turn> {
         .collect()
 }
 
-/// Process-wide instance pointing at the production data dir.
-/// Lazy-initialized on first use; subsequent calls reuse the same
-/// SQLite connection.
+/// Process-wide instance over the shared unified store
+/// (`crate::store`, ADR 0028). Lazy-initialized on first use; the
+/// underlying SQLite connection is the SAME one `lifetime_memory` and
+/// `rag` use — first touch runs migrations + the one-time legacy
+/// import.
 pub fn shared() -> Result<&'static Memory> {
     static M: OnceLock<Memory> = OnceLock::new();
     if let Some(m) = M.get() {
         return Ok(m);
     }
-    let path = db_path()?;
-    let mem = Memory::open(&path)?;
-    let _ = M.set(mem);
+    let conn = crate::store::shared_handle()?;
+    let _ = M.set(Memory { conn });
     M.get().ok_or_else(|| anyhow!("memory init race"))
 }
 

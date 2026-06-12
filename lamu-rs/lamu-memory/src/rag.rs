@@ -7,10 +7,10 @@
 //!   "find the function" queries are spelled exactly.
 //! - **semantic** — query embedding via OpenAI's
 //!   `text-embedding-3-small` (cheap, ~$0.02/M tokens). Brute-force
-//!   cosine-sim against an on-disk index at
-//!   `~/.local/share/lamu/embeddings.db`. Index is built on first
-//!   semantic query if missing; explicit `index_repo` tool also
-//!   builds it on demand.
+//!   cosine-sim against the `chunks` table of the unified `lamu.db`
+//!   (ADR 0028; previously its own `embeddings.db`). Index is built
+//!   on first semantic query if missing; explicit `index_repo` tool
+//!   also builds it on demand.
 //! - **auto** — ripgrep first; if it returns < k hits, augment with
 //!   semantic. Default.
 //!
@@ -21,26 +21,14 @@
 //! any modern CPU. HNSW / sqlite-vss / DuckDB-vss are overkill until
 //! the index hits 10K+ rows.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use crate::vector_index::{vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS chunks (
-    path TEXT NOT NULL,
-    chunk_idx INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    embedding BLOB NOT NULL,
-    mtime INTEGER NOT NULL,
-    PRIMARY KEY (path, chunk_idx)
-);
-CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
-";
+use std::sync::Arc;
 
 /// Embedding model + dimension. Hardcoded to OpenAI's
 /// text-embedding-3-small (1536 dims, $0.02/M tokens). If we ever
@@ -84,33 +72,11 @@ pub struct SearchHit {
 
 // ── Index DB handle ────────────────────────────────────────────────
 
-fn index_db_path() -> Result<PathBuf> {
-    let dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("no data_local_dir"))?
-        .join("lamu");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("embeddings.db"))
-}
-
-fn open_index_db(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.execute_batch(SCHEMA)?;
-    Ok(conn)
-}
-
-static INDEX_DB: OnceLock<Arc<Mutex<Connection>>> = OnceLock::new();
-
+/// The chunk index's connection — a thin delegate to the unified
+/// `lamu.db` singleton (`crate::store`, ADR 0028). Kept under its
+/// historical name so the call sites below read unchanged.
 fn index_db() -> Result<Arc<Mutex<Connection>>> {
-    if let Some(d) = INDEX_DB.get() {
-        return Ok(d.clone());
-    }
-    let path = index_db_path()?;
-    let conn = open_index_db(&path)?;
-    let arc = Arc::new(Mutex::new(conn));
-    let _ = INDEX_DB.set(arc.clone());
-    Ok(arc)
+    crate::store::shared_handle()
 }
 
 // ── Ripgrep mode ───────────────────────────────────────────────────
@@ -343,8 +309,8 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
     }
     for ((path, idx, content, mtime), emb) in to_embed.iter().zip(embeddings.iter()) {
         tx.execute(
-            "INSERT OR REPLACE INTO chunks (path, chunk_idx, content, embedding, mtime) VALUES (?, ?, ?, ?, ?)",
-            params![path, *idx as i64, content, vec_to_blob(emb), mtime],
+            "INSERT OR REPLACE INTO chunks (path, chunk_idx, content, embedding, embedding_model, mtime) VALUES (?, ?, ?, ?, ?, ?)",
+            params![path, *idx as i64, content, vec_to_blob(emb), EMBED_MODEL, mtime],
         )?;
     }
     tx.commit()?;
