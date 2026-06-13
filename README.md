@@ -65,11 +65,32 @@ memory, and a training pipeline, all on one RTX 4090.
 - **Sandboxed agents.** `lamu agent -- <cmd>` wraps mutating agents in
   bubblewrap (cwd-rw only) with a filesystem journal — `lamu rollback`
   reverses any session.
-- **37 ADRs.** Every architectural decision is written down with its
+- **39 ADRs.** Every architectural decision is written down with its
   alternatives and a falsifiable validation section
   ([`docs/decisions/`](lamu-rs/docs/decisions/)).
 
 Two upstream merges along the way ([Lucebox #89](https://github.com/Luce-Org/lucebox-hub/pull/89), [#94](https://github.com/Luce-Org/lucebox-hub/pull/94)).
+
+---
+
+## Current State
+
+*Snapshot: 2026-06-13. One `lamu` binary · 13-crate Rust workspace · 39 ADRs · ~860 tests. Release line `v0.30` on `main`; the agent-fabric + world-model waves (W8–W9, ADRs 0038/0039) land on `feat/jart-deep-research`.*
+
+**Six serving surfaces.** OpenAI `/v1/chat/completions` · Anthropic `/v1/messages` (real `thinking`) · Ollama `/api/chat` · MCP stdio (30+ tools) · ACP (`lamu acp`, native Zed agent) · A2A (`lamu a2a`, Agent2Agent card + JSON-RPC/SSE). Structured reasoning on every surface; prefix-cache control + engine-true token/occupancy reporting (ADR 0037). ACP + A2A share one `run_prompt_turn` loop core; tool dispatch single-sourced from MCP.
+
+**Three model formats, one scheduler.** GGUF via llama.cpp/BeeLlama (+ DFlash / megakernel speculative tiers), `.onnx` embeddings via ort (ADR 0034), HuggingFace safetensors via candle — Llama/Mistral/Qwen2 (ADR 0035). One NVML VRAM scheduler bin-packs and evicts LRU; the HTTP path never silently evicts.
+
+**Unified store — `lamu.db`** (one SQLite, versioned migrations, legacy import; ADR 0028):
+- **Temporal fact memory** — valid-time, supersede, contradiction judging, hybrid recall (FTS5 + persistent quantized turbovec index), local-first embeddings (ADRs 0030/0031).
+- **Memory-as-a-service HTTP** — `POST /v1/memory/{remember,recall,forget,supersede}`, per-API-key owner isolation (ADR 0032).
+- **World model** — causal event hypergraph: content-addressed nodes (BLAKE3 `b3:`), n-ary cause/effect hyperedges, cycle-safe `trace_causal`, MCP-only v1 (ADR 0039).
+
+**Ops & safety.** PDEATHSIG children that can't outlive lamu · port-anchored verified kills (PID-reuse safe) · training-lock GPU sharing · bubblewrap-sandboxed `lamu agent` + rollback journal · systemd unit · `lamu clean` retention.
+
+**Shipped waves.** D1–D11 (hardening) → W1 provider-grade serve → W2 lamu-memory/unified DB → W3 inproc + onnx + embedder chain + persistent turbovec → W4 memory HTTP → W5 candle runtime → W6 ACP → W7 README → W8 A2A → W9 causal hypergraph.
+
+**Live-gated / deferred** (not yet exercised on metal — GPU has been training): real Zed ACP session · A2A client driving a card-discovered call · ONNX/candle CUDA first loads · turbovec event-semantic search (`Store::Events`) · hyperbolic/Poincaré geometry · HTTP `/v1/graph`.
 
 ---
 
@@ -140,7 +161,7 @@ Run it as a service: [`lamu-rs/deploy/`](lamu-rs/deploy/) ships a user-level sys
 │    │              │              │             │           │
 │  ┌─▼─────┐  ┌─────▼──────┐  ┌────▼────┐  ┌─────▼────┐      │
 │  │llama  │  │megakernel  │  │ DFlash  │  │HF / ONNX │      │
-│  │.cpp   │  │  (PyTorch) │  │ lucebox │  │ (future) │      │
+│  │.cpp   │  │  (PyTorch) │  │ lucebox │  │ ort/cndl │      │
 │  └───────┘  └────────────┘  └─────────┘  └──────────┘      │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -353,7 +374,7 @@ lamu               scan|status|start|serve|repl  # canonical
 
 ```bash
 pytest tests/ -q          # 288 unit + 14 integration, heavy deps stubbed
-cargo test --workspace    # ~790 Rust tests across 13 crates
+cargo test --workspace    # ~860 Rust tests across 13 crates
 just test-contract        # Python ↔ Rust MCP wire-format parity
 ruff check lamu           # strict on lamu/, soft on legacy paths
 ```
@@ -396,7 +417,7 @@ Bifrost (`:8080`) is dead on the v3 request path — kept under `scripts/serve-b
 
 `dflash-speculative.md` · `build-requirements.md` · `262k-context.md` · `ngram-speculation.md` · `vram-budget.md` · `eagle-training.md` · `eagle-cpp-integration.md` · `mcp-setup.md` · `harness-setup.md` · `model-selection.md` · `serving-engine.md` · `token-efficiency.md` · `training-loop.md` · `vllm-limitations.md` · `bifrost-bench.md`.
 
-Knowledge graph (~1,600 nodes, 162 communities) in `graphify-out/graph.html`. Query with `/graphify query "<question>"`.
+Knowledge graph of the whole repo (~106,000 nodes, ~245,000 edges, ~5,600 communities), rebuilt on every commit by the graphify post-commit hook → `graphify-out/graph.json` + `GRAPH_REPORT.md` (HTML viz auto-skipped above 5,000 nodes). Query with `/graphify query "<question>"`.
 
 ---
 
