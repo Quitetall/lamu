@@ -50,6 +50,7 @@
 //! (ADR 0011) — fencing is a frontend wire concern. Wire contracts are
 //! frozen; this extraction is behavior-preserving.
 
+pub mod causal_graph;
 pub mod embedder;
 pub mod hybrid;
 pub mod lifetime_memory;

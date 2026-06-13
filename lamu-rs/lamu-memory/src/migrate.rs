@@ -52,6 +52,11 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "external-content FTS5 over memories(text) + turns(content)",
         up: m002_fts5,
     },
+    Migration {
+        version: 3,
+        name: "causal event hypergraph (events, hyperedges, hyperedge_members)",
+        up: m003_causal_graph,
+    },
 ];
 
 fn now_secs() -> i64 {
@@ -250,6 +255,58 @@ INSERT INTO turns_fts(turns_fts) VALUES ('rebuild');
     )
 }
 
+// ── Migration 003 — causal event hypergraph ─────────────────────────
+
+/// Three tables for the causal event hypergraph (ADR 0039):
+/// - `events` — content-addressed fact nodes (b3: hash key, owner-scoped,
+///   valid-time columns matching the `memories` pattern).
+/// - `hyperedges` — n-ary directional causal relations (one row per
+///   relation instance; owner-scoped; valid-time).
+/// - `hyperedge_members` — members of each hyperedge with a `role` tag
+///   ('cause' or 'effect').
+///
+/// FK enforcement is OFF (SQLite default; PRAGMA foreign_keys stays OFF):
+/// orphan members + dangling `memory_id` references are valid states.
+fn m003_causal_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+CREATE TABLE events (
+    node_hash  TEXT NOT NULL PRIMARY KEY,
+    owner      TEXT NOT NULL DEFAULT 'local',
+    kind       TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    valid_from INTEGER NOT NULL DEFAULT 0,
+    valid_until INTEGER,
+    memory_id  INTEGER
+);
+CREATE INDEX idx_events_owner_valid ON events(owner, valid_until);
+CREATE INDEX idx_events_owner_ts    ON events(owner, ts DESC);
+CREATE INDEX idx_events_memory_id   ON events(memory_id) WHERE memory_id IS NOT NULL;
+
+CREATE TABLE hyperedges (
+    id         INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    owner      TEXT NOT NULL DEFAULT 'local',
+    relation   TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    valid_from INTEGER NOT NULL DEFAULT 0,
+    valid_until INTEGER
+);
+CREATE INDEX idx_hyperedges_owner_valid ON hyperedges(owner, valid_until);
+
+CREATE TABLE hyperedge_members (
+    hyperedge_id INTEGER NOT NULL,
+    node_hash    TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    PRIMARY KEY (hyperedge_id, node_hash, role)
+);
+CREATE INDEX idx_members_cause  ON hyperedge_members(node_hash, role) WHERE role = 'cause';
+CREATE INDEX idx_members_effect ON hyperedge_members(node_hash, role) WHERE role = 'effect';
+CREATE INDEX idx_members_edge   ON hyperedge_members(hyperedge_id);
+",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +324,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
 
-        // Every unified table + the FTS layer is present.
+        // Every unified table + the FTS layer + the causal graph is present.
         let names = table_names(&conn);
         for t in [
             "schema_version",
@@ -285,6 +342,17 @@ mod tests {
             "idx_memories_owner",
             "memories_fts_ai",
             "turns_fts_ai",
+            // m003 — causal event hypergraph
+            "events",
+            "hyperedges",
+            "hyperedge_members",
+            "idx_events_owner_valid",
+            "idx_events_owner_ts",
+            "idx_events_memory_id",
+            "idx_hyperedges_owner_valid",
+            "idx_members_cause",
+            "idx_members_effect",
+            "idx_members_edge",
         ] {
             assert!(names.contains(t), "missing schema object: {t}");
         }

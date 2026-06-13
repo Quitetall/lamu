@@ -21,6 +21,7 @@ parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 dirs = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
 # OPT-IN compressed vector index backend. Off by default — the default
 # build never pulls this dep (verify: `cargo tree -p lamu-memory` lists no
 # turbovec). NOTE (Linux): turbovec links a system OpenBLAS via
