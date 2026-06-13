@@ -50,7 +50,7 @@ can talk its way past.
 ## Run
 
 ```bash
-PY=~/local-llm/odysseus/venv/bin/python   # py3.14, has pyyaml + pytest
+PY=python3   # any python3 with: pip install pyyaml pytest
 
 # Real run via Codex — one task, one variant:
 $PY run.py --variant behavioral_core --task offbyone_sum

@@ -11,7 +11,7 @@ Models route through your existing `~/.config/lamu/cloud-models.yaml` + `api-key
 
 ## Run
 ```bash
-PY=~/local-llm/odysseus/venv/bin/python   # has yaml + httpx
+PY=python3   # any python3 with: pip install pyyaml httpx
 $PY eval.py \
    --models mimo-v2.5,deepseek-v4-flash \                 # candidates
    --judges mimo-v2.5-pro,deepseek-v4-pro \               # PANEL: a crit passes only on a MAJORITY of judges

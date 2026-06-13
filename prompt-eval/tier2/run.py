@@ -28,7 +28,7 @@ For each task we:
   4. Emit results/report.md (variant -> objective pass-rate) + results.json.
 
 Usage:
-  PY=~/local-llm/odysseus/venv/bin/python
+  PY=python3   # any python3 with: pip install pyyaml pytest
 
   # real run, one task, one variant, via Codex:
   $PY run.py --variant behavioral_core --task offbyone_sum
