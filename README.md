@@ -3,8 +3,8 @@
 **Local Agent Model Utility** — the model OS for one GPU. A single Rust
 binary that discovers your models, schedules them on a budgeted card,
 and serves them to every client you have: OpenAI, Anthropic, and Ollama
-HTTP; MCP for agent harnesses; native ACP for Zed. Built to be the local
-backend other agent systems stand on.
+HTTP; MCP for agent harnesses; native ACP for Zed; A2A for agent-to-agent
+fleets. Built to be the local backend other agent systems stand on.
 
 Started from 2021 InferKit / GPT-2 nostalgia — the GPT-2 proxy is still
 in the registry, not dead code. Now it runs a 27B uncensored model at
@@ -19,11 +19,14 @@ memory, and a training pipeline, all on one RTX 4090.
 
 ## Why LAMU
 
-- **Five serving protocols, one port + one stdio pair.** OpenAI
+- **Six serving protocols, one port + one stdio pair.** OpenAI
   (`/v1/chat/completions`), Anthropic (`/v1/messages` with real
   `thinking` blocks), Ollama (`/api/chat`), MCP (30+ tools for Claude
-  Code), and **ACP** — `lamu acp` is a native Zed agent with streamed
-  thoughts, tool lifecycle, and permission prompts.
+  Code), **ACP** — `lamu acp` is a native Zed agent with streamed
+  thoughts, tool lifecycle, and permission prompts — and **A2A** —
+  `lamu a2a` exposes an Agent2Agent card + JSON-RPC/SSE surface so any
+  agent (or a katana fleet) can discover and task the local model as a
+  remote peer.
 - **Research where fake citations are structurally impossible.**
   `deep_research` / `answer` resolve every `[N]` to a real retrieved
   source IN CODE — the model never fabricates a link, because links
@@ -183,7 +186,7 @@ Reload Claude Code, then `/mcp` should show `local-llm` connected. Tools exposed
 
 ## Serving Surfaces
 
-`lamu serve` exposes the local model pool over **OpenAI-, Anthropic-, and Ollama-compatible** HTTP; `lamu start` speaks MCP on stdio; `lamu acp` is a native ACP agent for Zed. Point whatever client you already use at it — LAMU is the backend orchestrator; the frontend is your choice of harness (ADR [0016](lamu-rs/docs/decisions/0016-backend-orchestrator-byo-frontend.md)).
+`lamu serve` exposes the local model pool over **OpenAI-, Anthropic-, and Ollama-compatible** HTTP; `lamu start` speaks MCP on stdio; `lamu acp` is a native ACP agent for Zed; `lamu a2a` speaks Agent2Agent over HTTP. Point whatever client you already use at it — LAMU is the backend orchestrator; the frontend is your choice of harness (ADR [0016](lamu-rs/docs/decisions/0016-backend-orchestrator-byo-frontend.md)).
 
 Register LAMU as a Zed agent (`settings.json`):
 
@@ -199,6 +202,21 @@ Zed gets streamed answers AND thoughts (`<think>` blocks arrive as
 `agent_thought_chunk`s), live tool-call status for LAMU's research/memory
 tools, and permission prompts before any file write (ADR
 [0036](lamu-rs/docs/decisions/0036-acp-agent-surface.md)).
+
+Run LAMU as an Agent2Agent peer and discover it via its card:
+
+```bash
+lamu a2a                 # loopback :8022 (off-loopback needs LAMU_A2A_TOKEN)
+curl -s localhost:8022/.well-known/agent-card.json | jq .name   # "LAMU"
+```
+
+Any A2A client tasks the local model with `message/send` (run to
+completion) or `message/stream` (SSE: working → message/thought events →
+completed Task), with `tasks/get` and `tasks/cancel` for lifecycle. The
+A2A tool set is read/research/memory only — `write_file` is excluded and
+fails closed (no human present to approve). The inter-agent fabric for
+katana fleets (ADR
+[0038](lamu-rs/docs/decisions/0038-a2a-agent-surface.md)).
 
 Reasoning is structured data on every HTTP surface (OpenAI
 `reasoning_content`, Anthropic `thinking` blocks, Ollama
