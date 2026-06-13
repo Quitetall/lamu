@@ -410,6 +410,122 @@ pub(crate) async fn handle_export_memory_graph(args: serde_json::Value) -> Strin
     }
 }
 
+// ── Causal graph MCP tool handlers ─────────────────────────────────
+
+fn now_secs_local() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `record_event` tool handler. Records an event node (idempotent via
+/// content hash). Args: `kind` (required), `text` (required),
+/// `memory_id` (optional integer).
+pub(crate) async fn handle_record_event(args: serde_json::Value) -> String {
+    let kind = args["kind"].as_str().unwrap_or("").trim();
+    if kind.is_empty() {
+        return "error: kind is required".to_string();
+    }
+    let text = args["text"].as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return "error: text is required".to_string();
+    }
+    let memory_id = args["memory_id"].as_i64();
+    let arc = match lamu_memory::store::shared_handle() {
+        Ok(a) => a,
+        Err(e) => return format!("error: {e}"),
+    };
+    let conn = arc.lock();
+    match lamu_memory::causal_graph::record_event(&conn, kind, text, LOCAL_OWNER, memory_id) {
+        Ok(hash) => format!("event {hash} recorded"),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// `link_events` tool handler. Creates a hyperedge linking event nodes
+/// with a named relation. Args: `relation` (required), `members`
+/// (required array of `{node_hash, role}` objects, minItems 1).
+pub(crate) async fn handle_link_events(args: serde_json::Value) -> String {
+    let relation = args["relation"].as_str().unwrap_or("").trim();
+    if relation.is_empty() {
+        return "error: relation is required".to_string();
+    }
+    let members_val = match args["members"].as_array() {
+        Some(a) if !a.is_empty() => a,
+        Some(_) => return "error: members must have at least 1 element".to_string(),
+        None => return "error: members is required (array of {node_hash, role})".to_string(),
+    };
+    let mut members: Vec<(String, String)> = Vec::with_capacity(members_val.len());
+    for (i, m) in members_val.iter().enumerate() {
+        let hash = match m["node_hash"].as_str() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => return format!("error: members[{i}].node_hash is required"),
+        };
+        let role = match m["role"].as_str() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => return format!("error: members[{i}].role is required"),
+        };
+        members.push((hash, role));
+    }
+    let arc = match lamu_memory::store::shared_handle() {
+        Ok(a) => a,
+        Err(e) => return format!("error: {e}"),
+    };
+    let mut conn = arc.lock();
+    match lamu_memory::causal_graph::link_events(&mut conn, relation, LOCAL_OWNER, &members) {
+        Ok(edge_id) => format!("linked edge #{edge_id} ({relation}, {} members)", members.len()),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// `trace_causal` tool handler. Walks the causal graph from a seed node.
+/// Args: `node_hash` (required), `direction` (enum "downstream"|"upstream",
+/// default "downstream"), `max_depth` (integer, default 5),
+/// `include_expired` (bool, default false — pass now=0 when true).
+pub(crate) async fn handle_trace_causal(args: serde_json::Value) -> String {
+    let node_hash = args["node_hash"].as_str().unwrap_or("").trim();
+    if node_hash.is_empty() {
+        return "error: node_hash is required".to_string();
+    }
+    let direction = match args["direction"].as_str().unwrap_or("downstream") {
+        "upstream" => lamu_memory::causal_graph::TraceDirection::Upstream,
+        "downstream" | "" => lamu_memory::causal_graph::TraceDirection::Downstream,
+        other => return format!("error: direction must be 'downstream' or 'upstream', got '{other}'"),
+    };
+    let max_depth = args["max_depth"].as_u64().unwrap_or(5).min(100) as u32;
+    let include_expired = args["include_expired"].as_bool().unwrap_or(false);
+    let now = if include_expired { 0i64 } else { now_secs_local() };
+    let arc = match lamu_memory::store::shared_handle() {
+        Ok(a) => a,
+        Err(e) => return format!("error: {e}"),
+    };
+    let conn = arc.lock();
+    match lamu_memory::causal_graph::trace_causal(
+        &conn,
+        node_hash,
+        direction,
+        max_depth,
+        LOCAL_OWNER,
+        now,
+    ) {
+        Ok(nodes) if nodes.is_empty() => "(no causal nodes reachable)".to_string(),
+        Ok(nodes) => {
+            let mut out = String::new();
+            for n in &nodes {
+                let snippet: String = n.text.chars().take(80).collect();
+                let ellipsis = if n.text.chars().count() > 80 { "…" } else { "" };
+                out.push_str(&format!(
+                    "depth={} hash={} kind={} text={}{ellipsis}\n",
+                    n.depth, n.node_hash, n.kind, snippet
+                ));
+            }
+            out
+        }
+        Err(e) => format!("error: {e}"),
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]

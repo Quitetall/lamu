@@ -350,6 +350,67 @@ fn schema_consolidate_memory() -> Value {
     })
 }
 
+fn schema_record_event() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "description": "Category of the event node (e.g. 'fact', 'decision', 'observation')."},
+            "text": {"type": "string", "description": "The event text. Whitespace-normalized before hashing so equivalent phrasings map to the same node."},
+            "memory_id": {"type": "integer", "description": "Optional: link to an existing memories.id row (FK not enforced — dangling ids are valid)."}
+        },
+        "required": ["kind", "text"]
+    })
+}
+
+fn schema_link_events() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "relation": {"type": "string", "description": "Name of the causal relation (e.g. 'causes', 'enables', 'blocks')."},
+            "members": {
+                "type": "array",
+                "description": "Nodes participating in this hyperedge. Each entry has a node_hash and a role ('cause' or 'effect'). At least one member required.",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "node_hash": {"type": "string", "description": "b3:… hash returned by record_event."},
+                        "role": {"type": "string", "description": "'cause' or 'effect'"}
+                    },
+                    "required": ["node_hash", "role"]
+                }
+            }
+        },
+        "required": ["relation", "members"]
+    })
+}
+
+fn schema_trace_causal() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "node_hash": {"type": "string", "description": "b3:… hash of the seed event to start the traversal from."},
+            "direction": {
+                "type": "string",
+                "enum": ["downstream", "upstream"],
+                "default": "downstream",
+                "description": "downstream: follow cause→effect edges outward. upstream: follow effect→cause edges back toward causes."
+            },
+            "max_depth": {
+                "type": "integer",
+                "default": 5,
+                "description": "Maximum hop depth (clamped to 100). Cycles are terminated by a path guard."
+            },
+            "include_expired": {
+                "type": "boolean",
+                "default": false,
+                "description": "When false (default) only currently-valid nodes and edges are traversed. When true, pass now=0 so the valid_until clause passes all rows."
+            }
+        },
+        "required": ["node_hash"]
+    })
+}
+
 fn schema_write_file() -> Value {
     json!({
         "type": "object",
@@ -525,6 +586,18 @@ fn dispatch_forget_memory(args: Value) -> Pin<Box<dyn Future<Output = String> + 
 
 fn dispatch_export_memory_graph(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(crate::lifetime_memory::handle_export_memory_graph(args))
+}
+
+fn dispatch_record_event(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_record_event(args))
+}
+
+fn dispatch_link_events(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_link_events(args))
+}
+
+fn dispatch_trace_causal(args: Value) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(crate::lifetime_memory::handle_trace_causal(args))
 }
 
 // ── The catalog ─────────────────────────────────────────────────────
@@ -742,6 +815,27 @@ pub static TOOLS: &[ToolDef] = &[
         handler: HandlerKind::Free(dispatch_export_memory_graph),
         cloud: false,
     },
+    ToolDef {
+        name: "record_event",
+        description: "Record an event node in the causal event hypergraph (ADR 0039). Idempotent: the same (kind, text) pair always returns the same content hash (BLAKE3 over whitespace-normalised text). Use this to register a fact, decision, or observation before linking it into causal chains with link_events. Args: kind (required), text (required), memory_id (optional — links to a lifetime memory row). Returns the node hash.",
+        schema_fn: schema_record_event,
+        handler: HandlerKind::Free(dispatch_record_event),
+        cloud: false,
+    },
+    ToolDef {
+        name: "link_events",
+        description: "Create a causal hyperedge in the causal event hypergraph (ADR 0039). Links N event nodes under a named relation with 'cause' or 'effect' roles, supporting n-ary causation (multiple causes, multiple effects in one assertion). Each call records a distinct edge — not idempotent by design. Args: relation (required string, e.g. 'causes'), members (required array of {node_hash, role} — use hashes returned by record_event). Returns the new edge id.",
+        schema_fn: schema_link_events,
+        handler: HandlerKind::Free(dispatch_link_events),
+        cloud: false,
+    },
+    ToolDef {
+        name: "trace_causal",
+        description: "Walk the causal event hypergraph (ADR 0039) from a seed node. Downstream: follow cause→effect edges outward (what does this event cause?). Upstream: follow effect→cause edges back (what caused this?). Cycle-safe: the path guard prevents infinite loops on cyclic graphs. Valid-time aware: expired nodes and edges are hidden by default. Args: node_hash (required), direction ('downstream'|'upstream', default 'downstream'), max_depth (default 5, max 100), include_expired (default false). Returns the reachable nodes (hash, depth, kind, text snippet).",
+        schema_fn: schema_trace_causal,
+        handler: HandlerKind::Free(dispatch_trace_causal),
+        cloud: false,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static ToolDef> {
@@ -788,7 +882,7 @@ mod tests {
         // letting new tools land without a forced test bump. The
         // critical-tools test below pins the named entries that
         // external callers (Claude Code, ultrareview, etc.) depend on.
-        assert!(TOOLS.len() >= 20, "catalog shrunk below 20: {}", TOOLS.len());
+        assert!(TOOLS.len() >= 23, "catalog shrunk below 23: {}", TOOLS.len());
     }
 
     #[test]
@@ -813,6 +907,8 @@ mod tests {
             "recall_conversation", "train_from_conversations", "write_file",
             "parallel_query", "remember", "recall_memory",
             "forget_memory", "export_memory_graph", "council",
+            // causal graph tools — local SQLite ops, no cloud
+            "record_event", "link_events", "trace_causal",
         ] {
             assert!(!find(name).unwrap().cloud, "{name} must have cloud:false");
         }
@@ -828,6 +924,8 @@ mod tests {
             "list_models", "list_cloud_models", "write_file",
             "parallel_query", "set_routing_mode", "recall_conversation",
             "search_repo", "index_repo", "warmup",
+            // causal graph
+            "record_event", "link_events", "trace_causal",
         ] {
             assert!(find(name).is_some(), "missing critical tool: {name}");
         }
