@@ -1,6 +1,8 @@
 //! LAMU CLI entry point. Port of `lamu/daemon.py`.
 
+mod a2a;
 mod acp;
+mod agent_core;
 mod chat_tui;
 mod clean;
 mod cloud_models;
@@ -45,6 +47,18 @@ enum Command {
     /// (agentclientprotocol.com, ADR 0036). The editor spawns this and
     /// drives a LOCAL model with LAMU's in-process tool surface.
     Acp,
+    /// Boot A2A (Agent2Agent) HTTP server (ADR 0038). Exposes a JSON-RPC 2.0
+    /// endpoint + agent card so any A2A-compliant client can discover and
+    /// drive the local LAMU model over HTTP/SSE.
+    A2a {
+        /// Port to listen on (default 8022).
+        #[arg(short, long, default_value_t = 8022)]
+        port: u16,
+        /// Bind address (default 127.0.0.1 — loopback only).
+        /// Off-loopback requires LAMU_A2A_TOKEN to be set.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
     /// Deep research: decompose a question, search HuggingFace/PubMed/bioRxiv/
     /// Semantic Scholar (+ web when keyed), synthesize a CITED answer, then drop
     /// into a follow-up chat grounded in the retrieved studies.
@@ -397,6 +411,7 @@ async fn main() -> Result<()> {
         Some(Command::Status) => cmd_status().await,
         Some(Command::Start) => cmd_start().await,
         Some(Command::Acp) => cmd_acp().await,
+        Some(Command::A2a { port, bind }) => cmd_a2a(port, bind).await,
         Some(Command::Research { query, tui, web, sub_questions, limit, model, verify, no_chat }) => {
             if tui || web {
                 // Graphical frontend: jart's TUI / web SPA, LAMU-backed summarizer.
@@ -1130,6 +1145,17 @@ async fn cmd_acp() -> Result<()> {
     // Startup banner on stderr (stdout is the protocol channel).
     eprintln!("LAMU ACP agent ready (rust)");
     acp.run(tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// `lamu a2a` — A2A (Agent2Agent) HTTP server (ADR 0038). Exposes a
+/// JSON-RPC 2.0 endpoint + agent card so any A2A-compliant client can
+/// discover and drive the local LAMU model over HTTP/SSE.
+async fn cmd_a2a(port: u16, bind: String) -> Result<()> {
+    let server = std::sync::Arc::new(build_mcp_server().await?);
+    let cfg = a2a::A2aConfig::default();
+    let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address '{bind}:{port}': {e}"))?;
+    a2a::serve(server, cfg, addr).await
 }
 
 /// Build the MCP server (registry + VRAM scheduler, auto-registering any models

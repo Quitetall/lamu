@@ -2268,7 +2268,9 @@ name = "lamu-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
+ "axum",
  "clap",
  "crossterm 0.28.1",
  "dirs 5.0.1",
@@ -2293,6 +2295,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "subtle",
  "tempfile",
  "termimad",
  "tokio",

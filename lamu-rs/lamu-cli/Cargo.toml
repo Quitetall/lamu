@@ -54,6 +54,13 @@ getrandom = "0.2"
 termimad = "0.31"
 toml = "0.8"
 globset = "0.4"
+# A2A HTTP surface (ADR 0038). Versions pinned to match lamu-api + lamu-inproc.
+axum = { version = "0.7", features = ["macros"] }
+async-stream = "0.3"
+# Constant-time bearer-token compare for A2A auth (mirrors lamu-api/auth.rs).
+subtle = "2"
+# async_trait for agent_core PermissionGate.
+async-trait = "0.1"
 
 [features]
 # Module backends behind features (ADR 0034): heavy native deps opt in.
