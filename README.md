@@ -36,6 +36,13 @@ memory, and a training pipeline, all on one RTX 4090.
   vector search with persistent indexes), local embeddings — zero API
   keys required — and an owner-scoped HTTP memory API other agent
   harnesses consume as a service.
+- **A world model with structure, not just similarity.** A causal event
+  hypergraph in the same `lamu.db` — content-addressed nodes (BLAKE3
+  `b3:` hashes, dedup + cross-system CAS interop), n-ary cause/effect
+  hyperedges, and cycle-safe `trace_causal` traversal over MCP tools.
+  Vector search finds *similar* facts; the graph traces what *caused*
+  what — the relational layer a `WHERE` clause can't fake (ADR
+  [0039](lamu-rs/docs/decisions/0039-causal-event-hypergraph.md)).
 - **Provider-grade serving for harness builders.** Per-call engine-true
   token usage and context occupancy (un-fakeable: counted by the
   engine's own tokenizer), structured reasoning on every surface,

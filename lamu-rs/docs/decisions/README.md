@@ -83,6 +83,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0036](./0036-acp-agent-surface.md) | Native ACP agent surface (`lamu acp`) | Accepted |
 | [0037](./0037-provider-grade-serving.md) | Provider-grade serving: structured reasoning on all bridges, prefix-cache exposure, caps discovery | Accepted |
 | [0038](./0038-a2a-agent-surface.md) | A2A (Agent2Agent) agent surface (`lamu a2a`) — sixth serving surface, inter-agent fabric | Accepted |
+| [0039](./0039-causal-event-hypergraph.md) | Causal event hypergraph (graph-lite world-model v1) — events/hyperedges in lamu.db, BLAKE3 `b3:` CAS, MCP tools | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.
