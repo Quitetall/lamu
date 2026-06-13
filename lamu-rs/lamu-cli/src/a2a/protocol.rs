@@ -35,7 +35,11 @@ pub const M_TASKS_CANCEL: &str = "tasks/cancel";
 
 // ── Well-known paths ─────────────────────────────────────────────────
 
-pub const PATH_AGENT_CARD: &str = "/.well-known/agent.json";
+/// Canonical A2A v1.0.0 well-known path (renamed from `agent.json` in 0.2.x).
+pub const PATH_AGENT_CARD: &str = "/.well-known/agent-card.json";
+/// 0.2.x well-known path, kept as an alias for older clients.
+pub const PATH_AGENT_CARD_WK_COMPAT: &str = "/.well-known/agent.json";
+/// Bare alias some clients probe.
 pub const PATH_AGENT_CARD_COMPAT: &str = "/agent.json";
 pub const PATH_RPC: &str = "/";
 
@@ -51,7 +55,8 @@ pub const STATE_INPUT_REQUIRED: &str = "input-required";
 // ── Agent Card builder ───────────────────────────────────────────────
 
 /// Build the LAMU Agent Card (spec §AgentCard). Served at both
-/// `/.well-known/agent.json` (primary) and `/agent.json` (older clients).
+/// `/.well-known/agent-card.json` (v1.0.0 canonical), with
+/// `/.well-known/agent.json` (0.2.x) and `/agent.json` as aliases.
 ///
 /// `url` is the base URL of this A2A server (e.g. `http://127.0.0.1:8022`).
 pub fn agent_card(url: &str, skills: &[Value]) -> Value {

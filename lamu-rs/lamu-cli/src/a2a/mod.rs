@@ -1,6 +1,6 @@
 //! A2A (Agent2Agent) protocol surface for LAMU — `lamu a2a` (ADR 0038).
 //!
-//! Exposes a JSON-RPC 2.0 over HTTP endpoint plus a `/.well-known/agent.json`
+//! Exposes a JSON-RPC 2.0 over HTTP endpoint plus a `/.well-known/agent-card.json`
 //! agent card so any A2A-compliant client can discover and drive the local LAMU
 //! model via the same in-process MCP tool surface as ACP.
 //!
@@ -270,12 +270,13 @@ fn unauthorized_response() -> Response {
 pub fn router(state: A2aState) -> Router {
     Router::new()
         .route(proto::PATH_AGENT_CARD, get(handle_agent_card))
+        .route(proto::PATH_AGENT_CARD_WK_COMPAT, get(handle_agent_card))
         .route(proto::PATH_AGENT_CARD_COMPAT, get(handle_agent_card))
         .route(proto::PATH_RPC, post(handle_rpc))
         .with_state(state)
 }
 
-/// `GET /.well-known/agent.json` — auth exempt.
+/// `GET /.well-known/agent-card.json` (+ aliases) — auth exempt.
 async fn handle_agent_card(State(st): State<A2aState>) -> impl IntoResponse {
     // Advertise the effective bind URL (set by serve()); fall back to the
     // loopback default when unset (e.g. router-only test construction).

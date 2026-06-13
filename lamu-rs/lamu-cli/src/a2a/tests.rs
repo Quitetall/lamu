@@ -543,9 +543,9 @@ async fn write_file_absent_from_skills_and_forged_call_fails_closed() {
     let base = start_a2a_server(url).await;
     let client = Client::new();
 
-    // Check card.
+    // Check card (v1.0.0 canonical well-known path).
     let card_resp: Value = client
-        .get(&format!("{base}/.well-known/agent.json"))
+        .get(&format!("{base}/.well-known/agent-card.json"))
         .send()
         .await
         .unwrap()
@@ -619,13 +619,25 @@ async fn agent_card_is_auth_exempt_rpc_requires_token() {
 
     let client = Client::new();
 
-    // Card: no auth needed.
+    // Card: no auth needed (v1.0.0 canonical well-known path).
     let card_resp = client
-        .get(&format!("{base}/.well-known/agent.json"))
+        .get(&format!("{base}/.well-known/agent-card.json"))
         .send()
         .await
         .unwrap();
     assert_eq!(card_resp.status(), 200, "card should be auth-exempt");
+
+    // /.well-known/agent.json (0.2.x) alias: also auth-exempt.
+    let wk_alias_resp = client
+        .get(&format!("{base}/.well-known/agent.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wk_alias_resp.status(),
+        200,
+        "/.well-known/agent.json alias should be auth-exempt"
+    );
 
     // /agent.json alias: also auth-exempt.
     let alias_resp = client
