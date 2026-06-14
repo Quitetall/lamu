@@ -432,11 +432,10 @@ pub(crate) async fn handle_record_event(args: serde_json::Value) -> String {
         return "error: text is required".to_string();
     }
     let memory_id = args["memory_id"].as_i64();
-    let arc = match lamu_memory::store::shared_handle() {
-        Ok(a) => a,
+    let conn = match lamu_memory::store::conn() {
+        Ok(c) => c,
         Err(e) => return format!("error: {e}"),
     };
-    let conn = arc.lock();
     match lamu_memory::causal_graph::record_event(&conn, kind, text, LOCAL_OWNER, memory_id) {
         Ok(hash) => format!("event {hash} recorded"),
         Err(e) => format!("error: {e}"),
@@ -468,11 +467,10 @@ pub(crate) async fn handle_link_events(args: serde_json::Value) -> String {
         };
         members.push((hash, role));
     }
-    let arc = match lamu_memory::store::shared_handle() {
-        Ok(a) => a,
+    let mut conn = match lamu_memory::store::conn() {
+        Ok(c) => c,
         Err(e) => return format!("error: {e}"),
     };
-    let mut conn = arc.lock();
     match lamu_memory::causal_graph::link_events(&mut conn, relation, LOCAL_OWNER, &members) {
         Ok(edge_id) => format!("linked edge #{edge_id} ({relation}, {} members)", members.len()),
         Err(e) => format!("error: {e}"),
@@ -496,11 +494,10 @@ pub(crate) async fn handle_trace_causal(args: serde_json::Value) -> String {
     let max_depth = args["max_depth"].as_u64().unwrap_or(5).min(100) as u32;
     let include_expired = args["include_expired"].as_bool().unwrap_or(false);
     let now = if include_expired { 0i64 } else { now_secs_local() };
-    let arc = match lamu_memory::store::shared_handle() {
-        Ok(a) => a,
+    let conn = match lamu_memory::store::conn() {
+        Ok(c) => c,
         Err(e) => return format!("error: {e}"),
     };
-    let conn = arc.lock();
     match lamu_memory::causal_graph::trace_causal(
         &conn,
         node_hash,

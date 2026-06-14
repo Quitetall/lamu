@@ -46,10 +46,8 @@
 //! converges the rows.
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::embedder::EmbedderId;
 use crate::hybrid::{rrf_merge, sanitize_fts_query};
@@ -188,10 +186,9 @@ pub(crate) fn open_legacy_memory_db(path: &Path) -> Result<Connection> {
 }
 
 /// The fact store's connection — a thin delegate to the unified
-/// `lamu.db` singleton (`crate::store`, ADR 0028). Kept under its
-/// historical name so the storage fns below read unchanged.
-fn memory_db() -> Result<Arc<Mutex<Connection>>> {
-    crate::store::shared_handle()
+/// `lamu.db` pool (`crate::store`, ADRs 0028/0041).
+fn memory_db() -> Result<crate::store::PooledConn> {
+    crate::store::conn()
 }
 
 fn now_secs() -> i64 {
@@ -314,9 +311,8 @@ async fn embed_via_chain(text: &str) -> Result<Option<(Vec<f32>, EmbedderId)>> {
 /// surface passes the KeyStore principal's user.
 pub async fn remember(text: &str, kind: &str, source: &str, owner: &str) -> Result<i64> {
     let embedded = embed_via_chain(text).await?;
-    let arc = memory_db()?;
     let id = {
-        let conn = arc.lock();
+        let conn = memory_db()?;
         let now = now_secs();
         let id = insert_memory(
             &conn,
@@ -335,7 +331,7 @@ pub async fn remember(text: &str, kind: &str, source: &str, owner: &str) -> Resu
             crate::tv_store::note_added(&conn, TV_STORE, id, v, &ident.model);
         }
         id
-    }; // DB lock released — persist (file I/O) must not run under it.
+    }; // pool connection returned — persist (file I/O) must not run under it.
     crate::tv_store::maybe_persist(TV_STORE);
     Ok(id)
 }
@@ -478,9 +474,8 @@ pub async fn recall_memory(
         },
         None => None,
     };
-    let arc = memory_db()?;
+    let conn = memory_db()?;
     let now = now_secs();
-    let conn = arc.lock();
     recall_hybrid_conn(
         &conn,
         query,
@@ -888,7 +883,6 @@ pub async fn remember_if_novel(
         return remember(text, kind, source, owner).await.map(Some);
     };
 
-    let arc = memory_db()?;
     let now = now_secs();
     // Dedup only against CURRENTLY-VALID facts. The old SELECT had no
     // valid-time filter, so a re-asserted fact whose near-duplicate had
@@ -896,15 +890,24 @@ pub async fn remember_if_novel(
     // dropped as a "duplicate" — but default recall hides the expired row,
     // so the now-current fact silently vanished.
     let valid = valid_time_clause(false, now);
-    // Hold ONE guard across SELECT + is_novel + insert. is_novel (cosine)
-    // and insert_memory are synchronous (no await), so this is safe and
-    // closes the TOCTOU window where two concurrent autocapture threads
-    // both passed the novelty check against the same pre-insert snapshot
-    // and both inserted. Trade-off: the cosine scan now runs under the
-    // lock, serializing concurrent novelty checks — fine while memory.db
-    // is small + autocapture is bounded; revisit if the store grows large.
+    // M1 (ADR 0041): the pool gives each caller its OWN connection, so the
+    // single global connection-mutex that used to make this check-then-insert
+    // atomic is gone. Two concurrent callers would each read their own WAL
+    // snapshot, both pass the novelty gate, and both insert a near-duplicate.
+    // Serialize ONLY this novelty-gated write critical section with a dedicated
+    // lock — reads, recall, and plain remember() stay fully parallel (the whole
+    // point of the pool). A content-hash UNIQUE guard (M3) will replace this
+    // with finer-grained concurrency. is_novel (cosine) + insert are synchronous
+    // (no await), so holding a non-async mutex across them is safe.
+    static NOVELTY_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     let inserted = {
-        let conn = arc.lock();
+        // Deadlock-avoidance invariant: acquire the lock FIRST, then the pool
+        // conn — and no code path that already holds a pool conn may block on
+        // this lock. The conn must be taken INSIDE the critical section (not
+        // before) so the SELECT's snapshot can't go stale relative to a writer
+        // that committed between conn-acquire and lock-acquire.
+        let _novel_guard = NOVELTY_WRITE_LOCK.lock();
+        let conn = memory_db()?;
         // ADR 0031: with the persistent index active, probe it for the
         // nearest candidates instead of scanning every row — the novelty
         // gate then runs EXACT cosine over just those rows' stored
@@ -980,9 +983,8 @@ pub async fn supersede(
 ) -> Result<Option<i64>> {
     let embedded = embed_via_chain(new_text).await?;
     let now = now_secs();
-    let arc = memory_db()?;
     let id = {
-        let mut conn = arc.lock();
+        let mut conn = memory_db()?;
         // Will this call actually expire an INDEXED row? Checked under the
         // same guard as the supersede itself, so it's race-free. Drives
         // the stale-count bump below (ADR 0031): only rows that carry an
@@ -1098,8 +1100,7 @@ pub(crate) fn supersede_conn(
 /// No fact is ever hard-deleted; `forget` only moves a fact into history.
 pub fn forget(id: i64, owner: &str) -> Result<bool> {
     let now = now_secs();
-    let arc = memory_db()?;
-    let conn = arc.lock();
+    let conn = memory_db()?;
     // Indexed = currently valid AND embedding-bearing — only those rows
     // ever entered the .tv, so only they count toward stale (ADR 0031).
     let was_indexed: bool = {
@@ -1181,12 +1182,11 @@ fn yaml_scalar(s: &str) -> String {
 /// `export_memory_graph` handler passes [`LOCAL_OWNER`], so the graphify
 /// corpus never carries HTTP tenants' facts.
 pub fn export_graph_corpus(dir: &Path, include_expired: bool, owner: &str) -> Result<usize> {
-    let arc = memory_db()?;
     let now = now_secs();
-    // Load all rows under the lock, then release before doing filesystem
-    // writes — same don't-hold-the-mutex-across-I/O discipline as recall.
+    // Load all rows under the pool connection, then return it before doing
+    // filesystem writes — don't hold a pool connection across I/O.
     let rows = {
-        let conn = arc.lock();
+        let conn = memory_db()?;
         load_corpus_rows(&conn, include_expired, now, owner)?
     };
     write_corpus_rows(dir, &rows)
@@ -2016,8 +2016,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
 
         // Rows carry the chain identity; embedding_stores adopted it.
         {
-            let arc = memory_db().unwrap();
-            let conn = arc.lock();
+            let conn = memory_db().unwrap();
             let models: Vec<String> = {
                 let mut stmt = conn
                     .prepare("SELECT embedding_model FROM memories ORDER BY id")

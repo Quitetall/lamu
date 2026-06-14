@@ -52,11 +52,12 @@ pub async fn cmd_memory_reembed(store: Option<String>, yes: bool) -> Result<()> 
         identity.model, identity.dims
     );
 
-    let arc = lamu_memory::store::shared_handle()?;
-    let plans = {
-        let conn = arc.lock();
-        plan(&conn, &identity, sel)?
-    };
+    // Get a pool connection for the dry-run plan query.
+    let conn = lamu_memory::store::conn()?;
+    let plans = plan(&conn, &identity, sel)?;
+    // Release the pool connection before the embed loop.
+    drop(conn);
+
     let mut total_stale = 0u64;
     for p in &plans {
         println!(
@@ -74,6 +75,12 @@ pub async fn cmd_memory_reembed(store: Option<String>, yes: bool) -> Result<()> 
         return Ok(());
     }
 
+    // reembed::run() takes &Arc<Mutex<Connection>> for its internal
+    // lock-release-lock pattern. Open a dedicated connection via the
+    // pool-initialized path (pool() has already run migrate) and wrap it.
+    let path = lamu_memory::store::lamu_db_path();
+    let raw_conn = lamu_memory::store::open_at(&path)?;
+    let arc = std::sync::Arc::new(parking_lot::Mutex::new(raw_conn));
     let reports = run(&arc, embedder.as_ref(), sel, REEMBED_BATCH).await?;
     for r in &reports {
         println!("  {:<9} re-embedded {} row(s)", r.store, r.reembedded);

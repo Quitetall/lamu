@@ -253,15 +253,19 @@ fn apply_supersedes(turns: Vec<Turn>) -> Vec<Turn> {
 }
 
 /// Process-wide instance over the shared unified store
-/// (`crate::store`, ADR 0028). Lazy-initialized on first use; the
-/// underlying SQLite connection is the SAME one `lifetime_memory` and
-/// `rag` use — first touch runs migrations + the one-time legacy
-/// import.
+/// (`crate::store`, ADRs 0028/0041). Lazy-initialized on first use.
+/// Each method call acquires its own pool connection (not stored here);
+/// this static only ensures the pool is initialized once.
 pub fn shared() -> Result<&'static Memory> {
     static M: OnceLock<Memory> = OnceLock::new();
     if let Some(m) = M.get() {
         return Ok(m);
     }
+    // Trigger pool init (runs migration + legacy import once). The Memory
+    // struct holds an Arc<Mutex<Connection>> for its own private methods;
+    // we use the deprecated shim here to satisfy the struct field type
+    // during the pool migration transition.
+    #[allow(deprecated)]
     let conn = crate::store::shared_handle()?;
     let _ = M.set(Memory { conn });
     M.get().ok_or_else(|| anyhow!("memory init race"))

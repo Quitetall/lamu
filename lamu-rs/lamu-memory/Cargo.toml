@@ -21,6 +21,10 @@ parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 dirs = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+# r2d2_sqlite 0.25 re-exports rusqlite 0.32, matching the workspace pin.
+# Verified: https://crates.io/crates/r2d2_sqlite/versions (0.24→0.31, 0.25→0.32, 0.26→0.33)
+r2d2_sqlite = "0.25"
 blake3 = "1"
 # OPT-IN compressed vector index backend. Off by default — the default
 # build never pulls this dep (verify: `cargo tree -p lamu-memory` lists no

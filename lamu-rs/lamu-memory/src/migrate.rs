@@ -57,6 +57,11 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "causal event hypergraph (events, hyperedges, hyperedge_members)",
         up: m003_causal_graph,
     },
+    Migration {
+        version: 4,
+        name: "embedding_model partial index",
+        up: m004_embedding_model_index,
+    },
 ];
 
 fn now_secs() -> i64 {
@@ -307,6 +312,22 @@ CREATE INDEX idx_members_edge   ON hyperedge_members(hyperedge_id);
     )
 }
 
+// ── Migration 004 — embedding_model partial index ───────────────────
+
+/// Partial index on `memories(embedding_model, valid_until)` where an
+/// embedding is present. The model-filtered vector leg in recall
+/// (`WHERE embedding IS NOT NULL AND embedding_model = ?`) and the
+/// novelty probe both benefit: only embedded rows enter the index, so
+/// the scan is proportional to the embedded subset, not the whole table.
+fn m004_embedding_model_index(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_model_valid \
+         ON memories(embedding_model, valid_until) \
+         WHERE embedding IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +374,8 @@ mod tests {
             "idx_members_cause",
             "idx_members_effect",
             "idx_members_edge",
+            // m004 — embedding_model partial index
+            "idx_memories_model_valid",
         ] {
             assert!(names.contains(t), "missing schema object: {t}");
         }

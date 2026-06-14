@@ -24,12 +24,10 @@
 //! the index hits 10K+ rows.
 
 use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use crate::vector_index::{vector_backend, BruteForceCosine, Scored, VectorBackend, VectorIndex};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 
 /// The pre-ADR-0030 hardcoded model — every legacy row was embedded
 /// with it, so the one-time import (store.rs) backfills
@@ -77,10 +75,10 @@ pub struct SearchHit {
 // ── Index DB handle ────────────────────────────────────────────────
 
 /// The chunk index's connection — a thin delegate to the unified
-/// `lamu.db` singleton (`crate::store`, ADR 0028). Kept under its
+/// `lamu.db` pool (`crate::store`, ADRs 0028/0041). Kept under its
 /// historical name so the call sites below read unchanged.
-fn index_db() -> Result<Arc<Mutex<Connection>>> {
-    crate::store::shared_handle()
+fn index_db() -> Result<crate::store::PooledConn> {
+    crate::store::conn()
 }
 
 // ── Ripgrep mode ───────────────────────────────────────────────────
@@ -170,13 +168,12 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
         )
     })?;
     let files = git_ls_files(repo)?;
-    let arc = index_db()?;
 
     // Collect (path, chunk_idx, content, mtime) tuples that need
-    // embedding. We embed in batch outside the lock.
+    // embedding. We embed in batch with the connection released.
     let mut to_embed: Vec<(String, usize, String, i64)> = Vec::new();
     {
-        let conn = arc.lock();
+        let conn = index_db()?;
         for path in &files {
             let abs = repo.join(path);
             if !abs.is_file() {
@@ -243,7 +240,7 @@ pub async fn index_repo(repo: &Path, force: bool) -> Result<usize> {
     // await on embed_batch above; a transient embed failure (429/timeout/
     // network) then committed the deletes with no inserts, silently
     // dropping the path's chunks until a later successful re-index (#7).
-    let mut conn = arc.lock();
+    let mut conn = index_db()?;
     let tx = conn.transaction()?;
     let mut cleared: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // Rows replaced by this re-index are STALE in the persistent .tv
@@ -338,9 +335,8 @@ pub async fn semantic_search(query: &str, k: usize) -> Result<Vec<SearchHit>> {
         .pop()
         .ok_or_else(|| anyhow!("embedder returned no vector for the query"))?;
     let model = embedder.identity().model;
-    let arc = index_db()?;
     let hits = {
-        let conn = arc.lock();
+        let conn = index_db()?;
         // ADR 0031: persistent index first — raw over-fetched candidates,
         // hydrated + model-filtered by rowid below. `None` (persistent
         // path inactive / dims not %8 / error) → the per-query scan.
