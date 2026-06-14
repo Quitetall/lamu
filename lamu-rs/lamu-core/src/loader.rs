@@ -34,7 +34,12 @@ use crate::{Error, Result};
 /// rather than over-committing.
 const EVICT_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
-fn spawn_gate() -> &'static AsyncMutex<()> {
+/// Process-global mutex that serializes all backend spawn / evict sequences.
+/// HTTP `ensure_loaded_with` acquires this before any spawn work; MCP
+/// `handle_load_model` MUST also acquire it so the two surfaces are mutually
+/// exclusive. The returned reference is `'static` — safe to hold across
+/// `.await` points.
+pub fn spawn_gate() -> &'static AsyncMutex<()> {
     static GATE: OnceLock<AsyncMutex<()>> = OnceLock::new();
     GATE.get_or_init(|| AsyncMutex::new(()))
 }
@@ -248,7 +253,7 @@ where
     // Re-plan + reserve under the lock. After eviction the load must now fit;
     // if a concurrent load raced in and took the freed room, surface it as
     // VramExhausted rather than spawning into an over-committed device.
-    let port = {
+    let (port, load_gen) = {
         let mut sched = scheduler.lock();
         let (can, evict) = sched.plan_load(&entry);
         if !can || !evict.is_empty() {
@@ -262,8 +267,8 @@ where
                 "no free backend port available (all candidate ports 8000-8009 occupied)".into(),
             ));
         };
-        sched.mark_loading(entry.clone());
-        port
+        let slot_gen = sched.mark_loading(entry.clone());
+        (port, slot_gen)
     };
 
     // Cold load: holds the process-global single-flight gate for the
@@ -283,8 +288,12 @@ where
     // eviction (it's never evictable while Loading). The guard rolls that
     // back on Drop (cancel OR error) and is disarmed only after a successful
     // confirm_loaded.
+    //
+    // slot_gen-safe: uses mark_unloaded_gen so a concurrent re-load
+    // (slot_gen higher) is not clobbered by this guard's Drop.
     struct LoadRollback<'a> {
         name: String,
+        slot_gen: u64,
         scheduler: &'a Arc<Mutex<VramScheduler>>,
         health: &'a Arc<Mutex<HealthRegistry>>,
         armed: bool,
@@ -292,13 +301,14 @@ where
     impl Drop for LoadRollback<'_> {
         fn drop(&mut self) {
             if self.armed {
-                self.scheduler.lock().mark_unloaded(&self.name);
+                self.scheduler.lock().mark_unloaded_gen(&self.name, self.slot_gen);
                 HealthRegistry::drop(&mut self.health.lock(), &self.name);
             }
         }
     }
     let mut rollback = LoadRollback {
         name: entry.name.clone(),
+        slot_gen: load_gen,
         scheduler,
         health,
         armed: true,
@@ -306,8 +316,8 @@ where
 
     let (_backend, pid) = match spawn(entry.clone(), port).await {
         Ok(pair) => pair,
-        // The guard's Drop performs the mark_unloaded + health cleanup on this
-        // early return, so no manual rollback here.
+        // The guard's Drop performs the mark_unloaded_gen + health cleanup on
+        // this early return, so no manual rollback here.
         Err(e) => return Err(e),
     };
 
@@ -321,7 +331,10 @@ where
     };
     let lm = {
         let mut sched = scheduler.lock();
-        let _ = sched.confirm_loaded(&entry.name, pid, port, vram);
+        // If confirm fails (slot_gen mismatch = slot superseded), get_loaded
+        // returns None; the error propagates and the spawned server is torn
+        // down by rollback.armed remaining true via Err return below.
+        let _ = sched.confirm_loaded(&entry.name, load_gen, pid, port, vram);
         sched.get_loaded(&entry.name)
             .cloned()
             .ok_or_else(|| Error::ModelNotFound(entry.name.clone()))?

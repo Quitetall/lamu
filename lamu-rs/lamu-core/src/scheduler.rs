@@ -42,13 +42,17 @@ impl DeviceBudget {
 pub struct VramScheduler {
     devices: Vec<DeviceBudget>,
     nvml: Option<Nvml>,
+    /// Monotone counter: incremented at every `mark_loading` and
+    /// `register_loaded`. Self-cleanup paths carry their gen from the moment
+    /// they reserved the slot; a stale gen means a newer entry won supersede.
+    next_gen: u64,
 }
 
 impl VramScheduler {
     pub fn new() -> Self {
         let nvml = Nvml::init().ok();
         let devices = Self::enumerate_devices(nvml.as_ref());
-        Self { devices, nvml }
+        Self { devices, nvml, next_gen: 0 }
     }
 
     /// Which NVML indices to manage: `LAMU_GPU_INDEX` pins exactly one;
@@ -288,6 +292,8 @@ impl VramScheduler {
         for d in &mut self.devices {
             d.loaded.remove(&name);
         }
+        let generation = self.next_gen;
+        self.next_gen += 1;
         let booted_ctx = crate::backends::llamacpp::effective_ctx_size(entry.context_max);
         let model = LoadedModel {
             entry,
@@ -298,6 +304,7 @@ impl VramScheduler {
             last_used: Instant::now(),
             device: DevicePlacement::Single(nvml_index),
             booted_ctx,
+            generation,
         };
         self.devices[dev].loaded.insert(name.clone(), model);
         self.devices[dev].loaded.get(&name).expect("just inserted")
@@ -420,7 +427,12 @@ impl VramScheduler {
         }
     }
 
-    pub fn mark_loading(&mut self, entry: ModelEntry) {
+    /// Reserve a slot for a model that is about to be spawned.
+    /// Returns the generation token for this reservation; callers MUST thread
+    /// this gen through `confirm_loaded` and through any self-cleanup
+    /// (`mark_unloaded_gen`) so a stale cleanup from a prior attempt can't
+    /// clobber a newer entry.
+    pub fn mark_loading(&mut self, entry: ModelEntry) -> u64 {
         self.ensure_one_device();
         let dev = self.placement_for(entry.vram_mb).min(self.devices.len() - 1);
         let nvml_index = self.devices[dev].index;
@@ -428,6 +440,8 @@ impl VramScheduler {
         for d in &mut self.devices {
             d.loaded.remove(&entry.name);
         }
+        let generation = self.next_gen;
+        self.next_gen += 1;
         let booted_ctx = crate::backends::llamacpp::effective_ctx_size(entry.context_max);
         let model = LoadedModel {
             entry: entry.clone(),
@@ -438,11 +452,19 @@ impl VramScheduler {
             last_used: Instant::now(),
             device: DevicePlacement::Single(nvml_index),
             booted_ctx,
+            generation,
         };
         self.devices[dev].loaded.insert(entry.name, model);
+        generation
     }
 
-    pub fn confirm_loaded(&mut self, name: &str, pid: u32, port: u16, vram_actual_mb: u32) -> Result<()> {
+    /// Transition a `Loading` entry to `Loaded`.
+    ///
+    /// `slot_gen` must match the generation token returned by the `mark_loading`
+    /// call that reserved this slot. A mismatch means the slot has been
+    /// superseded by a newer load (or removed entirely) — the caller's spawned
+    /// server must be torn down rather than adopted.
+    pub fn confirm_loaded(&mut self, name: &str, slot_gen: u64, pid: u32, port: u16, vram_actual_mb: u32) -> Result<()> {
         let dev = self
             .device_holding(name)
             .ok_or_else(|| Error::ModelNotFound(name.to_string()))?;
@@ -450,12 +472,34 @@ impl VramScheduler {
             .loaded
             .get_mut(name)
             .ok_or_else(|| Error::ModelNotFound(name.to_string()))?;
+        if m.generation != slot_gen {
+            // A newer generation already owns this slot — stale confirm must
+            // not adopt it. Return ModelNotFound so callers tear down the
+            // orphaned server and leave the newer entry intact.
+            return Err(Error::ModelNotFound(name.to_string()));
+        }
         m.state = ModelState::Loaded;
         m.pid = Some(pid);
         m.port = port;
         m.vram_actual_mb = vram_actual_mb;
         m.last_used = Instant::now();
         Ok(())
+    }
+
+    /// Remove the entry for `name` ONLY if its current generation matches
+    /// `slot_gen`. Use this for self-cleanup paths (rollback guards, teardown
+    /// on error) so a stale cleanup from a prior attempt can't clobber a newer
+    /// reservation. Unconditional cleanup (operator unload, reconcile) should
+    /// still call `mark_unloaded`.
+    pub fn mark_unloaded_gen(&mut self, name: &str, slot_gen: u64) {
+        // Find which device (if any) holds this name with the matching generation.
+        let dev = self.devices.iter().position(|d| {
+            d.loaded.get(name).map_or(false, |m| m.generation == slot_gen)
+        });
+        if let Some(dev) = dev {
+            self.devices[dev].loaded.remove(name);
+        }
+        // If no device holds name with slot_gen (either gone or superseded), no-op.
     }
 }
 
@@ -481,6 +525,7 @@ impl VramScheduler {
     /// unit tests on a single-GPU (or no-GPU) box.
     pub fn set_devices_for_tests(&mut self, specs: &[(u32, &str)]) {
         self.nvml = None;
+        self.next_gen = 0;
         self.devices = specs
             .iter()
             .enumerate()

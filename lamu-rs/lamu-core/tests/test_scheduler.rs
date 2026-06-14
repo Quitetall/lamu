@@ -171,11 +171,11 @@ fn mark_loading_records_placement_before_confirm() {
     let mut s = VramScheduler::new();
     s.set_devices_for_tests(&[(24000, "a"), (48000, "b")]);
     let e = mk_entry("pending", 12000, Modality::Llm);
-    s.mark_loading(e.clone());
+    let slot_gen = s.mark_loading(e.clone());
     // placement is fixed at mark_loading time (loader reads it pre-spawn).
     assert_eq!(s.placement_of("pending"), Some(DevicePlacement::Single(1)));
     // confirm_loaded must NOT move the placement.
-    s.confirm_loaded("pending", 4242, 8001, 12000).unwrap();
+    s.confirm_loaded("pending", slot_gen, 4242, 8001, 12000).unwrap();
     assert_eq!(
         s.placement_of("pending"),
         Some(DevicePlacement::Single(1)),
@@ -187,6 +187,147 @@ fn mark_loading_records_placement_before_confirm() {
 fn placement_of_absent_is_none() {
     let s = VramScheduler::new();
     assert!(s.placement_of("never-loaded").is_none());
+}
+
+// ── Generation-token tests (ADR 0040) ─────────────────────────────────────
+
+/// mark_loading returns strictly increasing generation tokens.
+#[test]
+fn mark_loading_returns_strictly_increasing_gens() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let a = mk_entry("alpha", 1000, Modality::Llm);
+    let b = mk_entry("beta", 1000, Modality::Llm);
+    let g1 = s.mark_loading(a.clone());
+    s.mark_unloaded("alpha");
+    let g2 = s.mark_loading(b.clone());
+    s.mark_unloaded("beta");
+    let g3 = s.mark_loading(a.clone());
+    assert!(g1 < g2, "second mark_loading must get a higher gen than the first");
+    assert!(g2 < g3, "third mark_loading must get a higher gen than the second");
+}
+
+/// confirm_loaded with the correct generation succeeds and transitions to Loaded.
+#[test]
+fn confirm_loaded_correct_gen_succeeds() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let e = mk_entry("model", 1000, Modality::Llm);
+    let slot_gen = s.mark_loading(e);
+    assert!(
+        s.confirm_loaded("model", slot_gen, 1234, 8001, 1000).is_ok(),
+        "confirm with current gen must succeed"
+    );
+    let m = s.get_loaded("model").expect("entry must still exist after confirm");
+    assert_eq!(m.state, lamu_core::types::ModelState::Loaded, "state must be Loaded");
+}
+
+/// confirm_loaded with a STALE generation returns Err; the entry (newer gen) survives.
+#[test]
+fn confirm_loaded_stale_gen_returns_err_entry_untouched() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let e = mk_entry("model", 1000, Modality::Llm);
+    let stale_gen = s.mark_loading(e.clone());
+    // Supersede the first reservation with a second mark_loading.
+    let current_gen = s.mark_loading(e);
+
+    // Stale confirm must fail.
+    let result = s.confirm_loaded("model", stale_gen, 1, 8001, 1000);
+    assert!(result.is_err(), "stale gen confirm must return Err");
+
+    // The entry must still exist and still be Loading (the new gen).
+    let m = s.get_loaded("model").expect("entry must survive stale confirm");
+    assert_eq!(m.state, lamu_core::types::ModelState::Loading, "entry must still be Loading");
+    assert_eq!(m.generation, current_gen, "entry must hold the newer generation");
+}
+
+/// mark_unloaded_gen with a stale gen is a no-op; newer entry survives.
+#[test]
+fn mark_unloaded_gen_stale_is_noop() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let e = mk_entry("model", 1000, Modality::Llm);
+    let stale_gen = s.mark_loading(e.clone());
+    let current_gen = s.mark_loading(e); // supersedes stale
+
+    // Stale gen-gated removal: must NOT remove the newer entry.
+    s.mark_unloaded_gen("model", stale_gen);
+    assert!(
+        s.get_loaded("model").is_some(),
+        "stale mark_unloaded_gen must leave the newer entry intact"
+    );
+    assert_eq!(
+        s.get_loaded("model").unwrap().generation,
+        current_gen,
+        "entry must still hold the current generation after stale cleanup"
+    );
+}
+
+/// mark_unloaded_gen with the current gen removes the entry.
+#[test]
+fn mark_unloaded_gen_current_removes_entry() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let e = mk_entry("model", 1000, Modality::Llm);
+    let slot_gen = s.mark_loading(e);
+
+    s.mark_unloaded_gen("model", slot_gen);
+    assert!(
+        s.get_loaded("model").is_none(),
+        "current-gen mark_unloaded_gen must remove the entry"
+    );
+}
+
+/// Unconditional mark_unloaded still removes regardless of generation (operator path).
+#[test]
+fn mark_unloaded_unconditional_removes() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let e = mk_entry("model", 1000, Modality::Llm);
+    let _slot_gen = s.mark_loading(e);
+
+    s.mark_unloaded("model");
+    assert!(
+        s.get_loaded("model").is_none(),
+        "unconditional mark_unloaded must always remove the entry"
+    );
+}
+
+/// Full race regression: gen-1 load drains → gen-2 load starts →
+/// stale gen-1 mark_unloaded_gen and confirm_loaded are both no-ops.
+#[test]
+fn race_regression_stale_gen1_cannot_clobber_gen2() {
+    let mut s = VramScheduler::new();
+    s.set_total_mb_for_tests(48000);
+    let e = mk_entry("racemodel", 2000, Modality::Llm);
+
+    // Gen-1: start a load.
+    let gen1 = s.mark_loading(e.clone());
+
+    // Simulate mid-spawn drain (e.g. eviction scan removes the slot).
+    s.mark_unloaded("racemodel");
+    assert!(s.get_loaded("racemodel").is_none(), "after drain, model must not be loaded");
+
+    // Gen-2: a fresh load starts (e.g. user retries).
+    let gen2 = s.mark_loading(e);
+    assert!(gen2 > gen1, "gen2 must be strictly greater than gen1");
+
+    // Gen-1's stale self-cleanup fires: must be a NO-OP.
+    s.mark_unloaded_gen("racemodel", gen1);
+    assert!(
+        s.get_loaded("racemodel").is_some(),
+        "stale gen-1 mark_unloaded_gen must not clobber gen-2 entry"
+    );
+
+    // Gen-1's stale confirm fires: must return Err and not transition gen-2.
+    let result = s.confirm_loaded("racemodel", gen1, 99, 8099, 2000);
+    assert!(result.is_err(), "stale gen-1 confirm must return Err");
+
+    // Gen-2 entry is intact and still Loading.
+    let m = s.get_loaded("racemodel").expect("gen-2 entry must survive");
+    assert_eq!(m.state, lamu_core::types::ModelState::Loading, "gen-2 must still be Loading");
+    assert_eq!(m.generation, gen2, "gen-2 entry must hold gen2 token");
 }
 
 #[test]

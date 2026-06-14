@@ -367,6 +367,19 @@ impl LamuMcpServer {
             return "error: routing mode is 'cloud-only' — load_model refused (would re-allocate the VRAM you freed). Call set_routing_mode(mode='auto') first.".into();
         }
 
+        // Serialize MCP load through the same process-global spawn gate that
+        // HTTP ensure_loaded_with uses. This makes MCP and HTTP load paths
+        // mutually exclusive: only one backend spawn/evict sequence runs at a
+        // time, eliminating the cross-surface race where a concurrent HTTP and
+        // MCP load could both plan against the same VRAM budget.
+        let _gate = lamu_core::loader::spawn_gate().lock().await;
+
+        // Re-check loaded state UNDER the gate: a concurrent load may have
+        // beaten us while we waited for the gate.
+        if self.state.lock().scheduler.is_loaded(&name) {
+            return format!("Model '{}' already loaded.", name);
+        }
+
         // Atomic plan-and-reserve: hold the state lock across (a) entry
         // lookup, (b) plan_load, (c) mark_loading. Without this,
         // concurrent load_model calls could both pass the is_loaded check
@@ -374,7 +387,7 @@ impl LamuMcpServer {
         // Also pick a name-resolution mode: exact match wins; otherwise
         // require unique substring match. Ambiguous matches return an
         // error rather than silently picking one.
-        let (entry, to_evict, evict_targets) = {
+        let (entry, to_evict, evict_targets, reserve_gen) = {
             let mut st = self.state.lock();
 
             // 1. Resolve name: exact > unique-substring > error.
@@ -414,8 +427,8 @@ impl LamuMcpServer {
             // Reserve the incoming model's slot now (atomic plan-and-reserve so
             // no concurrent caller picks up the same plan), but only CAPTURE the
             // eviction targets — clone their handles, do NOT remove them or
-            // mark_unloaded yet. Each evictee's state is flipped only after its
-            // kill is VERIFIED below, so a failed eviction can never leave the
+            // mark_unloaded_gen yet. Each evictee's state is flipped only after
+            // its kill is VERIFIED below, so a failed eviction can never leave the
             // scheduler believing freed VRAM while a backend still lives. The
             // incoming entry is Loading meanwhile, which correctly blocks any
             // concurrent load during the eviction window.
@@ -427,10 +440,17 @@ impl LamuMcpServer {
                     .unwrap_or((None, 0));
                 evict_targets.push((evict_name.clone(), handle, pid, port));
             }
-            st.scheduler.mark_loading(entry.clone());
+            // Capture slot_gen from first mark_loading (eviction-window reservation).
+            // A second mark_loading below (placement step) will supersede it and
+            // produce the authoritative slot_gen used by confirm and teardown.
+            let slot_gen = st.scheduler.mark_loading(entry.clone());
 
-            (entry, evict, evict_targets)
+            (entry, evict, evict_targets, slot_gen)
         };
+        // reserve_gen is the gen from the first mark_loading above. It will be
+        // replaced by load_gen from the second mark_loading (placement step).
+        // Self-cleanup between here and the placement step uses reserve_gen.
+        let mut active_gen = reserve_gen;
 
         // VERIFIED eviction, outside the state lock. Route through
         // Backend::unload (per-impl cleanup + group-kill + port-released check)
@@ -438,6 +458,7 @@ impl LamuMcpServer {
         // mark_unloaded only AFTER a confirmed kill. If any eviction can't be
         // confirmed, ABORT the load — un-reserve the incoming model and return
         // an error — rather than spawn onto VRAM we failed to reclaim.
+        // Eviction of OTHER models uses unconditional mark_unloaded (not gen-gated).
         for (evict_name, handle, pid, port) in &evict_targets {
             let killed: std::result::Result<(), String> = if let Some(backend_arc) = handle {
                 let mut backend = backend_arc.lock().await;
@@ -462,13 +483,12 @@ impl LamuMcpServer {
                 Ok(()) => {
                     let mut st = self.state.lock();
                     st.backends.remove(evict_name);
-                    st.scheduler.mark_unloaded(evict_name);
+                    st.scheduler.mark_unloaded(evict_name); // unconditional: evicting OTHER model
                     st.health.drop(evict_name);
                 }
                 Err(reason) => {
-                    // Roll back the reservation so the failed load doesn't leave
-                    // the incoming model stuck Loading.
-                    self.state.lock().scheduler.mark_unloaded(&entry.name);
+                    // Roll back the reservation (self-cleanup → gen-gated).
+                    self.state.lock().scheduler.mark_unloaded_gen(&entry.name, active_gen);
                     warn!("load_model: evict({}) failed: {}", evict_name, reason);
                     return format!(
                         "error: cannot load '{}' — failed to evict '{}' ({}); it may still hold VRAM. Retry, or unload it explicitly.",
@@ -493,9 +513,11 @@ impl LamuMcpServer {
             lamu_core::loader::pick_backend_port(&st.scheduler, Some(lamu_core::config::PORT_MAIN))
         }
         // m10: refuse rather than spawn onto an occupied port when all candidate
-        // ports are taken. (This precedes mark_loading, so nothing to roll back.)
+        // ports are taken.
         .unwrap_or(0);
         if port == 0 {
+            // Self-cleanup: no port = can't spawn; roll back gen-safely.
+            self.state.lock().scheduler.mark_unloaded_gen(&entry.name, active_gen);
             return "error: no free backend port available (8001-8009 all occupied; 8020 reserved for `lamu serve`)".to_string();
         }
 
@@ -506,23 +528,30 @@ impl LamuMcpServer {
         let mut backend: Box<dyn Backend> = match make_backend(&entry) {
             Ok(b) => b,
             Err(e) => {
-                let mut st = self.state.lock();
-                st.scheduler.mark_unloaded(&entry.name);
+                // Self-cleanup: gen-gated.
+                self.state.lock().scheduler.mark_unloaded_gen(&entry.name, active_gen);
                 return format!("error: make_backend: {}", e);
             }
         };
-        let placement = {
+        // Second mark_loading: re-reserves with placement. This is the
+        // authoritative reservation — its slot_gen supersedes reserve_gen and is
+        // the one that confirm_loaded and all teardown paths below must use.
+        let load_gen = {
             let mut st = self.state.lock();
-            st.scheduler.mark_loading(entry.clone());
-            st.scheduler.placement_of(&entry.name).unwrap_or_default()
+            let slot_gen = st.scheduler.mark_loading(entry.clone());
+            let placement = st.scheduler.placement_of(&entry.name).unwrap_or_default();
+            backend.set_device(placement);
+            slot_gen
         };
-        backend.set_device(placement);
+        // Update active_gen: all self-cleanup paths from here on use load_gen.
+        active_gen = load_gen;
 
         let pid = match backend.load(&entry, port).await {
             Ok(pid) => pid,
             Err(e) => {
+                // Self-cleanup: gen-gated on load_gen.
                 let mut st = self.state.lock();
-                st.scheduler.mark_unloaded(&entry.name);
+                st.scheduler.mark_unloaded_gen(&entry.name, active_gen);
                 st.health.drop(&entry.name);
                 return format!("error: load failed: {}", e);
             }
@@ -543,8 +572,9 @@ impl LamuMcpServer {
                 Ok(Err(e)) => warn!("load_model: cloud-only teardown unload('{}') errored: {}", entry.name, e),
                 Err(_) => warn!("load_model: cloud-only teardown unload('{}') timed out — process may survive", entry.name),
             }
+            // Self-cleanup: gen-gated on active_gen (= load_gen at this point).
             let mut st = self.state.lock();
-            st.scheduler.mark_unloaded(&entry.name);
+            st.scheduler.mark_unloaded_gen(&entry.name, active_gen);
             st.health.drop(&entry.name);
             return format!(
                 "error: cannot load '{}' — routing flipped to cloud-only during the load; the spawned server was torn back down",
@@ -556,7 +586,8 @@ impl LamuMcpServer {
         // insert ATOMICALLY (one lock) so a query can't observe loaded-without-
         // a-backend. confirm_loaded fails IFF the entry was concurrently
         // mark_unloaded (an eviction or a cloud-only drain that raced our
-        // mark_loading) — then DON'T insert; hand the backend back to be torn
+        // mark_loading), OR if active_gen doesn't match (a newer reservation
+        // superseded ours) — then DON'T insert; hand the backend back to be torn
         // down, so a confirm-failure can't orphan a live server holding the
         // VRAM the scheduler now believes is free. (Was `let _ = confirm_loaded`
         // + unconditional insert → exactly that orphan.)
@@ -567,7 +598,7 @@ impl LamuMcpServer {
         };
         let orphan: Option<Box<dyn Backend>> = {
             let mut st = self.state.lock();
-            if st.scheduler.confirm_loaded(&entry.name, pid, port, vram).is_ok() {
+            if st.scheduler.confirm_loaded(&entry.name, active_gen, pid, port, vram).is_ok() {
                 st.backends.insert(entry.name.clone(), Arc::new(AsyncMutex::new(backend)));
                 st.health.get_or_create(&entry.name).record_success();
                 None
@@ -581,8 +612,10 @@ impl LamuMcpServer {
                 Ok(Err(e)) => warn!("load_model: orphan teardown unload('{}') errored: {}", entry.name, e),
                 Err(_) => warn!("load_model: orphan teardown unload('{}') timed out — process may survive", entry.name),
             }
+            // Self-cleanup: gen-gated — don't clobber a newer entry that may
+            // have already committed.
             let mut st = self.state.lock();
-            st.scheduler.mark_unloaded(&entry.name);
+            st.scheduler.mark_unloaded_gen(&entry.name, active_gen);
             st.health.drop(&entry.name);
             return format!(
                 "error: '{}' was concurrently evicted (e.g. set_routing_mode cloud-only) during the load; the spawned server was torn back down",

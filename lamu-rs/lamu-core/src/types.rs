@@ -452,6 +452,11 @@ pub struct LoadedModel {
     /// re-deriving from `LAMU_DEFAULT_CTX` per request, so it can't drift if
     /// the env changes after spawn.
     pub booted_ctx: u32,
+    /// Monotone generation counter assigned at `mark_loading` (and
+    /// `register_loaded`). Stale self-cleanup code carries its gen from the
+    /// moment it reserved the slot; if the slot has been superseded by a newer
+    /// load, the gen won't match and cleanup is a no-op.
+    pub generation: u64,
 }
 
 /// Result of router's model selection. Used by plan_query dry-run.
