@@ -85,6 +85,7 @@ grep -l 'Supersedes 0005' decisions/
 | [0038](./0038-a2a-agent-surface.md) | A2A (Agent2Agent) agent surface (`lamu a2a`) — sixth serving surface, inter-agent fabric | Accepted |
 | [0039](./0039-causal-event-hypergraph.md) | Causal event hypergraph (graph-lite world-model v1) — events/hyperedges in lamu.db, BLAKE3 `b3:` CAS, MCP tools | Accepted |
 | [0040](./0040-race-safe-load-lifecycle.md) | Race-safe load lifecycle — one spawn gate across surfaces + generation-guarded self-cleanup | Accepted |
+| [0041](./0041-memory-connection-pool.md) | Memory storage on a WAL connection pool (M1) — parallel reads, novelty write-lock | Accepted |
 
 The newest ADR is the most authoritative for a given topic; check
 `Status: Superseded by NNNN` on older entries.
