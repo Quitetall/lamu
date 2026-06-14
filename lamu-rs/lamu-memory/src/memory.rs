@@ -29,6 +29,14 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
+// Source of the DB connection for a Memory handle.
+// - Pool: shared() path — each method call acquires a fresh pooled conn.
+// - Explicit: open(path) path — holds its own private conn for tests.
+enum Source {
+    Pool,
+    Explicit(Arc<Mutex<Connection>>),
+}
+
 /// `conversation_id` allowlist. Matches `validate_session_id` in
 /// `lamu_core::sandbox::journal` — the same threat (caller-controlled
 /// string used to key persistent state) deserves the same defense.
@@ -67,10 +75,11 @@ pub struct Turn {
     pub metadata: Option<String>,
 }
 
-/// Conversation-memory handle. Wraps one SQLite connection; methods
-/// take `&self` so the handle can be shared via Arc.
+/// Conversation-memory handle. On the `shared()` path each method call
+/// acquires a fresh pooled connection (ADR 0041 pool migration — Item 4).
+/// On the `open(path)` path (tests, explicit DBs) it holds a private conn.
 pub struct Memory {
-    conn: Arc<Mutex<Connection>>,
+    source: Source,
 }
 
 impl Memory {
@@ -83,8 +92,46 @@ impl Memory {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = crate::store::open_at(path)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            source: Source::Explicit(Arc::new(Mutex::new(conn))),
         })
+    }
+
+    /// Execute `f` with a `&Connection`. On the pool path this acquires a
+    /// fresh pooled connection per call; on the explicit path it locks the
+    /// private connection.
+    fn with_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        match &self.source {
+            Source::Pool => {
+                let conn = crate::store::conn()?;
+                f(&conn)
+            }
+            Source::Explicit(arc) => {
+                let guard = arc.lock();
+                f(&guard)
+            }
+        }
+    }
+
+    /// Execute `f` with a `&mut Connection`. On the pool path the pooled
+    /// connection is temporarily borrowed mutably; on the explicit path the
+    /// private connection is locked and unwrapped.
+    fn with_conn_mut<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T>,
+    {
+        match &self.source {
+            Source::Pool => {
+                let mut conn = crate::store::conn()?;
+                f(&mut conn)
+            }
+            Source::Explicit(arc) => {
+                let mut guard = arc.lock();
+                f(&mut guard)
+            }
+        }
     }
 
     /// Append many turns under one transaction. Cheaper than calling
@@ -99,27 +146,28 @@ impl Memory {
         if turns.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        let ts = now_secs() as i64;
-        tx.execute(
-            "INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
-            params![conversation_id, ts],
-        )?;
-        let mut next_idx: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(idx), -1) + 1 FROM turns WHERE conversation_id = ?",
-            params![conversation_id],
-            |r| r.get(0),
-        )?;
-        for (role, content, metadata) in turns {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let ts = now_secs() as i64;
             tx.execute(
-                "INSERT INTO turns (conversation_id, idx, role, content, ts, metadata) VALUES (?, ?, ?, ?, ?, ?)",
-                params![conversation_id, next_idx, role, content, ts, metadata],
+                "INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
+                params![conversation_id, ts],
             )?;
-            next_idx += 1;
-        }
-        tx.commit()?;
-        Ok(())
+            let mut next_idx: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(idx), -1) + 1 FROM turns WHERE conversation_id = ?",
+                params![conversation_id],
+                |r| r.get(0),
+            )?;
+            for (role, content, metadata) in turns {
+                tx.execute(
+                    "INSERT INTO turns (conversation_id, idx, role, content, ts, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![conversation_id, next_idx, role, content, ts, metadata],
+                )?;
+                next_idx += 1;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Append one turn. Creates the conversation row on first use.
@@ -131,22 +179,23 @@ impl Memory {
         metadata: Option<&str>,
     ) -> Result<()> {
         validate_conversation_id(conversation_id)?;
-        let conn = self.conn.lock();
-        let ts = now_secs() as i64;
-        conn.execute(
-            "INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
-            params![conversation_id, ts],
-        )?;
-        let next_idx: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(idx), -1) + 1 FROM turns WHERE conversation_id = ?",
-            params![conversation_id],
-            |r| r.get(0),
-        )?;
-        conn.execute(
-            "INSERT INTO turns (conversation_id, idx, role, content, ts, metadata) VALUES (?, ?, ?, ?, ?, ?)",
-            params![conversation_id, next_idx, role, content, ts, metadata],
-        )?;
-        Ok(())
+        self.with_conn(|conn| {
+            let ts = now_secs() as i64;
+            conn.execute(
+                "INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
+                params![conversation_id, ts],
+            )?;
+            let next_idx: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(idx), -1) + 1 FROM turns WHERE conversation_id = ?",
+                params![conversation_id],
+                |r| r.get(0),
+            )?;
+            conn.execute(
+                "INSERT INTO turns (conversation_id, idx, role, content, ts, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                params![conversation_id, next_idx, role, content, ts, metadata],
+            )?;
+            Ok(())
+        })
     }
 
     /// Pull every turn whose `ts >= cutoff_unix_secs`, grouped under
@@ -160,62 +209,64 @@ impl Memory {
     /// the future `train_from_conversations` MCP tool dry-run.
     /// O(N) in returned rows; cap on the caller's side if needed.
     pub fn recall_since(&self, cutoff_unix_secs: i64) -> Result<Vec<(String, Turn)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT conversation_id, idx, role, content, ts, metadata \
-             FROM turns WHERE ts >= ? ORDER BY conversation_id, idx ASC",
-        )?;
-        let rows = stmt.query_map(params![cutoff_unix_secs], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                Turn {
-                    idx: r.get(1)?,
-                    role: r.get(2)?,
-                    content: r.get(3)?,
-                    ts: r.get(4)?,
-                    metadata: r.get(5)?,
-                },
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT conversation_id, idx, role, content, ts, metadata \
+                 FROM turns WHERE ts >= ? ORDER BY conversation_id, idx ASC",
+            )?;
+            let rows = stmt.query_map(params![cutoff_unix_secs], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    Turn {
+                        idx: r.get(1)?,
+                        role: r.get(2)?,
+                        content: r.get(3)?,
+                        ts: r.get(4)?,
+                        metadata: r.get(5)?,
+                    },
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
     }
 
     /// Read up to `limit` most-recent turns for a conversation,
     /// oldest-first. Pass `limit = 0` for no cap.
     pub fn recall(&self, conversation_id: &str, limit: usize) -> Result<Vec<Turn>> {
         validate_conversation_id(conversation_id)?;
-        let conn = self.conn.lock();
-        let sql = if limit == 0 {
-            "SELECT idx, role, content, ts, metadata FROM turns WHERE conversation_id = ? ORDER BY idx ASC".to_string()
-        } else {
-            format!(
-                "SELECT idx, role, content, ts, metadata FROM (\
-                    SELECT idx, role, content, ts, metadata \
-                    FROM turns WHERE conversation_id = ? \
-                    ORDER BY idx DESC LIMIT {}\
-                ) ORDER BY idx ASC",
-                limit
-            )
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![conversation_id], |r| {
-            Ok(Turn {
-                idx: r.get(0)?,
-                role: r.get(1)?,
-                content: r.get(2)?,
-                ts: r.get(3)?,
-                metadata: r.get(4)?,
-            })
+        let turns = self.with_conn(|conn| {
+            let sql = if limit == 0 {
+                "SELECT idx, role, content, ts, metadata FROM turns WHERE conversation_id = ? ORDER BY idx ASC".to_string()
+            } else {
+                format!(
+                    "SELECT idx, role, content, ts, metadata FROM (\
+                        SELECT idx, role, content, ts, metadata \
+                        FROM turns WHERE conversation_id = ? \
+                        ORDER BY idx DESC LIMIT {limit}\
+                    ) ORDER BY idx ASC"
+                )
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![conversation_id], |r| {
+                Ok(Turn {
+                    idx: r.get(0)?,
+                    role: r.get(1)?,
+                    content: r.get(2)?,
+                    ts: r.get(3)?,
+                    metadata: r.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
         })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(apply_supersedes(out))
+        Ok(apply_supersedes(turns))
     }
 }
 
@@ -254,20 +305,18 @@ fn apply_supersedes(turns: Vec<Turn>) -> Vec<Turn> {
 
 /// Process-wide instance over the shared unified store
 /// (`crate::store`, ADRs 0028/0041). Lazy-initialized on first use.
-/// Each method call acquires its own pool connection (not stored here);
-/// this static only ensures the pool is initialized once.
+/// Each method call acquires its own fresh pool connection (ADR 0041 Item 4:
+/// `Memory::shared()` no longer holds a long-lived `Arc<Mutex<Connection>>`).
 pub fn shared() -> Result<&'static Memory> {
     static M: OnceLock<Memory> = OnceLock::new();
     if let Some(m) = M.get() {
         return Ok(m);
     }
     // Trigger pool init (runs migration + legacy import once). The Memory
-    // struct holds an Arc<Mutex<Connection>> for its own private methods;
-    // we use the deprecated shim here to satisfy the struct field type
-    // during the pool migration transition.
-    #[allow(deprecated)]
-    let conn = crate::store::shared_handle()?;
-    let _ = M.set(Memory { conn });
+    // instance uses Source::Pool so every method call acquires a fresh
+    // pooled connection instead of holding a global mutex.
+    let _ = crate::store::conn()?; // ensure pool is initialised
+    let _ = M.set(Memory { source: Source::Pool });
     M.get().ok_or_else(|| anyhow!("memory init race"))
 }
 
@@ -516,24 +565,25 @@ mod tests {
         }
         // Backdate the rows: append created turns at "now"; rewrite ts
         // directly via a raw query so the test controls the times.
-        let conn = mem.conn.lock();
-        conn.execute("DELETE FROM turns", []).unwrap();
-        for (conv, ts) in [
-            ("alpha", 100i64),
-            ("alpha", 200),
-            ("alpha", 300),
-            ("bravo", 100),
-            ("bravo", 200),
-            ("bravo", 300),
-        ] {
-            conn.execute(
-                "INSERT INTO turns (conversation_id, idx, role, content, ts) \
-                 VALUES (?, ?, ?, ?, ?)",
-                params![conv, ts, "user", format!("at-{ts}"), ts],
-            )
-            .unwrap();
-        }
-        drop(conn);
+        // Use with_conn to access the connection without exposing conn field.
+        mem.with_conn(|conn| {
+            conn.execute("DELETE FROM turns", [])?;
+            for (conv, ts) in [
+                ("alpha", 100i64),
+                ("alpha", 200),
+                ("alpha", 300),
+                ("bravo", 100),
+                ("bravo", 200),
+                ("bravo", 300),
+            ] {
+                conn.execute(
+                    "INSERT INTO turns (conversation_id, idx, role, content, ts) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![conv, ts, "user", format!("at-{ts}"), ts],
+                )?;
+            }
+            Ok(())
+        }).unwrap();
 
         let rows = mem.recall_since(200).unwrap();
         assert_eq!(rows.len(), 4, "expect 2 turns per conv after cutoff");
@@ -610,10 +660,10 @@ mod tests {
     #[test]
     fn wal_mode_is_active_after_open() {
         let (_td, mem) = fresh();
-        let conn = mem.conn.lock();
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap();
+        let mode: String = mem.with_conn(|conn| {
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .map_err(Into::into)
+        }).unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
     }
 }

@@ -1000,6 +1000,9 @@ pub async fn supersede(
             .optional()?
             .unwrap_or(false)
         };
+        // Pass old_indexed so the stale bump happens inside supersede_conn's
+        // transaction (Item 3: tx-coupled stale signal). The note_stale call
+        // that used to follow here is now inside the tx via supersede_conn.
         let id = supersede_conn(
             &mut conn,
             old_id,
@@ -1010,17 +1013,16 @@ pub async fn supersede(
             source,
             now,
             owner,
+            old_indexed,
         )?;
         if let Some(id) = id {
             if let Some((v, ident)) = &embedded {
                 crate::store::record_store_identity(&conn, "memories", &ident.model, v.len(), now);
                 crate::tv_store::note_added(&conn, TV_STORE, id, v, &ident.model);
             }
+            // Also add old_id to the skip-set (in-memory, immediate ANN suppression).
             if old_indexed {
-                // Invalidation WITHOUT delete: the expired row's vector stays
-                // in the .tv; searches post-filter it out, and the stale
-                // counter drives the >25% rebuild threshold.
-                crate::tv_store::note_stale(&conn, TV_STORE, 1);
+                crate::tv_store::note_stale_rowid(&conn, TV_STORE, old_id);
             }
         }
         id
@@ -1044,6 +1046,12 @@ pub async fn supersede(
 /// the old fact is still `valid_until IS NULL` — both then appear in
 /// default recall, violating the "exactly one valid version" invariant
 /// supersession exists to enforce.
+///
+/// `old_indexed`: whether the old row carried an embedding (i.e. was in
+/// the vector index). When true the stale_count bump is executed INSIDE
+/// this function's transaction (Item 3: tx-coupled stale signal) so the
+/// signal cannot be lost if the process dies between the UPDATE commit
+/// and the bump. Callers that don't need the bump (tests) pass `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supersede_conn(
     conn: &mut Connection,
@@ -1055,6 +1063,7 @@ pub(crate) fn supersede_conn(
     source: &str,
     now: i64,
     owner: &str,
+    old_indexed: bool,
 ) -> Result<Option<i64>> {
     let tx = conn.transaction()?;
     // Ownership gate: the old row must be `owner`'s. Validity is NOT
@@ -1084,6 +1093,11 @@ pub(crate) fn supersede_conn(
         "UPDATE memories SET valid_until = ? WHERE id = ? AND owner = ? AND valid_until IS NULL",
         params![now, old_id, owner],
     )?;
+    // Item 3: tx-coupled stale signal. Bump stale_count inside this tx
+    // so the signal is atomic with the expiry — cannot be lost on crash.
+    if old_indexed {
+        crate::tv_store::bump_stale(&tx, TV_STORE, 1)?;
+    }
     tx.commit()?;
     Ok(Some(new_id))
 }
@@ -1100,23 +1114,38 @@ pub(crate) fn supersede_conn(
 /// No fact is ever hard-deleted; `forget` only moves a fact into history.
 pub fn forget(id: i64, owner: &str) -> Result<bool> {
     let now = now_secs();
-    let conn = memory_db()?;
-    // Indexed = currently valid AND embedding-bearing — only those rows
-    // ever entered the .tv, so only they count toward stale (ADR 0031).
-    let was_indexed: bool = {
+    let mut conn = memory_db()?;
+    // Item 3 (tx-coupled stale signal): the ownership + indexed check,
+    // the UPDATE, and the stale_count bump all run in ONE transaction so
+    // the signal cannot be lost if the process dies between the UPDATE
+    // commit and the bump.
+    let (affected, was_indexed) = {
         use rusqlite::OptionalExtension;
-        conn.query_row(
-            "SELECT embedding IS NOT NULL FROM memories \
-             WHERE id = ?1 AND owner = ?2 AND valid_until IS NULL",
-            params![id, owner],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(false)
+        let tx = conn.transaction()?;
+        let was_indexed: bool = tx
+            .query_row(
+                "SELECT embedding IS NOT NULL FROM memories \
+                 WHERE id = ?1 AND owner = ?2 AND valid_until IS NULL",
+                params![id, owner],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        let affected = tx.execute(
+            "UPDATE memories SET valid_until = ? WHERE id = ? AND owner = ? AND valid_until IS NULL",
+            params![now, id, owner],
+        )? > 0;
+        if affected && was_indexed {
+            // Stale bump is inside the tx — atomic with the expiry UPDATE.
+            crate::tv_store::bump_stale(&tx, TV_STORE, 1)?;
+        }
+        tx.commit()?;
+        (affected, was_indexed)
     };
-    let affected = forget_conn(&conn, id, now, owner)?;
+    // Add to skip-set outside the tx (in-memory, no ordering req) so the
+    // rowid is immediately filtered from ANN results on the next search.
     if affected && was_indexed {
-        crate::tv_store::note_stale(&conn, TV_STORE, 1);
+        crate::tv_store::note_stale_rowid(&conn, TV_STORE, id);
     }
     Ok(affected)
 }
@@ -1124,7 +1153,8 @@ pub fn forget(id: i64, owner: &str) -> Result<bool> {
 /// Connection-level core of [`forget`]: expire the row if it is currently
 /// valid AND belongs to `owner`, returning whether a row was affected.
 /// Factored out for testing against an in-memory connection with a known
-/// `now`.
+/// `now`. Does NOT bump stale_count (tests drive that separately).
+#[allow(dead_code)] // used in #[cfg(test)] blocks only
 pub(crate) fn forget_conn(conn: &Connection, id: i64, now: i64, owner: &str) -> Result<bool> {
     let affected = conn.execute(
         "UPDATE memories SET valid_until = ? WHERE id = ? AND owner = ? AND valid_until IS NULL",
@@ -1635,7 +1665,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
 
         // Supersede at now = 500.
         let new_id =
-            supersede_conn(&mut conn, old_id, "lives in NYC", None, None, "fact", "manual", 500, "local")
+            supersede_conn(&mut conn, old_id, "lives in NYC", None, None, "fact", "manual", 500, "local", false)
                 .unwrap()
                 .expect("old_id is owned — supersede must insert");
         assert_ne!(old_id, new_id);
@@ -2192,7 +2222,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
             .unwrap();
         // bob superseding alice's fact: None, nothing inserted, old intact.
-        let r = supersede_conn(&mut conn, a_vec, "bob's takeover", None, None, "fact", "manual", 500, "bob")
+        let r = supersede_conn(&mut conn, a_vec, "bob's takeover", None, None, "fact", "manual", 500, "bob", false)
             .unwrap();
         assert!(r.is_none(), "cross-owner supersede must return None");
         let after: i64 = conn
@@ -2205,12 +2235,12 @@ CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts);
         assert!(valid_until.is_none(), "old fact stays current");
 
         // Missing id behaves identically (no existence leak).
-        let r2 = supersede_conn(&mut conn, 999_999, "ghost", None, None, "fact", "manual", 500, "bob")
+        let r2 = supersede_conn(&mut conn, 999_999, "ghost", None, None, "fact", "manual", 500, "bob", false)
             .unwrap();
         assert!(r2.is_none());
 
         // alice superseding her own fact works and the new row is hers.
-        let new_id = supersede_conn(&mut conn, a_vec, "alpha vec v2", None, None, "fact", "manual", 600, "alice")
+        let new_id = supersede_conn(&mut conn, a_vec, "alpha vec v2", None, None, "fact", "manual", 600, "alice", false)
             .unwrap()
             .expect("own supersede inserts");
         let owner: String = conn

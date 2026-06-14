@@ -94,6 +94,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// These imports are only needed by the turbovec-gated background-rebuild
+// infrastructure (mod turbo). Suppress dead_code in feature-off builds.
+#[cfg(feature = "turbovec")]
+use std::collections::HashSet;
+#[cfg(feature = "turbovec")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::rag::blob_to_vec;
 use crate::vector_index::normalize;
 
@@ -131,6 +138,14 @@ impl Store {
         match self {
             Store::Memories => "memories",
             Store::Chunks => "chunks",
+        }
+    }
+
+    /// Index into a 2-element per-store array (Memories=0, Chunks=1).
+    pub(crate) fn idx(self) -> usize {
+        match self {
+            Store::Memories => 0,
+            Store::Chunks => 1,
         }
     }
 }
@@ -199,6 +214,25 @@ pub(crate) fn bump_stale(conn: &Connection, store: Store, n: i64) -> Result<()> 
     Ok(())
 }
 
+/// Subtract `n` from `stale_count`, flooring at 0. Used by the background
+/// rebuild to reset only the stale bumps that were OBSERVED before the build
+/// started — concurrent bumps arriving during the build are preserved.
+///
+/// Compare-and-decrement semantics: `stale_count = MAX(0, stale_count - n)`.
+/// This is correct because the background rebuild snapshotted `stale_count` at
+/// build start; any bumps that arrive AFTER the snapshot push `stale_count`
+/// above the snapshot value and MUST NOT be erased. A blind set-to-0 would
+/// swallow those concurrent bumps.
+pub(crate) fn subtract_stale(conn: &Connection, store: Store, n: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE vector_index_state \
+         SET stale_count = MAX(0, stale_count - ?2) \
+         WHERE store = ?1",
+        params![store.name(), n],
+    )?;
+    Ok(())
+}
+
 /// Record a completed full (re)build: adopt the identity, zero the stale
 /// counter, stamp `built_at`, set the watermark.
 pub(crate) fn record_built(
@@ -208,17 +242,27 @@ pub(crate) fn record_built(
     dims: usize,
     watermark: i64,
     now: i64,
+    reset_stale: bool,
 ) -> Result<()> {
+    // A SYNCHRONOUS full rebuild rebuilds the whole index → stale=0.
+    // A BACKGROUND rebuild leaves stale_count to its caller's
+    // compare-and-decrement (`subtract_stale` already ran) so it must NOT
+    // re-zero it here and swallow bumps that arrived during the build.
+    let stale_update = if reset_stale { "stale_count = 0," } else { "" };
+    // Safe: `stale_update` is one of two compile-time literals, never user
+    // input — no injection surface. All values go through bound params.
     conn.execute(
-        "INSERT INTO vector_index_state \
-             (store, last_indexed_rowid, stale_count, model, dims, built_at) \
-         VALUES (?1, ?2, 0, ?3, ?4, ?5) \
-         ON CONFLICT(store) DO UPDATE SET \
-             last_indexed_rowid = excluded.last_indexed_rowid, \
-             stale_count = 0, \
-             model = excluded.model, \
-             dims = excluded.dims, \
-             built_at = excluded.built_at",
+        &format!(
+            "INSERT INTO vector_index_state \
+                 (store, last_indexed_rowid, stale_count, model, dims, built_at) \
+             VALUES (?1, ?2, 0, ?3, ?4, ?5) \
+             ON CONFLICT(store) DO UPDATE SET \
+                 last_indexed_rowid = excluded.last_indexed_rowid, \
+                 {stale_update} \
+                 model = excluded.model, \
+                 dims = excluded.dims, \
+                 built_at = excluded.built_at"
+        ),
         params![store.name(), watermark, model, dims as i64, now],
     )?;
     Ok(())
@@ -619,7 +663,7 @@ fn rebuild_impl<B: QuantBackend>(
 ) -> Result<()> {
     let rows = pending_rows(conn, store, model, 0)?;
     let idx = PersistentIndex::<B>::build(&rows, model, dims, bit_width, watermark)?;
-    record_built(conn, store, model, dims, watermark, now_secs())?;
+    record_built(conn, store, model, dims, watermark, now_secs(), true)?;
     idx.backend.prepare();
     *slot = Some(idx);
     Ok(())
@@ -805,6 +849,182 @@ mod turbo {
             Store::Chunks => &CHUNKS,
         }
     }
+
+    // ── Item 1: background-rebuild in-flight guards ──────────────────
+    //
+    // One AtomicBool per store: false = idle, true = rebuild in flight.
+    // CAS false→true to become the sole rebuild owner; the bg thread
+    // clears it on completion (or error) via a drop guard.
+    static REBUILD_IN_FLIGHT: [AtomicBool; 2] =
+        [AtomicBool::new(false), AtomicBool::new(false)];
+
+    // ── Item 3: per-store skip-set ───────────────────────────────────
+    //
+    // Rowids known to be expired/superseded. Searches filter these out of
+    // the ANN result set WITHOUT waiting for the 25%-threshold rebuild, so
+    // an expired row disappears from results immediately after the expiry
+    // transaction commits. Additive correctness: the SQLite post-filter
+    // already enforces validity; this only prevents wasting over-fetch
+    // slots on known-dead rowids.
+    //
+    // The skip-set is cleared on every index swap (rebuild completion) so
+    // it stays bounded by the number of expirations between rebuilds.
+    static SKIP_SET_MEMORIES: Mutex<HashSet<i64>> = Mutex::new(HashSet::new());
+    static SKIP_SET_CHUNKS: Mutex<HashSet<i64>> = Mutex::new(HashSet::new());
+
+    pub(super) fn skip_set(
+        store: Store,
+    ) -> &'static Mutex<HashSet<i64>> {
+        match store {
+            Store::Memories => &SKIP_SET_MEMORIES,
+            Store::Chunks => &SKIP_SET_CHUNKS,
+        }
+    }
+
+    /// Add `rowid` to the store's skip-set. Called inside the expiry
+    /// transaction (see Item 3 in tv_store module), before the tx commits.
+    pub(super) fn insert_skip(store: Store, rowid: i64) {
+        skip_set(store).lock().insert(rowid);
+    }
+
+    /// Drain and discard the skip-set after a successful rebuild swap.
+    pub(super) fn clear_skip(store: Store) {
+        skip_set(store).lock().clear();
+    }
+
+    /// Filter `hits` removing any rowids in the skip-set. Applied after
+    /// the ANN search so expired rows are suppressed immediately.
+    pub(super) fn filter_skip(store: Store, hits: Vec<(i64, f32)>) -> Vec<(i64, f32)> {
+        let skip = skip_set(store).lock();
+        if skip.is_empty() {
+            return hits;
+        }
+        hits.into_iter().filter(|(rid, _)| !skip.contains(rid)).collect()
+    }
+
+    /// Trigger a background rebuild for `store` if none is currently
+    /// running. The calling thread (holding the slot lock + DB lock) must
+    /// have ALREADY read `stale_count` and `indexed` for the threshold
+    /// check. The search SERVES THE CURRENT (possibly stale) index and
+    /// returns immediately — the rebuild races concurrently.
+    ///
+    /// Safety + correctness invariants:
+    ///
+    /// 1. The O(N) `pending_rows` scan runs OFF the slot mutex (the new
+    ///    index is built in the spawned thread without holding any lock).
+    ///
+    /// 2. Rows added DURING the rebuild (rowid > watermark) land in the
+    ///    OLD live index via `note_added` pre-swap. After the swap they are
+    ///    covered by `ensure_loaded_impl`'s catch-up on the next search
+    ///    (the new index's `last_rowid == watermark` at swap time). Bounded
+    ///    + self-healing — no rows are lost.
+    ///
+    /// 3. stale_count is decremented by exactly the count seen at build
+    ///    start (not zeroed), so concurrent bumps arriving during the build
+    ///    survive the completion step.
+    pub(super) fn maybe_spawn_bg_rebuild(store: Store, stale_snapshot: i64, model: String, dims: usize) {
+        let idx = store.idx();
+        if REBUILD_IN_FLIGHT[idx]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another thread is already rebuilding this store.
+            return;
+        }
+        // `stale_snapshot` (the count observed at the threshold check) is
+        // moved into the thread and subtracted on completion — concurrent
+        // bumps arriving during the build push the live count above it and
+        // survive (compare-and-decrement, not zero).
+        std::thread::spawn(move || {
+            // Drop guard: clears the in-flight flag even on panic/error.
+            struct Guard(usize);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    REBUILD_IN_FLIGHT[self.0].store(false, Ordering::Release);
+                }
+            }
+            let _guard = Guard(idx);
+
+            // Step 1: Get a FRESH pooled connection (not the caller's).
+            let conn = match crate::store::conn() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("{} bg rebuild: pool conn failed: {e:#}", store.name());
+                    return;
+                }
+            };
+
+            // Step 2: Snapshot the current max rowid (WAL snapshot — rows
+            // written AFTER this watermark are in the old live index via
+            // note_added and will be caught up by ensure_loaded_impl after
+            // the swap).
+            let watermark = match max_rowid(&conn, store) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("{} bg rebuild: max_rowid failed: {e:#}", store.name());
+                    return;
+                }
+            };
+
+            // Step 3: Build the new index from SQLite — O(N) work, NO slot
+            // lock held. SQLite WAL snapshot means writers can continue.
+            let rows = match pending_rows(&conn, store, &model, 0) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("{} bg rebuild: pending_rows failed: {e:#}", store.name());
+                    return;
+                }
+            };
+            let new_idx = match PersistentIndex::<TurboBackend>::build(
+                &rows, &model, dims, DEFAULT_BIT_WIDTH, watermark,
+            ) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::warn!("{} bg rebuild: build failed: {e:#}", store.name());
+                    return;
+                }
+            };
+            new_idx.backend.prepare();
+
+            // Step 4: Persist the freshly-built index to disk BEFORE the
+            // swap. We still own `new_idx`, so this can't accidentally persist
+            // a DIFFERENT index that a concurrent identity-change swapped into
+            // the slot between our swap and a re-lock.
+            let dir = index_dir();
+            if let Err(e) = new_idx.persist(&dir, store) {
+                tracing::warn!("{} bg rebuild: persist failed: {e:#}", store.name());
+                // Non-fatal: swap it in regardless; a torn/missing sidecar just
+                // triggers a cold rebuild-from-SQLite on the next load.
+            }
+
+            // Step 5: Swap under the slot lock, and clear the skip-set in the
+            // SAME critical section so a concurrent insert_skip can't be lost
+            // in a gap between swap and clear.
+            {
+                let mut guard = handle(store).lock();
+                *guard = Some(new_idx);
+                clear_skip(store);
+            }
+
+            // Step 6: compare-and-decrement stale_count by the start-of-build
+            // snapshot (bumps that arrived DURING the build pushed it above the
+            // snapshot and survive), THEN record the build's watermark/model/
+            // dims/built_at WITHOUT re-zeroing stale (reset_stale=false) — so
+            // `vector_index_state` matches the new on-disk meta (no spurious
+            // rebuild on next restart) and the concurrent bumps are kept.
+            if let Err(e) = subtract_stale(&conn, store, stale_snapshot) {
+                tracing::warn!("{} bg rebuild: subtract_stale failed: {e:#}", store.name());
+            }
+            if let Err(e) = record_built(&conn, store, &model, dims, watermark, now_secs(), false) {
+                tracing::warn!("{} bg rebuild: record_built failed: {e:#}", store.name());
+            }
+
+            tracing::info!(
+                "{}: bg rebuild complete (watermark={watermark}, stale_absorbed={stale_snapshot})",
+                store.name()
+            );
+        });
+    }
 }
 
 // ── Hooks (the seam the write/read paths call) ──────────────────────
@@ -870,6 +1090,22 @@ pub(crate) fn note_stale(conn: &Connection, store: Store, n: i64) {
     }
 }
 
+/// Writer hook variant: add `rowid` to the per-store skip-set so it is
+/// filtered from ANN results on the NEXT search (before the 25% rebuild
+/// threshold is hit). The stale_count bump MUST already have been done
+/// inside the expiry transaction — this function only updates the in-memory
+/// skip-set. Call AFTER the transaction commits; the skip-set is in-memory
+/// so no DB lock or index lock is needed.
+pub(crate) fn note_stale_rowid(_conn: &Connection, store: Store, rowid: i64) {
+    if !persistent_active() {
+        return;
+    }
+    #[cfg(feature = "turbovec")]
+    turbo::insert_skip(store, rowid);
+    #[cfg(not(feature = "turbovec"))]
+    let _ = (store, rowid);
+}
+
 /// Throttled persist check — call AFTER releasing the DB lock (file I/O
 /// runs under the index lock only). No-op when nothing is loaded, the
 /// throttle isn't due, or the feature is off.
@@ -914,6 +1150,12 @@ pub fn flush_all() {
 /// falls back to the per-query scan. Call while HOLDING the DB lock
 /// (load/rebuild reads SQLite through `conn`); the returned rowids MUST
 /// be post-filtered against SQLite (validity + model) before use.
+///
+/// Background rebuild (Item 1): when `stale_count > 25%` of indexed rows
+/// a non-blocking background rebuild is spawned. The search SERVES THE
+/// CURRENT (possibly stale) index immediately — never blocks. The
+/// per-store skip-set (Item 3) filters known-expired rowids from the
+/// result before returning so they don't consume over-fetch slots.
 pub(crate) fn search_persistent(
     conn: &Connection,
     store: Store,
@@ -926,27 +1168,49 @@ pub(crate) fn search_persistent(
     }
     #[cfg(feature = "turbovec")]
     {
+        let dims = qvec.len();
         let mut guard = turbo::handle(store).lock();
-        match search_impl(
+
+        // Ensure the index is loaded (first use or identity change).
+        if let Err(e) = ensure_loaded_impl(
             conn,
             &index_dir(),
             store,
-            qvec,
             model,
+            dims,
             DEFAULT_BIT_WIDTH,
-            k,
             &mut guard,
         ) {
-            Ok(hits) => Some(hits),
-            Err(e) => {
-                tracing::warn!(
-                    "{} persistent index search failed ({e:#}); falling back to brute scan",
-                    store.name()
-                );
-                *guard = None;
-                None
-            }
+            tracing::warn!(
+                "{} persistent index load failed ({e:#}); falling back to brute scan",
+                store.name()
+            );
+            *guard = None;
+            return None;
         }
+
+        // Check stale threshold and spawn background rebuild if due.
+        // We NEVER block here — serve the current index regardless.
+        let stale = read_state(conn, store).ok().flatten().map_or(0, |s| s.stale_count);
+        let indexed = guard.as_ref().map_or(0, PersistentIndex::len);
+        if stale_rebuild_due(stale, indexed) {
+            tracing::info!(
+                "{}: stale_count {stale} exceeds 25% of {indexed} indexed rows — spawning bg rebuild",
+                store.name()
+            );
+            // Spawn off-lock: the heavy O(N) work runs in the bg thread
+            // WITHOUT holding this slot mutex.
+            turbo::maybe_spawn_bg_rebuild(store, stale, model.to_string(), dims);
+        }
+
+        // Search the current (possibly stale) index immediately.
+        let hits = match guard.as_ref() {
+            Some(idx) => idx.search(qvec, k.saturating_mul(OVERFETCH)),
+            None => return None,
+        };
+
+        // Item 3: filter skip-set rowids (known-expired) before returning.
+        Some(turbo::filter_skip(store, hits))
     }
     #[cfg(not(feature = "turbovec"))]
     {
@@ -1176,7 +1440,7 @@ mod tests {
         assert_eq!(s.last_indexed_rowid, 5, "stale bump must not touch the watermark");
 
         // record_built adopts identity, zeroes stale, sets watermark.
-        record_built(&conn, Store::Memories, "model-a", 8, 42, 1000).unwrap();
+        record_built(&conn, Store::Memories, "model-a", 8, 42, 1000, true).unwrap();
         let s = read_state(&conn, Store::Memories).unwrap().unwrap();
         assert_eq!(s.last_indexed_rowid, 42);
         assert_eq!(s.stale_count, 0);
@@ -1447,6 +1711,103 @@ mod tests {
             .unwrap();
         let s = read_state(&conn, Store::Memories).unwrap().unwrap();
         assert_eq!(s.stale_count, 1, "at-threshold stale count survives");
+    }
+
+    // ── M2 new tests ─────────────────────────────────────────────────
+
+    /// Item 2: flush_all persists a dirty index; calling it twice is
+    /// idempotent (no error, no tmp files left behind).
+    #[test]
+    fn flush_all_persists_dirty_index_and_is_idempotent() {
+        let td = tempfile::tempdir().unwrap();
+        let rows = sep_rows();
+        let mut idx =
+            PersistentIndex::<BruteBackend>::build(&rows, "m", 8, 4, 40).unwrap();
+        idx.persist(td.path(), Store::Memories).unwrap();
+
+        // Add a row to make the index dirty.
+        let mut q = vec![0.0f32; 8];
+        q[7] = 1.0;
+        idx.add(50, &q);
+        assert!(idx.dirty(), "index should be dirty after add");
+
+        // Simulate flush_all: persist the index.
+        idx.persist(td.path(), Store::Memories).unwrap();
+        assert!(!idx.dirty(), "flush clears dirty flag");
+
+        // Second flush is idempotent (nothing dirty).
+        idx.persist(td.path(), Store::Memories).unwrap();
+        assert!(!idx.dirty(), "second flush still clean");
+
+        // No tmp files left behind.
+        let tmp_left = std::fs::read_dir(td.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!tmp_left, "no tmp files after flush");
+
+        // Round-trip: the new row is searchable after a reload.
+        let loaded =
+            PersistentIndex::<BruteBackend>::load_from(td.path(), Store::Memories).unwrap();
+        assert_eq!(loaded.len(), 5, "5 rows after flush");
+        let hits = loaded.search(&q, 1);
+        assert_eq!(hits[0].0, 50, "newly flushed row is searchable");
+    }
+
+    /// Item 3: subtract_stale decrements without going below 0, and does
+    /// not clobber concurrent bumps (compare-and-decrement semantics).
+    #[test]
+    fn subtract_stale_compare_and_decrement() {
+        let conn = open_test_db();
+        bump_stale(&conn, Store::Memories, 10).unwrap();
+        let s = read_state(&conn, Store::Memories).unwrap().unwrap();
+        assert_eq!(s.stale_count, 10);
+
+        // Subtract only 3 (the "snapshot" from build start).
+        subtract_stale(&conn, Store::Memories, 3).unwrap();
+        let s = read_state(&conn, Store::Memories).unwrap().unwrap();
+        assert_eq!(s.stale_count, 7, "remaining bumps preserved");
+
+        // A concurrent bump of 5 arrives.
+        bump_stale(&conn, Store::Memories, 5).unwrap();
+        let s = read_state(&conn, Store::Memories).unwrap().unwrap();
+        assert_eq!(s.stale_count, 12);
+
+        // Subtract the original 7 (second pass would subtract more).
+        subtract_stale(&conn, Store::Memories, 7).unwrap();
+        let s = read_state(&conn, Store::Memories).unwrap().unwrap();
+        assert_eq!(s.stale_count, 5, "concurrent bump survived");
+
+        // Subtracting more than the count floors at 0.
+        subtract_stale(&conn, Store::Memories, 100).unwrap();
+        let s = read_state(&conn, Store::Memories).unwrap().unwrap();
+        assert_eq!(s.stale_count, 0, "floors at 0, never negative");
+
+        // Per-store isolation.
+        assert_eq!(read_state(&conn, Store::Chunks).unwrap(), None);
+    }
+
+    /// Item 1 (generic path): background-rebuild semantics via the generic
+    /// `search_impl`. This path keeps synchronous rebuild (BruteBackend in
+    /// tests), so we verify the stale-zeroing and rebuild still fire.
+    #[test]
+    fn search_impl_stale_rebuild_zeroes_counter() {
+        let conn = open_test_db();
+        let td = tempfile::tempdir().unwrap();
+        for axis in 0..4 {
+            let mut v = vec![0.0f32; 8];
+            v[axis] = 1.0;
+            insert_mem(&conn, &v, "m");
+        }
+        let mut slot: Option<PersistentIndex<BruteBackend>> = None;
+        // Prime the index.
+        search_impl(&conn, td.path(), Store::Memories, &axis_query(0), "m", 4, 1, &mut slot).unwrap();
+
+        // Stale 2 of 4 (>25%) → synchronous rebuild clears the counter.
+        bump_stale(&conn, Store::Memories, 2).unwrap();
+        search_impl(&conn, td.path(), Store::Memories, &axis_query(0), "m", 4, 1, &mut slot).unwrap();
+        let s = read_state(&conn, Store::Memories).unwrap().unwrap();
+        assert_eq!(s.stale_count, 0, "rebuild zeroed stale count");
     }
 
     // ── TurboVec round-trips (feature-gated) ────────────────────────

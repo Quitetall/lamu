@@ -1133,7 +1133,11 @@ fn format_status_line(port: u16, health: Option<&Value>, models: Option<&Value>)
 
 async fn cmd_start() -> Result<()> {
     let server = build_mcp_server().await?;
-    server.run().await
+    let result = server.run().await;
+    // Flush any dirty persistent vector-index to disk on normal exit / EOF
+    // of the stdio MCP loop (Item 2: flush_all on shutdown).
+    lamu_memory::tv_store::flush_all();
+    result
 }
 
 /// `lamu acp` — ACP agent over stdio (ADR 0036). Composes the same

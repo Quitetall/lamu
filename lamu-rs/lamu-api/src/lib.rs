@@ -81,6 +81,11 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown)
         .await?;
 
+    // Flush any dirty persistent vector-index to disk before the process
+    // exits (Item 2: flush_all on shutdown). This runs after the server
+    // has stopped accepting requests so no concurrent index mutations occur.
+    lamu_memory::tv_store::flush_all();
+
     // PidFile::Drop unlinks the file.
     drop(pidfile);
     Ok(())

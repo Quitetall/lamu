@@ -144,28 +144,16 @@ pub fn conn() -> Result<PooledConn> {
     pool()?.get().map_err(|e| anyhow!("pool get: {e}"))
 }
 
-/// Deprecated process-wide handle — thin shim over the pool so existing
-/// call sites that haven't been migrated yet continue to compile.
+/// Deprecated process-wide handle shim. All internal callers have been
+/// migrated to `store::conn()` (M2 Item 4). This shim is kept ONLY for
+/// any external / downstream code that hasn't migrated yet. It opens a
+/// fresh non-pool connection each call — heavier than `conn()`.
 ///
-/// Prefer `store::conn()` for new code. This shim wraps ONE pool
-/// connection in `Arc<Mutex<>>` on each call, so concurrent callers no
-/// longer serialize on a single global mutex — they each hold their own
-/// pooled connection.
-#[deprecated(since = "0.1.0", note = "use store::conn() instead")]
+/// Zero internal callers remain as of M2 (ADR 0042).
+#[deprecated(since = "0.1.0", note = "use store::conn() instead — zero internal callers remain")]
 pub fn shared_handle() -> Result<Arc<Mutex<Connection>>> {
-    // Get a pooled connection and move it into a temporary Arc<Mutex<>>
-    // so old call sites (lock → use → drop) keep working. The pooled
-    // connection is returned to the pool when the Arc is dropped.
-    // Note: this is purely a migration shim; new code should call conn().
-    //
-    // Because PooledConn cannot be moved into a Connection directly, we
-    // open a fresh non-pool connection to the same (already-migrated) path.
-    // This is acceptable for the deprecated path only.
     let _ = pool()?; // ensure pool (and migration) is initialized
     let path = lamu_db_path();
-    // Use open_at (WAL + synchronous + busy_timeout + idempotent migrate) so
-    // the shim has no hidden ordering dependency on pool() having migrated —
-    // exactly one non-pool open path, same guarantees as the pool members.
     let c = open_at(&path)?;
     Ok(Arc::new(Mutex::new(c)))
 }
